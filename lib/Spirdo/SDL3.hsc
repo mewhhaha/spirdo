@@ -67,7 +67,13 @@ module Spirdo.SDL3
   , sdlSubmitGPUCommandBuffer
   , sdl_INIT_VIDEO
   , sdl_EVENT_QUIT
+  , sdl_EVENT_KEY_DOWN
+  , sdl_EVENT_KEY_UP
+  , sdl_SCANCODE_LEFT
+  , sdl_SCANCODE_RIGHT
   , sdlEventSize
+  , sdlKeyboardEventScancodeOffset
+  , sdlKeyboardEventRepeatOffset
   , sdl_GPU_SHADERFORMAT_SPIRV
   , sdl_GPU_SHADERSTAGE_VERTEX
   , sdl_GPU_SHADERSTAGE_FRAGMENT
@@ -86,6 +92,7 @@ module Spirdo.SDL3
 #include <SDL3/SDL_render.h>
 #include <SDL3/SDL_pixels.h>
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_scancode.h>
 
 import Foreign
 import Foreign.C.Types
@@ -125,8 +132,26 @@ sdl_INIT_VIDEO = #{const SDL_INIT_VIDEO}
 sdl_EVENT_QUIT :: Word32
 sdl_EVENT_QUIT = #{const SDL_EVENT_QUIT}
 
+sdl_EVENT_KEY_DOWN :: Word32
+sdl_EVENT_KEY_DOWN = #{const SDL_EVENT_KEY_DOWN}
+
+sdl_EVENT_KEY_UP :: Word32
+sdl_EVENT_KEY_UP = #{const SDL_EVENT_KEY_UP}
+
 sdlEventSize :: Int
 sdlEventSize = #{size SDL_Event}
+
+sdlKeyboardEventScancodeOffset :: Int
+sdlKeyboardEventScancodeOffset = #{offset SDL_KeyboardEvent, scancode}
+
+sdlKeyboardEventRepeatOffset :: Int
+sdlKeyboardEventRepeatOffset = #{offset SDL_KeyboardEvent, repeat}
+
+sdl_SCANCODE_LEFT :: Word32
+sdl_SCANCODE_LEFT = #{const SDL_SCANCODE_LEFT}
+
+sdl_SCANCODE_RIGHT :: Word32
+sdl_SCANCODE_RIGHT = #{const SDL_SCANCODE_RIGHT}
 
 sdl_GPU_SHADERFORMAT_SPIRV :: Word32
 sdl_GPU_SHADERFORMAT_SPIRV = #{const SDL_GPU_SHADERFORMAT_SPIRV}

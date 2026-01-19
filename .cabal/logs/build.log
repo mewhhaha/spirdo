@@ -76,3 +76,1336 @@ install-outcome: InstallOk
 docs-outcome:    NotTried
 tests-outcome:   NotTried
 
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: BuildFailed
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    template-haskell-2.23.0.0
+
+install-outcome: BuildFailed
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: DependencyFailed spirdo-0.1.0.0
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    template-haskell-2.23.0.0
+
+install-outcome: BuildFailed
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: DependencyFailed spirdo-0.1.0.0
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    template-haskell-2.23.0.0
+
+install-outcome: BuildFailed
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    spirdo-0.1.0.0
+
+install-outcome: DependencyFailed spirdo-0.1.0.0
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: BuildFailed
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: BuildFailed
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: BuildFailed
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: BuildFailed
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: TestsFailed
+docs-outcome:    NotTried
+tests-outcome:   Failed
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: TestsFailed
+docs-outcome:    NotTried
+tests-outcome:   Failed
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: BuildFailed
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: DependencyFailed spirdo-0.1.0.0
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    containers-0.7
+    directory-1.3.9.0
+    filepath-1.5.4.0
+    template-haskell-2.23.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+
+
+package:         spirdo-0.1.0.0
+os:              linux
+arch:            x86_64
+compiler:        ghc-9.12.2
+client:          cabal-install-3.16.1.0
+dependencies:
+    base-4.21.0.0
+    bytestring-0.12.2.0
+    filepath-1.5.4.0
+    spirdo-0.1.0.0
+
+install-outcome: InstallOk
+docs-outcome:    NotTried
+tests-outcome:   NotTried
+

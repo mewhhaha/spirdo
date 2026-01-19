@@ -26,6 +26,9 @@ library
     build-depends:
         base ^>=4.21.0.0,
         bytestring,
+        containers,
+        directory,
+        filepath,
         template-haskell
     build-tool-depends:
         hsc2hs:hsc2hs
@@ -42,9 +45,24 @@ executable spirdo
     build-depends:
         base ^>=4.21.0.0,
         bytestring,
+        filepath,
         spirdo
     pkgconfig-depends:
         sdl3
 
     hs-source-dirs:   exe
+    default-language: GHC2024
+
+test-suite spirdo-tests
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Main.hs
+    hs-source-dirs:   test
+    build-depends:
+        base ^>=4.21.0.0,
+        bytestring,
+        directory,
+        filepath,
+        process,
+        spirdo
     default-language: GHC2024
