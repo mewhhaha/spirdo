@@ -29,6 +29,7 @@ library
         containers,
         directory,
         filepath,
+        text,
         template-haskell
     build-tool-depends:
         hsc2hs:hsc2hs

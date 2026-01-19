@@ -1,6 +1,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -56,26 +57,31 @@ module Spirdo.Wesl
   , wesl
   ) where
 
+import Control.Exception (SomeException, catch)
 import Control.Monad (foldM, zipWithM, zipWithM_, when)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
+import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, ord)
 import Data.Either (partitionEithers)
 import Data.Int (Int32)
-import Data.List (intercalate, isInfixOf, isPrefixOf, mapAccumL, partition)
+import Data.List (intercalate, isPrefixOf, mapAccumL, partition)
 import Data.Maybe (fromMaybe, isJust, mapMaybe, maybeToList)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Proxy (Proxy(..))
-import Data.Word (Word8, Word16, Word32)
+import Data.Text (Text)
+import qualified Data.Text as T
+import Data.Word (Word8, Word16, Word32, Word64)
 import GHC.TypeLits (KnownNat, KnownSymbol, Nat, Symbol, natVal, symbolVal)
 import GHC.Float (castFloatToWord32, castWord32ToFloat)
 import Language.Haskell.TH (Exp, Q)
 import qualified Language.Haskell.TH as TH
 import Language.Haskell.TH.Quote (QuasiQuoter(..))
-import System.Directory (doesFileExist)
+import Numeric (showHex)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (dropExtension, isRelative, makeRelative, normalise, splitDirectories, takeDirectory, (<.>), (</>))
+import Text.Read (readMaybe)
 
 -- Type-level interface representation
 
@@ -102,10 +108,10 @@ data BindingKind
   | BStorageTexture2D
   | BStorageTexture2DArray
   | BStorageTexture3D
-  deriving (Eq, Show)
+  deriving (Eq, Show, Read)
 
 data StorageAccess = StorageRead | StorageWrite | StorageReadWrite
-  deriving (Eq, Show)
+  deriving (Eq, Show, Read)
 
 data StorageFormat
   = FormatRgba8Unorm
@@ -147,10 +153,10 @@ data StorageFormat
   | FormatRgb10a2Unorm
   | FormatRgb10a2Uint
   | FormatRg11b10Float
-  deriving (Eq, Show)
+  deriving (Eq, Show, Read)
 
 data ScalarType = SI32 | SU32 | SF16 | SF32 | SBool
-  deriving (Eq, Show)
+  deriving (Eq, Show, Read)
 
 data Field = Field Symbol Ty
 
@@ -186,11 +192,11 @@ data Ty
 data Binding = Binding Symbol BindingKind Nat Nat Ty
 
 data BindingDesc = BindingDesc
-  { descName :: String
-  , descKind :: BindingKind
-  , descGroup :: Word32
-  , descBinding :: Word32
-  } deriving (Eq, Show)
+  { descName :: !String
+  , descKind :: !BindingKind
+  , descGroup :: !Word32
+  , descBinding :: !Word32
+  } deriving (Eq, Show, Read)
 
 class KnownBindingKind (k :: BindingKind) where
   bindingKindVal :: Proxy k -> BindingKind
@@ -332,14 +338,14 @@ storageTextureBindingsFor _ = storageTextureBindings (Proxy @iface)
 -- Runtime interface representation
 
 data Scalar = I32 | U32 | F16 | F32 | Bool
-  deriving (Eq, Show)
+  deriving (Eq, Show, Read)
 
 data Type
   = TyScalar Scalar
   | TyVector Int Scalar
   | TyMatrix Int Int Scalar
   | TyArray Type (Maybe Int)
-  | TyStructRef String
+  | TyStructRef Text
   | TySampler
   | TySamplerComparison
   | TyTexture1D Scalar
@@ -360,64 +366,64 @@ data Type
   | TyStorageTexture2DArray StorageFormat StorageAccess
   | TyStorageTexture3D StorageFormat StorageAccess
   | TyAtomic Scalar
-  | TyPtr String (Maybe StorageAccess) Type
+  | TyPtr Text (Maybe StorageAccess) Type
   deriving (Eq, Show)
 
 data FieldDecl = FieldDecl
-  { fdName :: String
-  , fdType :: Type
-  , fdAttrs :: [Attr]
+  { fdName :: !Text
+  , fdType :: !Type
+  , fdAttrs :: ![Attr]
   } deriving (Eq, Show)
 
 data StructDecl = StructDecl
-  { sdName :: String
-  , sdFields :: [FieldDecl]
+  { sdName :: !Text
+  , sdFields :: ![FieldDecl]
   } deriving (Eq, Show)
 
 data BindingInfo = BindingInfo
-  { biName :: String
-  , biKind :: BindingKind
-  , biGroup :: Word32
-  , biBinding :: Word32
-  , biType :: TypeLayout
-  } deriving (Eq, Show)
+  { biName :: !String
+  , biKind :: !BindingKind
+  , biGroup :: !Word32
+  , biBinding :: !Word32
+  , biType :: !TypeLayout
+  } deriving (Eq, Show, Read)
 
 data FieldLayout = FieldLayout
-  { flName :: String
-  , flOffset :: Word32
-  , flType :: TypeLayout
-  , flAlign :: Word32
-  , flSize :: Word32
-  } deriving (Eq, Show)
+  { flName :: !String
+  , flOffset :: !Word32
+  , flType :: !TypeLayout
+  , flAlign :: !Word32
+  , flSize :: !Word32
+  } deriving (Eq, Show, Read)
 
 data TypeLayout
-  = TLScalar Scalar Word32 Word32
-  | TLVector Int Scalar Word32 Word32
-  | TLMatrix Int Int Scalar Word32 Word32 Word32
-  | TLArray (Maybe Int) Word32 TypeLayout Word32 Word32
-  | TLStruct String [FieldLayout] Word32 Word32
+  = TLScalar !Scalar !Word32 !Word32
+  | TLVector !Int !Scalar !Word32 !Word32
+  | TLMatrix !Int !Int !Scalar !Word32 !Word32 !Word32
+  | TLArray !(Maybe Int) !Word32 !TypeLayout !Word32 !Word32
+  | TLStruct !String ![FieldLayout] !Word32 !Word32
   | TLSampler
   | TLSamplerComparison
-  | TLTexture1D Scalar
-  | TLTexture1DArray Scalar
-  | TLTexture2D Scalar
-  | TLTexture2DArray Scalar
-  | TLTexture3D Scalar
-  | TLTextureCube Scalar
-  | TLTextureCubeArray Scalar
-  | TLTextureMultisampled2D Scalar
+  | TLTexture1D !Scalar
+  | TLTexture1DArray !Scalar
+  | TLTexture2D !Scalar
+  | TLTexture2DArray !Scalar
+  | TLTexture3D !Scalar
+  | TLTextureCube !Scalar
+  | TLTextureCubeArray !Scalar
+  | TLTextureMultisampled2D !Scalar
   | TLTextureDepth2D
   | TLTextureDepth2DArray
   | TLTextureDepthCube
   | TLTextureDepthCubeArray
   | TLTextureDepthMultisampled2D
-  | TLStorageTexture1D StorageFormat StorageAccess
-  | TLStorageTexture2D StorageFormat StorageAccess
-  | TLStorageTexture2DArray StorageFormat StorageAccess
-  | TLStorageTexture3D StorageFormat StorageAccess
-  | TLAtomic Scalar
-  | TLPointer Word32 (Maybe StorageAccess) TypeLayout
-  deriving (Eq, Show)
+  | TLStorageTexture1D !StorageFormat !StorageAccess
+  | TLStorageTexture2D !StorageFormat !StorageAccess
+  | TLStorageTexture2DArray !StorageFormat !StorageAccess
+  | TLStorageTexture3D !StorageFormat !StorageAccess
+  | TLAtomic !Scalar
+  | TLPointer !Word32 !(Maybe StorageAccess) !TypeLayout
+  deriving (Eq, Show, Read)
 
 layoutAlign :: TypeLayout -> Word32
 layoutAlign tl = case tl of
@@ -503,16 +509,16 @@ matrixLayout cols rows scalar =
   in TLMatrix cols rows scalar a total stride
 
 data OverrideInfo = OverrideInfo
-  { oiName :: String
-  , oiId :: Maybe Word32
-  , oiSpecId :: Maybe Word32
-  , oiType :: TypeLayout
-  } deriving (Eq, Show)
+  { oiName :: !String
+  , oiId :: !(Maybe Word32)
+  , oiSpecId :: !(Maybe Word32)
+  , oiType :: !TypeLayout
+  } deriving (Eq, Show, Read)
 
 data ShaderInterface = ShaderInterface
-  { siBindings :: [BindingInfo]
-  , siOverrides :: [OverrideInfo]
-  } deriving (Eq, Show)
+  { siBindings :: ![BindingInfo]
+  , siOverrides :: ![OverrideInfo]
+  } deriving (Eq, Show, Read)
 
 specializableOverrides :: ShaderInterface -> [OverrideInfo]
 specializableOverrides iface =
@@ -530,17 +536,17 @@ data SomeCompiledShader = forall iface. SomeCompiledShader (CompiledShader iface
 -- Errors and options
 
 data CompileError = CompileError
-  { ceMessage :: String
-  , ceLine :: Maybe Int
-  , ceColumn :: Maybe Int
+  { ceMessage :: !String
+  , ceLine :: !(Maybe Int)
+  , ceColumn :: !(Maybe Int)
   } deriving (Eq, Show)
 
 data Diagnostic = Diagnostic
-  { diagSeverity :: DiagnosticSeverity
-  , diagRule :: String
-  , diagMessage :: String
-  , diagLine :: Maybe Int
-  , diagColumn :: Maybe Int
+  { diagSeverity :: !DiagnosticSeverity
+  , diagRule :: !String
+  , diagMessage :: !String
+  , diagLine :: !(Maybe Int)
+  , diagColumn :: !(Maybe Int)
   } deriving (Eq, Show)
 
 data CompileOptions = CompileOptions
@@ -553,7 +559,7 @@ data CompileOptions = CompileOptions
 data OverrideSpecMode
   = SpecStrict
   | SpecParity
-  deriving (Eq, Show)
+  deriving (Eq, Show, Read)
 
 data OverrideValue
   = OVBool Bool
@@ -562,11 +568,14 @@ data OverrideValue
   | OVF32 Float
   | OVF16 Float
   | OVComposite [OverrideValue]
-  deriving (Eq, Show)
+  deriving (Eq, Show, Read)
 
 -- Default to SPIR-V 1.6 (0x00010600). Override if needed.
 defaultCompileOptions :: CompileOptions
 defaultCompileOptions = CompileOptions 0x00010600 [] [] SpecStrict
+
+overrideValuesText :: [(String, OverrideValue)] -> [(Text, OverrideValue)]
+overrideValuesText = map (\(k, v) -> (T.pack k, v))
 
 -- Public API
 
@@ -577,7 +586,7 @@ compileWeslToSpirvWith :: CompileOptions -> String -> Either CompileError SomeCo
 compileWeslToSpirvWith opts src = do
   moduleAst0 <- parseModuleWith (enabledFeatures opts) src
   moduleAst1 <- resolveTypeAliases moduleAst0
-  moduleAst <- lowerOverridesWith [] (overrideValues opts) moduleAst1
+  moduleAst <- lowerOverridesWith [] (overrideValuesText (overrideValues opts)) moduleAst1
   when (not (null (modImports moduleAst))) $
     Left (CompileError "imports require file-based compilation" Nothing Nothing)
   let node = ModuleNode "<inline>" [] moduleAst []
@@ -595,7 +604,7 @@ compileWeslToSpirvWithDiagnostics :: CompileOptions -> String -> Either CompileE
 compileWeslToSpirvWithDiagnostics opts src = do
   moduleAst0 <- parseModuleWith (enabledFeatures opts) src
   moduleAst1 <- resolveTypeAliases moduleAst0
-  moduleAst <- lowerOverridesWith [] (overrideValues opts) moduleAst1
+  moduleAst <- lowerOverridesWith [] (overrideValuesText (overrideValues opts)) moduleAst1
   when (not (null (modImports moduleAst))) $
     Left (CompileError "imports require file-based compilation" Nothing Nothing)
   let node = ModuleNode "<inline>" [] moduleAst []
@@ -632,7 +641,7 @@ compileWeslToSpirvFileWith opts path = do
                 Right linked' -> do
                   let rootDir = takeDirectory filePath
                       rootPath = modulePathFromFile rootDir filePath
-                  case lowerOverridesWith rootPath (overrideValues opts) linked' of
+                  case lowerOverridesWith rootPath (overrideValuesText (overrideValues opts)) linked' of
                     Left err -> pure (Left err)
                     Right lowered -> do
                       case validateConstAssertsMerged opts rootPath lowered of
@@ -665,7 +674,7 @@ compileWeslToSpirvFileWithDiagnostics opts path = do
                 Right linked' -> do
                   let rootDir = takeDirectory filePath
                       rootPath = modulePathFromFile rootDir filePath
-                  case lowerOverridesWith rootPath (overrideValues opts) linked' of
+                  case lowerOverridesWith rootPath (overrideValuesText (overrideValues opts)) linked' of
                     Left err -> pure (Left err)
                     Right lowered -> do
                       case collectDiagnosticsMerged opts rootPath lowered of
@@ -736,7 +745,7 @@ parseWeslToml path = do
               "dependencies" -> (TomlSectionDependencies, mName, mVersion, mSource, deps)
               name
                 | "dependencies." `isPrefixOf` name ->
-                    let depName = drop (length ("dependencies.")) name
+                    let depName = drop (length ("dependencies." :: String)) name
                     in (TomlSectionDependency depName, mName, mVersion, mSource, deps)
               _ -> (TomlSectionNone, mName, mVersion, mSource, deps)
           _ ->
@@ -846,7 +855,7 @@ compileWeslToSpirvBytesWith :: CompileOptions -> String -> Either CompileError B
 compileWeslToSpirvBytesWith opts src = do
   moduleAst0 <- parseModuleWith (enabledFeatures opts) src
   moduleAst1 <- resolveTypeAliases moduleAst0
-  moduleAst <- lowerOverridesWith [] (overrideValues opts) moduleAst1
+  moduleAst <- lowerOverridesWith [] (overrideValuesText (overrideValues opts)) moduleAst1
   when (not (null (modImports moduleAst))) $
     Left (CompileError "imports require file-based compilation" Nothing Nothing)
   let node = ModuleNode "<inline>" [] moduleAst []
@@ -862,7 +871,7 @@ compileWeslToSpirvBytesWithDiagnostics :: CompileOptions -> String -> Either Com
 compileWeslToSpirvBytesWithDiagnostics opts src = do
   moduleAst0 <- parseModuleWith (enabledFeatures opts) src
   moduleAst1 <- resolveTypeAliases moduleAst0
-  moduleAst <- lowerOverridesWith [] (overrideValues opts) moduleAst1
+  moduleAst <- lowerOverridesWith [] (overrideValuesText (overrideValues opts)) moduleAst1
   when (not (null (modImports moduleAst))) $
     Left (CompileError "imports require file-based compilation" Nothing Nothing)
   let node = ModuleNode "<inline>" [] moduleAst []
@@ -876,6 +885,67 @@ compileWeslToSpirvBytesWithDiagnostics opts src = do
   diags <- collectDiagnosticsMerged opts [] moduleAst
   pure (bytes, diags)
 
+weslCacheVersion :: String
+weslCacheVersion = "wesl-cache-v1"
+
+weslCacheDir :: FilePath
+weslCacheDir = "dist-newstyle" </> ".wesl-cache"
+
+weslCacheKey :: CompileOptions -> String -> String
+weslCacheKey opts src =
+  let keySrc =
+        intercalate
+          "\n"
+          [ weslCacheVersion
+          , "v=" <> show (spirvVersion opts)
+          , "features=" <> show (enabledFeatures opts)
+          , "overrides=" <> show (overrideValues opts)
+          , "spec=" <> show (overrideSpecMode opts)
+          , src
+          ]
+      bytes = BS.pack (map (fromIntegral . ord) keySrc)
+      hash = fnv1a64 bytes
+      hex = showHex hash ""
+  in replicate (16 - length hex) '0' <> hex
+
+fnv1a64 :: ByteString -> Word64
+fnv1a64 = BS.foldl' step offset
+  where
+    offset = 14695981039346656037
+    prime = 1099511628211
+    step acc byte = (acc `xor` fromIntegral byte) * prime
+
+weslCachePaths :: CompileOptions -> String -> (FilePath, FilePath)
+weslCachePaths opts src =
+  let key = weslCacheKey opts src
+      base = weslCacheDir </> key
+  in (base <.> "spv", base <.> "iface")
+
+loadWeslCache :: CompileOptions -> String -> IO (Maybe (ByteString, ShaderInterface))
+loadWeslCache opts src = do
+  let (spvPath, ifacePath) = weslCachePaths opts src
+  okSpv <- doesFileExist spvPath
+  okIface <- doesFileExist ifacePath
+  if not (okSpv && okIface)
+    then pure Nothing
+    else
+      (do
+        bytes <- BS.readFile spvPath
+        ifaceText <- readFile ifacePath
+        case readMaybe ifaceText of
+          Just iface -> pure (Just (bytes, iface))
+          Nothing -> pure Nothing
+      ) `catch` \(_ :: SomeException) -> pure Nothing
+
+writeWeslCache :: CompileOptions -> String -> ByteString -> ShaderInterface -> IO ()
+writeWeslCache opts src bytes iface =
+  let (spvPath, ifacePath) = weslCachePaths opts src
+  in (do
+        createDirectoryIfMissing True (takeDirectory spvPath)
+        BS.writeFile spvPath bytes
+        writeFile ifacePath (show iface)
+     ) `catch` \(_ :: SomeException) -> pure ()
+
 -- Quasiquoter
 
 wesl :: QuasiQuoter
@@ -888,10 +958,19 @@ wesl =
     }
 
 weslExp :: String -> Q Exp
-weslExp src =
-  case compileWeslToSpirvWith defaultCompileOptions src of
-    Left err -> fail (renderError err)
-    Right (SomeCompiledShader (CompiledShader bytes iface)) -> do
+weslExp src = do
+  let opts = defaultCompileOptions
+  cached <- TH.runIO (loadWeslCache opts src)
+  case cached of
+    Just (bytes, iface) -> emitWeslExp bytes iface
+    Nothing ->
+      case compileWeslToSpirvWith opts src of
+        Left err -> fail (renderError err)
+        Right (SomeCompiledShader (CompiledShader bytes iface)) -> do
+          TH.runIO (writeWeslCache opts src bytes iface)
+          emitWeslExp bytes iface
+  where
+    emitWeslExp bytes iface = do
       bytesExp <- bytesToExp bytes
       ifaceExp <- interfaceToExp iface
       let ifaceTy = interfaceToType iface
@@ -901,21 +980,21 @@ weslExp src =
 -- Parsing
 
 data SrcPos = SrcPos
-  { spLine :: Int
-  , spCol :: Int
+  { spLine :: !Int
+  , spCol :: !Int
   } deriving (Eq, Show)
 
 data Token = Token
-  { tkKind :: TokKind
-  , tkPos :: SrcPos
+  { tkKind :: !TokKind
+  , tkPos :: !SrcPos
   } deriving (Eq, Show)
 
 data TokKind
-  = TkIdent String
-  | TkInt Integer
-  | TkFloat Float
-  | TkString String
-  | TkSymbol String
+  = TkIdent !Text
+  | TkInt !Integer
+  | TkFloat !Float
+  | TkString !Text
+  | TkSymbol !Text
   deriving (Eq, Show)
 
 data ImportRelative
@@ -924,145 +1003,145 @@ data ImportRelative
   deriving (Eq, Show)
 
 data ImportItem = ImportItem
-  { iiPath :: [String]
-  , iiAlias :: Maybe String
+  { iiPath :: ![Text]
+  , iiAlias :: !(Maybe Text)
   } deriving (Eq, Show)
 
 data ImportDecl = ImportDecl
-  { idRelative :: Maybe ImportRelative
-  , idItems :: [ImportItem]
+  { idRelative :: !(Maybe ImportRelative)
+  , idItems :: ![ImportItem]
   } deriving (Eq, Show)
 
 data DiagnosticSeverity = DiagError | DiagWarning | DiagInfo | DiagOff
   deriving (Eq, Show)
 
 data Directive
-  = DirEnable String
-  | DirDiagnostic DiagnosticSeverity String
+  = DirEnable !Text
+  | DirDiagnostic !DiagnosticSeverity !Text
   deriving (Eq, Show)
 
 data AliasDecl = AliasDecl
-  { adName :: String
-  , adType :: Type
+  { adName :: !Text
+  , adType :: !Type
   } deriving (Eq, Show)
 
 data OverrideDecl = OverrideDecl
-  { odName :: String
-  , odId :: Maybe Word32
-  , odType :: Type
-  , odExpr :: Maybe Expr
+  { odName :: !Text
+  , odId :: !(Maybe Word32)
+  , odType :: !Type
+  , odExpr :: !(Maybe Expr)
   } deriving (Eq, Show)
 
 data ConstAssert = ConstAssert
-  { caPos :: SrcPos
-  , caExpr :: Expr
+  { caPos :: !SrcPos
+  , caExpr :: !Expr
   } deriving (Eq, Show)
 
 data ModuleAst = ModuleAst
-  { modDirectives :: [Directive]
-  , modImports :: [ImportDecl]
-  , modAliases :: [AliasDecl]
-  , modStructs :: [StructDecl]
-  , modBindings :: [BindingDecl]
-  , modGlobals :: [GlobalVarDecl]
-  , modConsts :: [ConstDecl]
-  , modOverrides :: [OverrideDecl]
-  , modConstAsserts :: [ConstAssert]
-  , modFunctions :: [FunctionDecl]
-  , modEntry :: Maybe EntryPoint
+  { modDirectives :: ![Directive]
+  , modImports :: ![ImportDecl]
+  , modAliases :: ![AliasDecl]
+  , modStructs :: ![StructDecl]
+  , modBindings :: ![BindingDecl]
+  , modGlobals :: ![GlobalVarDecl]
+  , modConsts :: ![ConstDecl]
+  , modOverrides :: ![OverrideDecl]
+  , modConstAsserts :: ![ConstAssert]
+  , modFunctions :: ![FunctionDecl]
+  , modEntry :: !(Maybe EntryPoint)
   } deriving (Eq, Show)
 
 data BindingDecl = BindingDecl
-  { bdName :: String
-  , bdKind :: BindingKind
-  , bdGroup :: Word32
-  , bdBinding :: Word32
-  , bdType :: Type
+  { bdName :: !Text
+  , bdKind :: !BindingKind
+  , bdGroup :: !Word32
+  , bdBinding :: !Word32
+  , bdType :: !Type
   } deriving (Eq, Show)
 
 data GlobalVarDecl = GlobalVarDecl
-  { gvName :: String
-  , gvSpace :: String
-  , gvType :: Type
-  , gvInit :: Maybe Expr
+  { gvName :: !Text
+  , gvSpace :: !Text
+  , gvType :: !Type
+  , gvInit :: !(Maybe Expr)
   } deriving (Eq, Show)
 
 data ConstDecl = ConstDecl
-  { cdName :: String
-  , cdExpr :: Expr
+  { cdName :: !Text
+  , cdExpr :: !Expr
   } deriving (Eq, Show)
 
 data Stage = StageCompute | StageFragment | StageVertex
   deriving (Eq, Show)
 
 data Param = Param
-  { paramName :: String
-  , paramType :: Type
-  , paramAttrs :: [Attr]
+  { paramName :: !Text
+  , paramType :: !Type
+  , paramAttrs :: ![Attr]
   } deriving (Eq, Show)
 
 data EntryPoint = EntryPoint
-  { epName :: String
-  , epStage :: Stage
-  , epWorkgroupSize :: Maybe (Word32, Word32, Word32)
-  , epParams :: [Param]
-  , epReturnType :: Maybe Type
-  , epReturnLocation :: Maybe Word32
-  , epReturnBuiltin :: Maybe String
-  , epBody :: [Stmt]
+  { epName :: !Text
+  , epStage :: !Stage
+  , epWorkgroupSize :: !(Maybe (Word32, Word32, Word32))
+  , epParams :: ![Param]
+  , epReturnType :: !(Maybe Type)
+  , epReturnLocation :: !(Maybe Word32)
+  , epReturnBuiltin :: !(Maybe Text)
+  , epBody :: ![Stmt]
   } deriving (Eq, Show)
 
 data FunctionDecl = FunctionDecl
-  { fnName :: String
-  , fnParams :: [Param]
-  , fnReturnType :: Maybe Type
-  , fnBody :: [Stmt]
+  { fnName :: !Text
+  , fnParams :: ![Param]
+  , fnReturnType :: !(Maybe Type)
+  , fnBody :: ![Stmt]
   } deriving (Eq, Show)
 
 data Stmt
-  = SLet String Expr
-  | SVar String Expr
-  | SAssign LValue Expr
-  | SAssignOp LValue BinOp Expr
-  | SInc LValue
-  | SDec LValue
-  | SExpr Expr
-  | SIf Expr [Stmt] (Maybe [Stmt])
-  | SWhile Expr [Stmt]
-  | SLoop [Stmt] (Maybe [Stmt])
-  | SFor (Maybe Stmt) (Maybe Expr) (Maybe Stmt) [Stmt]
-  | SSwitch Expr [SwitchCase] (Maybe [Stmt])
+  = SLet !Text !Expr
+  | SVar !Text !Expr
+  | SAssign !LValue !Expr
+  | SAssignOp !LValue !BinOp !Expr
+  | SInc !LValue
+  | SDec !LValue
+  | SExpr !Expr
+  | SIf !Expr ![Stmt] !(Maybe [Stmt])
+  | SWhile !Expr ![Stmt]
+  | SLoop ![Stmt] !(Maybe [Stmt])
+  | SFor !(Maybe Stmt) !(Maybe Expr) !(Maybe Stmt) ![Stmt]
+  | SSwitch !Expr ![SwitchCase] !(Maybe [Stmt])
   | SBreak
-  | SBreakIf Expr
+  | SBreakIf !Expr
   | SContinue
   | SDiscard
   | SFallthrough
-  | SReturn (Maybe Expr)
+  | SReturn !(Maybe Expr)
   deriving (Eq, Show)
 
 data SwitchCase = SwitchCase
-  { scSelectors :: [Expr]
-  , scBody :: [Stmt]
+  { scSelectors :: ![Expr]
+  , scBody :: ![Stmt]
   } deriving (Eq, Show)
 
 data LValue
-  = LVVar String
-  | LVField LValue String
-  | LVIndex LValue Expr
-  | LVDeref Expr
+  = LVVar !Text
+  | LVField !LValue !Text
+  | LVIndex !LValue !Expr
+  | LVDeref !Expr
   deriving (Eq, Show)
 
 data Expr
-  = EVar String
-  | EInt Integer
-  | EFloat Float
-  | EBool Bool
-  | EBinary BinOp Expr Expr
-  | EUnary UnaryOp Expr
-  | ECall String [Expr]
-  | EBitcast Type Expr
-  | EField Expr String
-  | EIndex Expr Expr
+  = EVar !Text
+  | EInt !Integer
+  | EFloat !Float
+  | EBool !Bool
+  | EBinary !BinOp !Expr !Expr
+  | EUnary !UnaryOp !Expr
+  | ECall !Text ![Expr]
+  | EBitcast !Type !Expr
+  | EField !Expr !Text
+  | EIndex !Expr !Expr
   deriving (Eq, Show)
 
 data BinOp
@@ -1091,172 +1170,137 @@ data UnaryOp = OpNeg | OpNot | OpAddr | OpDeref
 
 parseModuleWith :: [String] -> String -> Either CompileError ModuleAst
 parseModuleWith features src = do
-  toks <- lexWesl src
-  parseModuleTokensWith (Set.fromList features) toks
+  toks <- lexWesl (T.pack src)
+  parseModuleTokensWith (Set.fromList (map T.pack features)) toks
 
-type FeatureSet = Set.Set String
+type FeatureSet = Set.Set Text
 
-lexWesl :: String -> Either CompileError [Token]
+lexWesl :: Text -> Either CompileError [Token]
 lexWesl = go (SrcPos 1 1)
   where
-    go _ [] = pure []
-    go pos (c:cs)
-      | c == ' ' || c == '\t' = go (advance pos c) cs
-      | c == '\n' = go (advance pos c) cs
-      | c == '\r' = go (advance pos c) cs
-      | c == '/' && prefix "//" (c:cs) =
-          let (_, rest, pos') = consumeLine (advance (advance pos '/') '/') (drop 1 cs)
-          in go pos' rest
-      | c == '/' && prefix "/*" (c:cs) =
-          case consumeBlockComment (advance (advance pos '/') '*') (drop 1 cs) of
-            Left err -> Left err
-            Right (rest, pos') -> go pos' rest
-      | isAlpha c || c == '_' =
-          let (ident, rest, pos') = consumeIdent pos (c:cs)
-          in (Token (TkIdent ident) pos :) <$> go pos' rest
-      | isDigit c =
-          let (tok, rest, pos') = consumeNumber pos (c:cs)
-          in (Token tok pos :) <$> go pos' rest
-      | c == '"' =
-          case consumeString pos cs of
-            Left err -> Left err
-            Right (str, rest, pos') -> (Token (TkString str) pos :) <$> go pos' rest
-      | prefix "::" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "::") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after ':'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "==" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "==") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '='" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "!=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "!=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '!'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "<=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "<=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '<'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix ">=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol ">=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '>'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "&&" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "&&") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '&'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "||" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "||") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '|'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "<<=" (c:cs) =
-          case cs of
-            (c2:c3:rest) -> (Token (TkSymbol "<<=") pos :) <$> go (advance3 pos c c2 c3) rest
-            _ -> Left (CompileError "unexpected end after '<<'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix ">>=" (c:cs) =
-          case cs of
-            (c2:c3:rest) -> (Token (TkSymbol ">>=") pos :) <$> go (advance3 pos c c2 c3) rest
-            _ -> Left (CompileError "unexpected end after '>>'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "<<" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "<<") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '<'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix ">>" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol ">>") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '>'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "++" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "++") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '+'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "--" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "--") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '-'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "+=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "+=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '+'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "-=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "-=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '-'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "*=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "*=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '*'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "/=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "/=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '/'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "%=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "%=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '%'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "&=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "&=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '&'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "|=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "|=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '|'" (Just (spLine pos)) (Just (spCol pos)))
-      | prefix "^=" (c:cs) =
-          case cs of
-            (c2:rest) -> (Token (TkSymbol "^=") pos :) <$> go (advance2 pos c c2) rest
-            [] -> Left (CompileError "unexpected end after '^'" (Just (spLine pos)) (Just (spCol pos)))
-      | c `elem` symbolChars =
-          let sym = [c]
-          in (Token (TkSymbol sym) pos :) <$> go (advance pos c) cs
-      | otherwise =
-          Left (CompileError ("unexpected character: " <> [c]) (Just (spLine pos)) (Just (spCol pos)))
+    go _ src
+      | T.null src = pure []
+    go pos src =
+      case T.uncons src of
+        Nothing -> pure []
+        Just (c, cs)
+          | c == ' ' || c == '\t' -> go (advance pos c) cs
+          | c == '\n' -> go (advance pos c) cs
+          | c == '\r' -> go (advance pos c) cs
+          | c == '/' && prefix "//" src ->
+              let (_, rest, pos') = consumeLine (advance (advance pos '/') '/') (T.drop 2 src)
+              in go pos' rest
+          | c == '/' && prefix "/*" src ->
+              case consumeBlockComment (advance (advance pos '/') '*') (T.drop 2 src) of
+                Left err -> Left err
+                Right (rest, pos') -> go pos' rest
+          | isAlpha c || c == '_' ->
+              let (ident, rest, pos') = consumeIdent pos src
+              in (Token (TkIdent ident) pos :) <$> go pos' rest
+          | isDigit c ->
+              let (tok, rest, pos') = consumeNumber pos src
+              in (Token tok pos :) <$> go pos' rest
+          | c == '"' ->
+              case consumeString pos cs of
+                Left err -> Left err
+                Right (str, rest, pos') -> (Token (TkString str) pos :) <$> go pos' rest
+          | prefix "::" src -> token2 "::" pos c src
+          | prefix "==" src -> token2 "==" pos c src
+          | prefix "!=" src -> token2 "!=" pos c src
+          | prefix "<=" src -> token2 "<=" pos c src
+          | prefix ">=" src -> token2 ">=" pos c src
+          | prefix "&&" src -> token2 "&&" pos c src
+          | prefix "||" src -> token2 "||" pos c src
+          | prefix "<<=" src -> token3 "<<=" pos c src
+          | prefix ">>=" src -> token3 ">>=" pos c src
+          | prefix "<<" src -> token2 "<<" pos c src
+          | prefix ">>" src -> token2 ">>" pos c src
+          | prefix "++" src -> token2 "++" pos c src
+          | prefix "--" src -> token2 "--" pos c src
+          | prefix "+=" src -> token2 "+=" pos c src
+          | prefix "-=" src -> token2 "-=" pos c src
+          | prefix "*=" src -> token2 "*=" pos c src
+          | prefix "/=" src -> token2 "/=" pos c src
+          | prefix "%=" src -> token2 "%=" pos c src
+          | prefix "&=" src -> token2 "&=" pos c src
+          | prefix "|=" src -> token2 "|=" pos c src
+          | prefix "^=" src -> token2 "^=" pos c src
+          | c `elem` symbolChars ->
+              let sym = T.singleton c
+              in (Token (TkSymbol sym) pos :) <$> go (advance pos c) cs
+          | otherwise ->
+              Left (CompileError ("unexpected character: " <> [c]) (Just (spLine pos)) (Just (spCol pos)))
 
+    symbolChars :: String
     symbolChars = "@:{}();,<>=[]+-*/.%!&|^"
 
-    prefix s xs = take (length s) xs == s
+    prefix s xs = s `T.isPrefixOf` xs
     advance2 p a b = advance (advance p a) b
     advance3 p a b c = advance (advance2 p a b) c
 
+    token2 sym p ch s =
+      let c2 = T.index s 1
+          rest = T.drop 2 s
+      in (Token (TkSymbol sym) p :) <$> go (advance2 p ch c2) rest
+
+    token3 sym p ch s =
+      let c2 = T.index s 1
+          c3 = T.index s 2
+          rest = T.drop 3 s
+      in (Token (TkSymbol sym) p :) <$> go (advance3 p ch c2 c3) rest
+
     consumeLine p rest =
-      let (line, rest') = break (== '\n') rest
-          pos' = foldl' advance p line
-      in case rest' of
-           [] -> (line, [], pos')
-           (_:rs) -> (line, rs, advance pos' '\n')
+      let (line, rest') = T.break (== '\n') rest
+          pos' = T.foldl' advance p line
+      in if T.null rest'
+           then (line, T.empty, pos')
+           else (line, T.drop 1 rest', advance pos' '\n')
 
     consumeBlockComment p cs =
-      let goBlock pos' [] = Left (CompileError "unterminated block comment" (Just (spLine pos')) (Just (spCol pos')))
-          goBlock pos' (x:y:rest)
-            | x == '*' && y == '/' = Right (rest, advance (advance pos' x) y)
-            | otherwise = goBlock (advance pos' x) (y:rest)
-          goBlock pos' [x] = goBlock (advance pos' x) []
+      let goBlock pos' src' =
+            case T.uncons src' of
+              Nothing -> Left (CompileError "unterminated block comment" (Just (spLine pos')) (Just (spCol pos')))
+              Just (x, rest0) ->
+                case T.uncons rest0 of
+                  Just (y, rest)
+                    | x == '*' && y == '/' -> Right (rest, advance (advance pos' x) y)
+                    | otherwise -> goBlock (advance pos' x) rest0
+                  Nothing -> goBlock (advance pos' x) T.empty
       in goBlock p cs
 
     consumeIdent p cs =
-      let (ident, rest) = span (\x -> isAlphaNum x || x == '_') cs
-          pos' = foldl' advance p ident
+      let (ident, rest) = T.span (\x -> isAlphaNum x || x == '_') cs
+          pos' = T.foldl' advance p ident
       in (ident, rest, pos')
 
     consumeNumber p cs =
-      let (digits, rest) = span isDigit cs
-      in case rest of
-          ('.':r@(d:_)) | isDigit d ->
-            let (frac, rest') = span isDigit r
-                numStr = digits <> "." <> frac
-                pos' = foldl' advance p (digits <> "." <> frac)
-            in (TkFloat (read numStr), rest', pos')
+      let (digits, rest) = T.span isDigit cs
+      in case T.uncons rest of
+          Just ('.', r) ->
+            case T.uncons r of
+              Just (d, _rest1) | isDigit d ->
+                let (frac, rest') = T.span isDigit r
+                    numTxt = digits <> "." <> frac
+                    pos' = T.foldl' advance p numTxt
+                in (TkFloat (read (T.unpack numTxt)), rest', pos')
+              _ ->
+                let pos' = T.foldl' advance p digits
+                in (TkInt (read (T.unpack digits)), rest, pos')
           _ ->
-            let pos' = foldl' advance p digits
-            in (TkInt (read digits), rest, pos')
+            let pos' = T.foldl' advance p digits
+            in (TkInt (read (T.unpack digits)), rest, pos')
 
     consumeString p cs =
-      let goStr _ pos' [] = Left (CompileError "unterminated string" (Just (spLine pos')) (Just (spCol pos')))
-          goStr acc pos' (x:xs)
-            | x == '"' = Right (reverse acc, xs, advance pos' x)
-            | x == '\\' = case xs of
-                [] -> Left (CompileError "unterminated escape" (Just (spLine pos')) (Just (spCol pos')))
-                (e:rest) -> goStr (e:acc) (advance (advance pos' x) e) rest
-            | otherwise = goStr (x:acc) (advance pos' x) xs
+      let goStr acc pos' src' =
+            case T.uncons src' of
+              Nothing -> Left (CompileError "unterminated string" (Just (spLine pos')) (Just (spCol pos')))
+              Just (x, xs)
+                | x == '"' -> Right (T.pack (reverse acc), xs, advance pos' x)
+                | x == '\\' ->
+                    case T.uncons xs of
+                      Nothing -> Left (CompileError "unterminated escape" (Just (spLine pos')) (Just (spCol pos')))
+                      Just (e, rest) -> goStr (e : acc) (advance (advance pos' x) e) rest
+                | otherwise -> goStr (x : acc) (advance pos' x) xs
       in goStr [] (advance p '"') cs
 
     advance (SrcPos l c) ch
@@ -1610,7 +1654,7 @@ parseImportPathOrItem toks = do
   where
     prefix name items = [item { iiPath = name : iiPath item } | item <- items]
 
-parseImportAlias :: [Token] -> Either CompileError (Maybe String, [Token])
+parseImportAlias :: [Token] -> Either CompileError (Maybe Text, [Token])
 parseImportAlias toks =
   case toks of
     (Token (TkIdent "as") _ : rest) -> do
@@ -1755,7 +1799,7 @@ parseDiagnosticDirective toks =
         "off" -> Right DiagOff
         _ -> Left (errorAt toks' "unknown diagnostic severity")
 
-parseAddressSpaceMaybe :: [Token] -> Either CompileError (Maybe String, Maybe String, [Token])
+parseAddressSpaceMaybe :: [Token] -> Either CompileError (Maybe Text, Maybe Text, [Token])
 parseAddressSpaceMaybe toks =
   case toks of
     (Token (TkSymbol "<") _ : _) -> do
@@ -1763,7 +1807,7 @@ parseAddressSpaceMaybe toks =
       Right (Just addr, access, rest)
     _ -> Right (Nothing, Nothing, toks)
 
-parseAddressSpace :: [Token] -> Either CompileError (String, Maybe String, [Token])
+parseAddressSpace :: [Token] -> Either CompileError (Text, Maybe Text, [Token])
 parseAddressSpace toks =
   case toks of
     (Token (TkSymbol "<") _ : Token (TkIdent addr) _ : rest) ->
@@ -1774,7 +1818,7 @@ parseAddressSpace toks =
         _ -> Left (errorAt rest "expected address space qualifier")
     _ -> Left (errorAt toks "expected address space qualifiers")
 
-parseFunctionGeneric :: FeatureSet -> [Token] -> Either CompileError (String, [Param], Maybe Type, Maybe Word32, Maybe String, [Stmt], [Token])
+parseFunctionGeneric :: FeatureSet -> [Token] -> Either CompileError (Text, [Param], Maybe Type, Maybe Word32, Maybe Text, [Stmt], [Token])
 parseFunctionGeneric feats toks =
   case toks of
     (Token (TkIdent "fn") _ : Token (TkIdent name) _ : Token (TkSymbol "(") _ : rest) -> do
@@ -1812,7 +1856,7 @@ parseParams feats toks =
       let param = Param name ty attrs'
       pure (if keep then Just param else Nothing, rest4)
 
-parseReturnType :: [Token] -> Either CompileError ([Token], Maybe Type, Maybe Word32, Maybe String)
+parseReturnType :: [Token] -> Either CompileError ([Token], Maybe Type, Maybe Word32, Maybe Text)
 parseReturnType toks =
   case toks of
     (Token (TkSymbol "-") _ : Token (TkSymbol ">") _ : rest) -> do
@@ -2062,7 +2106,7 @@ parseForCond toks =
       (expr, rest) <- parseExpr toks
       Right (Just expr, rest)
 
-assignOpFromSymbol :: String -> Maybe BinOp
+assignOpFromSymbol :: Text -> Maybe BinOp
 assignOpFromSymbol sym =
   case sym of
     "+=" -> Just OpAdd
@@ -2337,17 +2381,17 @@ validateEntry entry =
 -- Import resolution (subset: module imports + qualified names)
 
 data ModuleNode = ModuleNode
-  { mnFile :: FilePath
-  , mnPath :: [String]
-  , mnAst :: ModuleAst
-  , mnImports :: [ImportResolved]
+  { mnFile :: !FilePath
+  , mnPath :: ![Text]
+  , mnAst :: !ModuleAst
+  , mnImports :: ![ImportResolved]
   } deriving (Eq, Show)
 
 data ImportResolved = ImportResolved
-  { irModulePath :: [String]
-  , irModuleFile :: FilePath
-  , irItem :: Maybe String
-  , irAlias :: Maybe String
+  { irModulePath :: ![Text]
+  , irModuleFile :: !FilePath
+  , irItem :: !(Maybe Text)
+  , irAlias :: !(Maybe Text)
   } deriving (Eq, Show)
 
 emptyModuleAst :: ModuleAst
@@ -2398,23 +2442,23 @@ validateImportAliases imports =
       targets = map importTarget imports
       (dupTargets, _) = foldl' collect ([], Set.empty) targets
   in if not (null dups)
-      then Left (CompileError ("duplicate import aliases: " <> intercalate ", " dups) Nothing Nothing)
+      then Left (CompileError ("duplicate import aliases: " <> T.unpack (T.intercalate ", " dups)) Nothing Nothing)
       else
         if null dupTargets
           then Right ()
-          else Left (CompileError ("duplicate imports: " <> intercalate ", " dupTargets) Nothing Nothing)
+          else Left (CompileError ("duplicate imports: " <> T.unpack (T.intercalate ", " dupTargets)) Nothing Nothing)
   where
     aliasFor imp =
       case irItem imp of
         Nothing ->
           let alias = fromMaybe (last (irModulePath imp)) (irAlias imp)
-          in if null alias then Nothing else Just alias
+          in if T.null alias then Nothing else Just alias
         Just item ->
           let alias = fromMaybe item (irAlias imp)
-          in if null alias then Nothing else Just alias
+          in if T.null alias then Nothing else Just alias
 
     importTarget imp =
-      let modName = intercalate "::" (irModulePath imp)
+      let modName = T.intercalate "::" (irModulePath imp)
       in case irItem imp of
           Nothing -> modName
           Just item -> modName <> "::" <> item
@@ -2453,7 +2497,7 @@ resolveImportItem :: CompileOptions -> FilePath -> FilePath -> ImportDecl -> Imp
 resolveImportItem opts rootDir moduleFile decl item = do
   let baseDir = importBaseDir rootDir moduleFile (idRelative decl)
   let segs = iiPath item
-  let fullBase = foldl (</>) baseDir segs
+  let fullBase = foldl (</>) baseDir (map T.unpack segs)
   fullMod <- findModuleFile fullBase
   case fullMod of
     Just moduleBase -> do
@@ -2463,7 +2507,7 @@ resolveImportItem opts rootDir moduleFile decl item = do
         _ -> do
           let modSegs = init segs
           let itemName = last segs
-          let moduleBasePath = foldl (</>) baseDir modSegs
+          let moduleBasePath = foldl (</>) baseDir (map T.unpack modSegs)
           moduleBaseItem <- findModuleFile moduleBasePath
           case moduleBaseItem of
             Nothing -> pure False
@@ -2471,24 +2515,24 @@ resolveImportItem opts rootDir moduleFile decl item = do
               itemExists <- moduleHasItem opts mb itemName
               pure itemExists
       if ambiguous
-        then pure (Left (CompileError ("ambiguous import: " <> intercalate "::" segs <> " refers to both a module and an item") Nothing Nothing))
+        then pure (Left (CompileError ("ambiguous import: " <> T.unpack (T.intercalate "::" segs) <> " refers to both a module and an item") Nothing Nothing))
         else pure (Right (ImportResolved (modulePathFromFile rootDir moduleBase) moduleBase Nothing (iiAlias item)))
     Nothing ->
       case segs of
         [] -> pure (Left (CompileError "import path is empty" Nothing Nothing))
-        [_] -> pure (Left (CompileError ("import module not found: " <> intercalate "::" segs) Nothing Nothing))
+        [_] -> pure (Left (CompileError ("import module not found: " <> T.unpack (T.intercalate "::" segs)) Nothing Nothing))
         _ -> do
           let modSegs = init segs
           let itemName = last segs
-          let moduleBasePath = foldl (</>) baseDir modSegs
+          let moduleBasePath = foldl (</>) baseDir (map T.unpack modSegs)
           moduleBase <- findModuleFile moduleBasePath
           case moduleBase of
             Just mb ->
               pure (Right (ImportResolved (modulePathFromFile rootDir mb) mb (Just itemName) (iiAlias item)))
             Nothing ->
-              pure (Left (CompileError ("import module not found: " <> intercalate "::" modSegs) Nothing Nothing))
+              pure (Left (CompileError ("import module not found: " <> T.unpack (T.intercalate "::" modSegs)) Nothing Nothing))
 
-moduleHasItem :: CompileOptions -> FilePath -> String -> IO Bool
+moduleHasItem :: CompileOptions -> FilePath -> Text -> IO Bool
 moduleHasItem opts moduleBase itemName = do
   astResult <- loadModuleFromFile opts moduleBase
   case astResult of
@@ -2517,10 +2561,10 @@ findModuleFile base = do
         then pure (Just base)
         else pure Nothing
 
-modulePathFromFile :: FilePath -> FilePath -> [String]
+modulePathFromFile :: FilePath -> FilePath -> [Text]
 modulePathFromFile rootDir filePath =
   let rel = dropExtension (makeRelative rootDir filePath)
-  in filter (not . null) (splitDirectories rel)
+  in map T.pack (filter (not . null) (splitDirectories rel))
 
 importBaseDir :: FilePath -> FilePath -> Maybe ImportRelative -> FilePath
 importBaseDir rootDir moduleFile rel =
@@ -2572,16 +2616,16 @@ mergeModule acc node =
       }
 
 data ModuleContext = ModuleContext
-  { mcPath :: [String]
-  , mcModuleAliases :: Map.Map String [String]
-  , mcItemAliases :: Map.Map String [String]
-  , mcLocals :: Set.Set String
-  , mcConstNames :: Set.Set String
-  , mcFunctionNames :: Set.Set String
-  , mcRootPath :: [String]
+  { mcPath :: [Text]
+  , mcModuleAliases :: Map.Map Text [Text]
+  , mcItemAliases :: Map.Map Text [Text]
+  , mcLocals :: Set.Set Text
+  , mcConstNames :: Set.Set Text
+  , mcFunctionNames :: Set.Set Text
+  , mcRootPath :: [Text]
   }
 
-buildModuleContext :: [String] -> FilePath -> ModuleNode -> ModuleContext
+buildModuleContext :: [Text] -> FilePath -> ModuleNode -> ModuleContext
 buildModuleContext rootPath _rootDir node =
   let ast = mnAst node
       localNames =
@@ -2599,7 +2643,7 @@ buildModuleContext rootPath _rootDir node =
       (moduleAliases, itemAliases) = buildAliasMaps (mnImports node)
   in ModuleContext (mnPath node) moduleAliases itemAliases localNames constNames functionNames rootPath
 
-type ConstIndex = Map.Map [String] (Map.Map String Expr)
+type ConstIndex = Map.Map [Text] (Map.Map Text Expr)
 
 buildConstIndex :: [ModuleNode] -> ConstIndex
 buildConstIndex nodes =
@@ -2614,7 +2658,7 @@ buildConstIndex nodes =
           overrides = [(odName o, expr) | o <- modOverrides ast, Just expr <- [odExpr o]]
       in consts <> overrides
 
-type OverrideIndex = Map.Map [String] (Set.Set String)
+type OverrideIndex = Map.Map [Text] (Set.Set Text)
 
 buildOverrideIndex :: [ModuleNode] -> OverrideIndex
 buildOverrideIndex nodes =
@@ -2623,7 +2667,7 @@ buildOverrideIndex nodes =
     | n <- nodes
     ]
 
-type StructIndex = Map.Map [String] (Map.Map String StructDecl)
+type StructIndex = Map.Map [Text] (Map.Map Text StructDecl)
 
 buildStructIndex :: [ModuleNode] -> StructIndex
 buildStructIndex nodes =
@@ -2632,7 +2676,7 @@ buildStructIndex nodes =
     | n <- nodes
     ]
 
-type FunctionIndex = Map.Map [String] (Map.Map String [FunctionDecl])
+type FunctionIndex = Map.Map [Text] (Map.Map Text [FunctionDecl])
 
 buildFunctionIndex :: [ModuleNode] -> FunctionIndex
 buildFunctionIndex nodes =
@@ -2641,7 +2685,7 @@ buildFunctionIndex nodes =
     | n <- nodes
     ]
 
-lowerOverridesWith :: [String] -> [(String, OverrideValue)] -> ModuleAst -> Either CompileError ModuleAst
+lowerOverridesWith :: [Text] -> [(Text, OverrideValue)] -> ModuleAst -> Either CompileError ModuleAst
 lowerOverridesWith rootPath overridesMap ast =
   case modOverrides ast of
     [] -> Right ast
@@ -2649,7 +2693,7 @@ lowerOverridesWith rootPath overridesMap ast =
       let existing = Set.fromList (map cdName (modConsts ast))
       let (dups, _) = foldl' collect ([], Set.empty) (map odName overrides)
       when (not (null dups)) $
-        Left (CompileError ("duplicate override declarations: " <> intercalate ", " dups) Nothing Nothing)
+        Left (CompileError ("duplicate override declarations: " <> T.unpack (T.intercalate ", " dups)) Nothing Nothing)
       when (any (`Set.member` existing) (map odName overrides)) $
         Left (CompileError "override names must not conflict with const declarations" Nothing Nothing)
       let overrideLookup = buildOverrideValueMap rootPath overridesMap
@@ -2668,7 +2712,7 @@ lowerOverridesWith rootPath overridesMap ast =
           Right (ConstDecl (odName o) expr : constAcc, keepAcc)
         Nothing -> Right (constAcc, o : keepAcc)
 
-buildOverrideValueMap :: [String] -> [(String, OverrideValue)] -> Map.Map String OverrideValue
+buildOverrideValueMap :: [Text] -> [(Text, OverrideValue)] -> Map.Map Text OverrideValue
 buildOverrideValueMap rootPath overrides =
   Map.fromList
     [ (candidate, val)
@@ -2676,9 +2720,9 @@ buildOverrideValueMap rootPath overrides =
     , candidate <- overrideKeyCandidates rootPath key
     ]
 
-overrideKeyCandidates :: [String] -> String -> [String]
+overrideKeyCandidates :: [Text] -> Text -> [Text]
 overrideKeyCandidates rootPath key
-  | "__wesl__" `isPrefixOf` key = [key]
+  | "__wesl__" `T.isPrefixOf` key = [key]
   | otherwise =
       case splitQName key of
         [] -> []
@@ -2688,9 +2732,9 @@ overrideKeyCandidates rootPath key
               name = last segs
           in if path == rootPath || null rootPath
                 then [name]
-                else ["__wesl__" <> intercalate "__" path <> "__" <> name]
+                else ["__wesl__" <> T.intercalate "__" path <> "__" <> name]
 
-overrideValueToExpr :: [(String, StructDecl)] -> Type -> OverrideValue -> Either CompileError Expr
+overrideValueToExpr :: [(Text, StructDecl)] -> Type -> OverrideValue -> Either CompileError Expr
 overrideValueToExpr structEnv ty ov =
   case ty of
     TyScalar Bool ->
@@ -2721,7 +2765,7 @@ overrideValueToExpr structEnv ty ov =
           when (length vals /= n) $
             Left (CompileError "override vector arity does not match" Nothing Nothing)
           args <- mapM (overrideValueToExpr structEnv (TyScalar scalar)) vals
-          Right (ECall ("vec" <> show n) args)
+          Right (ECall ("vec" <> T.pack (show n)) args)
         _ -> Left (CompileError "override value must be a vector" Nothing Nothing)
     TyMatrix cols rows scalar ->
       case ov of
@@ -2730,7 +2774,7 @@ overrideValueToExpr structEnv ty ov =
             Left (CompileError "override matrix column count does not match" Nothing Nothing)
           let colTy = TyVector rows scalar
           args <- mapM (overrideValueToExpr structEnv colTy) colsVals
-          Right (ECall ("mat" <> show cols <> "x" <> show rows) args)
+          Right (ECall ("mat" <> T.pack (show cols) <> "x" <> T.pack (show rows)) args)
         _ -> Left (CompileError "override value must be a matrix" Nothing Nothing)
     TyArray elemTy (Just n) ->
       case ov of
@@ -2744,7 +2788,7 @@ overrideValueToExpr structEnv ty ov =
       Left (CompileError "override values cannot target runtime-sized arrays" Nothing Nothing)
     TyStructRef name ->
       case lookup name structEnv of
-        Nothing -> Left (CompileError ("unknown struct: " <> name) Nothing Nothing)
+        Nothing -> Left (CompileError ("unknown struct: " <> T.unpack name) Nothing Nothing)
         Just decl ->
           case ov of
             OVComposite vals -> do
@@ -2760,7 +2804,7 @@ resolveTypeAliases :: ModuleAst -> Either CompileError ModuleAst
 resolveTypeAliases ast = do
   let (dupAliases, _) = foldl' collect ([], Set.empty) (map adName (modAliases ast))
   when (not (null dupAliases)) $
-    Left (CompileError ("duplicate type aliases: " <> intercalate ", " dupAliases) Nothing Nothing)
+    Left (CompileError ("duplicate type aliases: " <> T.unpack (T.intercalate ", " dupAliases)) Nothing Nothing)
   let aliasMap = Map.fromList [(adName a, adType a) | a <- modAliases ast]
   let expand = expandType aliasMap
   aliases <- mapM (\a -> (\ty -> a { adType = ty }) <$> expand (adType a)) (modAliases ast)
@@ -2797,7 +2841,7 @@ resolveTypeAliases ast = do
                 Nothing -> Right ty
                 Just aliasTy ->
                   if Set.member name stack
-                    then Left (CompileError ("type alias cycle involving: " <> name) Nothing Nothing)
+                    then Left (CompileError ("type alias cycle involving: " <> T.unpack name) Nothing Nothing)
                     else go (Set.insert name stack) aliasTy
             TyArray elemTy n -> TyArray <$> go stack elemTy <*> pure n
             _ -> Right ty
@@ -2884,29 +2928,29 @@ resolveTypeAliases ast = do
         EIndex base idx -> EIndex <$> expandExpr expand base <*> expandExpr expand idx
         _ -> Right expr
 
-buildAliasMaps :: [ImportResolved] -> (Map.Map String [String], Map.Map String [String])
+buildAliasMaps :: [ImportResolved] -> (Map.Map Text [Text], Map.Map Text [Text])
 buildAliasMaps imports = foldl' add (Map.empty, Map.empty) imports
   where
     add (modAcc, itemAcc) imp =
       case irItem imp of
         Nothing ->
           let alias = fromMaybe (last (irModulePath imp)) (irAlias imp)
-          in if null alias
+          in if T.null alias
               then (modAcc, itemAcc)
               else (Map.insert alias (irModulePath imp) modAcc, itemAcc)
         Just item ->
           let alias = fromMaybe item (irAlias imp)
               target = irModulePath imp <> [item]
-          in if null alias
+          in if T.null alias
               then (modAcc, itemAcc)
               else (modAcc, Map.insert alias target itemAcc)
 
 data Scope = Scope
-  { scGlobals :: Set.Set String
-  , scScopes :: [Set.Set String]
-  , scModuleAliases :: Set.Set String
-  , scItemAliases :: Set.Set String
-  , scTypeAliases :: Set.Set String
+  { scGlobals :: Set.Set Text
+  , scScopes :: [Set.Set Text]
+  , scModuleAliases :: Set.Set Text
+  , scItemAliases :: Set.Set Text
+  , scTypeAliases :: Set.Set Text
   , scAllowShadowing :: Bool
   , scAllowFallthrough :: Bool
   }
@@ -2916,27 +2960,27 @@ validateDirectives opts directives = do
   mapM_ checkEnable directives
   pure (foldl' applyDiag Map.empty directives)
   where
-    enabled = Set.fromList (enabledFeatures opts)
+    enabled = Set.fromList (map T.pack (enabledFeatures opts))
     checkEnable dir =
       case dir of
         DirEnable feat ->
           if Set.member feat enabled
             then Right ()
-            else Left (CompileError ("feature not enabled: " <> feat) Nothing Nothing)
+            else Left (CompileError ("feature not enabled: " <> T.unpack feat) Nothing Nothing)
         _ -> Right ()
     applyDiag acc dir =
       case dir of
-        DirDiagnostic severity rule -> Map.insert rule severity acc
+        DirDiagnostic severity rule -> Map.insert (T.unpack rule) severity acc
         _ -> acc
 
 diagnosticSeverity :: DiagnosticConfig -> String -> DiagnosticSeverity
 diagnosticSeverity cfg rule = fromMaybe DiagError (Map.lookup rule cfg)
 
-validateModuleScopes :: CompileOptions -> Bool -> [String] -> FilePath -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideIndex -> [ModuleNode] -> Either CompileError ()
+validateModuleScopes :: CompileOptions -> Bool -> [Text] -> FilePath -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideIndex -> [ModuleNode] -> Either CompileError ()
 validateModuleScopes opts skipConstAsserts rootPath rootDir constIndex fnIndex structIndex overrideIndex nodes =
   mapM_ (validateModuleScope opts skipConstAsserts rootPath rootDir constIndex fnIndex structIndex overrideIndex) nodes
 
-validateModuleScope :: CompileOptions -> Bool -> [String] -> FilePath -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideIndex -> ModuleNode -> Either CompileError ()
+validateModuleScope :: CompileOptions -> Bool -> [Text] -> FilePath -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideIndex -> ModuleNode -> Either CompileError ()
 validateModuleScope opts skipConstAsserts rootPath rootDir constIndex fnIndex structIndex overrideIndex node = do
   let ctx = buildModuleContext rootPath rootDir node
   diagConfig <- validateDirectives opts (modDirectives (mnAst node))
@@ -2970,7 +3014,7 @@ validateModuleAst ctx constIndex fnIndex structIndex overrideIndex scope diagCon
     Nothing -> Right ()
     Just entry -> validateEntryPoint ctx constIndex fnIndex structIndex skipConstAsserts scope entry
 
-validateConstAssertsMerged :: CompileOptions -> [String] -> ModuleAst -> Either CompileError ()
+validateConstAssertsMerged :: CompileOptions -> [Text] -> ModuleAst -> Either CompileError ()
 validateConstAssertsMerged opts rootPath ast = do
   let node = ModuleNode "<merged>" rootPath ast []
   let constIndex = buildConstIndex [node]
@@ -2981,7 +3025,7 @@ validateConstAssertsMerged opts rootPath ast = do
   mapM_ (validateConstAssert ctx constIndex fnIndex structIndex diagConfig) (modConstAsserts ast)
   Right ()
 
-collectDiagnosticsMerged :: CompileOptions -> [String] -> ModuleAst -> Either CompileError [Diagnostic]
+collectDiagnosticsMerged :: CompileOptions -> [Text] -> ModuleAst -> Either CompileError [Diagnostic]
 collectDiagnosticsMerged opts rootPath ast = do
   let node = ModuleNode "<merged>" rootPath ast []
   let constIndex = buildConstIndex [node]
@@ -3107,7 +3151,7 @@ collectUnusedVariableDiagnostics diagConfig ast =
     Nothing -> []
     Just DiagOff -> []
     Just sev ->
-      let diag name = Diagnostic sev "unused_variable" ("unused variable: " <> name) Nothing Nothing
+      let diag name = Diagnostic sev "unused_variable" ("unused variable: " <> T.unpack name) Nothing Nothing
           bodies = map fnBody (modFunctions ast) <> maybe [] (pure . epBody) (modEntry ast)
       in concatMap (unusedVarsInBody diag) bodies
   where
@@ -3117,7 +3161,7 @@ collectUnusedVariableDiagnostics diagConfig ast =
           unused = filter (\name -> not (Set.member name used) && not (isIgnored name)) (Set.toList declared)
       in map mkDiag unused
 
-    isIgnored name = "_" `isPrefixOf` name
+    isIgnored name = T.isPrefixOf "_" name
 
     collectDecls = concatMap declsInStmt
     declsInStmt stmt =
@@ -3139,7 +3183,7 @@ collectUnusedParameterDiagnostics diagConfig ast =
     Nothing -> []
     Just DiagOff -> []
     Just sev ->
-      let mkDiag name = Diagnostic sev "unused_parameter" ("unused parameter: " <> name) Nothing Nothing
+      let mkDiag name = Diagnostic sev "unused_parameter" ("unused parameter: " <> T.unpack name) Nothing Nothing
       in concatMap (unusedParamsInFunction mkDiag) (modFunctions ast)
           <> maybe [] (unusedParamsInEntry mkDiag) (modEntry ast)
   where
@@ -3153,7 +3197,7 @@ collectUnusedParameterDiagnostics diagConfig ast =
           params = map paramName (epParams entry)
           unused = filter (\name -> not (Set.member name used) && not (isIgnored name)) params
       in map mkDiag unused
-    isIgnored name = "_" `isPrefixOf` name
+    isIgnored name = T.isPrefixOf "_" name
 
 collectShadowingDiagnostics :: DiagnosticConfig -> ModuleAst -> [Diagnostic]
 collectShadowingDiagnostics diagConfig ast =
@@ -3161,7 +3205,7 @@ collectShadowingDiagnostics diagConfig ast =
     Nothing -> []
     Just DiagOff -> []
     Just sev ->
-      let mkDiag name = Diagnostic sev "shadowing" ("name shadows outer scope: " <> name) Nothing Nothing
+      let mkDiag name = Diagnostic sev "shadowing" ("name shadows outer scope: " <> T.unpack name) Nothing Nothing
       in concatMap (shadowingInFunction mkDiag) (modFunctions ast)
           <> maybe [] (shadowingInEntry mkDiag) (modEntry ast)
   where
@@ -3219,7 +3263,7 @@ collectShadowingDiagnostics diagConfig ast =
 
     pushScope scopes = Set.empty : scopes
 
-    isIgnored name = "_" `isPrefixOf` name
+    isIgnored name = T.isPrefixOf "_" name
 
 collectConstantConditionDiagnostics :: DiagnosticConfig -> ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ModuleAst -> [Diagnostic]
 collectConstantConditionDiagnostics diagConfig ctx constIndex fnIndex structIndex ast =
@@ -3313,10 +3357,10 @@ collectDuplicateCaseDiagnostics diagConfig ctx constIndex fnIndex structIndex as
         I32 -> "i"
         _ -> ""
 
-collectUsesInStmts :: [Stmt] -> [String]
+collectUsesInStmts :: [Stmt] -> [Text]
 collectUsesInStmts = concatMap collectUsesInStmt
 
-collectUsesInStmt :: Stmt -> [String]
+collectUsesInStmt :: Stmt -> [Text]
 collectUsesInStmt stmt =
   case stmt of
     SLet _ expr -> collectUsesInExpr expr
@@ -3340,11 +3384,11 @@ collectUsesInStmt stmt =
     SReturn mexpr -> maybe [] collectUsesInExpr mexpr
     _ -> []
 
-collectUsesInCase :: SwitchCase -> [String]
+collectUsesInCase :: SwitchCase -> [Text]
 collectUsesInCase sc =
   concatMap collectUsesInExpr (scSelectors sc) <> collectUsesInStmts (scBody sc)
 
-collectUsesInExpr :: Expr -> [String]
+collectUsesInExpr :: Expr -> [Text]
 collectUsesInExpr expr =
   case expr of
     EVar name -> [name]
@@ -3358,7 +3402,7 @@ collectUsesInExpr expr =
     EField base _ -> collectUsesInExpr base
     EIndex base idx -> collectUsesInExpr base <> collectUsesInExpr idx
 
-collectUsesInLValue :: LValue -> [String]
+collectUsesInLValue :: LValue -> [Text]
 collectUsesInLValue lv =
   case lv of
     LVVar name -> [name]
@@ -3386,7 +3430,7 @@ validateGlobalVar ctx scope decl = do
       case gvInit decl of
         Nothing -> Right ()
         Just _ -> Left (CompileError "workgroup variables cannot have initializers" Nothing Nothing)
-    _ -> Left (CompileError ("unsupported global address space: " <> gvSpace decl) Nothing Nothing)
+    _ -> Left (CompileError ("unsupported global address space: " <> textToString (gvSpace decl)) Nothing Nothing)
 
 validateConst :: ModuleContext -> Scope -> ConstDecl -> Either CompileError ()
 validateConst ctx scope decl = validateExpr ctx scope (cdExpr decl) >> Right ()
@@ -3581,7 +3625,7 @@ data ConstValue
   | CVVector Int Scalar [ConstValue]
   | CVMatrix Int Int Scalar [ConstValue]
   | CVArray Type [ConstValue]
-  | CVStruct String [(String, ConstValue)]
+  | CVStruct Text [(Text, ConstValue)]
   | CVPointer Type LValue
   deriving (Eq, Show)
 
@@ -3590,7 +3634,7 @@ data ConstBinding = ConstBinding
   , cbMutable :: Bool
   } deriving (Eq, Show)
 
-type ConstEnv = Map.Map String ConstBinding
+type ConstEnv = Map.Map Text ConstBinding
 
 constValueType :: ConstValue -> Type
 constValueType val =
@@ -3713,11 +3757,11 @@ coerceConstValueToType ctx structIndex target val =
     coerceField pairs field = do
       val' <- case lookup (fdName field) pairs of
         Just v -> Right v
-        Nothing -> Left (CompileError ("missing field: " <> fdName field) Nothing Nothing)
+        Nothing -> Left (CompileError ("missing field: " <> textToString (fdName field)) Nothing Nothing)
       coerced <- coerceConstValueToType ctx structIndex (fdType field) val'
       Right (fdName field, coerced)
 
-resolveStructDecl :: ModuleContext -> StructIndex -> String -> Either CompileError StructDecl
+resolveStructDecl :: ModuleContext -> StructIndex -> Text -> Either CompileError StructDecl
 resolveStructDecl ctx structIndex name =
   case splitQName name of
     [] -> Left (CompileError "invalid struct reference" Nothing Nothing)
@@ -3732,22 +3776,22 @@ resolveStructDecl ctx structIndex name =
                 Just (path, item) ->
                   case lookupStruct path item of
                     Just decl -> Right decl
-                    Nothing -> Left (CompileError ("unknown struct: " <> item) Nothing Nothing)
-            Nothing -> Left (CompileError ("unknown struct: " <> single) Nothing Nothing)
+                    Nothing -> Left (CompileError ("unknown struct: " <> textToString item) Nothing Nothing)
+            Nothing -> Left (CompileError ("unknown struct: " <> textToString single) Nothing Nothing)
     seg0 : segRest ->
       case Map.lookup seg0 (mcModuleAliases ctx) of
-        Nothing -> Left (CompileError ("unknown module alias: " <> seg0) Nothing Nothing)
+        Nothing -> Left (CompileError ("unknown module alias: " <> textToString seg0) Nothing Nothing)
         Just target ->
           case splitLast (target <> segRest) of
             Nothing -> Left (CompileError "invalid struct reference" Nothing Nothing)
             Just (path, item) ->
               case lookupStruct path item of
                 Just decl -> Right decl
-                Nothing -> Left (CompileError ("unknown struct: " <> item) Nothing Nothing)
+                Nothing -> Left (CompileError ("unknown struct: " <> textToString item) Nothing Nothing)
   where
     lookupStruct path item = Map.lookup path structIndex >>= Map.lookup item
 
-evalConstValueWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set String -> Set.Set String -> Expr -> Either CompileError ConstValue
+evalConstValueWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Expr -> Either CompileError ConstValue
 evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr = go seenConsts seenFns expr
   where
     go seen fnSeen ex =
@@ -3761,12 +3805,12 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns 
             Just binding -> Right (cbValue binding)
             Nothing -> do
               (path, ident) <- resolveConstRef ctx name
-              let key = intercalate "::" (path <> [ident])
+              let key = T.intercalate "::" (path <> [ident])
               when (Set.member key seen) $
                 Left (CompileError "cycle detected while evaluating constant expression" Nothing Nothing)
               let entry = Map.lookup path constIndex >>= Map.lookup ident
               case entry of
-                Nothing -> Left (CompileError ("unknown constant: " <> ident) Nothing Nothing)
+                Nothing -> Left (CompileError ("unknown constant: " <> textToString ident) Nothing Nothing)
                 Just expr' -> evalConstValueWithEnv ctx constIndex fnIndex structIndex env (Set.insert key seen) fnSeen expr'
         EField base field -> do
           baseVal <- go seen fnSeen base
@@ -3888,7 +3932,7 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns 
 
     evalConstStructCtor name fields seen fnSeen args = do
       when (length args /= length fields) $
-        Left (CompileError ("struct constructor arity mismatch for " <> name) Nothing Nothing)
+        Left (CompileError ("struct constructor arity mismatch for " <> textToString name) Nothing Nothing)
       vals <- mapM (go seen fnSeen) args
       let pairs = zip (map fdName fields) vals
       Right (CVStruct name pairs)
@@ -3925,7 +3969,7 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns 
         LVDeref _ ->
           Left (CompileError "address-of requires an lvalue" Nothing Nothing)
 
-evalConstFunctionValueWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set String -> Set.Set String -> FunctionDecl -> Either CompileError ConstValue
+evalConstFunctionValueWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> FunctionDecl -> Either CompileError ConstValue
 evalConstFunctionValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns decl = do
   (_, ctrl, _) <- evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns constEvalMaxSteps (fnBody decl)
   val <- case ctrl of
@@ -3937,14 +3981,14 @@ evalConstFunctionValueWithEnv ctx constIndex fnIndex structIndex env seenConsts 
     Just ty -> coerceConstValueToType ctx structIndex ty val
     Nothing -> Left (CompileError "const function must declare a return type" Nothing Nothing)
 
-evalConstUserFunctionCall :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set String -> Set.Set String -> String -> [Expr] -> Either CompileError ConstValue
+evalConstUserFunctionCall :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Text -> [Expr] -> Either CompileError ConstValue
 evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seenConsts seenFns name args = do
   (path, ident) <- resolveFunctionRef ctx name
-  let key = intercalate "::" (path <> [ident])
+  let key = T.intercalate "::" (path <> [ident])
   when (Set.member key seenFns) $
     Left (CompileError "cycle detected while evaluating const function" Nothing Nothing)
   decls <- case Map.lookup path fnIndex >>= Map.lookup ident of
-    Nothing -> Left (CompileError ("unknown function: " <> ident) Nothing Nothing)
+    Nothing -> Left (CompileError ("unknown function: " <> textToString ident) Nothing Nothing)
     Just ds -> Right ds
   argVals <- mapM (evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns) args
   let seenFns' = Set.insert key seenFns
@@ -3975,7 +4019,7 @@ data ConstControl
 constEvalMaxSteps :: Int
 constEvalMaxSteps = 20000
 
-evalConstStmtList :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set String -> Set.Set String -> Int -> [Stmt] -> Either CompileError (ConstEnv, ConstControl, Int)
+evalConstStmtList :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Int -> [Stmt] -> Either CompileError (ConstEnv, ConstControl, Int)
 evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stmts = go env fuel stmts
   where
     go env' fuel' [] = Right (env', CCNone, fuel')
@@ -3985,7 +4029,7 @@ evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel
         CCNone -> go envNext fuelNext rest
         _ -> Right (envNext, ctrl, fuelNext)
 
-evalConstStmt :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set String -> Set.Set String -> Int -> Stmt -> Either CompileError (ConstEnv, ConstControl, Int)
+evalConstStmt :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Int -> Stmt -> Either CompileError (ConstEnv, ConstControl, Int)
 evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stmt = do
   fuel' <- consumeConstFuel fuel
   case stmt of
@@ -4140,13 +4184,13 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
                     CCContinue -> loop fuelCont envCont
                     _ -> Right (envCont, ctrlCont, fuelCont)
 
-evalConstLValueGet :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set String -> Set.Set String -> LValue -> Either CompileError ConstValue
+evalConstLValueGet :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> LValue -> Either CompileError ConstValue
 evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv =
   case lv of
     LVVar name ->
       case Map.lookup name env of
         Just binding -> Right (cbValue binding)
-        Nothing -> Left (CompileError ("unknown variable: " <> name) Nothing Nothing)
+        Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
     LVField base field -> do
       baseVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns base
       evalConstFieldAccess baseVal field
@@ -4160,12 +4204,12 @@ evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv 
         CVPointer _ ptrLv -> evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns ptrLv
         _ -> Left (CompileError "deref requires a pointer value" Nothing Nothing)
 
-evalConstLValueSet :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set String -> Set.Set String -> LValue -> ConstValue -> Either CompileError ConstEnv
+evalConstLValueSet :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> LValue -> ConstValue -> Either CompileError ConstEnv
 evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal =
   case lv of
     LVVar name ->
       case Map.lookup name env of
-        Nothing -> Left (CompileError ("unknown variable: " <> name) Nothing Nothing)
+        Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
         Just binding ->
           if cbMutable binding
             then Right (Map.insert name binding { cbValue = newVal } env)
@@ -4185,13 +4229,13 @@ evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv 
         CVPointer _ ptrLv -> evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns ptrLv newVal
         _ -> Left (CompileError "deref requires a pointer value" Nothing Nothing)
 
-updateFieldValue :: ConstValue -> String -> ConstValue -> Either CompileError ConstValue
+updateFieldValue :: ConstValue -> Text -> ConstValue -> Either CompileError ConstValue
 updateFieldValue base field newVal =
   case base of
     CVStruct name pairs ->
       if any ((== field) . fst) pairs
         then Right (CVStruct name (map upd pairs))
-        else Left (CompileError ("unknown field: " <> field) Nothing Nothing)
+        else Left (CompileError ("unknown field: " <> textToString field) Nothing Nothing)
       where
         upd (fname, fval)
           | fname == field = (fname, newVal)
@@ -4313,7 +4357,7 @@ evalConstAssignOp op lhs rhs =
       when (n < 0 || n > 0x7FFFFFFF) $
         Left (CompileError "constant i32 is out of range" Nothing Nothing)
 
-evalConstFieldAccess :: ConstValue -> String -> Either CompileError ConstValue
+evalConstFieldAccess :: ConstValue -> Text -> Either CompileError ConstValue
 evalConstFieldAccess val field =
   case val of
     CVVector n scalar comps -> do
@@ -4326,7 +4370,7 @@ evalConstFieldAccess val field =
     CVStruct _ fields ->
       case lookup field fields of
         Just v -> Right v
-        Nothing -> Left (CompileError ("unknown field: " <> field) Nothing Nothing)
+        Nothing -> Left (CompileError ("unknown field: " <> textToString field) Nothing Nothing)
     _ -> Left (CompileError "field access requires struct or vector type" Nothing Nothing)
 
 evalConstIndexAccess :: ConstValue -> ConstInt -> Either CompileError ConstValue
@@ -4349,7 +4393,7 @@ evalConstIntExpr :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex 
 evalConstIntExpr ctx constIndex fnIndex structIndex expr =
   evalConstIntExprWithEnv ctx constIndex fnIndex structIndex Map.empty Set.empty Set.empty expr
 
-evalConstIntExprWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set String -> Set.Set String -> Expr -> Either CompileError ConstInt
+evalConstIntExprWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Expr -> Either CompileError ConstInt
 evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr = go seenConsts seenFns expr
   where
     go seen fnSeen ex =
@@ -4430,12 +4474,12 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFn
                 _ -> Left (CompileError "const int expression references a composite value" Nothing Nothing)
             Nothing -> do
               (path, ident) <- resolveConstRef ctx name
-              let key = intercalate "::" (path <> [ident])
+              let key = T.intercalate "::" (path <> [ident])
               when (Set.member key seen) $
                 Left (CompileError "cycle detected while evaluating constant selector" Nothing Nothing)
               let entry = Map.lookup path constIndex >>= Map.lookup ident
               case entry of
-                Nothing -> Left (CompileError ("unknown constant: " <> ident) Nothing Nothing)
+                Nothing -> Left (CompileError ("unknown constant: " <> textToString ident) Nothing Nothing)
                 Just expr' -> evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env (Set.insert key seen) fnSeen expr'
         EField _ _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
@@ -4520,7 +4564,7 @@ quantizeF16 v =
       bits = floatToHalfBits f
   in realToFrac (halfBitsToFloat bits) :: Double
 
-evalConstFloatExprWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set String -> Set.Set String -> Expr -> Either CompileError ConstFloat
+evalConstFloatExprWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Expr -> Either CompileError ConstFloat
 evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr = go seenConsts seenFns expr
   where
     go seen fnSeen ex =
@@ -4600,12 +4644,12 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seen
                 _ -> Left (CompileError "const float expression references a composite value" Nothing Nothing)
             Nothing -> do
               (path, ident) <- resolveConstRef ctx name
-              let key = intercalate "::" (path <> [ident])
+              let key = T.intercalate "::" (path <> [ident])
               when (Set.member key seen) $
                 Left (CompileError "cycle detected while evaluating const float expression" Nothing Nothing)
               let entry = Map.lookup path constIndex >>= Map.lookup ident
               case entry of
-                Nothing -> Left (CompileError ("unknown constant: " <> ident) Nothing Nothing)
+                Nothing -> Left (CompileError ("unknown constant: " <> textToString ident) Nothing Nothing)
                 Just expr' -> evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env (Set.insert key seen) fnSeen expr'
         EField _ _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
@@ -4633,7 +4677,7 @@ evalConstBoolExpr :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex
 evalConstBoolExpr ctx constIndex fnIndex structIndex expr =
   evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex Map.empty Set.empty Set.empty expr
 
-evalConstBoolExprWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set String -> Set.Set String -> Expr -> Either CompileError Bool
+evalConstBoolExprWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Expr -> Either CompileError Bool
 evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr = go seenConsts seenFns expr
   where
     go seen fnSeen ex =
@@ -4670,12 +4714,12 @@ evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenF
                 _ -> Left (CompileError "const bool expression references a composite value" Nothing Nothing)
             Nothing -> do
               (path, ident) <- resolveConstRef ctx name
-              let key = intercalate "::" (path <> [ident])
+              let key = T.intercalate "::" (path <> [ident])
               when (Set.member key seen) $
                 Left (CompileError "cycle detected while evaluating const_assert" Nothing Nothing)
               let entry = Map.lookup path constIndex >>= Map.lookup ident
               case entry of
-                Nothing -> Left (CompileError ("unknown constant: " <> ident) Nothing Nothing)
+                Nothing -> Left (CompileError ("unknown constant: " <> textToString ident) Nothing Nothing)
                 Just expr' -> evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env (Set.insert key seen) fnSeen expr'
         EField _ _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
@@ -4758,7 +4802,7 @@ coerceConstIntToScalar target (ConstInt scalar val) =
     _ -> Left (CompileError "unsupported const integer coercion" Nothing Nothing)
 
 
-resolveConstRef :: ModuleContext -> String -> Either CompileError ([String], String)
+resolveConstRef :: ModuleContext -> Text -> Either CompileError ([Text], Text)
 resolveConstRef ctx name =
   case splitQName name of
     [] -> Left (CompileError "invalid constant reference" Nothing Nothing)
@@ -4770,16 +4814,16 @@ resolveConstRef ctx name =
             case splitLast target of
               Nothing -> Left (CompileError "invalid constant reference" Nothing Nothing)
               Just (path, item) -> Right (path, item)
-          Nothing -> Left (CompileError ("unknown constant: " <> single) Nothing Nothing)
+          Nothing -> Left (CompileError ("unknown constant: " <> textToString single) Nothing Nothing)
     seg0 : segRest ->
       case Map.lookup seg0 (mcModuleAliases ctx) of
-        Nothing -> Left (CompileError ("unknown module alias: " <> seg0) Nothing Nothing)
+        Nothing -> Left (CompileError ("unknown module alias: " <> textToString seg0) Nothing Nothing)
         Just target ->
           case splitLast (target <> segRest) of
             Nothing -> Left (CompileError "invalid constant reference" Nothing Nothing)
             Just (path, item) -> Right (path, item)
 
-resolveFunctionRef :: ModuleContext -> String -> Either CompileError ([String], String)
+resolveFunctionRef :: ModuleContext -> Text -> Either CompileError ([Text], Text)
 resolveFunctionRef ctx name =
   case splitQName name of
     [] -> Left (CompileError "invalid function reference" Nothing Nothing)
@@ -4791,10 +4835,10 @@ resolveFunctionRef ctx name =
             case splitLast target of
               Nothing -> Left (CompileError "invalid function reference" Nothing Nothing)
               Just (path, item) -> Right (path, item)
-          Nothing -> Left (CompileError ("unknown function: " <> single) Nothing Nothing)
+          Nothing -> Left (CompileError ("unknown function: " <> textToString single) Nothing Nothing)
     seg0 : segRest ->
       case Map.lookup seg0 (mcModuleAliases ctx) of
-        Nothing -> Left (CompileError ("unknown module alias: " <> seg0) Nothing Nothing)
+        Nothing -> Left (CompileError ("unknown module alias: " <> textToString seg0) Nothing Nothing)
         Just target ->
           case splitLast (target <> segRest) of
             Nothing -> Left (CompileError "invalid function reference" Nothing Nothing)
@@ -4860,7 +4904,7 @@ validateType ctx scope ty =
     TySamplerComparison -> Right ()
     TyScalar _ -> Right ()
 
-validateName :: ModuleContext -> Scope -> String -> Either CompileError ()
+validateName :: ModuleContext -> Scope -> Text -> Either CompileError ()
 validateName _ scope name =
   case splitQName name of
     [] -> Right ()
@@ -4870,30 +4914,30 @@ validateName _ scope name =
         || Set.member single (scGlobals scope)
         || Set.member single (scItemAliases scope)
         then Right ()
-        else Left (CompileError ("unknown identifier: " <> single) Nothing Nothing)
+        else Left (CompileError ("unknown identifier: " <> textToString single) Nothing Nothing)
     seg0 : _ ->
       if Set.member seg0 (scModuleAliases scope)
         then Right ()
-        else Left (CompileError ("unknown module alias: " <> seg0) Nothing Nothing)
+        else Left (CompileError ("unknown module alias: " <> textToString seg0) Nothing Nothing)
 
-scopeLocals :: Scope -> Set.Set String
+scopeLocals :: Scope -> Set.Set Text
 scopeLocals scope = foldl' Set.union Set.empty (scScopes scope)
 
-currentScope :: Scope -> Set.Set String
+currentScope :: Scope -> Set.Set Text
 currentScope scope =
   case scScopes scope of
     [] -> Set.empty
     s : _ -> s
 
-scopeAdd :: Scope -> String -> Either CompileError Scope
+scopeAdd :: Scope -> Text -> Either CompileError Scope
 scopeAdd scope name =
   if Set.member name (currentScope scope)
-    then Left (CompileError ("duplicate local declaration: " <> name) Nothing Nothing)
+    then Left (CompileError ("duplicate local declaration: " <> textToString name) Nothing Nothing)
     else
       if not (scAllowShadowing scope)
-        && not ("_" `isPrefixOf` name)
+        && not (T.isPrefixOf "_" name)
         && Set.member name (scopeOuterLocals scope)
-        then Left (CompileError ("shadowing is not allowed: " <> name) Nothing Nothing)
+        then Left (CompileError ("shadowing is not allowed: " <> textToString name) Nothing Nothing)
         else
           case scScopes scope of
             [] ->
@@ -4901,7 +4945,7 @@ scopeAdd scope name =
             current : rest ->
               Right scope { scScopes = Set.insert name current : rest }
 
-scopeOuterLocals :: Scope -> Set.Set String
+scopeOuterLocals :: Scope -> Set.Set Text
 scopeOuterLocals scope =
   case scScopes scope of
     [] -> Set.empty
@@ -4910,23 +4954,23 @@ scopeOuterLocals scope =
 enterBlock :: Scope -> Scope
 enterBlock scope = scope { scScopes = Set.empty : scScopes scope }
 
-ensureNoDuplicates :: String -> [String] -> Either CompileError ()
+ensureNoDuplicates :: Text -> [Text] -> Either CompileError ()
 ensureNoDuplicates label names =
   let (dups, _) = foldl' collect ([], Set.empty) names
   in if null dups
       then Right ()
-      else Left (CompileError ("duplicate " <> label <> ": " <> intercalate ", " dups) Nothing Nothing)
+      else Left (CompileError ("duplicate " <> textToString label <> ": " <> T.unpack (T.intercalate ", " dups)) Nothing Nothing)
   where
     collect (acc, seen) name =
       if Set.member name seen
         then (name : acc, seen)
         else (acc, Set.insert name seen)
 
-isBuiltinName :: String -> Bool
+isBuiltinName :: Text -> Bool
 isBuiltinName name =
   name `Set.member` builtinNames || maybe False (const True) (parseMatrixName name)
 
-builtinNames :: Set.Set String
+builtinNames :: Set.Set Text
 builtinNames =
   Set.fromList
     [ "vec2"
@@ -5043,7 +5087,7 @@ builtinNames =
     , "atomicExchange"
     ]
 
-qualifyModule :: [String] -> Map.Map FilePath ModuleContext -> ModuleNode -> ModuleNode
+qualifyModule :: [Text] -> Map.Map FilePath ModuleContext -> ModuleNode -> ModuleNode
 qualifyModule rootPath ctxs node =
   let ctx = fromMaybe (buildModuleContext rootPath "" node) (Map.lookup (mnFile node) ctxs)
       ast = mnAst node
@@ -5123,13 +5167,13 @@ qualifyModule rootPath ctxs node =
           }
   in node { mnAst = ast' }
 
-qualNameWithRoot :: [String] -> [String] -> String -> String
+qualNameWithRoot :: [Text] -> [Text] -> Text -> Text
 qualNameWithRoot rootPath path name =
   if null path || path == rootPath
     then name
-    else "__wesl__" <> intercalate "__" path <> "__" <> name
+    else "__wesl__" <> T.intercalate "__" path <> "__" <> name
 
-rewriteIdent :: ModuleContext -> String -> String
+rewriteIdent :: ModuleContext -> Text -> Text
 rewriteIdent ctx name =
   case splitQName name of
     [] -> name
@@ -5256,19 +5300,12 @@ rewriteExprNames ctx expr =
     EField base field -> EField (rewriteExprNames ctx base) field
     EIndex base idx -> EIndex (rewriteExprNames ctx base) (rewriteExprNames ctx idx)
 
-splitQName :: String -> [String]
+splitQName :: Text -> [Text]
 splitQName name =
-  case breakOn name of
-    Nothing -> [name]
-    Just (headSeg, rest) -> headSeg : splitQName rest
-  where
-    breakOn [] = Nothing
-    breakOn (':':':':rest) = Just ("", rest)
-    breakOn s =
-      let go _ [] = Nothing
-          go acc (':':':':rest) = Just (reverse acc, rest)
-          go acc (x:xs) = go (x:acc) xs
-      in go [] s
+  let (headSeg, rest) = T.breakOn "::" name
+  in if T.null rest
+       then [headSeg]
+       else headSeg : splitQName (T.drop 2 rest)
 
 splitLast :: [a] -> Maybe ([a], a)
 splitLast xs =
@@ -5279,7 +5316,7 @@ splitLast xs =
       (prefix, lastVal) <- splitLast rest
       Just (x : prefix, lastVal)
 
-builtinInputType :: Stage -> String -> Maybe Type
+builtinInputType :: Stage -> Text -> Maybe Type
 builtinInputType stage name =
   case (stage, name) of
     (StageCompute, "global_invocation_id") -> Just (TyVector 3 U32)
@@ -5294,14 +5331,14 @@ builtinInputType stage name =
     (StageFragment, "sample_index") -> Just (TyScalar U32)
     _ -> Nothing
 
-builtinOutputType :: Stage -> String -> Maybe Type
+builtinOutputType :: Stage -> Text -> Maybe Type
 builtinOutputType stage name =
   case (stage, name) of
     (StageVertex, "position") -> Just (TyVector 4 F32)
     (StageFragment, "frag_depth") -> Just (TyScalar F32)
     _ -> Nothing
 
-builtinInputDecoration :: Stage -> String -> Maybe Word32
+builtinInputDecoration :: Stage -> Text -> Maybe Word32
 builtinInputDecoration stage name =
   case (stage, name) of
     (StageCompute, "global_invocation_id") -> Just builtInGlobalInvocationId
@@ -5316,7 +5353,7 @@ builtinInputDecoration stage name =
     (StageFragment, "sample_index") -> Just builtInSampleIndex
     _ -> Nothing
 
-builtinOutputDecoration :: Stage -> String -> Maybe Word32
+builtinOutputDecoration :: Stage -> Text -> Maybe Word32
 builtinOutputDecoration stage name =
   case (stage, name) of
     (StageVertex, "position") -> Just builtInPosition
@@ -5329,7 +5366,7 @@ paramLocation = attrLocation
 parseType :: [Token] -> Either CompileError (Type, [Token])
 parseType toks = do
   (name, rest) <- parseFullIdent toks
-  if "::" `isInfixOf` name
+  if "::" `T.isInfixOf` name
     then Right (TyStructRef name, rest)
     else
       case name of
@@ -5483,7 +5520,7 @@ parseType toks = do
                   Right (TyArray elemTy Nothing, rest3)
         _ -> Right (TyStructRef name, rest)
 
-parseFullIdent :: [Token] -> Either CompileError (String, [Token])
+parseFullIdent :: [Token] -> Either CompileError (Text, [Token])
 parseFullIdent toks = do
   (name, rest) <- parseIdent toks
   go name rest
@@ -5495,19 +5532,19 @@ parseFullIdent toks = do
           go (acc <> "::" <> next) rest1
         _ -> Right (acc, rest)
 
-parseIdent :: [Token] -> Either CompileError (String, [Token])
+parseIdent :: [Token] -> Either CompileError (Text, [Token])
 parseIdent toks =
   case toks of
     (Token (TkIdent name) _ : rest) -> Right (name, rest)
     _ -> Left (errorAt toks "expected identifier")
 
-expectSymbol :: String -> [Token] -> Either CompileError [Token]
+expectSymbol :: Text -> [Token] -> Either CompileError [Token]
 expectSymbol sym toks =
   case toks of
     (Token (TkSymbol s) _ : rest) | s == sym -> Right rest
-    _ -> Left (errorAt toks ("expected symbol '" <> sym <> "'"))
+    _ -> Left (errorAt toks ("expected symbol '" <> textToString sym <> "'"))
 
-parseScalar :: String -> Scalar
+parseScalar :: Text -> Scalar
 parseScalar name = case name of
   "i32" -> I32
   "u32" -> U32
@@ -5671,7 +5708,7 @@ storageFormatToImageFormat fmt =
     FormatRgb10a2Uint -> imageFormatRgb10a2ui
     FormatRg11b10Float -> imageFormatR11fG11fB10f
 
-toBindingKind :: String -> Maybe String -> Type -> Either CompileError BindingKind
+toBindingKind :: Text -> Maybe Text -> Type -> Either CompileError BindingKind
 toBindingKind addrSpace access ty =
   case addrSpace of
     "uniform" -> Right BUniform
@@ -5685,7 +5722,7 @@ toBindingKind addrSpace access ty =
           Just "read" -> Right BStorageRead
           Just "read_write" -> Right BStorageReadWrite
           Nothing -> Right BStorageRead
-          Just other -> Left (CompileError ("unsupported storage access: " <> other) Nothing Nothing)
+          Just other -> Left (CompileError ("unsupported storage access: " <> textToString other) Nothing Nothing)
     "sampler" -> Right BSampler
     "sampler_comparison" -> Right BSamplerComparison
     "texture" ->
@@ -5704,7 +5741,7 @@ toBindingKind addrSpace access ty =
         TyTextureDepthCubeArray -> Right BTextureDepthCubeArray
         TyTextureDepthMultisampled2D -> Right BTextureDepthMultisampled2D
         _ -> Left (CompileError "texture address space requires a texture type" Nothing Nothing)
-    other -> Left (CompileError ("unsupported address space: " <> other) Nothing Nothing)
+    other -> Left (CompileError ("unsupported address space: " <> textToString other) Nothing Nothing)
 
 bindingKindFromType :: Type -> Either CompileError BindingKind
 bindingKindFromType ty =
@@ -5730,21 +5767,21 @@ bindingKindFromType ty =
     TyStorageTexture3D _ _ -> Right BStorageTexture3D
     _ -> Left (CompileError "bindings without address space must be sampler or texture types" Nothing Nothing)
 
-vecSize :: String -> Int
-vecSize name = case name of
+vecSize :: Text -> Int
+vecSize name = case T.unpack name of
   "vec2" -> 2
   "vec3" -> 3
   "vec4" -> 4
   _ -> 4
 
-parseMatrixName :: String -> Maybe (Int, Int)
+parseMatrixName :: Text -> Maybe (Int, Int)
 parseMatrixName name =
-  case name of
+  case T.unpack name of
     "mat2" -> Just (2, 2)
     "mat3" -> Just (3, 3)
     "mat4" -> Just (4, 4)
     _ ->
-      case name of
+      case T.unpack name of
         'm':'a':'t':rest ->
           let (a, rest1) = span isDigit rest
           in case rest1 of
@@ -5795,7 +5832,7 @@ entryAttributesMaybe attrs =
         Attr name _ -> name == target
         AttrIf _ -> False
 
-paramBuiltin :: [Attr] -> Maybe String
+paramBuiltin :: [Attr] -> Maybe Text
 paramBuiltin = attrBuiltin
 
 errorAt :: [Token] -> String -> CompileError
@@ -5825,10 +5862,13 @@ renderError err =
         _ -> ""
   in ceMessage err <> loc
 
+textToString :: Text -> String
+textToString = T.unpack
+
 -- Attributes
 
 data TTExpr
-  = TTVar String
+  = TTVar Text
   | TTBool Bool
   | TTNot TTExpr
   | TTAnd TTExpr TTExpr
@@ -5836,31 +5876,31 @@ data TTExpr
   deriving (Eq, Show)
 
 data Attr
-  = Attr String [AttrArg]
-  | AttrIf TTExpr
+  = Attr !Text ![AttrArg]
+  | AttrIf !TTExpr
   deriving (Eq, Show)
 
-data AttrArg = AttrInt Integer | AttrIdent String deriving (Eq, Show)
+data AttrArg = AttrInt !Integer | AttrIdent !Text deriving (Eq, Show)
 
-attrInt :: String -> [Attr] -> Maybe Integer
+attrInt :: Text -> [Attr] -> Maybe Integer
 attrInt name attrs =
   case [v | Attr n args <- attrs, n == name, AttrInt v <- args] of
     (x:_) -> Just x
     _ -> Nothing
 
-attrIntMaybe :: String -> [Attr] -> Maybe Word32
+attrIntMaybe :: Text -> [Attr] -> Maybe Word32
 attrIntMaybe name attrs = fmap fromIntegral (attrInt name attrs)
 
 attrLocation :: [Attr] -> Maybe Word32
 attrLocation = attrIntMaybe "location"
 
-attrBuiltin :: [Attr] -> Maybe String
+attrBuiltin :: [Attr] -> Maybe Text
 attrBuiltin attrs =
   case [name | Attr n args <- attrs, n == "builtin", AttrIdent name <- args] of
     (x:_) -> Just x
     _ -> Nothing
 
-attrInts :: String -> [Attr] -> Maybe [Integer]
+attrInts :: Text -> [Attr] -> Maybe [Integer]
 attrInts name attrs =
   case [nums | Attr n args <- attrs, n == name, let nums = [v | AttrInt v <- args], not (null nums)] of
     (x:_) -> Just x
@@ -5875,14 +5915,14 @@ buildInterface specMode modAst = do
   overrides <- buildOverrideInfo specMode structEnv (modOverrides modAst)
   pure (ShaderInterface bindings overrides)
 
-buildOverrideInfo :: OverrideSpecMode -> [(String, StructDecl)] -> [OverrideDecl] -> Either CompileError [OverrideInfo]
+buildOverrideInfo :: OverrideSpecMode -> [(Text, StructDecl)] -> [OverrideDecl] -> Either CompileError [OverrideInfo]
 buildOverrideInfo specMode structEnv decls = do
   specIds <- assignOverrideSpecIds decls
   let depsMap = overrideDependencies decls
   _ <- topoSortOverrides (map odName decls) depsMap
   mapM (layoutOverride specMode specIds depsMap structEnv) decls
 
-layoutOverride :: OverrideSpecMode -> Map.Map String Word32 -> Map.Map String (Set.Set String) -> [(String, StructDecl)] -> OverrideDecl -> Either CompileError OverrideInfo
+layoutOverride :: OverrideSpecMode -> Map.Map Text Word32 -> Map.Map Text (Set.Set Text) -> [(Text, StructDecl)] -> OverrideDecl -> Either CompileError OverrideInfo
 layoutOverride specMode specIds depsMap structEnv decl = do
   layout <- resolveTypeLayout structEnv [] (odType decl)
   let deps = Map.findWithDefault Set.empty (odName decl) depsMap
@@ -5898,9 +5938,9 @@ layoutOverride specMode specIds depsMap structEnv decl = do
             Just sid -> Right (Just sid)
             Nothing -> Left (CompileError "missing specialization id for override" Nothing Nothing)
           else Right Nothing
-  pure (OverrideInfo (odName decl) (odId decl) specId layout)
+  pure (OverrideInfo (textToString (odName decl)) (odId decl) specId layout)
 
-assignOverrideSpecIds :: [OverrideDecl] -> Either CompileError (Map.Map String Word32)
+assignOverrideSpecIds :: [OverrideDecl] -> Either CompileError (Map.Map Text Word32)
 assignOverrideSpecIds overrides = do
   let explicit = [(odName d, i) | d <- overrides, Just i <- [odId d]]
   let ids = map snd explicit
@@ -5929,15 +5969,15 @@ assignOverrideSpecIds overrides = do
         then
           if next == maxBound
             then Left (CompileError "ran out of override specialization ids" Nothing Nothing)
-            else nextSpecId used (next + 1)
+          else nextSpecId used (next + 1)
         else Right (next, Set.insert next used, next + 1)
 
-overrideDependencies :: [OverrideDecl] -> Map.Map String (Set.Set String)
+overrideDependencies :: [OverrideDecl] -> Map.Map Text (Set.Set Text)
 overrideDependencies decls =
   let names = Set.fromList (map odName decls)
   in Map.fromList [(odName d, maybe Set.empty (collectOverrideRefs names) (odExpr d)) | d <- decls]
 
-collectOverrideRefs :: Set.Set String -> Expr -> Set.Set String
+collectOverrideRefs :: Set.Set Text -> Expr -> Set.Set Text
 collectOverrideRefs names expr =
   case expr of
     EVar n | Set.member n names -> Set.singleton n
@@ -5949,14 +5989,14 @@ collectOverrideRefs names expr =
     EIndex a b -> collectOverrideRefs names a <> collectOverrideRefs names b
     _ -> Set.empty
 
-topoSortOverrides :: [String] -> Map.Map String (Set.Set String) -> Either CompileError [String]
+topoSortOverrides :: [Text] -> Map.Map Text (Set.Set Text) -> Either CompileError [Text]
 topoSortOverrides order depsMap = go Set.empty Set.empty [] order
   where
     go _ _ acc [] = Right (reverse acc)
     go temp perm acc (n:ns)
       | Set.member n perm = go temp perm acc ns
       | Set.member n temp =
-          Left (CompileError ("override dependency cycle involving " <> n) Nothing Nothing)
+          Left (CompileError ("override dependency cycle involving " <> textToString n) Nothing Nothing)
       | otherwise = do
           (perm', acc') <- visit temp (perm, acc) n
           go temp perm' acc' ns
@@ -5964,7 +6004,7 @@ topoSortOverrides order depsMap = go Set.empty Set.empty [] order
     visit temp (perm, acc) n
       | Set.member n perm = Right (perm, acc)
       | Set.member n temp =
-          Left (CompileError ("override dependency cycle involving " <> n) Nothing Nothing)
+          Left (CompileError ("override dependency cycle involving " <> textToString n) Nothing Nothing)
       | otherwise = do
           let temp' = Set.insert n temp
           let deps = Set.toList (Map.findWithDefault Set.empty n depsMap)
@@ -5972,7 +6012,7 @@ topoSortOverrides order depsMap = go Set.empty Set.empty [] order
           let perm'' = Set.insert n perm'
           Right (perm'', n : acc')
 
-layoutBinding :: [(String, StructDecl)] -> BindingDecl -> Either CompileError BindingInfo
+layoutBinding :: [(Text, StructDecl)] -> BindingDecl -> Either CompileError BindingInfo
 layoutBinding env decl = do
   case bdKind decl of
     BUniform -> ensureStructBinding
@@ -6065,14 +6105,14 @@ layoutBinding env decl = do
           then Left (CompileError "uniform bindings cannot contain runtime arrays" Nothing Nothing)
           else pure ()
     _ -> pure ()
-  pure (BindingInfo (bdName decl) (bdKind decl) (bdGroup decl) (bdBinding decl) tyLayout)
+  pure (BindingInfo (textToString (bdName decl)) (bdKind decl) (bdGroup decl) (bdBinding decl) tyLayout)
   where
     ensureStructBinding =
       case bdType decl of
         TyStructRef _ -> pure ()
         _ -> Left (CompileError "bindings must use a struct type (wrap arrays in a struct)" Nothing Nothing)
 
-resolveTypeLayout :: [(String, StructDecl)] -> [String] -> Type -> Either CompileError TypeLayout
+resolveTypeLayout :: [(Text, StructDecl)] -> [Text] -> Type -> Either CompileError TypeLayout
 resolveTypeLayout env stack ty =
   case ty of
     TyScalar s ->
@@ -6125,7 +6165,7 @@ resolveTypeLayout env stack ty =
         "workgroup" -> Right storageClassWorkgroup
         "uniform" -> Right storageClassUniform
         "storage" -> Right storageClassStorageBuffer
-        _ -> Left (CompileError ("unsupported pointer address space: " <> addr) Nothing Nothing)
+        _ -> Left (CompileError ("unsupported pointer address space: " <> textToString addr) Nothing Nothing)
       access' <- case addr of
         "storage" ->
           case access of
@@ -6146,17 +6186,17 @@ resolveTypeLayout env stack ty =
       Right (TLPointer storageClass access' elemLayout)
     TyStructRef name ->
       if name `elem` stack
-        then Left (CompileError ("recursive struct: " <> name) Nothing Nothing)
+        then Left (CompileError ("recursive struct: " <> textToString name) Nothing Nothing)
         else case lookup name env of
-          Nothing -> Left (CompileError ("unknown struct: " <> name) Nothing Nothing)
+          Nothing -> Left (CompileError ("unknown struct: " <> textToString name) Nothing Nothing)
           Just decl -> do
             let stack' = name : stack
             fields <- resolveFields env stack' (sdFields decl)
             let align = maximum (1 : map flAlign fields)
             let size = structSize fields align
-            Right (TLStruct name fields align size)
+            Right (TLStruct (textToString name) fields align size)
 
-resolveFields :: [(String, StructDecl)] -> [String] -> [FieldDecl] -> Either CompileError [FieldLayout]
+resolveFields :: [(Text, StructDecl)] -> [Text] -> [FieldDecl] -> Either CompileError [FieldLayout]
 resolveFields env stack fields =
   let go _ acc [] = Right (reverse acc)
       go offset acc (FieldDecl name fty attrs : rest) = do
@@ -6183,7 +6223,7 @@ resolveFields env stack fields =
                     then Left (CompileError "field @size must be a multiple of its alignment" Nothing Nothing)
                   else Right sz
             let aligned = roundUp offset fieldAlign
-            let entry = FieldLayout name aligned fLayout fieldAlign fieldSize
+            let entry = FieldLayout (textToString name) aligned fLayout fieldAlign fieldSize
             let offset' = aligned + fieldSize
             go offset' (entry:acc) rest
   in go 0 [] fields
@@ -6201,18 +6241,18 @@ parseFieldAlign attrs = do
 parseFieldSize :: [Attr] -> Either CompileError (Maybe Word32)
 parseFieldSize attrs = attrSingleInt "size" attrs
 
-attrSingleInt :: String -> [Attr] -> Either CompileError (Maybe Word32)
+attrSingleInt :: Text -> [Attr] -> Either CompileError (Maybe Word32)
 attrSingleInt name attrs =
   case [args | Attr n args <- attrs, n == name] of
     [] -> Right Nothing
     [args] ->
       case args of
         [AttrInt v]
-          | v <= 0 -> Left (CompileError ("@" <> name <> " must be positive") Nothing Nothing)
-          | v > fromIntegral (maxBound :: Word32) -> Left (CompileError ("@" <> name <> " is out of range") Nothing Nothing)
+          | v <= 0 -> Left (CompileError ("@" <> textToString name <> " must be positive") Nothing Nothing)
+          | v > fromIntegral (maxBound :: Word32) -> Left (CompileError ("@" <> textToString name <> " is out of range") Nothing Nothing)
           | otherwise -> Right (Just (fromIntegral v))
-        _ -> Left (CompileError ("@" <> name <> " expects a single integer argument") Nothing Nothing)
-    _ -> Left (CompileError ("duplicate @" <> name <> " attribute") Nothing Nothing)
+        _ -> Left (CompileError ("@" <> textToString name <> " expects a single integer argument") Nothing Nothing)
+    _ -> Left (CompileError ("duplicate @" <> textToString name <> " attribute") Nothing Nothing)
 
 isPowerOfTwo :: Word32 -> Bool
 isPowerOfTwo v =
@@ -6300,7 +6340,7 @@ emitSpirv opts modAst iface = do
     (StageVertex, Just ty) -> Just <$> resolveTypeLayout structEnv [] ty
     (StageVertex, Nothing) -> Left (CompileError "vertex entry point missing return type" Nothing Nothing)
     _ -> Right Nothing
-  let blockStructs = [name | BindingInfo _ _ _ _ (TLStruct name _ _ _) <- siBindings iface]
+  let blockStructs = [T.pack name | BindingInfo _ _ _ _ (TLStruct name _ _ _) <- siBindings iface]
   let state0 = emptyGenState (epStage entry) structLayouts blockStructs
   let ((), state1) = emitStructs state0
   let node = ModuleNode "<merged>" [] modAst []
@@ -6317,7 +6357,7 @@ emitSpirv opts modAst iface = do
   let spirvWords = buildSpirvWords opts entry state7
   pure (spirvToBytes spirvWords)
 
-emitModuleOverrides :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideSpecMode -> [(String, StructDecl)] -> [OverrideDecl] -> GenState -> Either CompileError GenState
+emitModuleOverrides :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideSpecMode -> [(Text, StructDecl)] -> [OverrideDecl] -> GenState -> Either CompileError GenState
 emitModuleOverrides ctx constIndex fnIndex structIndex specMode structEnv decls st0 =
   case decls of
     [] -> Right st0
@@ -6366,7 +6406,7 @@ emitModuleOverrides ctx constIndex fnIndex structIndex specMode structEnv decls 
               Just i -> Right i
             Right (addDecoration (Instr opDecorate [valId val, decorationSpecId, specId]) st2)
           else Right st2
-      let st4 = addName (Instr opName (valId val : encodeString (odName decl))) st3
+      let st4 = addName (Instr opName (valId val : encodeString (textToString (odName decl)))) st3
       let st5 = st4 { gsConstValues = (odName decl, val) : gsConstValues st4 }
       Right st5
 
@@ -6375,7 +6415,7 @@ emitModuleOverrides ctx constIndex fnIndex structIndex specMode structEnv decls 
       emitSpecConstValueToLayout layout constVal st
 
 
-defaultConstValueForType :: [(String, StructDecl)] -> Type -> Either CompileError ConstValue
+defaultConstValueForType :: [(Text, StructDecl)] -> Type -> Either CompileError ConstValue
 defaultConstValueForType structEnv ty =
   case ty of
     TyScalar Bool -> Right (CVBool False)
@@ -6396,7 +6436,7 @@ defaultConstValueForType structEnv ty =
       Left (CompileError "override defaults cannot target runtime-sized arrays" Nothing Nothing)
     TyStructRef name ->
       case lookup name structEnv of
-        Nothing -> Left (CompileError ("unknown struct: " <> name) Nothing Nothing)
+        Nothing -> Left (CompileError ("unknown struct: " <> textToString name) Nothing Nothing)
         Just decl -> do
           fields <- mapM fieldDefault (sdFields decl)
           Right (CVStruct name fields)
@@ -6411,7 +6451,7 @@ emitModuleConstants decls st0 = foldM emitOne st0 decls
   where
     emitOne st decl =
       case lookup (cdName decl) (gsConstValues st) of
-        Just _ -> Left (CompileError ("duplicate constant: " <> cdName decl) Nothing Nothing)
+        Just _ -> Left (CompileError ("duplicate constant: " <> textToString (cdName decl)) Nothing Nothing)
         Nothing -> do
           (st1, val) <- emitConstExpr st (cdExpr decl)
           let st2 = st1 { gsConstValues = (cdName decl, val) : gsConstValues st1 }
@@ -6503,7 +6543,7 @@ emitConstExpr st expr =
     EVar name ->
       case lookup name (gsConstValues st) of
         Just val -> Right (st, val)
-        Nothing -> Left (CompileError ("unknown constant: " <> name) Nothing Nothing)
+        Nothing -> Left (CompileError ("unknown constant: " <> textToString name) Nothing Nothing)
     ECall name args ->
       case name of
         "vec2" -> emitConstVectorCtor 2 args st
@@ -6520,7 +6560,7 @@ emitConstExpr st expr =
             Nothing ->
               case lookup name (gsStructLayouts st) of
                 Just layout -> emitConstStructCtor name layout args st
-                Nothing -> Left (CompileError ("unsupported constant constructor: " <> name) Nothing Nothing)
+                Nothing -> Left (CompileError ("unsupported constant constructor: " <> textToString name) Nothing Nothing)
     _ -> Left (CompileError "unsupported constant expression" Nothing Nothing)
   where
     constKeyToInt key =
@@ -6598,8 +6638,9 @@ emitConstValueToLayout layout val st =
         (Nothing, _) -> Left (CompileError "runtime array constants are not supported" Nothing Nothing)
         _ -> Left (CompileError "array constant does not match type" Nothing Nothing)
     TLStruct name fields _ _ ->
-      case val of
-        CVStruct structName pairs | structName == name -> do
+      let nameT = T.pack name
+      in case val of
+        CVStruct structName pairs | structName == nameT -> do
           fieldVals <- mapM (lookupField pairs) fields
           (st1, emitted) <- emitConstValuesFromFields fields fieldVals st
           let (cid, st2) = emitConstComposite layout (map valId emitted) st1
@@ -6608,7 +6649,7 @@ emitConstValueToLayout layout val st =
     _ -> Left (CompileError "unsupported constant layout" Nothing Nothing)
   where
     lookupField pairs fld =
-      case lookup (flName fld) pairs of
+      case lookup (T.pack (flName fld)) pairs of
         Just v -> Right v
         Nothing -> Left (CompileError ("missing field: " <> flName fld) Nothing Nothing)
 
@@ -6667,8 +6708,9 @@ emitSpecConstValueToLayout layout val st =
         (Nothing, _) -> Left (CompileError "runtime array constants are not supported" Nothing Nothing)
         _ -> Left (CompileError "array constant does not match type" Nothing Nothing)
     TLStruct name fields _ _ ->
-      case val of
-        CVStruct structName pairs | structName == name -> do
+      let nameT = T.pack name
+      in case val of
+        CVStruct structName pairs | structName == nameT -> do
           fieldVals <- mapM (lookupField pairs) fields
           (st1, emitted) <- emitConstValuesFromFields fields fieldVals st
           let (cid, st2) = emitSpecConstComposite layout (map valId emitted) st1
@@ -6677,7 +6719,7 @@ emitSpecConstValueToLayout layout val st =
     _ -> Left (CompileError "unsupported constant layout" Nothing Nothing)
   where
     lookupField pairs fld =
-      case lookup (flName fld) pairs of
+      case lookup (T.pack (flName fld)) pairs of
         Just v -> Right v
         Nothing -> Left (CompileError ("missing field: " <> flName fld) Nothing Nothing)
 
@@ -6721,7 +6763,7 @@ constValueLayout st val =
     CVStruct name _ ->
       case lookup name (gsStructLayouts st) of
         Just layout -> Right layout
-        Nothing -> Left (CompileError ("unknown struct layout for constant: " <> name) Nothing Nothing)
+        Nothing -> Left (CompileError ("unknown struct layout for constant: " <> textToString name) Nothing Nothing)
     CVPointer _ _ ->
       Left (CompileError "pointer constants are not supported" Nothing Nothing)
   where
@@ -6747,7 +6789,7 @@ constValueLayout st val =
         TyStructRef name ->
           case lookup name (gsStructLayouts st) of
             Just layout -> Right layout
-            Nothing -> Left (CompileError ("unknown struct layout for constant: " <> name) Nothing Nothing)
+            Nothing -> Left (CompileError ("unknown struct layout for constant: " <> textToString name) Nothing Nothing)
         _ -> Left (CompileError "unsupported constant type layout" Nothing Nothing)
 
 emitSpecConstOp :: TypeLayout -> Word16 -> [Word32] -> GenState -> Either CompileError (GenState, Value)
@@ -6900,7 +6942,7 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
                 Nothing ->
                   case lookup name (gsStructLayouts st) of
                     Just layout -> emitSpecConstStructCtor ctx constIndex fnIndex structIndex name layout args st0
-                    Nothing -> Left (CompileError ("unsupported spec constant constructor: " <> name) Nothing Nothing)
+                    Nothing -> Left (CompileError ("unsupported spec constant constructor: " <> textToString name) Nothing Nothing)
         EVar name ->
           case lookup name (gsConstValues st0) of
             Just val -> Right (st0, val)
@@ -7040,17 +7082,17 @@ emitSpecConstMatrixCtor ctx constIndex fnIndex structIndex cols rows args st =
           (st2, colsVals) <- buildColumns vecLayout rest st1
           Right (st2, Value vecLayout cid : colsVals)
 
-emitSpecConstStructCtor :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> String -> TypeLayout -> [Expr] -> GenState -> Either CompileError (GenState, Value)
+emitSpecConstStructCtor :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Text -> TypeLayout -> [Expr] -> GenState -> Either CompileError (GenState, Value)
 emitSpecConstStructCtor ctx constIndex fnIndex structIndex name layout args st =
   case layout of
     TLStruct _ fields _ _ -> do
       when (length args /= length fields) $
-        Left (CompileError ("struct constructor arity mismatch for " <> name) Nothing Nothing)
+        Left (CompileError ("struct constructor arity mismatch for " <> textToString name) Nothing Nothing)
       (st1, vals) <- emitSpecConstExprList ctx constIndex fnIndex structIndex st args
       (st2, vals') <- coerceSpecConstArgsToLayouts vals (map flType fields) st1
       let (cid, st3) = emitSpecConstComposite layout (map valId vals') st2
       Right (st3, Value layout cid)
-    _ -> Left (CompileError ("unsupported constructor: " <> name) Nothing Nothing)
+    _ -> Left (CompileError ("unsupported constructor: " <> textToString name) Nothing Nothing)
 
 emitSpecConstArrayCtor :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> [Expr] -> GenState -> Either CompileError (GenState, Value)
 emitSpecConstArrayCtor ctx constIndex fnIndex structIndex args st =
@@ -7158,17 +7200,17 @@ emitConstMatrixCtor cols rows args st =
           (st2, colsVals) <- buildColumns vecLayout rest st1
           Right (st2, Value vecLayout cid : colsVals)
 
-emitConstStructCtor :: String -> TypeLayout -> [Expr] -> GenState -> Either CompileError (GenState, Value)
+emitConstStructCtor :: Text -> TypeLayout -> [Expr] -> GenState -> Either CompileError (GenState, Value)
 emitConstStructCtor name layout args st =
   case layout of
     TLStruct _ fields _ _ -> do
       when (length args /= length fields) $
-        Left (CompileError ("struct constructor arity mismatch for " <> name) Nothing Nothing)
+        Left (CompileError ("struct constructor arity mismatch for " <> textToString name) Nothing Nothing)
       (st1, vals) <- emitConstExprList st args
       (st2, vals') <- coerceConstArgsToLayouts vals (map flType fields) st1
       let (cid, st3) = emitConstComposite layout (map valId vals') st2
       Right (st3, Value layout cid)
-    _ -> Left (CompileError ("unsupported constructor: " <> name) Nothing Nothing)
+    _ -> Left (CompileError ("unsupported constructor: " <> textToString name) Nothing Nothing)
 
 emitConstArrayCtor :: [Expr] -> GenState -> Either CompileError (GenState, Value)
 emitConstArrayCtor args st =
@@ -7266,7 +7308,7 @@ constKeyToU32 key =
     ConstF16 bits -> Right (fromIntegral (truncate (halfBitsToFloat bits) :: Integer))
     ConstBool _ -> Left (CompileError "cannot convert bool literal to u32" Nothing Nothing)
 
-resolveStructLayout :: [(String, StructDecl)] -> StructDecl -> Either CompileError (String, TypeLayout)
+resolveStructLayout :: [(Text, StructDecl)] -> StructDecl -> Either CompileError (Text, TypeLayout)
 resolveStructLayout env decl = do
   layout <- resolveTypeLayout env [] (TyStructRef (sdName decl))
   Right (sdName decl, layout)
@@ -8167,17 +8209,17 @@ glslStd450FindUMsb = 75
 
 data GenState = GenState
   { gsNextId :: Word32
-  , gsStructLayouts :: [(String, TypeLayout)]
-  , gsStructIds :: [(String, Word32)]
-  , gsBlockStructs :: [String]
+  , gsStructLayouts :: [(Text, TypeLayout)]
+  , gsStructIds :: [(Text, Word32)]
+  , gsBlockStructs :: [Text]
   , gsTypeCache :: [(TypeKey, Word32)]
   , gsConstCache :: [(ConstKey, Word32)]
   , gsExtInstIds :: [(String, Word32)]
   , gsExtInstImports :: [Instr]
-  , gsGlobalVars :: [(String, VarInfo)]
+  , gsGlobalVars :: [(Text, VarInfo)]
   , gsFunctionTable :: [FunctionInfo]
   , gsEntryStage :: Stage
-  , gsConstValues :: [(String, Value)]
+  , gsConstValues :: [(Text, Value)]
   , gsCapabilities :: [Word32]
   , gsNames :: [Instr]
   , gsDecorations :: [Instr]
@@ -8189,7 +8231,7 @@ data GenState = GenState
   , gsInterfaceIds :: [Word32]
   }
 
-emptyGenState :: Stage -> [(String, TypeLayout)] -> [String] -> GenState
+emptyGenState :: Stage -> [(Text, TypeLayout)] -> [Text] -> GenState
 emptyGenState stage structLayouts blockStructs =
   let (ids, nextId) = assignStructIds 1 structLayouts
   in GenState
@@ -8216,7 +8258,7 @@ emptyGenState stage structLayouts blockStructs =
       , gsInterfaceIds = []
       }
 
-assignStructIds :: Word32 -> [(String, TypeLayout)] -> ([(String, Word32)], Word32)
+assignStructIds :: Word32 -> [(Text, TypeLayout)] -> ([(Text, Word32)], Word32)
 assignStructIds start layouts =
   let go next acc [] = (reverse acc, next)
       go next acc ((name, _):rest) = go (next + 1) ((name, next):acc) rest
@@ -8263,7 +8305,7 @@ emitStructs st0 =
           let structId = fromMaybe (error "missing struct id") (lookup name (gsStructIds st))
               (st1, fieldTypeIds) = mapAccumL emitFieldType st fields
               st2 = addType (Instr opTypeStruct (structId : fieldTypeIds)) st1
-              st3 = addName (Instr opName (structId : encodeString name)) st2
+              st3 = addName (Instr opName (structId : encodeString (textToString name))) st2
               st4 = foldl' (emitMemberDecorate structId) st3 (zip [0 :: Int ..] fields)
               st5 = if name `elem` gsBlockStructs st4
                 then addDecoration (Instr opDecorate [structId, decorationBlock]) st4
@@ -8305,53 +8347,53 @@ varAccessToPtrAccess acc =
     ReadWrite -> Just StorageReadWrite
 
 data VarInfo = VarInfo
-  { viType :: TypeLayout
-  , viPtrId :: Word32
-  , viStorage :: Word32
-  , viAccess :: VarAccess
+  { viType :: !TypeLayout
+  , viPtrId :: !Word32
+  , viStorage :: !Word32
+  , viAccess :: !VarAccess
   } deriving (Eq, Show)
 
 data EntryFieldInit = EntryFieldInit
-  { efiLayout :: TypeLayout
-  , efiVar :: VarInfo
+  { efiLayout :: !TypeLayout
+  , efiVar :: !VarInfo
   } deriving (Eq, Show)
 
 data EntryParamInit = EntryParamInit
-  { epiName :: String
-  , epiLayout :: TypeLayout
-  , epiFields :: [EntryFieldInit]
+  { epiName :: !Text
+  , epiLayout :: !TypeLayout
+  , epiFields :: ![EntryFieldInit]
   } deriving (Eq, Show)
 
 data OutputTarget = OutputTarget
-  { otVar :: VarInfo
-  , otLayout :: TypeLayout
-  , otPath :: [Word32]
+  { otVar :: !VarInfo
+  , otLayout :: !TypeLayout
+  , otPath :: ![Word32]
   } deriving (Eq, Show)
 
 data Value = Value
-  { valType :: TypeLayout
-  , valId :: Word32
+  { valType :: !TypeLayout
+  , valId :: !Word32
   } deriving (Eq, Show)
 
 data FunctionInfo = FunctionInfo
-  { fiName :: String
-  , fiParams :: [TypeLayout]
-  , fiReturn :: Maybe TypeLayout
-  , fiId :: Word32
-  , fiTypeId :: Word32
+  { fiName :: !Text
+  , fiParams :: ![TypeLayout]
+  , fiReturn :: !(Maybe TypeLayout)
+  , fiId :: !Word32
+  , fiTypeId :: !Word32
   } deriving (Eq, Show)
 
 data FuncState = FuncState
-  { fsLocals :: [Instr]
-  , fsInstrs :: [Instr]
-  , fsVars :: [(String, VarInfo)]
-  , fsValues :: [(String, Value)]
-  , fsTerminated :: Bool
-  , fsLoopStack :: [(Word32, Word32)]
-  , fsBreakStack :: [Word32]
+  { fsLocals :: ![Instr]
+  , fsInstrs :: ![Instr]
+  , fsVars :: ![(Text, VarInfo)]
+  , fsValues :: ![(Text, Value)]
+  , fsTerminated :: !Bool
+  , fsLoopStack :: ![(Word32, Word32)]
+  , fsBreakStack :: ![Word32]
   } deriving (Eq, Show)
 
-emitGlobals :: [(String, StructDecl)] -> ShaderInterface -> EntryPoint -> Maybe TypeLayout -> [GlobalVarDecl] -> GenState -> Either CompileError ([(String, VarInfo)], [EntryParamInit], [Word32], [OutputTarget], GenState)
+emitGlobals :: [(Text, StructDecl)] -> ShaderInterface -> EntryPoint -> Maybe TypeLayout -> [GlobalVarDecl] -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], [OutputTarget], GenState)
 emitGlobals structEnv iface entry retLayout globals st0 = do
   let (envBindings, idsBindings, st1) = foldl' emitBinding ([], [], st0) (siBindings iface)
   (envGlobals, st2) <- emitModuleGlobals structEnv globals st1
@@ -8397,9 +8439,9 @@ emitGlobals structEnv iface entry retLayout globals st0 = do
             BStorageReadWrite -> ReadWrite
             _ -> ReadOnly
           info = VarInfo (biType binding) varId storageClass access
-      in (envAcc <> [(biName binding, info)], idAcc <> [varId], st6)
+      in (envAcc <> [(T.pack (biName binding), info)], idAcc <> [varId], st6)
 
-emitModuleGlobals :: [(String, StructDecl)] -> [GlobalVarDecl] -> GenState -> Either CompileError ([(String, VarInfo)], GenState)
+emitModuleGlobals :: [(Text, StructDecl)] -> [GlobalVarDecl] -> GenState -> Either CompileError ([(Text, VarInfo)], GenState)
 emitModuleGlobals structEnv decls st0 = foldM emitOne ([], st0) decls
   where
     emitOne (envAcc, st) decl = do
@@ -8413,7 +8455,7 @@ emitModuleGlobals structEnv decls st0 = foldM emitOne ([], st0) decls
       storageClass <- case gvSpace decl of
         "private" -> Right storageClassPrivate
         "workgroup" -> Right storageClassWorkgroup
-        other -> Left (CompileError ("unsupported global address space: " <> other) Nothing Nothing)
+        other -> Left (CompileError ("unsupported global address space: " <> textToString other) Nothing Nothing)
       (initId, st1) <- case gvInit decl of
         Nothing -> Right (Nothing, st)
         Just expr -> do
@@ -8430,32 +8472,32 @@ emitModuleGlobals structEnv decls st0 = foldM emitOne ([], st0) decls
               Nothing -> [ptrTy, varId, storageClass]
               Just cid -> [ptrTy, varId, storageClass, cid]
       let st5 = addGlobal (Instr opVariable operands) st4
-      let st6 = addName (Instr opName (varId : encodeString (gvName decl))) st5
+      let st6 = addName (Instr opName (varId : encodeString (textToString (gvName decl)))) st5
       let info = VarInfo layout varId storageClass ReadWrite
       Right (envAcc <> [(gvName decl, info)], st6)
 
-emitEntryInputs :: [(String, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(String, VarInfo)], [EntryParamInit], [Word32], GenState)
+emitEntryInputs :: [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
 emitEntryInputs structEnv entry st0 =
   case epStage entry of
     StageCompute -> emitComputeInputs structEnv entry st0
     StageFragment -> emitFragmentInputs structEnv entry st0
     StageVertex -> emitVertexInputs structEnv entry st0
 
-emitComputeInputs :: [(String, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(String, VarInfo)], [EntryParamInit], [Word32], GenState)
+emitComputeInputs :: [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
 emitComputeInputs structEnv entry st0 =
   emitStageInputs StageCompute structEnv entry st0
 
-emitFragmentInputs :: [(String, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(String, VarInfo)], [EntryParamInit], [Word32], GenState)
+emitFragmentInputs :: [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
 emitFragmentInputs structEnv entry st0 = do
   emitStageInputs StageFragment structEnv entry st0
 
-emitVertexInputs :: [(String, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(String, VarInfo)], [EntryParamInit], [Word32], GenState)
+emitVertexInputs :: [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
 emitVertexInputs structEnv entry st0 =
   emitStageInputs StageVertex structEnv entry st0
 
 data InputDecoration = InputBuiltin Word32 | InputLocation Word32
 
-emitStageInputs :: Stage -> [(String, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(String, VarInfo)], [EntryParamInit], [Word32], GenState)
+emitStageInputs :: Stage -> [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
 emitStageInputs stage structEnv entry st0 = do
   let params = epParams entry
   let go envAcc initAcc idAcc _ _ st [] =
@@ -8471,7 +8513,7 @@ emitStageInputs stage structEnv entry st0 = do
           when (paramBuiltin attrs /= Nothing || paramLocation attrs /= Nothing) $
             Left (CompileError "struct parameters cannot have @location or @builtin attributes" Nothing Nothing)
           structDecl <- case lookup structName env of
-            Nothing -> Left (CompileError ("unknown struct: " <> structName) Nothing Nothing)
+            Nothing -> Left (CompileError ("unknown struct: " <> textToString structName) Nothing Nothing)
             Just decl -> Right decl
           structLayout <- resolveTypeLayout env [] ty
           when (containsResource structLayout) $
@@ -8493,15 +8535,15 @@ emitStageInputs stage structEnv entry st0 = do
           case paramBuiltin attrs of
             Just builtin -> do
               when (builtin `elem` usedBuiltins) $
-                Left (CompileError ("duplicate @builtin(" <> builtin <> ") on stage inputs") Nothing Nothing)
+                Left (CompileError ("duplicate @builtin(" <> textToString builtin <> ") on stage inputs") Nothing Nothing)
               expected <- case builtinInputType stg builtin of
-                Nothing -> Left (CompileError ("unsupported @builtin(" <> builtin <> ") for stage input") Nothing Nothing)
+                Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for stage input") Nothing Nothing)
                 Just ty' -> Right ty'
               if expected /= ty
-                then Left (CompileError ("@builtin(" <> builtin <> ") has wrong type") Nothing Nothing)
+                then Left (CompileError ("@builtin(" <> textToString builtin <> ") has wrong type") Nothing Nothing)
                 else pure ()
               builtinId <- case builtinInputDecoration stg builtin of
-                Nothing -> Left (CompileError ("unsupported @builtin(" <> builtin <> ") for stage input") Nothing Nothing)
+                Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for stage input") Nothing Nothing)
                 Just bid -> Right bid
               (info, varId, st1) <- emitInputVar name layout (InputBuiltin builtinId) st
               pure ((name, info):envAcc, initAcc, varId:idAcc, usedLocs, builtin:usedBuiltins, st1)
@@ -8536,15 +8578,15 @@ emitStageInputs stage structEnv entry st0 = do
             case attrBuiltin attrs of
               Just builtin -> do
                 when (builtin `elem` accBuiltins) $
-                  Left (CompileError ("duplicate @builtin(" <> builtin <> ") on stage inputs") Nothing Nothing)
+                  Left (CompileError ("duplicate @builtin(" <> textToString builtin <> ") on stage inputs") Nothing Nothing)
                 expected <- case builtinInputType stg builtin of
-                  Nothing -> Left (CompileError ("unsupported @builtin(" <> builtin <> ") for stage input") Nothing Nothing)
+                  Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for stage input") Nothing Nothing)
                   Just ty' -> Right ty'
                 if expected /= fty
-                  then Left (CompileError ("@builtin(" <> builtin <> ") has wrong type") Nothing Nothing)
+                  then Left (CompileError ("@builtin(" <> textToString builtin <> ") has wrong type") Nothing Nothing)
                   else pure ()
                 builtinId <- case builtinInputDecoration stg builtin of
-                  Nothing -> Left (CompileError ("unsupported @builtin(" <> builtin <> ") for stage input") Nothing Nothing)
+                  Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for stage input") Nothing Nothing)
                   Just bid -> Right bid
                 (info, varId, st1) <- emitInputVar fullName layout (InputBuiltin builtinId) st'
                 let fieldInit = EntryFieldInit layout info
@@ -8566,7 +8608,7 @@ emitStageInputs stage structEnv entry st0 = do
       (vars, locs, builtins, ids, st1) <- go [] idAcc usedLocs usedBuiltins st fields
       pure (vars, locs, builtins, ids, st1)
 
-emitInputVar :: String -> TypeLayout -> InputDecoration -> GenState -> Either CompileError (VarInfo, Word32, GenState)
+emitInputVar :: Text -> TypeLayout -> InputDecoration -> GenState -> Either CompileError (VarInfo, Word32, GenState)
 emitInputVar name layout deco st0 = do
   let (baseTy, st1) = emitTypeFromLayout st0 layout
   let (ptrTy, st2) = emitPointerType st1 storageClassInput baseTy
@@ -8575,11 +8617,11 @@ emitInputVar name layout deco st0 = do
   let st5 = case deco of
         InputBuiltin bid -> addDecoration (Instr opDecorate [varId, decorationBuiltIn, bid]) st4
         InputLocation loc -> addDecoration (Instr opDecorate [varId, decorationLocation, loc]) st4
-  let st6 = addName (Instr opName (varId : encodeString name)) st5
+  let st6 = addName (Instr opName (varId : encodeString (textToString name))) st5
   let info = VarInfo layout varId storageClassInput ReadOnly
   pure (info, varId, st6)
 
-emitStageOutput :: [(String, StructDecl)] -> EntryPoint -> Maybe TypeLayout -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
+emitStageOutput :: [(Text, StructDecl)] -> EntryPoint -> Maybe TypeLayout -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
 emitStageOutput structEnv entry retLayout st0 =
   case epStage entry of
     StageCompute ->
@@ -8591,7 +8633,7 @@ emitStageOutput structEnv entry retLayout st0 =
     StageVertex ->
       emitVertexOutput structEnv entry retLayout st0
 
-emitFragmentOutput :: [(String, StructDecl)] -> EntryPoint -> Maybe TypeLayout -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
+emitFragmentOutput :: [(Text, StructDecl)] -> EntryPoint -> Maybe TypeLayout -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
 emitFragmentOutput structEnv entry retLayout st0 =
   case (retLayout, epReturnType entry) of
     (Nothing, _) -> Left (CompileError "fragment entry point missing return type" Nothing Nothing)
@@ -8601,7 +8643,7 @@ emitFragmentOutput structEnv entry retLayout st0 =
           when (epReturnBuiltin entry /= Nothing || epReturnLocation entry /= Nothing) $
             Left (CompileError "struct return values cannot use @location or @builtin on the function" Nothing Nothing)
           structDecl <- case lookup structName structEnv of
-            Nothing -> Left (CompileError ("unknown struct: " <> structName) Nothing Nothing)
+            Nothing -> Left (CompileError ("unknown struct: " <> textToString structName) Nothing Nothing)
             Just decl -> Right decl
           emitStructOutputs StageFragment structName layout structDecl st0
         _ -> do
@@ -8614,12 +8656,12 @@ emitFragmentOutput structEnv entry retLayout st0 =
           case epReturnBuiltin entry of
             Just builtin -> do
               expected <- case builtinOutputType StageFragment builtin of
-                Nothing -> Left (CompileError ("unsupported @builtin(" <> builtin <> ") for fragment output") Nothing Nothing)
+                Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for fragment output") Nothing Nothing)
                 Just t -> Right t
               when (expected /= ty) $
-                Left (CompileError ("@builtin(" <> builtin <> ") has wrong type") Nothing Nothing)
+                Left (CompileError ("@builtin(" <> textToString builtin <> ") has wrong type") Nothing Nothing)
               builtinId <- case builtinOutputDecoration StageFragment builtin of
-                Nothing -> Left (CompileError ("unsupported @builtin(" <> builtin <> ") for fragment output") Nothing Nothing)
+                Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for fragment output") Nothing Nothing)
                 Just bid -> Right bid
               (info, varId, st1) <- emitOutputVar "frag_output" layout (InputBuiltin builtinId) st0
               let target = OutputTarget info layout []
@@ -8631,7 +8673,7 @@ emitFragmentOutput structEnv entry retLayout st0 =
               pure ([target], [varId], st1)
     _ -> Left (CompileError "fragment entry point missing return type" Nothing Nothing)
 
-emitVertexOutput :: [(String, StructDecl)] -> EntryPoint -> Maybe TypeLayout -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
+emitVertexOutput :: [(Text, StructDecl)] -> EntryPoint -> Maybe TypeLayout -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
 emitVertexOutput structEnv entry retLayout st0 =
   case (retLayout, epReturnType entry) of
     (Nothing, _) -> Left (CompileError "vertex entry point missing return type" Nothing Nothing)
@@ -8641,7 +8683,7 @@ emitVertexOutput structEnv entry retLayout st0 =
           when (epReturnBuiltin entry /= Nothing || epReturnLocation entry /= Nothing) $
             Left (CompileError "struct return values cannot use @location or @builtin on the function" Nothing Nothing)
           structDecl <- case lookup structName structEnv of
-            Nothing -> Left (CompileError ("unknown struct: " <> structName) Nothing Nothing)
+            Nothing -> Left (CompileError ("unknown struct: " <> textToString structName) Nothing Nothing)
             Just decl -> Right decl
           emitStructOutputs StageVertex structName layout structDecl st0
         _ -> do
@@ -8659,13 +8701,13 @@ emitVertexOutput structEnv entry retLayout st0 =
             _ -> Left (CompileError "vertex entry point must return @builtin(position)" Nothing Nothing)
     _ -> Left (CompileError "vertex entry point missing return type" Nothing Nothing)
 
-emitStructOutputs :: Stage -> String -> TypeLayout -> StructDecl -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
+emitStructOutputs :: Stage -> Text -> TypeLayout -> StructDecl -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
 emitStructOutputs stage structName layout structDecl st0 =
   case layout of
     TLStruct _ fieldLayouts _ _ -> do
       let fields = sdFields structDecl
       when (length fields /= length fieldLayouts) $
-        Left (CompileError ("struct layout mismatch for " <> structName) Nothing Nothing)
+        Left (CompileError ("struct layout mismatch for " <> textToString structName) Nothing Nothing)
       let go _idx accTargets accIds usedLocs usedBuiltins st [] = Right (reverse accTargets, reverse accIds, st, usedLocs, usedBuiltins)
           go idx accTargets accIds usedLocs usedBuiltins st (field:rest) = do
             let fieldName = fdName field
@@ -8682,14 +8724,14 @@ emitStructOutputs stage structName layout structDecl st0 =
             case attrBuiltin attrs of
               Just builtin -> do
                 when (builtin `elem` usedBuiltins) $
-                  Left (CompileError ("duplicate @builtin(" <> builtin <> ") on stage outputs") Nothing Nothing)
+                  Left (CompileError ("duplicate @builtin(" <> textToString builtin <> ") on stage outputs") Nothing Nothing)
                 expected <- case builtinOutputType stage builtin of
-                  Nothing -> Left (CompileError ("unsupported @builtin(" <> builtin <> ") for stage output") Nothing Nothing)
+                  Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for stage output") Nothing Nothing)
                   Just t -> Right t
                 when (expected /= fty) $
-                  Left (CompileError ("@builtin(" <> builtin <> ") has wrong type") Nothing Nothing)
+                  Left (CompileError ("@builtin(" <> textToString builtin <> ") has wrong type") Nothing Nothing)
                 builtinId <- case builtinOutputDecoration stage builtin of
-                  Nothing -> Left (CompileError ("unsupported @builtin(" <> builtin <> ") for stage output") Nothing Nothing)
+                  Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for stage output") Nothing Nothing)
                   Just bid -> Right bid
                 (info, varId, st1) <- emitOutputVar (structName <> "_" <> fieldName) fieldLayout (InputBuiltin builtinId) st
                 let target = OutputTarget info fieldLayout [fromIntegral idx]
@@ -8715,7 +8757,7 @@ emitStructOutputs stage structName layout structDecl st0 =
       pure (targets, ids, st1)
     _ -> Left (CompileError "expected struct return type" Nothing Nothing)
 
-emitOutputVar :: String -> TypeLayout -> InputDecoration -> GenState -> Either CompileError (VarInfo, Word32, GenState)
+emitOutputVar :: Text -> TypeLayout -> InputDecoration -> GenState -> Either CompileError (VarInfo, Word32, GenState)
 emitOutputVar name layout deco st0 = do
   let (baseTy, st1) = emitTypeFromLayout st0 layout
   let (ptrTy, st2) = emitPointerType st1 storageClassOutput baseTy
@@ -8724,17 +8766,17 @@ emitOutputVar name layout deco st0 = do
   let st5 = case deco of
         InputBuiltin bid -> addDecoration (Instr opDecorate [varId, decorationBuiltIn, bid]) st4
         InputLocation loc -> addDecoration (Instr opDecorate [varId, decorationLocation, loc]) st4
-  let st6 = addName (Instr opName (varId : encodeString name)) st5
+  let st6 = addName (Instr opName (varId : encodeString (textToString name))) st5
   let info = VarInfo layout varId storageClassOutput ReadWrite
   pure (info, varId, st6)
 
-emitMainFunction :: EntryPoint -> [(String, VarInfo)] -> [EntryParamInit] -> [OutputTarget] -> GenState -> Either CompileError GenState
+emitMainFunction :: EntryPoint -> [(Text, VarInfo)] -> [EntryParamInit] -> [OutputTarget] -> GenState -> Either CompileError GenState
 emitMainFunction entry env entryInits outTargets st0 = do
   let (voidTy, st1) = emitVoidType st0
   let (fnTy, st2) = emitFunctionType st1 voidTy []
   let (fnId, st3) = freshId st2
   let (labelId, st4) = freshId st3
-  let st5 = addName (Instr opName (fnId : encodeString (epName entry))) st4
+  let st5 = addName (Instr opName (fnId : encodeString (textToString (epName entry)))) st4
   let fs0 = FuncState [] [] env [] False [] []
   (st6, fs1) <- emitEntryParamInits entryInits st5 fs0
   (st7, fs2) <- emitStatements entry outTargets st6 fs1
@@ -8777,7 +8819,7 @@ emitLoadVar st fs info = do
   let fs1 = addFuncInstr (Instr opLoad [tyId, resId, viPtrId info]) fs
   pure (st2, fs1, Value (viType info) resId)
 
-registerFunctions :: [(String, StructDecl)] -> [FunctionDecl] -> GenState -> Either CompileError GenState
+registerFunctions :: [(Text, StructDecl)] -> [FunctionDecl] -> GenState -> Either CompileError GenState
 registerFunctions structEnv decls st0 = foldM registerOne st0 decls
   where
     registerOne st decl =
@@ -8792,7 +8834,7 @@ registerFunctions structEnv decls st0 = foldM registerOne st0 decls
             Right (Just layout)
         let existing = [fi | fi <- gsFunctionTable st, fiName fi == fnName decl]
         when (any (\fi -> fiParams fi == paramLayouts) existing) $
-          Left (CompileError ("duplicate function overload: " <> fnName decl) Nothing Nothing)
+          Left (CompileError ("duplicate function overload: " <> textToString (fnName decl)) Nothing Nothing)
         let (retTyId, st1) = case retLayout of
               Nothing -> emitVoidType st
               Just layout -> emitTypeFromLayout st layout
@@ -8804,16 +8846,16 @@ registerFunctions structEnv decls st0 = foldM registerOne st0 decls
         let st5 = st4 { gsFunctionTable = info : gsFunctionTable st4 }
         pure st5
 
-emitFunctionBodies :: [(String, StructDecl)] -> [FunctionDecl] -> GenState -> Either CompileError GenState
+emitFunctionBodies :: [(Text, StructDecl)] -> [FunctionDecl] -> GenState -> Either CompileError GenState
 emitFunctionBodies structEnv decls st0 = foldM emitOne st0 decls
   where
     emitOne st decl = do
       paramLayouts <- mapM (resolveTypeLayout structEnv []) (map paramType (fnParams decl))
       case findFunctionInfo (fnName decl) paramLayouts (gsFunctionTable st) of
-        Nothing -> Left (CompileError ("missing function info for " <> fnName decl) Nothing Nothing)
+        Nothing -> Left (CompileError ("missing function info for " <> textToString (fnName decl)) Nothing Nothing)
         Just info -> emitFunctionBody info decl st
 
-findFunctionInfo :: String -> [TypeLayout] -> [FunctionInfo] -> Maybe FunctionInfo
+findFunctionInfo :: Text -> [TypeLayout] -> [FunctionInfo] -> Maybe FunctionInfo
 findFunctionInfo name paramLayouts infos =
   case filter (\fi -> fiName fi == name && fiParams fi == paramLayouts) infos of
     (x:_) -> Just x
@@ -8825,7 +8867,7 @@ emitFunctionBody info decl st0 = do
         Nothing -> emitVoidType st0
         Just layout -> emitTypeFromLayout st0 layout
   let (fnLabel, st2) = freshId st1
-  let st3 = addName (Instr opName (fiId info : encodeString (fnName decl))) st2
+  let st3 = addName (Instr opName (fiId info : encodeString (textToString (fnName decl)))) st2
   let (paramInstrs, paramLocals, paramStores, env, st4) = emitFunctionParams (fnParams decl) (fiParams info) st3
   let envWithGlobals = gsGlobalVars st4 <> env
   let fs0 = FuncState paramLocals paramStores envWithGlobals [] False [] []
@@ -8839,7 +8881,7 @@ emitFunctionBody info decl st0 = do
   let st6 = addFunctions funcInstrs st5
   pure st6
 
-emitFunctionParams :: [Param] -> [TypeLayout] -> GenState -> ([Instr], [Instr], [Instr], [(String, VarInfo)], GenState)
+emitFunctionParams :: [Param] -> [TypeLayout] -> GenState -> ([Instr], [Instr], [Instr], [(Text, VarInfo)], GenState)
 emitFunctionParams params layouts st0 =
   let go st accInstrs accLocals accStores accEnv [] [] = (reverse accInstrs, reverse accLocals, reverse accStores, reverse accEnv, st)
       go st accInstrs accLocals accStores accEnv (p:ps) (l:ls) =
@@ -9374,7 +9416,7 @@ emitConstOne layout st =
     TLScalar F16 _ _ -> Right (emitConstF16 st 1.0)
     _ -> Left (CompileError "increment/decrement requires an i32, u32, f16, or f32 scalar" Nothing Nothing)
 
-emitLet :: String -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
+emitLet :: Text -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitLet name expr st fs = do
   (st1, fs1, val) <- emitExpr st fs expr
   case valType val of
@@ -9383,14 +9425,14 @@ emitLet name expr st fs = do
       in Right (st1, fs2)
     _ -> emitLocalValue name val st1 fs1
 
-emitVar :: String -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
+emitVar :: Text -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitVar name expr st fs = do
   (st1, fs1, val) <- emitExpr st fs expr
   case valType val of
     TLPointer {} -> Left (CompileError "var cannot have pointer type" Nothing Nothing)
     _ -> emitLocalValue name val st1 fs1
 
-emitLocalValue :: String -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
+emitLocalValue :: Text -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitLocalValue name val st fs = do
   let (baseTy, st1) = emitTypeFromLayout st (valType val)
   let (ptrTy, st2) = emitPointerType st1 storageClassFunction baseTy
@@ -9717,7 +9759,7 @@ emitLoadFromExpr st fs expr =
       let fs2 = addFuncInstr (Instr opLoad [tyId, resId, viPtrId ptrInfo]) fs1
       Right (st3, fs2, Value (viType ptrInfo) resId)
 
-emitFieldExpr :: GenState -> FuncState -> Expr -> String -> Either CompileError (GenState, FuncState, Value)
+emitFieldExpr :: GenState -> FuncState -> Expr -> Text -> Either CompileError (GenState, FuncState, Value)
 emitFieldExpr st fs base field = do
   (st1, fs1, baseVal) <- emitExpr st fs base
   case valType baseVal of
@@ -9741,7 +9783,7 @@ emitFieldExpr st fs base field = do
           let fs2 = addFuncInstr (Instr opVectorShuffle shuffleOps) fs1
           Right (st3, fs2, Value layout resId)
     TLStruct _ fields _ _ -> do
-      (ix, fieldLayout) <- findField field fields
+      (ix, fieldLayout) <- findField (textToString field) fields
       let (tyId, st2) = emitTypeFromLayout st1 fieldLayout
       let (resId, st3) = freshId st2
       let fs2 = addFuncInstr (Instr opCompositeExtract [tyId, resId, valId baseVal, fromIntegral ix]) fs1
@@ -9905,7 +9947,7 @@ emitBinary op layout lhs rhs st fs =
           let fs1 = addFuncInstr (Instr opcode [tyId, resId, lhs, rhs]) fs
           Right (st2, fs1, Value resultLayout resId)
 
-emitCall :: String -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
+emitCall :: Text -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitCall name args st fs =
   case name of
     "vec2" -> emitVectorCtor 2 args st fs
@@ -10860,7 +10902,7 @@ emitArrayLengthLValue lv st fs =
         Left (CompileError "arrayLength requires a storage buffer struct" Nothing Nothing)
       case viType baseInfo of
         TLStruct _ fields _ _ -> do
-          (ix, fieldLayout) <- findField field fields
+          (ix, fieldLayout) <- findField (textToString field) fields
           when (ix /= length fields - 1) $
             Left (CompileError "runtime arrays must be the last struct member" Nothing Nothing)
           case fieldLayout of
@@ -10875,7 +10917,7 @@ emitArrayLengthLValue lv st fs =
         _ -> Left (CompileError "arrayLength expects a struct field" Nothing Nothing)
     _ -> Left (CompileError "arrayLength expects a struct runtime array field" Nothing Nothing)
 
-emitFunctionCallByName :: String -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Maybe Value)
+emitFunctionCallByName :: Text -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Maybe Value)
 emitFunctionCallByName name args st fs = do
   (st1, fs1, vals) <- emitExprList st fs args
   let candidates = [fi | fi <- gsFunctionTable st, fiName fi == name, length (fiParams fi) == length vals]
@@ -10891,9 +10933,9 @@ emitFunctionCallByName name args st fs = do
         [fi] -> do
           (st2, fs2, vals') <- coerceArgsToLayouts vals (fiParams fi) st1 fs1
           emitFunctionCall fi vals' st2 fs2
-        [] -> Left (CompileError ("unsupported call: " <> name) Nothing Nothing)
-        _ -> Left (CompileError ("ambiguous overload for " <> name) Nothing Nothing)
-    _ -> Left (CompileError ("ambiguous overload for " <> name) Nothing Nothing)
+        [] -> Left (CompileError ("unsupported call: " <> textToString name) Nothing Nothing)
+        _ -> Left (CompileError ("ambiguous overload for " <> textToString name) Nothing Nothing)
+    _ -> Left (CompileError ("ambiguous overload for " <> textToString name) Nothing Nothing)
 
 argCoercible :: GenState -> Value -> TypeLayout -> Bool
 argCoercible st actual expected =
@@ -10983,19 +11025,19 @@ emitMatrixCtor cols rows args st fs =
           (st3, fs2, colsVals) <- buildColumns vecLayout rest st2 fs1
           Right (st3, fs2, Value vecLayout resId : colsVals)
 
-emitStructCtor :: String -> TypeLayout -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
+emitStructCtor :: Text -> TypeLayout -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitStructCtor name layout args st fs =
   case layout of
     TLStruct _ fields _ _ -> do
       when (length args /= length fields) $
-        Left (CompileError ("struct constructor arity mismatch for " <> name) Nothing Nothing)
+        Left (CompileError ("struct constructor arity mismatch for " <> textToString name) Nothing Nothing)
       (st1, fs1, vals) <- emitExprList st fs args
       (st2, fs2, vals') <- coerceArgsToLayouts vals (map flType fields) st1 fs1
       let (tyId, st3) = emitTypeFromLayout st2 layout
       let (resId, st4) = freshId st3
       let fs3 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map valId vals')) fs2
       Right (st4, fs3, Value layout resId)
-    _ -> Left (CompileError ("unsupported constructor: " <> name) Nothing Nothing)
+    _ -> Left (CompileError ("unsupported constructor: " <> textToString name) Nothing Nothing)
 
 emitArrayCtor :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitArrayCtor args st fs =
@@ -12456,16 +12498,16 @@ emitLValuePtr st fs lv =
         Nothing ->
           case lookup name (fsValues fs) of
             Just _ -> Left (CompileError "cannot take the address of an immutable let binding" Nothing Nothing)
-            Nothing -> Left (CompileError ("unknown variable: " <> name) Nothing Nothing)
+            Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
     LVField base field -> do
       (st1, fs1, baseInfo) <- emitLValuePtr st fs base
       case viType baseInfo of
         TLStruct _ fields _ _ -> do
-          (ix, fieldLayout) <- findField field fields
+          (ix, fieldLayout) <- findField (textToString field) fields
           let (ixId, st2) = emitConstU32 st1 (fromIntegral ix)
           emitAccessChain st2 fs1 baseInfo [ixId] fieldLayout
         TLVector n scalar _ _ -> do
-          if length field /= 1
+          if T.length field /= 1
             then Left (CompileError "cannot assign to vector swizzle" Nothing Nothing)
             else do
               ix <- vectorFieldIndex field n
@@ -12649,16 +12691,16 @@ findField name fields = go 0 fields
       | flName f == name = Right (ix, flType f)
       | otherwise = go (ix + 1) fs
 
-vectorFieldIndex :: String -> Int -> Either CompileError Int
+vectorFieldIndex :: Text -> Int -> Either CompileError Int
 vectorFieldIndex field n =
   case vectorFieldIndices field n of
     Right [ix] -> Right (fromIntegral ix)
     Right _ -> Left (CompileError "expected single-component vector field" Nothing Nothing)
     Left err -> Left err
 
-vectorFieldIndices :: String -> Int -> Either CompileError [Word32]
+vectorFieldIndices :: Text -> Int -> Either CompileError [Word32]
 vectorFieldIndices field n = do
-  indices <- mapM charIndex field
+  indices <- mapM charIndex (T.unpack field)
   mapM_ (checkRange field) indices
   Right indices
   where
@@ -12679,7 +12721,7 @@ vectorFieldIndices field n = do
     checkRange name ix =
       if fromIntegral ix < n
         then Right ()
-        else Left (CompileError ("vector field out of range: " <> name) Nothing Nothing)
+        else Left (CompileError ("vector field out of range: " <> textToString name) Nothing Nothing)
 
 classifyNumeric :: TypeLayout -> Maybe (Int, Scalar)
 classifyNumeric layout =
@@ -12711,7 +12753,7 @@ buildSpirvWords opts entry st =
       entryPointInstr = case gsEntryPoint st of
         Nothing -> []
         Just epId ->
-          let nameWords = encodeString (epName entry)
+          let nameWords = encodeString (textToString (epName entry))
               model = case epStage entry of
                 StageCompute -> executionModelGLCompute
                 StageFragment -> executionModelFragment
@@ -12953,16 +12995,17 @@ emitTypeFromLayout st layout =
         Just n ->
           emitArrayType elemId (fromIntegral n) stride st1
     TLStruct name fields _ _ ->
-      case lookup name (gsStructIds st) of
+      let nameT = T.pack name
+      in case lookup nameT (gsStructIds st) of
         Just sid -> (sid, st)
         Nothing ->
           let (sid, st1) = freshId st
-              st2 = st1 { gsStructIds = (name, sid) : gsStructIds st1 }
+              st2 = st1 { gsStructIds = (nameT, sid) : gsStructIds st1 }
               (st3, fieldTypeIds) = mapAccumL emitFieldType st2 fields
               st4 = addType (Instr opTypeStruct (sid : fieldTypeIds)) st3
               st5 = addName (Instr opName (sid : encodeString name)) st4
               st6 = foldl' (emitMemberDecorate sid) st5 (zip [0 :: Int ..] fields)
-              st7 = if name `elem` gsBlockStructs st6
+              st7 = if nameT `elem` gsBlockStructs st6
                 then addDecoration (Instr opDecorate [sid, decorationBlock]) st6
                 else st6
               st8 = foldl' (emitMemberName sid) st7 (zip [0 :: Int ..] fields)
