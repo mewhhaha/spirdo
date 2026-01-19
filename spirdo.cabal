@@ -18,7 +18,7 @@ common warnings
 
 library
     import:           warnings
-    exposed-modules:  MyLib
+    exposed-modules:
                      , Spirdo.Wesl
                      , Spirdo.SDL3
     -- other-modules:
