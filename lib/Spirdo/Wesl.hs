@@ -93,12 +93,14 @@ module Spirdo.Wesl
   ) where
 
 import Control.Exception (SomeException, catch)
-import Control.Monad (foldM, zipWithM, zipWithM_, when)
+import Control.Monad (foldM, forM_, zipWithM, zipWithM_, when)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Internal as BSI
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, ord)
 import Data.Either (partitionEithers)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List (find, intercalate, isPrefixOf, mapAccumL, partition)
 import qualified Data.Kind as K
@@ -111,6 +113,9 @@ import Data.Proxy (Proxy(..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word8, Word16, Word32, Word64)
+import Foreign.Marshal.Utils (fillBytes)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (pokeByteOff)
 import GHC.TypeLits (KnownNat, KnownSymbol, Nat, Symbol, natVal, symbolVal)
 import GHC.Float (castFloatToWord32, castWord32ToFloat)
 import GHC.Generics (Generic, Rep, K1(..), M1(..), (:*:)(..), Selector, selName, S, from)
@@ -120,6 +125,7 @@ import Language.Haskell.TH.Quote (QuasiQuoter(..))
 import Numeric (showHex)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (dropExtension, isRelative, makeRelative, normalise, splitDirectories, takeDirectory, (<.>), (</>))
+import System.IO.Unsafe (unsafePerformIO)
 import Text.Read (readMaybe)
 
 -- Type-level interface representation
@@ -587,76 +593,117 @@ lookupBindingInfo name iface =
     Just info -> Right info
     Nothing -> Left ("binding not found in interface: " <> name)
 
-type ByteMap = IntMap.IntMap Word8
+type UniformPath = String
 
 packUniform :: TypeLayout -> UniformValue -> Either String ByteString
-packUniform layout value = do
-  bytes <- writeUniform 0 layout value
+packUniform layout value = unsafePerformIO $ do
   let size = fromIntegral (layoutSize layout)
-  let out = [IntMap.findWithDefault 0 i bytes | i <- [0 .. size - 1]]
-  pure (BS.pack out)
+  errRef <- newIORef Nothing
+  bs <- BSI.create size $ \ptr -> do
+    fillBytes ptr 0 size
+    result <- writeUniformM ptr "" 0 layout value
+    case result of
+      Left err -> writeIORef errRef (Just err)
+      Right () -> pure ()
+  mErr <- readIORef errRef
+  pure $ case mErr of
+    Just err -> Left err
+    Nothing -> Right bs
+{-# NOINLINE packUniform #-}
 
-writeUniform :: Int -> TypeLayout -> UniformValue -> Either String ByteMap
-writeUniform off layout value =
+writeUniformM :: Ptr Word8 -> UniformPath -> Int -> TypeLayout -> UniformValue -> IO (Either String ())
+writeUniformM ptr ctx off layout value =
   case (layout, value) of
-    (TLScalar s _ _, UVScalar v) -> do
-      bs <- scalarValueBytes s v
-      pure (bytesAt off bs)
+    (TLScalar s _ _, UVScalar v) ->
+      writeScalarAtM ptr ctx off s v
     (TLVector n s _ _, UVVector n' vals)
-      | n == n' -> foldM (writeScalarAt s off) IntMap.empty (zip [0 ..] vals)
-      | otherwise -> Left ("vector length mismatch: expected " <> show n <> ", got " <> show n')
-    (TLMatrix cols rows s _ _ stride, UVMatrix c r vals)
-      | cols == c && rows == r -> writeMatrix off cols rows s (fromIntegral stride) vals
+      | n == n' ->
+          writeAll (zip [0 ..] vals) $ \(ix, val) ->
+            writeScalarAtM ptr (ctxIndex ctx ix) (off + ix * scalarByteSize s) s val
       | otherwise ->
-          Left ("matrix size mismatch: expected " <> show cols <> "x" <> show rows <> ", got " <> show c <> "x" <> show r)
-    (TLArray mlen stride elemLayout _ _, UVArray elems) -> do
+          pure (Left (formatAt ctx ("vector length mismatch: expected " <> show n <> ", got " <> show n')))
+    (TLMatrix cols rows s _ _ stride, UVMatrix c r vals)
+      | cols == c && rows == r ->
+          writeMatrixM ptr ctx off cols rows s (fromIntegral stride) vals
+      | otherwise ->
+          pure (Left (formatAt ctx ("matrix size mismatch: expected " <> show cols <> "x" <> show rows <> ", got " <> show c <> "x" <> show r)))
+    (TLArray mlen stride elemLayout _ _, UVArray elems) ->
       case mlen of
         Just n | n /= length elems ->
-          Left ("array length mismatch: expected " <> show n <> ", got " <> show (length elems))
-        _ -> pure ()
-      foldM
-        (\acc (ix, el) -> do
-            bytes <- writeUniform (off + ix * fromIntegral stride) elemLayout el
-            pure (IntMap.union bytes acc)
-        )
-        IntMap.empty
-        (zip [0 ..] elems)
-    (TLStruct _ fields _ _, UVStruct vals) -> do
-      let valMap = Map.fromList vals
-      foldM
-        (\acc fld -> do
-            val <- case Map.lookup (flName fld) valMap of
-              Just v -> Right v
-              Nothing -> Left ("missing struct field: " <> flName fld)
-            bytes <- writeUniform (off + fromIntegral (flOffset fld)) (flType fld) val
-            pure (IntMap.union bytes acc)
-        )
-        IntMap.empty
-        fields
-    _ -> Left ("uniform value does not match layout: " <> show layout)
+          pure (Left (formatAt ctx ("array length mismatch: expected " <> show n <> ", got " <> show (length elems))))
+        _ ->
+          writeAll (zip [0 ..] elems) $ \(ix, el) ->
+            writeUniformM ptr (ctxIndex ctx ix) (off + ix * fromIntegral stride) elemLayout el
+    (TLStruct structName fields _ _, UVStruct vals) -> do
+      let structCtx = if null ctx then structName else ctx
+      let nameCounts = Map.fromListWith (+) [(n, 1 :: Int) | (n, _) <- vals]
+      let dupes = Map.keys (Map.filter (> 1) nameCounts)
+      if not (null dupes)
+        then pure (Left (formatAt structCtx ("duplicate struct fields: " <> intercalate ", " dupes)))
+        else do
+          let fieldNames = map flName fields
+          let fieldSet = Set.fromList fieldNames
+          let extra = filter (`Set.notMember` fieldSet) (map fst vals)
+          if not (null extra)
+            then pure (Left (formatAt structCtx ("unexpected struct fields: " <> intercalate ", " extra)))
+            else do
+              let valMap = Map.fromList vals
+              writeAll fields $ \fld ->
+                case Map.lookup (flName fld) valMap of
+                  Nothing -> pure (Left (formatAt structCtx ("missing struct field: " <> flName fld)))
+                  Just v ->
+                    writeUniformM ptr (ctxField structCtx (flName fld)) (off + fromIntegral (flOffset fld)) (flType fld) v
+    _ ->
+      pure (Left (formatAt ctx ("uniform value does not match layout: " <> show layout)))
 
-writeScalarAt :: Scalar -> Int -> ByteMap -> (Int, ScalarValue) -> Either String ByteMap
-writeScalarAt s off acc (ix, val) = do
-  bs <- scalarValueBytes s val
-  let elemSize = scalarByteSize s
-  let bytes = bytesAt (off + ix * elemSize) bs
-  pure (IntMap.union bytes acc)
+writeScalarAtM :: Ptr Word8 -> UniformPath -> Int -> Scalar -> ScalarValue -> IO (Either String ())
+writeScalarAtM ptr ctx off s val =
+  case scalarValueBytes s val of
+    Left err -> pure (Left (formatAt ctx err))
+    Right bs -> do
+      writeBytes ptr off bs
+      pure (Right ())
 
-writeMatrix :: Int -> Int -> Int -> Scalar -> Int -> [ScalarValue] -> Either String ByteMap
-writeMatrix off cols rows scalar stride vals = do
+writeMatrixM :: Ptr Word8 -> UniformPath -> Int -> Int -> Int -> Scalar -> Int -> [ScalarValue] -> IO (Either String ())
+writeMatrixM ptr ctx off cols rows scalar stride vals = do
   let expected = cols * rows
-  when (length vals /= expected) $
-    Left ("matrix value count mismatch: expected " <> show expected <> ", got " <> show (length vals))
-  foldM
-    (\acc (ix, val) -> do
-        bs <- scalarValueBytes scalar val
+  if length vals /= expected
+    then pure (Left (formatAt ctx ("matrix value count mismatch: expected " <> show expected <> ", got " <> show (length vals))))
+    else
+      writeAll (zip [0 ..] vals) $ \(ix, val) -> do
         let col = ix `div` rows
         let row = ix `mod` rows
         let base = off + col * stride + row * scalarByteSize scalar
-        pure (IntMap.union (bytesAt base bs) acc)
-    )
-    IntMap.empty
-    (zip [0 ..] vals)
+        writeScalarAtM ptr (ctxIndex (ctxIndex ctx col) row) base scalar val
+
+writeBytes :: Ptr Word8 -> Int -> [Word8] -> IO ()
+writeBytes ptr off bytes =
+  forM_ (zip [0 ..] bytes) $ \(ix, byte) ->
+    pokeByteOff ptr (off + ix) byte
+
+formatAt :: UniformPath -> String -> String
+formatAt ctx msg =
+  if null ctx
+    then msg
+    else "at " <> ctx <> ": " <> msg
+
+writeAll :: [a] -> (a -> IO (Either String ())) -> IO (Either String ())
+writeAll [] _ = pure (Right ())
+writeAll (x:xs) action = do
+  result <- action x
+  case result of
+    Left err -> pure (Left err)
+    Right () -> writeAll xs action
+
+ctxField :: UniformPath -> String -> UniformPath
+ctxField ctx name =
+  if null ctx then name else ctx <> "." <> name
+
+ctxIndex :: UniformPath -> Int -> UniformPath
+ctxIndex ctx ix =
+  if null ctx
+    then "[" <> show ix <> "]"
+    else ctx <> "[" <> show ix <> "]"
 
 scalarValueBytes :: Scalar -> ScalarValue -> Either String [Word8]
 scalarValueBytes scalar value =
@@ -686,10 +733,6 @@ word32LE w =
   , fromIntegral ((w `shiftR` 16) .&. 0xFF)
   , fromIntegral ((w `shiftR` 24) .&. 0xFF)
   ]
-
-bytesAt :: Int -> [Word8] -> ByteMap
-bytesAt off bytes =
-  IntMap.fromList (zip [off ..] bytes)
 
 class ApplyCategory (c :: BindingCategory) where
   applyCategory :: BindingInfo -> InputForCategory c -> ShaderInputs iface -> Either String (ShaderInputs iface)
@@ -777,7 +820,9 @@ instance
     base <- buildInputsWith @iface @bs shader xs
     let name = symbolVal (Proxy @name)
     info <- lookupBindingInfo name (shaderInterface shader)
-    applyKind @kind info x base
+    case applyKind @kind info x base of
+      Left err -> Left ("binding " <> name <> ": " <> err)
+      Right ok -> Right ok
 
 inputsForEither :: forall iface. BuildInputsWith iface iface => CompiledShader iface -> HList (InputsOf iface) -> Either String (ShaderInputs iface)
 inputsForEither shader xs = buildInputsWith @iface @iface shader xs
@@ -2172,11 +2217,11 @@ parseBinding attrs toks =
       rest3 <- expectSymbol ":" rest2
       (ty, rest4) <- parseType rest3
       rest5 <- expectSymbol ";" rest4
-      (group, binding) <- bindingNumbers attrs
+      (group, bindingIx) <- bindingNumbers attrs
       kind <- case addrSpace of
         Just space -> toBindingKind space access ty
         Nothing -> bindingKindFromType ty
-      Right (BindingDecl name kind group binding ty, rest5)
+      Right (BindingDecl name kind group bindingIx ty, rest5)
     _ -> Left (errorAt toks "expected var declaration")
 
 parseGlobalVar :: [Attr] -> [Token] -> Either CompileError (GlobalVarDecl, [Token])
@@ -4448,7 +4493,7 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns 
           derefConstPointer seen fnSeen ptr
         EVar name ->
           case Map.lookup name env of
-            Just binding -> Right (cbValue binding)
+            Just envBinding -> Right (cbValue envBinding)
             Nothing -> do
               (path, ident) <- resolveConstRef ctx name
               let key = T.intercalate "::" (path <> [ident])
@@ -4835,7 +4880,7 @@ evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv 
   case lv of
     LVVar name ->
       case Map.lookup name env of
-        Just binding -> Right (cbValue binding)
+        Just envBinding -> Right (cbValue envBinding)
         Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
     LVField base field -> do
       baseVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns base
@@ -4854,12 +4899,12 @@ evalConstLValueSet :: ModuleContext -> ConstIndex -> FunctionIndex -> StructInde
 evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal =
   case lv of
     LVVar name ->
-      case Map.lookup name env of
-        Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
-        Just binding ->
-          if cbMutable binding
-            then Right (Map.insert name binding { cbValue = newVal } env)
-            else Left (CompileError "cannot assign to immutable let binding" Nothing Nothing)
+        case Map.lookup name env of
+          Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
+          Just envBinding ->
+            if cbMutable envBinding
+              then Right (Map.insert name envBinding { cbValue = newVal } env)
+              else Left (CompileError "cannot assign to immutable let binding" Nothing Nothing)
     LVField base field -> do
       baseVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns base
       updated <- updateFieldValue baseVal field newVal
@@ -5112,8 +5157,8 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFn
             _ -> Left (CompileError "unsupported const integer operation" Nothing Nothing)
         EVar name ->
           case Map.lookup name env of
-            Just binding ->
-              case cbValue binding of
+            Just envBinding ->
+              case cbValue envBinding of
                 CVInt v -> Right v
                 CVBool _ -> Left (CompileError "const int expression references a bool value" Nothing Nothing)
                 CVFloat _ -> Left (CompileError "const int expression references a float value" Nothing Nothing)
@@ -5282,8 +5327,8 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seen
             _ -> Left (CompileError "unsupported const float operation" Nothing Nothing)
         EVar name ->
           case Map.lookup name env of
-            Just binding ->
-              case cbValue binding of
+            Just envBinding ->
+              case cbValue envBinding of
                 CVFloat v -> Right v
                 CVInt (ConstInt _ v) -> Right (ConstFloat F32 (fromIntegral v))
                 CVBool _ -> Left (CompileError "const float expression references a bool value" Nothing Nothing)
@@ -5352,8 +5397,8 @@ evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenF
               constValueToBool val
         EVar name ->
           case Map.lookup name env of
-            Just binding ->
-              case cbValue binding of
+            Just envBinding ->
+              case cbValue envBinding of
                 CVBool b -> Right b
                 CVInt _ -> Left (CompileError "const bool expression references an int value" Nothing Nothing)
                 CVFloat _ -> Left (CompileError "const bool expression references a float value" Nothing Nothing)
@@ -7474,8 +7519,8 @@ isSpecConstantLiteral cid st = any matches (gsConstants st)
       | otherwise = False
 
 emitSpecConstScalarConvert :: Scalar -> Scalar -> Value -> GenState -> Either CompileError (GenState, Value)
-emitSpecConstScalarConvert from to val st = do
-  opcode <- case (from, to) of
+emitSpecConstScalarConvert fromScalar toScalarTy val st = do
+  opcode <- case (fromScalar, toScalarTy) of
     (U32, F32) -> Right opConvertUToF
     (I32, F32) -> Right opConvertSToF
     (U32, F16) -> Right opConvertUToF
@@ -7489,8 +7534,8 @@ emitSpecConstScalarConvert from to val st = do
     (U32, I32) -> Right opBitcast
     (I32, U32) -> Right opBitcast
     _ -> Left (CompileError "unsupported scalar conversion for spec constant" Nothing Nothing)
-  let (a, sz) = scalarLayout to
-  let layout = TLScalar to a sz
+  let (a, sz) = scalarLayout toScalarTy
+  let layout = TLScalar toScalarTy a sz
   emitSpecConstOp layout opcode [valId val] st
 
 coerceSpecConstValueToLayout :: TypeLayout -> Value -> GenState -> Either CompileError (GenState, Value)
@@ -9064,10 +9109,10 @@ emitGlobals structEnv iface entry retLayout globals st0 = do
   let st5 = st4 { gsInterfaceIds = ifaceIds, gsGlobalVars = envBindings <> envGlobals }
   pure (envAll, entryInits, ifaceIds, outTargets, st5)
   where
-    emitBinding (envAcc, idAcc, st) binding =
-      let (ptrTy, st1) = emitPointerForBinding st (biKind binding) (biType binding)
+    emitBinding (envAcc, idAcc, st) bindInfo =
+      let (ptrTy, st1) = emitPointerForBinding st (biKind bindInfo) (biType bindInfo)
           (varId, st2) = freshId st1
-          storageClass = case biKind binding of
+          storageClass = case biKind bindInfo of
             BUniform -> storageClassUniform
             BStorageRead -> storageClassStorageBuffer
             BStorageReadWrite -> storageClassStorageBuffer
@@ -9091,14 +9136,14 @@ emitGlobals structEnv iface entry retLayout globals st0 = do
             BStorageTexture2DArray -> storageClassUniformConstant
             BStorageTexture3D -> storageClassUniformConstant
           st3 = addGlobal (Instr opVariable [ptrTy, varId, storageClass]) st2
-          st4 = addDecoration (Instr opDecorate [varId, decorationDescriptorSet, biGroup binding]) st3
-          st5 = addDecoration (Instr opDecorate [varId, decorationBinding, biBinding binding]) st4
-          st6 = addName (Instr opName (varId : encodeString (biName binding))) st5
-          access = case biKind binding of
+          st4 = addDecoration (Instr opDecorate [varId, decorationDescriptorSet, biGroup bindInfo]) st3
+          st5 = addDecoration (Instr opDecorate [varId, decorationBinding, biBinding bindInfo]) st4
+          st6 = addName (Instr opName (varId : encodeString (biName bindInfo))) st5
+          access = case biKind bindInfo of
             BStorageReadWrite -> ReadWrite
             _ -> ReadOnly
-          info = VarInfo (biType binding) varId storageClass access
-      in (envAcc <> [(T.pack (biName binding), info)], idAcc <> [varId], st6)
+          info = VarInfo (biType bindInfo) varId storageClass access
+      in (envAcc <> [(T.pack (biName bindInfo), info)], idAcc <> [varId], st6)
 
 emitModuleGlobals :: [(Text, StructDecl)] -> [GlobalVarDecl] -> GenState -> Either CompileError ([(Text, VarInfo)], GenState)
 emitModuleGlobals structEnv decls st0 = foldM emitOne ([], st0) decls
@@ -10947,12 +10992,12 @@ frexpStructLayout baseLayout = do
   pure (makeBuiltinStructLayout name [("fract", baseLayout), ("exp", expLayout)])
 
 emitFloatConvert :: Scalar -> Scalar -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
-emitFloatConvert from to val st fs =
+emitFloatConvert fromScalar toScalarTy val st fs =
   case valType val of
-    TLScalar s _ _ | s == from -> emitScalarConvert from to val st fs
-    TLVector n s _ _ | s == from -> do
-      let (a, sz) = vectorLayout to n
-      let layout = TLVector n to a sz
+    TLScalar s _ _ | s == fromScalar -> emitScalarConvert fromScalar toScalarTy val st fs
+    TLVector n s _ _ | s == fromScalar -> do
+      let (a, sz) = vectorLayout toScalarTy n
+      let layout = TLVector n toScalarTy a sz
       let (tyId, st1) = emitTypeFromLayout st layout
       let (resId, st2) = freshId st1
       let fs1 = addFuncInstr (Instr opFConvert [tyId, resId, valId val]) fs
@@ -11735,8 +11780,8 @@ emitScalarCtor scalar args st fs =
     _ -> Left (CompileError "scalar cast requires a single argument" Nothing Nothing)
 
 emitScalarConvert :: Scalar -> Scalar -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
-emitScalarConvert from to val st fs = do
-  opcode <- case (from, to) of
+emitScalarConvert fromScalar toScalarTy val st fs = do
+  opcode <- case (fromScalar, toScalarTy) of
     (U32, F32) -> Right opConvertUToF
     (I32, F32) -> Right opConvertSToF
     (U32, F16) -> Right opConvertUToF
@@ -11750,8 +11795,8 @@ emitScalarConvert from to val st fs = do
     (U32, I32) -> Right opBitcast
     (I32, U32) -> Right opBitcast
     _ -> Left (CompileError "unsupported scalar conversion" Nothing Nothing)
-  let (a, sz) = scalarLayout to
-  let layout = TLScalar to a sz
+  let (a, sz) = scalarLayout toScalarTy
+  let layout = TLScalar toScalarTy a sz
   let (tyId, st1) = emitTypeFromLayout st layout
   let (resId, st2) = freshId st1
   let fs1 = addFuncInstr (Instr opcode [tyId, resId, valId val]) fs

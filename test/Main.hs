@@ -3,8 +3,9 @@ module Main (main) where
 import Control.Monad (forM_, unless)
 import Data.Bits ((.|.), shiftL)
 import qualified Data.ByteString as BS
-import Data.List (find, isPrefixOf)
+import Data.List (find, isInfixOf, isPrefixOf)
 import Data.Word (Word32)
+import GHC.Float (castFloatToWord32)
 import System.FilePath ((</>), takeExtension)
 import System.Directory (doesDirectoryExist, findExecutable, getTemporaryDirectory, listDirectory, removeFile)
 import System.Exit (ExitCode(..))
@@ -69,6 +70,8 @@ main = do
   checkDiagnosticConstantCondition
   checkDiagnosticDuplicateCase
   checkSamplerInterface
+  checkPackUniformLayout
+  checkPackUniformErrors
   putStrLn "All tests passed."
 
 assertSpirv :: Maybe FilePath -> String -> BS.ByteString -> IO ()
@@ -117,6 +120,103 @@ checkSamplerInterface =
       let kinds = map biKind (siBindings iface)
       unless (BTexture2D `elem` kinds && BSampler `elem` kinds) $
         fail "sampler-interface: expected texture_2d and sampler bindings"
+
+checkPackUniformLayout :: IO ()
+checkPackUniformLayout =
+  case compileWeslToSpirv packUniformShader of
+    Left err -> fail ("pack-uniform-layout: " <> show err)
+    Right (SomeCompiledShader (CompiledShader _ iface)) -> do
+      info <- case find (\b -> biName b == "payload") (siBindings iface) of
+        Nothing -> fail "pack-uniform-layout: missing payload binding"
+        Just bi -> pure bi
+      let value =
+            UVStruct
+              [ ("a", uniform (1.25 :: Float))
+              , ("b", uniform (V3 2.0 3.0 4.0 :: V3 Float))
+              , ("c", uniform (M3 (V3 10.0 11.0 12.0) (V3 13.0 14.0 15.0) (V3 16.0 17.0 18.0) :: M3 Float))
+              , ("d", uniform ([V2 21.0 22.0, V2 23.0 24.0] :: [V2 Float]))
+              ]
+      bytes <- case packUniform (biType info) value of
+        Left err -> fail ("pack-uniform-layout: " <> err)
+        Right bs -> pure bs
+      case biType info of
+        TLStruct _ fields _ size -> do
+          unless (BS.length bytes == fromIntegral size) $
+            fail "pack-uniform-layout: byte size mismatch"
+          aOffset <- fieldOffset "a" fields
+          bOffset <- fieldOffset "b" fields
+          cField <- fieldLayout "c" fields
+          dField <- fieldLayout "d" fields
+          assertFloatAt "pack-uniform-layout:a" bytes aOffset 1.25
+          assertFloatAt "pack-uniform-layout:b0" bytes bOffset 2.0
+          assertFloatAt "pack-uniform-layout:b1" bytes (bOffset + 4) 3.0
+          assertFloatAt "pack-uniform-layout:b2" bytes (bOffset + 8) 4.0
+          let paddingBytes = [BS.index bytes (bOffset + 12 + i) | i <- [0 .. 3]]
+          unless (all (== 0) paddingBytes) $
+            fail "pack-uniform-layout: vec3 padding not zeroed"
+          case flType cField of
+            TLMatrix _ rows _ _ _ stride -> do
+              let cOffset = fromIntegral (flOffset cField)
+              let stride' = fromIntegral stride
+              assertFloatAt "pack-uniform-layout:c00" bytes (cOffset + 0 * stride' + 0 * 4) 10.0
+              assertFloatAt "pack-uniform-layout:c11" bytes (cOffset + 1 * stride' + 1 * 4) 14.0
+              assertFloatAt "pack-uniform-layout:c22" bytes (cOffset + 2 * stride' + (rows - 1) * 4) 18.0
+            _ -> fail "pack-uniform-layout: expected matrix layout for c"
+          case flType dField of
+            TLArray _ stride _ _ _ -> do
+              let dOffset = fromIntegral (flOffset dField)
+              let stride' = fromIntegral stride
+              assertFloatAt "pack-uniform-layout:d0x" bytes dOffset 21.0
+              assertFloatAt "pack-uniform-layout:d0y" bytes (dOffset + 4) 22.0
+              assertFloatAt "pack-uniform-layout:d1x" bytes (dOffset + stride') 23.0
+              assertFloatAt "pack-uniform-layout:d1y" bytes (dOffset + stride' + 4) 24.0
+            _ -> fail "pack-uniform-layout: expected array layout for d"
+        _ -> fail "pack-uniform-layout: expected struct layout"
+  where
+    fieldOffset name fields =
+      case find (\fld -> flName fld == name) fields of
+        Just fld -> pure (fromIntegral (flOffset fld))
+        Nothing -> fail ("pack-uniform-layout: missing field " <> name)
+    fieldLayout name fields =
+      case find (\fld -> flName fld == name) fields of
+        Just fld -> pure fld
+        Nothing -> fail ("pack-uniform-layout: missing field " <> name)
+    assertFloatAt label bytes offset value = do
+      let got = word32At bytes offset
+      let expected = castFloatToWord32 value
+      unless (got == expected) $
+        fail (label <> ": expected " <> show expected <> ", got " <> show got)
+
+checkPackUniformErrors :: IO ()
+checkPackUniformErrors =
+  case compileWeslToSpirv packUniformShader of
+    Left err -> fail ("pack-uniform-errors: " <> show err)
+    Right (SomeCompiledShader (CompiledShader _ iface)) -> do
+      info <- case find (\b -> biName b == "payload") (siBindings iface) of
+        Nothing -> fail "pack-uniform-errors: missing payload binding"
+        Just bi -> pure bi
+      let missing =
+            UVStruct
+              [ ("a", uniform (1.0 :: Float))
+              ]
+      case packUniform (biType info) missing of
+        Left err ->
+          unless ("missing struct field" `isInfixOf` err) $
+            fail ("pack-uniform-errors: unexpected missing error: " <> err)
+        Right _ -> fail "pack-uniform-errors: expected missing field failure"
+      let extra =
+            UVStruct
+              [ ("a", uniform (1.0 :: Float))
+              , ("b", uniform (V3 0.0 0.0 0.0 :: V3 Float))
+              , ("c", uniform (M3 (V3 0.0 0.0 0.0) (V3 0.0 0.0 0.0) (V3 0.0 0.0 0.0) :: M3 Float))
+              , ("d", uniform ([V2 0.0 0.0, V2 0.0 0.0] :: [V2 Float]))
+              , ("oops", uniform (0.0 :: Float))
+              ]
+      case packUniform (biType info) extra of
+        Left err ->
+          unless ("unexpected struct fields" `isInfixOf` err) $
+            fail ("pack-uniform-errors: unexpected extra error: " <> err)
+        Right _ -> fail "pack-uniform-errors: expected extra field failure"
 
 checkIfTranslation :: IO ()
 checkIfTranslation = do
@@ -1108,6 +1208,24 @@ layoutAttrShader =
     , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
     , "  let v = stuff.a.x + stuff.b.x;"
     , "  return vec4(v, 0.0, 0.0, 1.0);"
+    , "}"
+    ]
+
+packUniformShader :: String
+packUniformShader =
+  unlines
+    [ "struct Payload {"
+    , "  a: f32;"
+    , "  b: vec3<f32>;"
+    , "  c: mat3x3<f32>;"
+    , "  d: array<vec2<f32>, 2>;"
+    , "};"
+    , "@group(0) @binding(0)"
+    , "var<uniform> payload: Payload;"
+    , "@fragment"
+    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
+    , "  let _ = payload.a + payload.b.x + payload.c[0][0] + payload.d[0].x;"
+    , "  return vec4(0.0, 0.0, 0.0, 1.0);"
     , "}"
     ]
 
