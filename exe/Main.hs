@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE QuasiQuotes #-}
 
 module Main (main) where
@@ -7,6 +8,7 @@ import qualified Data.ByteString as BS
 import Foreign
 import Foreign.C.String (withCString, peekCString)
 import Foreign.C.Types (CBool(..), CFloat)
+import GHC.Generics (Generic)
 
 import Spirdo.SDL3
 import Spirdo.Wesl
@@ -15,6 +17,10 @@ import Spirdo.Wesl
   , BindingKind(..)
   , CompiledShader(..)
   , CompileOptions(..)
+  , ToUniform(..)
+  , V4(..)
+  , uniform
+  , packUniform
   , OverrideValue(..)
   , ReflectBindings
   , ShaderInterface(..)
@@ -36,6 +42,7 @@ data ShaderVariant = ShaderVariant
   , svStorageBufferCount :: Word32
   , svUniformCount :: Word32
   , svUniformSlot :: Word32
+  , svInterface :: ShaderInterface
   }
 
 data VariantState = VariantState
@@ -44,6 +51,8 @@ data VariantState = VariantState
   , vsShader :: Ptr SDL_GPUShader
   , vsUniformCount :: Word32
   , vsUniformSlot :: Word32
+  , vsInterface :: ShaderInterface
+  , vsUniformInfo :: Maybe BindingInfo
   }
 
 main :: IO ()
@@ -1016,12 +1025,21 @@ renderFrame renderer variant color t mode = do
   sdlCheckBool "sdlSetRenderDrawColor" (sdlSetRenderDrawColor renderer 8 8 8 255)
   sdlCheckBool "sdlRenderClear" (sdlRenderClear renderer)
 
-  let timeRes = SDL_FColor t 800 600 (fromIntegral mode)
-      params = Params timeRes color
-  when (vsUniformCount variant > 0) $
-    with params $ \paramPtr ->
-      sdlCheckBool "sdlSetGPURenderStateFragmentUniforms" $
-        sdlSetGPURenderStateFragmentUniforms (vsState variant) (vsUniformSlot variant) (castPtr paramPtr) (fromIntegral (sizeOf params))
+  let SDL_FColor cr cg cb ca = color
+      params =
+        ParamsU
+          { time_res = V4 (realToFrac t) 800 600 (fromIntegral mode)
+          , color = V4 (realToFrac cr) (realToFrac cg) (realToFrac cb) (realToFrac ca)
+          }
+  case vsUniformInfo variant of
+    Nothing -> pure ()
+    Just info ->
+      case packUniform (biType info) (uniform params) of
+        Left err -> error ("uniform pack failed: " <> err)
+        Right bytes ->
+          BS.useAsCStringLen bytes $ \(paramPtr, len) ->
+            sdlCheckBool "sdlSetGPURenderStateFragmentUniforms" $
+              sdlSetGPURenderStateFragmentUniforms (vsState variant) (biBinding info) (castPtr paramPtr) (fromIntegral len)
   sdlCheckBool "sdlSetGPURenderState" (sdlSetGPURenderState renderer (vsState variant))
 
   let positions :: [CFloat]
@@ -1145,7 +1163,7 @@ mkVariant name shader =
       storageTextureCount = bindingCount (storageTextureBindingsFor shader)
       uniformCount = fragmentUniformCount shader
       uniformSlot = fragmentUniformSlot shader
-  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot
+  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot (shaderInterface shader)
 
 mkVariantDynamic :: String -> SomeCompiledShader -> ShaderVariant
 mkVariantDynamic name (SomeCompiledShader shader) =
@@ -1159,7 +1177,7 @@ mkVariantDynamic name (SomeCompiledShader shader) =
         case [biBinding info | info <- infos, biKind info == BUniform] of
           (b:_) -> b
           [] -> 0
-  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot
+  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot iface
   where
     bindingCountInfo predKind xs =
       let bindings = [biBinding info | info <- xs, predKind (biKind info)]
@@ -1198,12 +1216,18 @@ createVariantState device renderer variant = do
     (svUniformCount variant)
     (svSpirv variant)
   state <- createRenderState renderer frag
+  let uniformInfo =
+        case [info | info <- siBindings (svInterface variant), biKind info == BUniform] of
+          (info:_) -> Just info
+          [] -> Nothing
   pure VariantState
     { vsName = svName variant
     , vsState = state
     , vsShader = frag
     , vsUniformCount = svUniformCount variant
     , vsUniformSlot = svUniformSlot variant
+    , vsInterface = svInterface variant
+    , vsUniformInfo = uniformInfo
     }
 
 destroyVariantState :: Ptr SDL_GPUDevice -> VariantState -> IO ()
@@ -1225,18 +1249,9 @@ fromCBool :: CBool -> Bool
 fromCBool (CBool 0) = False
 fromCBool _ = True
 
-data Params = Params
-  { paramTimeRes :: SDL_FColor
-  , paramColor :: SDL_FColor
-  } deriving (Eq, Show)
+data ParamsU = ParamsU
+  { time_res :: V4 Float
+  , color :: V4 Float
+  } deriving (Eq, Show, Generic)
 
-instance Storable Params where
-  sizeOf _ = 2 * sizeOf (undefined :: SDL_FColor)
-  alignment _ = alignment (undefined :: SDL_FColor)
-  poke ptr (Params timeRes color) = do
-    pokeByteOff ptr 0 timeRes
-    pokeByteOff ptr (sizeOf (undefined :: SDL_FColor)) color
-  peek ptr =
-    Params
-      <$> peekByteOff ptr 0
-      <*> peekByteOff ptr (sizeOf (undefined :: SDL_FColor))
+instance ToUniform ParamsU

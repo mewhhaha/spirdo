@@ -67,3 +67,14 @@ test-suite spirdo-tests
         process,
         spirdo
     default-language: GHC2024
+
+benchmark spirdo-compile-bench
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          CompileBench.hs
+    hs-source-dirs:   bench
+    build-depends:
+        base ^>=4.21.0.0,
+        bytestring,
+        spirdo
+    default-language: GHC2024

@@ -166,3 +166,7 @@ Recommended path to full parity (now implemented):
    - Interface clearly marks runtime-specializable overrides (`oiSpecId = Just ...`) vs derived ones (`oiSpecId = Nothing`).
 
 This keeps default builds fully validated while providing an opt-in path to strict WESL parity for toolchains that accept `SpecId` on `OpSpecConstantOp`.
+
+## Next Steps (Paused)
+- DONE: added `Bindings iface` + `binding @"name"` lookup with compile-time membership checks (no manual list plumbing).
+- DONE: README updated with zero-plumbing binding access examples.

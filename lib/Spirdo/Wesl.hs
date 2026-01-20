@@ -1,12 +1,17 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 module Spirdo.Wesl
   ( -- * Compile-time interface types
@@ -19,6 +24,36 @@ module Spirdo.Wesl
   , Binding(..)
   , BindingDesc(..)
   , ReflectBindings(..)
+  , Bindings(..)
+  , bindingsFor
+  , HasBinding
+  , binding
+  , HList(..)
+  , InputFor
+  , InputsOf
+  , inputsFor
+  , inputsForEither
+  , UniformValue(..)
+  , ToUniform(..)
+  , uniform
+  , packUniform
+  , V2(..)
+  , V3(..)
+  , V4(..)
+  , M2(..)
+  , M3(..)
+  , M4(..)
+  , Half(..)
+  , ShaderInputs(..)
+  , SDLUniform(..)
+  , SDLSampler(..)
+  , SDLTexture(..)
+  , SDLStorageBuffer(..)
+  , SDLStorageTexture(..)
+  , SDLSamplerHandle(..)
+  , SDLTextureHandle(..)
+  , SDLBufferHandle(..)
+  , emptyInputs
   , samplerBindings
   , uniformBindings
   , storageBufferBindings
@@ -65,7 +100,10 @@ import qualified Data.ByteString as BS
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, ord)
 import Data.Either (partitionEithers)
 import Data.Int (Int32)
-import Data.List (intercalate, isPrefixOf, mapAccumL, partition)
+import Data.List (find, intercalate, isPrefixOf, mapAccumL, partition)
+import qualified Data.Kind as K
+import qualified Data.IntMap.Strict as IntMap
+import qualified Data.IntSet as IntSet
 import Data.Maybe (fromMaybe, isJust, mapMaybe, maybeToList)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -75,6 +113,7 @@ import qualified Data.Text as T
 import Data.Word (Word8, Word16, Word32, Word64)
 import GHC.TypeLits (KnownNat, KnownSymbol, Nat, Symbol, natVal, symbolVal)
 import GHC.Float (castFloatToWord32, castWord32ToFloat)
+import GHC.Generics (Generic, Rep, K1(..), M1(..), (:*:)(..), Selector, selName, S, from)
 import Language.Haskell.TH (Exp, Q)
 import qualified Language.Haskell.TH as TH
 import Language.Haskell.TH.Quote (QuasiQuoter(..))
@@ -287,6 +326,467 @@ instance ReflectBindings '[] where
 
 instance (ReflectBinding b, ReflectBindings bs) => ReflectBindings (b ': bs) where
   reflectBindings _ = reflectBinding (Proxy @b) : reflectBindings (Proxy @bs)
+
+-- | Typed binding list for an interface.
+newtype Bindings (iface :: [Binding]) = Bindings
+  { unBindings :: [BindingDesc]
+  }
+
+bindingsFor :: forall iface. ReflectBindings iface => CompiledShader iface -> Bindings iface
+bindingsFor _ = Bindings (reflectBindings (Proxy @iface))
+
+type family HasBinding (name :: Symbol) (iface :: [Binding]) :: Bool where
+  HasBinding _ '[] = 'False
+  HasBinding name ('Binding name _ _ _ _ ': _) = 'True
+  HasBinding name (_ ': rest) = HasBinding name rest
+
+binding :: forall name iface. (KnownSymbol name, HasBinding name iface ~ 'True, ReflectBindings iface) => CompiledShader iface -> BindingDesc
+binding _ =
+  let key = symbolVal (Proxy @name)
+  in case find (\b -> descName b == key) (reflectBindings (Proxy @iface)) of
+      Just b -> b
+      Nothing -> error ("binding: missing " <> key)
+
+-- Typed inputs derived from the interface.
+
+data HList (xs :: [K.Type]) where
+  HNil :: HList '[]
+  (:&) :: x -> HList xs -> HList (x ': xs)
+
+infixr 5 :&
+
+data BindingCategory
+  = CatUniform
+  | CatSampler
+  | CatTexture
+  | CatStorageBuffer
+  | CatStorageTexture
+
+type family CategoryOf (k :: BindingKind) :: BindingCategory where
+  CategoryOf 'BUniform = 'CatUniform
+  CategoryOf 'BSampler = 'CatSampler
+  CategoryOf 'BSamplerComparison = 'CatSampler
+  CategoryOf 'BStorageRead = 'CatStorageBuffer
+  CategoryOf 'BStorageReadWrite = 'CatStorageBuffer
+  CategoryOf 'BStorageTexture1D = 'CatStorageTexture
+  CategoryOf 'BStorageTexture2D = 'CatStorageTexture
+  CategoryOf 'BStorageTexture2DArray = 'CatStorageTexture
+  CategoryOf 'BStorageTexture3D = 'CatStorageTexture
+  CategoryOf _ = 'CatTexture
+
+type family InputForCategory (c :: BindingCategory) :: K.Type where
+  InputForCategory 'CatUniform = UniformValue
+  InputForCategory 'CatSampler = SDLSamplerHandle
+  InputForCategory 'CatTexture = SDLTextureHandle
+  InputForCategory 'CatStorageBuffer = SDLBufferHandle
+  InputForCategory 'CatStorageTexture = SDLTextureHandle
+
+type family InputForKind (k :: BindingKind) :: K.Type where
+  InputForKind k = InputForCategory (CategoryOf k)
+
+type family InputFor (b :: Binding) :: K.Type where
+  InputFor ('Binding _ kind _ _ _) = InputForKind kind
+
+type family InputsOf (iface :: [Binding]) :: [K.Type] where
+  InputsOf '[] = '[]
+  InputsOf (b ': bs) = InputFor b ': InputsOf bs
+
+-- | Typed uniform values for packing.
+data Half = Half !Word16
+  deriving (Eq, Show)
+
+data V2 a = V2 !a !a
+  deriving (Eq, Show)
+
+data V3 a = V3 !a !a !a
+  deriving (Eq, Show)
+
+data V4 a = V4 !a !a !a !a
+  deriving (Eq, Show)
+
+data M2 a = M2 !(V2 a) !(V2 a)
+  deriving (Eq, Show)
+
+data M3 a = M3 !(V3 a) !(V3 a) !(V3 a)
+  deriving (Eq, Show)
+
+data M4 a = M4 !(V4 a) !(V4 a) !(V4 a) !(V4 a)
+  deriving (Eq, Show)
+
+data ScalarValue
+  = SVI32 !Int32
+  | SVU32 !Word32
+  | SVF16 !Word16
+  | SVF32 !Float
+  | SVBool !Bool
+  deriving (Eq, Show)
+
+data UniformValue
+  = UVScalar !ScalarValue
+  | UVVector !Int ![ScalarValue]
+  | UVMatrix !Int !Int ![ScalarValue]
+  | UVArray ![UniformValue]
+  | UVStruct ![(String, UniformValue)]
+  deriving (Eq, Show)
+
+class ToScalar a where
+  toScalar :: a -> ScalarValue
+
+instance ToScalar Float where
+  toScalar = SVF32
+
+instance ToScalar Int32 where
+  toScalar = SVI32
+
+instance ToScalar Word32 where
+  toScalar = SVU32
+
+instance ToScalar Bool where
+  toScalar = SVBool
+
+instance ToScalar Half where
+  toScalar (Half w) = SVF16 w
+
+class ToUniform a where
+  toUniform :: a -> UniformValue
+  default toUniform :: (Generic a, GUniform (Rep a)) => a -> UniformValue
+  toUniform a = UVStruct (gUniform (from a))
+
+uniform :: ToUniform a => a -> UniformValue
+uniform = toUniform
+
+instance ToUniform Float where
+  toUniform = UVScalar . toScalar
+
+instance ToUniform Int32 where
+  toUniform = UVScalar . toScalar
+
+instance ToUniform Word32 where
+  toUniform = UVScalar . toScalar
+
+instance ToUniform Bool where
+  toUniform = UVScalar . toScalar
+
+instance ToUniform Half where
+  toUniform = UVScalar . toScalar
+
+instance ToScalar a => ToUniform (V2 a) where
+  toUniform (V2 a b) = UVVector 2 [toScalar a, toScalar b]
+
+instance ToScalar a => ToUniform (V3 a) where
+  toUniform (V3 a b c) = UVVector 3 [toScalar a, toScalar b, toScalar c]
+
+instance ToScalar a => ToUniform (V4 a) where
+  toUniform (V4 a b c d) = UVVector 4 [toScalar a, toScalar b, toScalar c, toScalar d]
+
+instance ToScalar a => ToUniform (M2 a) where
+  toUniform (M2 c0 c1) =
+    case (toUniform c0, toUniform c1) of
+      (UVVector _ v0, UVVector _ v1) -> UVMatrix 2 2 (v0 <> v1)
+      _ -> error "ToUniform M2: invalid column vectors"
+
+instance ToScalar a => ToUniform (M3 a) where
+  toUniform (M3 c0 c1 c2) =
+    case (toUniform c0, toUniform c1, toUniform c2) of
+      (UVVector _ v0, UVVector _ v1, UVVector _ v2) -> UVMatrix 3 3 (v0 <> v1 <> v2)
+      _ -> error "ToUniform M3: invalid column vectors"
+
+instance ToScalar a => ToUniform (M4 a) where
+  toUniform (M4 c0 c1 c2 c3) =
+    case (toUniform c0, toUniform c1, toUniform c2, toUniform c3) of
+      (UVVector _ v0, UVVector _ v1, UVVector _ v2, UVVector _ v3) -> UVMatrix 4 4 (v0 <> v1 <> v2 <> v3)
+      _ -> error "ToUniform M4: invalid column vectors"
+
+instance ToUniform a => ToUniform [a] where
+  toUniform xs = UVArray (map toUniform xs)
+
+class GUniform f where
+  gUniform :: f p -> [(String, UniformValue)]
+
+instance (GUniform a, GUniform b) => GUniform (a :*: b) where
+  gUniform (a :*: b) = gUniform a <> gUniform b
+
+instance {-# OVERLAPPABLE #-} (GUniform a) => GUniform (M1 i c a) where
+  gUniform (M1 x) = gUniform x
+
+instance {-# OVERLAPPING #-} (Selector s, ToUniform a) => GUniform (M1 S s (K1 i a)) where
+  gUniform m1 =
+    let name = selName m1
+    in if null name
+        then error "ToUniform: expected record fields (missing selector name)"
+        else [(name, toUniform (unK1 (unM1 m1)))]
+
+-- | Minimal SDL-like handles (replace with real SDL3.4 handles in your app).
+newtype SDLSamplerHandle = SDLSamplerHandle Word64
+  deriving (Eq, Show)
+
+newtype SDLTextureHandle = SDLTextureHandle Word64
+  deriving (Eq, Show)
+
+newtype SDLBufferHandle = SDLBufferHandle Word64
+  deriving (Eq, Show)
+
+data SDLUniform = SDLUniform
+  { sdlUniformName :: !String
+  , sdlUniformGroup :: !Word32
+  , sdlUniformBinding :: !Word32
+  , sdlUniformBytes :: !ByteString
+  } deriving (Eq, Show)
+
+data SDLSampler = SDLSampler
+  { sdlSamplerName :: !String
+  , sdlSamplerGroup :: !Word32
+  , sdlSamplerBinding :: !Word32
+  , sdlSamplerHandle :: !SDLSamplerHandle
+  } deriving (Eq, Show)
+
+data SDLTexture = SDLTexture
+  { sdlTextureName :: !String
+  , sdlTextureGroup :: !Word32
+  , sdlTextureBinding :: !Word32
+  , sdlTextureHandle :: !SDLTextureHandle
+  } deriving (Eq, Show)
+
+data SDLStorageBuffer = SDLStorageBuffer
+  { sdlStorageBufferName :: !String
+  , sdlStorageBufferGroup :: !Word32
+  , sdlStorageBufferBinding :: !Word32
+  , sdlStorageBufferHandle :: !SDLBufferHandle
+  } deriving (Eq, Show)
+
+data SDLStorageTexture = SDLStorageTexture
+  { sdlStorageTextureName :: !String
+  , sdlStorageTextureGroup :: !Word32
+  , sdlStorageTextureBinding :: !Word32
+  , sdlStorageTextureHandle :: !SDLTextureHandle
+  } deriving (Eq, Show)
+
+data ShaderInputs (iface :: [Binding]) = ShaderInputs
+  { siShader :: !(CompiledShader iface)
+  , siUniforms :: ![SDLUniform]
+  , siSamplers :: ![SDLSampler]
+  , siTextures :: ![SDLTexture]
+  , siStorageBuffers :: ![SDLStorageBuffer]
+  , siStorageTextures :: ![SDLStorageTexture]
+  }
+
+emptyInputs :: CompiledShader iface -> ShaderInputs iface
+emptyInputs shader =
+  ShaderInputs
+    { siShader = shader
+    , siUniforms = []
+    , siSamplers = []
+    , siTextures = []
+    , siStorageBuffers = []
+    , siStorageTextures = []
+    }
+
+lookupBindingInfo :: String -> ShaderInterface -> Either String BindingInfo
+lookupBindingInfo name iface =
+  case find (\b -> biName b == name) (siBindings iface) of
+    Just info -> Right info
+    Nothing -> Left ("binding not found in interface: " <> name)
+
+type ByteMap = IntMap.IntMap Word8
+
+packUniform :: TypeLayout -> UniformValue -> Either String ByteString
+packUniform layout value = do
+  bytes <- writeUniform 0 layout value
+  let size = fromIntegral (layoutSize layout)
+  let out = [IntMap.findWithDefault 0 i bytes | i <- [0 .. size - 1]]
+  pure (BS.pack out)
+
+writeUniform :: Int -> TypeLayout -> UniformValue -> Either String ByteMap
+writeUniform off layout value =
+  case (layout, value) of
+    (TLScalar s _ _, UVScalar v) -> do
+      bs <- scalarValueBytes s v
+      pure (bytesAt off bs)
+    (TLVector n s _ _, UVVector n' vals)
+      | n == n' -> foldM (writeScalarAt s off) IntMap.empty (zip [0 ..] vals)
+      | otherwise -> Left ("vector length mismatch: expected " <> show n <> ", got " <> show n')
+    (TLMatrix cols rows s _ _ stride, UVMatrix c r vals)
+      | cols == c && rows == r -> writeMatrix off cols rows s (fromIntegral stride) vals
+      | otherwise ->
+          Left ("matrix size mismatch: expected " <> show cols <> "x" <> show rows <> ", got " <> show c <> "x" <> show r)
+    (TLArray mlen stride elemLayout _ _, UVArray elems) -> do
+      case mlen of
+        Just n | n /= length elems ->
+          Left ("array length mismatch: expected " <> show n <> ", got " <> show (length elems))
+        _ -> pure ()
+      foldM
+        (\acc (ix, el) -> do
+            bytes <- writeUniform (off + ix * fromIntegral stride) elemLayout el
+            pure (IntMap.union bytes acc)
+        )
+        IntMap.empty
+        (zip [0 ..] elems)
+    (TLStruct _ fields _ _, UVStruct vals) -> do
+      let valMap = Map.fromList vals
+      foldM
+        (\acc fld -> do
+            val <- case Map.lookup (flName fld) valMap of
+              Just v -> Right v
+              Nothing -> Left ("missing struct field: " <> flName fld)
+            bytes <- writeUniform (off + fromIntegral (flOffset fld)) (flType fld) val
+            pure (IntMap.union bytes acc)
+        )
+        IntMap.empty
+        fields
+    _ -> Left ("uniform value does not match layout: " <> show layout)
+
+writeScalarAt :: Scalar -> Int -> ByteMap -> (Int, ScalarValue) -> Either String ByteMap
+writeScalarAt s off acc (ix, val) = do
+  bs <- scalarValueBytes s val
+  let elemSize = scalarByteSize s
+  let bytes = bytesAt (off + ix * elemSize) bs
+  pure (IntMap.union bytes acc)
+
+writeMatrix :: Int -> Int -> Int -> Scalar -> Int -> [ScalarValue] -> Either String ByteMap
+writeMatrix off cols rows scalar stride vals = do
+  let expected = cols * rows
+  when (length vals /= expected) $
+    Left ("matrix value count mismatch: expected " <> show expected <> ", got " <> show (length vals))
+  foldM
+    (\acc (ix, val) -> do
+        bs <- scalarValueBytes scalar val
+        let col = ix `div` rows
+        let row = ix `mod` rows
+        let base = off + col * stride + row * scalarByteSize scalar
+        pure (IntMap.union (bytesAt base bs) acc)
+    )
+    IntMap.empty
+    (zip [0 ..] vals)
+
+scalarValueBytes :: Scalar -> ScalarValue -> Either String [Word8]
+scalarValueBytes scalar value =
+  case (scalar, value) of
+    (I32, SVI32 v) -> Right (word32LE (fromIntegral v))
+    (U32, SVU32 v) -> Right (word32LE v)
+    (F32, SVF32 v) -> Right (word32LE (castFloatToWord32 v))
+    (F16, SVF16 v) -> Right (word16LE v)
+    (Bool, SVBool v) -> Right (word32LE (if v then 1 else 0))
+    _ -> Left ("scalar type mismatch: expected " <> show scalar <> ", got " <> show value)
+
+scalarByteSize :: Scalar -> Int
+scalarByteSize s = case s of
+  F16 -> 2
+  _ -> 4
+
+word16LE :: Word16 -> [Word8]
+word16LE w =
+  [ fromIntegral (w .&. 0xFF)
+  , fromIntegral ((w `shiftR` 8) .&. 0xFF)
+  ]
+
+word32LE :: Word32 -> [Word8]
+word32LE w =
+  [ fromIntegral (w .&. 0xFF)
+  , fromIntegral ((w `shiftR` 8) .&. 0xFF)
+  , fromIntegral ((w `shiftR` 16) .&. 0xFF)
+  , fromIntegral ((w `shiftR` 24) .&. 0xFF)
+  ]
+
+bytesAt :: Int -> [Word8] -> ByteMap
+bytesAt off bytes =
+  IntMap.fromList (zip [off ..] bytes)
+
+class ApplyCategory (c :: BindingCategory) where
+  applyCategory :: BindingInfo -> InputForCategory c -> ShaderInputs iface -> Either String (ShaderInputs iface)
+
+instance ApplyCategory 'CatUniform where
+  applyCategory info val inputs = do
+    bytes <- packUniform (biType info) val
+    let entry =
+          SDLUniform
+            { sdlUniformName = biName info
+            , sdlUniformGroup = biGroup info
+            , sdlUniformBinding = biBinding info
+            , sdlUniformBytes = bytes
+            }
+    pure inputs { siUniforms = entry : siUniforms inputs }
+
+instance ApplyCategory 'CatSampler where
+  applyCategory info handle inputs =
+    let entry =
+          SDLSampler
+            { sdlSamplerName = biName info
+            , sdlSamplerGroup = biGroup info
+            , sdlSamplerBinding = biBinding info
+            , sdlSamplerHandle = handle
+            }
+    in Right inputs { siSamplers = entry : siSamplers inputs }
+
+instance ApplyCategory 'CatTexture where
+  applyCategory info handle inputs =
+    let entry =
+          SDLTexture
+            { sdlTextureName = biName info
+            , sdlTextureGroup = biGroup info
+            , sdlTextureBinding = biBinding info
+            , sdlTextureHandle = handle
+            }
+    in Right inputs { siTextures = entry : siTextures inputs }
+
+instance ApplyCategory 'CatStorageBuffer where
+  applyCategory info handle inputs =
+    let entry =
+          SDLStorageBuffer
+            { sdlStorageBufferName = biName info
+            , sdlStorageBufferGroup = biGroup info
+            , sdlStorageBufferBinding = biBinding info
+            , sdlStorageBufferHandle = handle
+            }
+    in Right inputs { siStorageBuffers = entry : siStorageBuffers inputs }
+
+instance ApplyCategory 'CatStorageTexture where
+  applyCategory info handle inputs =
+    let entry =
+          SDLStorageTexture
+            { sdlStorageTextureName = biName info
+            , sdlStorageTextureGroup = biGroup info
+            , sdlStorageTextureBinding = biBinding info
+            , sdlStorageTextureHandle = handle
+            }
+    in Right inputs { siStorageTextures = entry : siStorageTextures inputs }
+
+class ApplyKind (k :: BindingKind) where
+  applyKind :: BindingInfo -> InputForKind k -> ShaderInputs iface -> Either String (ShaderInputs iface)
+
+instance ApplyCategory (CategoryOf k) => ApplyKind k where
+  applyKind = applyCategory @(CategoryOf k)
+
+class BuildInputsWith (iface :: [Binding]) (bs :: [Binding]) where
+  buildInputsWith :: CompiledShader iface -> HList (InputsOf bs) -> Either String (ShaderInputs iface)
+
+instance BuildInputsWith iface '[] where
+  buildInputsWith shader HNil = Right (emptyInputs shader)
+
+instance
+  forall iface name kind set binding ty bs.
+  ( KnownSymbol name
+  , KnownBindingKind kind
+  , KnownNat set
+  , KnownNat binding
+  , ApplyKind kind
+  , BuildInputsWith iface bs
+  ) =>
+  BuildInputsWith iface ('Binding name kind set binding ty ': bs)
+  where
+  buildInputsWith shader (x :& xs) = do
+    base <- buildInputsWith @iface @bs shader xs
+    let name = symbolVal (Proxy @name)
+    info <- lookupBindingInfo name (shaderInterface shader)
+    applyKind @kind info x base
+
+inputsForEither :: forall iface. BuildInputsWith iface iface => CompiledShader iface -> HList (InputsOf iface) -> Either String (ShaderInputs iface)
+inputsForEither shader xs = buildInputsWith @iface @iface shader xs
+
+inputsFor :: forall iface. BuildInputsWith iface iface => CompiledShader iface -> HList (InputsOf iface) -> ShaderInputs iface
+inputsFor shader xs =
+  case inputsForEither @iface shader xs of
+    Left err -> error ("inputsFor: " <> err)
+    Right ok -> ok
 
 samplerBindings :: forall iface. ReflectBindings iface => Proxy iface -> [BindingDesc]
 samplerBindings _ =
@@ -976,6 +1476,7 @@ weslExp src = do
       let ifaceTy = interfaceToType iface
       let shaderExp = TH.AppE (TH.AppE (TH.ConE 'CompiledShader) bytesExp) ifaceExp
       pure (TH.SigE shaderExp (TH.AppT (TH.ConT ''CompiledShader) ifaceTy))
+
 
 -- Parsing
 
@@ -2625,6 +3126,53 @@ data ModuleContext = ModuleContext
   , mcRootPath :: [Text]
   }
 
+data NameTable = NameTable
+  { ntNext :: !Int
+  , ntMap :: !(Map.Map Text Int)
+  } deriving (Eq, Show)
+
+emptyNameTable :: NameTable
+emptyNameTable = NameTable 0 Map.empty
+
+internName :: Text -> NameTable -> (Int, NameTable)
+internName name table =
+  case Map.lookup name (ntMap table) of
+    Just i -> (i, table)
+    Nothing ->
+      let i = ntNext table
+          table' = table { ntNext = i + 1, ntMap = Map.insert name i (ntMap table) }
+      in (i, table')
+
+internNames :: NameTable -> [Text] -> (NameTable, [Int])
+internNames table names =
+  let (table', revIds) = foldl' step (table, []) names
+  in (table', reverse revIds)
+  where
+    step (t, acc) name =
+      let (i, t') = internName name t
+      in (t', i : acc)
+
+internNameSet :: NameTable -> [Text] -> (NameTable, IntSet.IntSet)
+internNameSet table names =
+  let (table', ids) = internNames table names
+  in (table', IntSet.fromList ids)
+
+internNamePairs :: NameTable -> [Text] -> (NameTable, [(Text, Int)])
+internNamePairs table names =
+  let (table', ids) = internNames table names
+  in (table', zip names ids)
+
+uniqueById :: [(Text, Int)] -> [(Text, Int)]
+uniqueById = go IntSet.empty
+  where
+    go _ [] = []
+    go seen ((name, ident) : rest)
+      | IntSet.member ident seen = go seen rest
+      | otherwise = (name, ident) : go (IntSet.insert ident seen) rest
+
+pathKey :: [Text] -> Text
+pathKey = T.intercalate "::"
+
 buildModuleContext :: [Text] -> FilePath -> ModuleNode -> ModuleContext
 buildModuleContext rootPath _rootDir node =
   let ast = mnAst node
@@ -2643,20 +3191,36 @@ buildModuleContext rootPath _rootDir node =
       (moduleAliases, itemAliases) = buildAliasMaps (mnImports node)
   in ModuleContext (mnPath node) moduleAliases itemAliases localNames constNames functionNames rootPath
 
-type ConstIndex = Map.Map [Text] (Map.Map Text Expr)
+data ConstIndex = ConstIndex
+  { ciPathTable :: !NameTable
+  , ciNameTable :: !NameTable
+  , ciEntries :: !(IntMap.IntMap (IntMap.IntMap Expr))
+  }
 
 buildConstIndex :: [ModuleNode] -> ConstIndex
 buildConstIndex nodes =
-  Map.fromList
-    [ (mnPath n, Map.fromList (constPairs n))
-    | n <- nodes
-    ]
+  let (pt, nt, entries) = foldl' addNode (emptyNameTable, emptyNameTable, IntMap.empty) nodes
+  in ConstIndex pt nt entries
   where
+    addNode (pt, nt, acc) node =
+      let (pid, pt1) = internName (pathKey (mnPath node)) pt
+          (nt1, entryMap) = foldl' addEntry (nt, IntMap.empty) (constPairs node)
+          merged = IntMap.union entryMap (IntMap.findWithDefault IntMap.empty pid acc)
+      in (pt1, nt1, IntMap.insert pid merged acc)
+    addEntry (nt0, m) (name, expr) =
+      let (nid, nt1) = internName name nt0
+      in (nt1, IntMap.insert nid expr m)
     constPairs n =
       let ast = mnAst n
           consts = [(cdName c, cdExpr c) | c <- modConsts ast]
           overrides = [(odName o, expr) | o <- modOverrides ast, Just expr <- [odExpr o]]
       in consts <> overrides
+
+lookupConstIndex :: ConstIndex -> [Text] -> Text -> Maybe Expr
+lookupConstIndex idx path name = do
+  pid <- Map.lookup (pathKey path) (ntMap (ciPathTable idx))
+  nid <- Map.lookup name (ntMap (ciNameTable idx))
+  IntMap.lookup pid (ciEntries idx) >>= IntMap.lookup nid
 
 type OverrideIndex = Map.Map [Text] (Set.Set Text)
 
@@ -2667,23 +3231,57 @@ buildOverrideIndex nodes =
     | n <- nodes
     ]
 
-type StructIndex = Map.Map [Text] (Map.Map Text StructDecl)
+data StructIndex = StructIndex
+  { siPathTable :: !NameTable
+  , siNameTable :: !NameTable
+  , siEntries :: !(IntMap.IntMap (IntMap.IntMap StructDecl))
+  }
 
 buildStructIndex :: [ModuleNode] -> StructIndex
 buildStructIndex nodes =
-  Map.fromList
-    [ (mnPath n, Map.fromList [(sdName s, s) | s <- modStructs (mnAst n)])
-    | n <- nodes
-    ]
+  let (pt, nt, entries) = foldl' addNode (emptyNameTable, emptyNameTable, IntMap.empty) nodes
+  in StructIndex pt nt entries
+  where
+    addNode (pt, nt, acc) node =
+      let (pid, pt1) = internName (pathKey (mnPath node)) pt
+          (nt1, entryMap) = foldl' addEntry (nt, IntMap.empty) [(sdName s, s) | s <- modStructs (mnAst node)]
+          merged = IntMap.union entryMap (IntMap.findWithDefault IntMap.empty pid acc)
+      in (pt1, nt1, IntMap.insert pid merged acc)
+    addEntry (nt0, m) (name, decl) =
+      let (nid, nt1) = internName name nt0
+      in (nt1, IntMap.insert nid decl m)
 
-type FunctionIndex = Map.Map [Text] (Map.Map Text [FunctionDecl])
+lookupStructIndex :: StructIndex -> [Text] -> Text -> Maybe StructDecl
+lookupStructIndex idx path name = do
+  pid <- Map.lookup (pathKey path) (ntMap (siPathTable idx))
+  nid <- Map.lookup name (ntMap (siNameTable idx))
+  IntMap.lookup pid (siEntries idx) >>= IntMap.lookup nid
+
+data FunctionIndex = FunctionIndex
+  { fiPathTable :: !NameTable
+  , fiNameTable :: !NameTable
+  , fiEntries :: !(IntMap.IntMap (IntMap.IntMap [FunctionDecl]))
+  }
 
 buildFunctionIndex :: [ModuleNode] -> FunctionIndex
 buildFunctionIndex nodes =
-  Map.fromList
-    [ (mnPath n, Map.fromListWith (<>) [(fnName f, [f]) | f <- modFunctions (mnAst n)])
-    | n <- nodes
-    ]
+  let (pt, nt, entries) = foldl' addNode (emptyNameTable, emptyNameTable, IntMap.empty) nodes
+  in FunctionIndex pt nt entries
+  where
+    addNode (pt, nt, acc) node =
+      let (pid, pt1) = internName (pathKey (mnPath node)) pt
+          (nt1, entryMap) = foldl' addEntry (nt, IntMap.empty) [(fnName f, [f]) | f <- modFunctions (mnAst node)]
+          merged = IntMap.unionWith (<>) entryMap (IntMap.findWithDefault IntMap.empty pid acc)
+      in (pt1, nt1, IntMap.insert pid merged acc)
+    addEntry (nt0, m) (name, decls) =
+      let (nid, nt1) = internName name nt0
+      in (nt1, IntMap.insertWith (<>) nid decls m)
+
+lookupFunctionIndex :: FunctionIndex -> [Text] -> Text -> Maybe [FunctionDecl]
+lookupFunctionIndex idx path name = do
+  pid <- Map.lookup (pathKey path) (ntMap (fiPathTable idx))
+  nid <- Map.lookup name (ntMap (fiNameTable idx))
+  IntMap.lookup pid (fiEntries idx) >>= IntMap.lookup nid
 
 lowerOverridesWith :: [Text] -> [(Text, OverrideValue)] -> ModuleAst -> Either CompileError ModuleAst
 lowerOverridesWith rootPath overridesMap ast =
@@ -2946,11 +3544,12 @@ buildAliasMaps imports = foldl' add (Map.empty, Map.empty) imports
               else (modAcc, Map.insert alias target itemAcc)
 
 data Scope = Scope
-  { scGlobals :: Set.Set Text
-  , scScopes :: [Set.Set Text]
-  , scModuleAliases :: Set.Set Text
-  , scItemAliases :: Set.Set Text
-  , scTypeAliases :: Set.Set Text
+  { scNameTable :: !NameTable
+  , scGlobals :: IntSet.IntSet
+  , scScopes :: [IntSet.IntSet]
+  , scModuleAliases :: IntSet.IntSet
+  , scItemAliases :: IntSet.IntSet
+  , scTypeAliases :: IntSet.IntSet
   , scAllowShadowing :: Bool
   , scAllowFallthrough :: Bool
   }
@@ -2985,13 +3584,18 @@ validateModuleScope opts skipConstAsserts rootPath rootDir constIndex fnIndex st
   let ctx = buildModuleContext rootPath rootDir node
   diagConfig <- validateDirectives opts (modDirectives (mnAst node))
   let allowShadowing = diagnosticSeverity diagConfig "shadowing" /= DiagError
+  let (nt1, globalsIds) = internNameSet emptyNameTable (Set.toList (mcLocals ctx))
+  let (nt2, moduleAliasIds) = internNameSet nt1 (Map.keys (mcModuleAliases ctx))
+  let (nt3, itemAliasIds) = internNameSet nt2 (Map.keys (mcItemAliases ctx))
+  let (nt4, typeAliasIds) = internNameSet nt3 (map adName (modAliases (mnAst node)))
   let scope0 =
         Scope
-          { scGlobals = mcLocals ctx
-          , scScopes = [Set.empty]
-          , scModuleAliases = Set.fromList (Map.keys (mcModuleAliases ctx))
-          , scItemAliases = Set.fromList (Map.keys (mcItemAliases ctx))
-          , scTypeAliases = Set.fromList (map adName (modAliases (mnAst node)))
+          { scNameTable = nt4
+          , scGlobals = globalsIds
+          , scScopes = [IntSet.empty]
+          , scModuleAliases = moduleAliasIds
+          , scItemAliases = itemAliasIds
+          , scTypeAliases = typeAliasIds
           , scAllowShadowing = allowShadowing
           , scAllowFallthrough = False
           }
@@ -3156,9 +3760,15 @@ collectUnusedVariableDiagnostics diagConfig ast =
       in concatMap (unusedVarsInBody diag) bodies
   where
     unusedVarsInBody mkDiag stmts =
-      let declared = Set.fromList (collectDecls stmts)
-          used = Set.fromList (collectUsesInStmts stmts)
-          unused = filter (\name -> not (Set.member name used) && not (isIgnored name)) (Set.toList declared)
+      let declaredNames = collectDecls stmts
+          (nt1, declaredPairs) = internNamePairs emptyNameTable declaredNames
+          (_, usedIds) = internNameSet nt1 (collectUsesInStmts stmts)
+          unused =
+            [ name
+            | (name, ident) <- uniqueById declaredPairs
+            , not (IntSet.member ident usedIds)
+            , not (isIgnored name)
+            ]
       in map mkDiag unused
 
     isIgnored name = T.isPrefixOf "_" name
@@ -3188,14 +3798,26 @@ collectUnusedParameterDiagnostics diagConfig ast =
           <> maybe [] (unusedParamsInEntry mkDiag) (modEntry ast)
   where
     unusedParamsInFunction mkDiag fn =
-      let used = Set.fromList (collectUsesInStmts (fnBody fn))
-          params = map paramName (fnParams fn)
-          unused = filter (\name -> not (Set.member name used) && not (isIgnored name)) params
+      let params = map paramName (fnParams fn)
+          (nt1, paramPairs) = internNamePairs emptyNameTable params
+          (_, usedIds) = internNameSet nt1 (collectUsesInStmts (fnBody fn))
+          unused =
+            [ name
+            | (name, ident) <- uniqueById paramPairs
+            , not (IntSet.member ident usedIds)
+            , not (isIgnored name)
+            ]
       in map mkDiag unused
     unusedParamsInEntry mkDiag entry =
-      let used = Set.fromList (collectUsesInStmts (epBody entry))
-          params = map paramName (epParams entry)
-          unused = filter (\name -> not (Set.member name used) && not (isIgnored name)) params
+      let params = map paramName (epParams entry)
+          (nt1, paramPairs) = internNamePairs emptyNameTable params
+          (_, usedIds) = internNameSet nt1 (collectUsesInStmts (epBody entry))
+          unused =
+            [ name
+            | (name, ident) <- uniqueById paramPairs
+            , not (IntSet.member ident usedIds)
+            , not (isIgnored name)
+            ]
       in map mkDiag unused
     isIgnored name = T.isPrefixOf "_" name
 
@@ -3210,58 +3832,88 @@ collectShadowingDiagnostics diagConfig ast =
           <> maybe [] (shadowingInEntry mkDiag) (modEntry ast)
   where
     shadowingInFunction mkDiag fn =
-      let params = Set.fromList (map paramName (fnParams fn))
-      in shadowingInStmts mkDiag [Set.empty, params] (fnBody fn)
+      let params = map paramName (fnParams fn)
+          (nt1, paramIds) = internNames emptyNameTable params
+      in shadowingInStmts mkDiag nt1 [IntSet.empty, IntSet.fromList paramIds] (fnBody fn)
     shadowingInEntry mkDiag entry =
-      let params = Set.fromList (map paramName (epParams entry))
-      in shadowingInStmts mkDiag [Set.empty, params] (epBody entry)
+      let params = map paramName (epParams entry)
+          (nt1, paramIds) = internNames emptyNameTable params
+      in shadowingInStmts mkDiag nt1 [IntSet.empty, IntSet.fromList paramIds] (epBody entry)
 
-    shadowingInStmts mkDiag scopes0 stmts = fst (go scopes0 stmts)
+    shadowingInStmts mkDiag table scopes0 stmts = let (diags, _, _) = go table scopes0 stmts in diags
       where
-        go scopes [] = ([], scopes)
-        go scopes (stmt:rest) =
-          let (diags1, scopes1) = shadowingInStmt mkDiag scopes stmt
-              (diags2, scopes2) = go scopes1 rest
-          in (diags1 <> diags2, scopes2)
+        go table0 scopesAcc [] = ([], table0, scopesAcc)
+        go table0 scopesAcc (stmt:rest) =
+          let (diags1, table1, scopes1) = shadowingInStmt mkDiag table0 scopesAcc stmt
+              (diags2, table2, scopes2) = go table1 scopes1 rest
+          in (diags1 <> diags2, table2, scopes2)
 
-    shadowingInStmt mkDiag scopes stmt =
+    shadowingInStmt mkDiag table scopes stmt =
       case stmt of
-        SLet name _ -> (diagIfShadow mkDiag scopes name, addToCurrent name scopes)
-        SVar name _ -> (diagIfShadow mkDiag scopes name, addToCurrent name scopes)
+        SLet name _ ->
+          let (ident, table') = internName name table
+          in (diagIfShadow mkDiag scopes ident name, table', addToCurrent ident scopes)
+        SVar name _ ->
+          let (ident, table') = internName name table
+          in (diagIfShadow mkDiag scopes ident name, table', addToCurrent ident scopes)
         SIf _ thenBody elseBody ->
-          ( shadowingInBlock mkDiag scopes thenBody <> maybe [] (shadowingInBlock mkDiag scopes) elseBody
-          , scopes
-          )
+          let (diags1, table1) = shadowingInBlock mkDiag table scopes thenBody
+              (diags2, table2) = maybe ([], table1) (shadowingInBlock mkDiag table1 scopes) elseBody
+          in (diags1 <> diags2, table2, scopes)
         SWhile _ body ->
-          (shadowingInBlock mkDiag scopes body, scopes)
+          let (diags1, table1) = shadowingInBlock mkDiag table scopes body
+          in (diags1, table1, scopes)
         SLoop body continuing ->
-          (shadowingInBlock mkDiag scopes body <> maybe [] (shadowingInBlock mkDiag scopes) continuing, scopes)
+          let (diags1, table1) = shadowingInBlock mkDiag table scopes body
+              (diags2, table2) = maybe ([], table1) (shadowingInBlock mkDiag table1 scopes) continuing
+          in (diags1 <> diags2, table2, scopes)
         SFor initStmt _ contStmt body ->
           let loopScopes = pushScope scopes
-              (diagsInit, loopScopes1) = maybe ([], loopScopes) (shadowingInStmt mkDiag loopScopes) initStmt
-              (diagsCont, loopScopes2) = maybe ([], loopScopes1) (shadowingInStmt mkDiag loopScopes1) contStmt
-              diagsBody = shadowingInBlock mkDiag loopScopes2 body
-          in (diagsInit <> diagsCont <> diagsBody, scopes)
+              (diagsInit, table1, loopScopes1) =
+                case initStmt of
+                  Nothing -> ([], table, loopScopes)
+                  Just s -> shadowingInStmt mkDiag table loopScopes s
+              (diagsCont, table2, loopScopes2) =
+                case contStmt of
+                  Nothing -> ([], table1, loopScopes1)
+                  Just s -> shadowingInStmt mkDiag table1 loopScopes1 s
+              (diagsBody, table3) = shadowingInBlock mkDiag table2 loopScopes2 body
+          in (diagsInit <> diagsCont <> diagsBody, table3, scopes)
         SSwitch _ cases defBody ->
-          let diagsCases = concatMap (shadowingInBlock mkDiag scopes . scBody) cases
-              diagsDef = maybe [] (shadowingInBlock mkDiag scopes) defBody
-          in (diagsCases <> diagsDef, scopes)
-        _ -> ([], scopes)
+          let (diagsCases, table1) = shadowingInCases mkDiag table scopes cases
+              (diagsDef, table2) = maybe ([], table1) (shadowingInBlock mkDiag table1 scopes) defBody
+          in (diagsCases <> diagsDef, table2, scopes)
+        _ -> ([], table, scopes)
 
-    shadowingInBlock mkDiag scopes body = shadowingInStmts mkDiag (pushScope scopes) body
+    shadowingInBlock mkDiag table scopes body = shadowingInStmtsWithTable mkDiag table (pushScope scopes) body
 
-    diagIfShadow mkDiag scopes name
+    shadowingInStmtsWithTable mkDiag table scopes stmts = go table scopes stmts
+      where
+        go table0 _ [] = ([], table0)
+        go table0 scopes0 (stmt:rest) =
+          let (diags1, table1, scopes1) = shadowingInStmt mkDiag table0 scopes0 stmt
+              (diags2, table2) = go table1 scopes1 rest
+          in (diags1 <> diags2, table2)
+
+    shadowingInCases mkDiag table scopes cases =
+      foldl' step ([], table) cases
+      where
+        step (diagsAcc, tableAcc) sc =
+          let (diags, table') = shadowingInBlock mkDiag tableAcc scopes (scBody sc)
+          in (diagsAcc <> diags, table')
+
+    diagIfShadow mkDiag scopes ident name
       | isIgnored name = []
       | otherwise =
           let outers = drop 1 scopes
-          in if any (Set.member name) outers then [mkDiag name] else []
+          in if any (IntSet.member ident) outers then [mkDiag name] else []
 
-    addToCurrent name scopes =
+    addToCurrent ident scopes =
       case scopes of
-        [] -> [Set.singleton name]
-        current : rest -> Set.insert name current : rest
+        [] -> [IntSet.singleton ident]
+        current : rest -> IntSet.insert ident current : rest
 
-    pushScope scopes = Set.empty : scopes
+    pushScope scopes = IntSet.empty : scopes
 
     isIgnored name = T.isPrefixOf "_" name
 
@@ -3467,10 +4119,7 @@ validateFunction ctx constIndex fnIndex structIndex skipConstEval scope fn = do
   mapM_ (validateType ctx scope) (maybeToList (fnReturnType fn))
   let paramNames = map paramName (fnParams fn)
   ensureNoDuplicates "function parameters" paramNames
-  let scope1 =
-        scope
-          { scScopes = [Set.fromList paramNames]
-          }
+  let scope1 = scopeWithParams scope paramNames
   validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 (fnBody fn)
 
 validateEntryPoint :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> EntryPoint -> Either CompileError ()
@@ -3479,10 +4128,7 @@ validateEntryPoint ctx constIndex fnIndex structIndex skipConstEval scope entry 
   mapM_ (validateType ctx scope) (maybeToList (epReturnType entry))
   let paramNames = map paramName (epParams entry)
   ensureNoDuplicates "entry point parameters" paramNames
-  let scope1 =
-        scope
-          { scScopes = [Set.fromList paramNames]
-          }
+  let scope1 = scopeWithParams scope paramNames
   validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 (epBody entry)
 
 validateStmtList :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> [Stmt] -> Either CompileError ()
@@ -3789,7 +4435,7 @@ resolveStructDecl ctx structIndex name =
                 Just decl -> Right decl
                 Nothing -> Left (CompileError ("unknown struct: " <> textToString item) Nothing Nothing)
   where
-    lookupStruct path item = Map.lookup path structIndex >>= Map.lookup item
+    lookupStruct path item = lookupStructIndex structIndex path item
 
 evalConstValueWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Expr -> Either CompileError ConstValue
 evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr = go seenConsts seenFns expr
@@ -3808,7 +4454,7 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns 
               let key = T.intercalate "::" (path <> [ident])
               when (Set.member key seen) $
                 Left (CompileError "cycle detected while evaluating constant expression" Nothing Nothing)
-              let entry = Map.lookup path constIndex >>= Map.lookup ident
+              let entry = lookupConstIndex constIndex path ident
               case entry of
                 Nothing -> Left (CompileError ("unknown constant: " <> textToString ident) Nothing Nothing)
                 Just expr' -> evalConstValueWithEnv ctx constIndex fnIndex structIndex env (Set.insert key seen) fnSeen expr'
@@ -3987,7 +4633,7 @@ evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seenConsts seen
   let key = T.intercalate "::" (path <> [ident])
   when (Set.member key seenFns) $
     Left (CompileError "cycle detected while evaluating const function" Nothing Nothing)
-  decls <- case Map.lookup path fnIndex >>= Map.lookup ident of
+  decls <- case lookupFunctionIndex fnIndex path ident of
     Nothing -> Left (CompileError ("unknown function: " <> textToString ident) Nothing Nothing)
     Just ds -> Right ds
   argVals <- mapM (evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns) args
@@ -4477,7 +5123,7 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFn
               let key = T.intercalate "::" (path <> [ident])
               when (Set.member key seen) $
                 Left (CompileError "cycle detected while evaluating constant selector" Nothing Nothing)
-              let entry = Map.lookup path constIndex >>= Map.lookup ident
+              let entry = lookupConstIndex constIndex path ident
               case entry of
                 Nothing -> Left (CompileError ("unknown constant: " <> textToString ident) Nothing Nothing)
                 Just expr' -> evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env (Set.insert key seen) fnSeen expr'
@@ -4647,7 +5293,7 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seen
               let key = T.intercalate "::" (path <> [ident])
               when (Set.member key seen) $
                 Left (CompileError "cycle detected while evaluating const float expression" Nothing Nothing)
-              let entry = Map.lookup path constIndex >>= Map.lookup ident
+              let entry = lookupConstIndex constIndex path ident
               case entry of
                 Nothing -> Left (CompileError ("unknown constant: " <> textToString ident) Nothing Nothing)
                 Just expr' -> evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env (Set.insert key seen) fnSeen expr'
@@ -4717,7 +5363,7 @@ evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenF
               let key = T.intercalate "::" (path <> [ident])
               when (Set.member key seen) $
                 Left (CompileError "cycle detected while evaluating const_assert" Nothing Nothing)
-              let entry = Map.lookup path constIndex >>= Map.lookup ident
+              let entry = lookupConstIndex constIndex path ident
               case entry of
                 Nothing -> Left (CompileError ("unknown constant: " <> textToString ident) Nothing Nothing)
                 Just expr' -> evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env (Set.insert key seen) fnSeen expr'
@@ -4875,9 +5521,9 @@ validateType :: ModuleContext -> Scope -> Type -> Either CompileError ()
 validateType ctx scope ty =
   case ty of
     TyStructRef name ->
-      if Set.member name (scTypeAliases scope)
-        then Right ()
-        else validateName ctx scope name
+      case lookupNameId scope name of
+        Just sid | IntSet.member sid (scTypeAliases scope) -> Right ()
+        _ -> validateName ctx scope name
     TyArray elemTy _ -> validateType ctx scope elemTy
     TyVector _ _ -> Right ()
     TyMatrix _ _ _ -> Right ()
@@ -4910,49 +5556,62 @@ validateName _ scope name =
     [] -> Right ()
     [single] ->
       if isBuiltinName single
-        || Set.member single (scopeLocals scope)
-        || Set.member single (scGlobals scope)
-        || Set.member single (scItemAliases scope)
         then Right ()
-        else Left (CompileError ("unknown identifier: " <> textToString single) Nothing Nothing)
+        else
+          case lookupNameId scope single of
+            Just sid
+              | IntSet.member sid (scopeLocals scope)
+                  || IntSet.member sid (scGlobals scope)
+                  || IntSet.member sid (scItemAliases scope) -> Right ()
+            _ -> Left (CompileError ("unknown identifier: " <> textToString single) Nothing Nothing)
     seg0 : _ ->
-      if Set.member seg0 (scModuleAliases scope)
-        then Right ()
-        else Left (CompileError ("unknown module alias: " <> textToString seg0) Nothing Nothing)
+      case lookupNameId scope seg0 of
+        Just sid | IntSet.member sid (scModuleAliases scope) -> Right ()
+        _ -> Left (CompileError ("unknown module alias: " <> textToString seg0) Nothing Nothing)
 
-scopeLocals :: Scope -> Set.Set Text
-scopeLocals scope = foldl' Set.union Set.empty (scScopes scope)
+lookupNameId :: Scope -> Text -> Maybe Int
+lookupNameId scope name = Map.lookup name (ntMap (scNameTable scope))
 
-currentScope :: Scope -> Set.Set Text
+scopeLocals :: Scope -> IntSet.IntSet
+scopeLocals scope = foldl' IntSet.union IntSet.empty (scScopes scope)
+
+currentScope :: Scope -> IntSet.IntSet
 currentScope scope =
   case scScopes scope of
-    [] -> Set.empty
+    [] -> IntSet.empty
     s : _ -> s
 
 scopeAdd :: Scope -> Text -> Either CompileError Scope
 scopeAdd scope name =
-  if Set.member name (currentScope scope)
-    then Left (CompileError ("duplicate local declaration: " <> textToString name) Nothing Nothing)
-    else
-      if not (scAllowShadowing scope)
-        && not (T.isPrefixOf "_" name)
-        && Set.member name (scopeOuterLocals scope)
-        then Left (CompileError ("shadowing is not allowed: " <> textToString name) Nothing Nothing)
-        else
-          case scScopes scope of
-            [] ->
-              Right scope { scScopes = [Set.singleton name] }
-            current : rest ->
-              Right scope { scScopes = Set.insert name current : rest }
+  let (nameId, table') = internName name (scNameTable scope)
+      scope' = scope { scNameTable = table' }
+  in if IntSet.member nameId (currentScope scope')
+      then Left (CompileError ("duplicate local declaration: " <> textToString name) Nothing Nothing)
+      else
+        if not (scAllowShadowing scope')
+          && not (T.isPrefixOf "_" name)
+          && IntSet.member nameId (scopeOuterLocals scope')
+          then Left (CompileError ("shadowing is not allowed: " <> textToString name) Nothing Nothing)
+          else
+            case scScopes scope' of
+              [] ->
+                Right scope' { scScopes = [IntSet.singleton nameId] }
+              current : rest ->
+                Right scope' { scScopes = IntSet.insert nameId current : rest }
 
-scopeOuterLocals :: Scope -> Set.Set Text
+scopeOuterLocals :: Scope -> IntSet.IntSet
 scopeOuterLocals scope =
   case scScopes scope of
-    [] -> Set.empty
-    _ : rest -> foldl' Set.union Set.empty rest
+    [] -> IntSet.empty
+    _ : rest -> foldl' IntSet.union IntSet.empty rest
 
 enterBlock :: Scope -> Scope
-enterBlock scope = scope { scScopes = Set.empty : scScopes scope }
+enterBlock scope = scope { scScopes = IntSet.empty : scScopes scope }
+
+scopeWithParams :: Scope -> [Text] -> Scope
+scopeWithParams scope names =
+  let (table', ids) = internNames (scNameTable scope) names
+  in scope { scNameTable = table', scScopes = [IntSet.fromList ids] }
 
 ensureNoDuplicates :: Text -> [Text] -> Either CompileError ()
 ensureNoDuplicates label names =
