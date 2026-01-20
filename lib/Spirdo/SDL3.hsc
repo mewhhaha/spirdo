@@ -8,10 +8,15 @@ module Spirdo.SDL3
   , SDL_Texture
   , SDL_GPUDevice
   , SDL_GPUShader
+  , SDL_GPUSampler
   , SDL_GPUGraphicsPipeline
   , SDL_GPUCommandBuffer
   , SDL_GPURenderPass
   , SDL_GPUTexture
+  , SDL_GPUTextureFormat
+  , SDL_GPUTextureCreateInfo(..)
+  , SDL_GPUSamplerCreateInfo(..)
+  , SDL_GPUTextureSamplerBinding(..)
   , SDL_GPURenderState
   , SDL_GPUShaderStage
   , SDL_FColor(..)
@@ -54,12 +59,17 @@ module Spirdo.SDL3
   , sdlGetGPUSwapchainTextureFormat
   , sdlCreateGPUShader
   , sdlReleaseGPUShader
+  , sdlCreateGPUTexture
+  , sdlReleaseGPUTexture
+  , sdlCreateGPUSampler
+  , sdlReleaseGPUSampler
   , sdlCreateGPUGraphicsPipeline
   , sdlReleaseGPUGraphicsPipeline
   , sdlAcquireGPUCommandBuffer
   , sdlWaitAndAcquireGPUSwapchainTexture
   , sdlBeginGPURenderPass
   , sdlBindGPUGraphicsPipeline
+  , sdlBindGPUFragmentSamplers
   , sdlSetGPUViewport
   , sdlPushGPUFragmentUniformData
   , sdlDrawGPUPrimitives
@@ -85,6 +95,14 @@ module Spirdo.SDL3
   , sdl_GPU_COMPAREOP_ALWAYS
   , sdl_GPU_LOADOP_CLEAR
   , sdl_GPU_STOREOP_STORE
+  , sdl_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT
+  , sdl_GPU_TEXTUREUSAGE_SAMPLER
+  , sdl_GPU_TEXTUREUSAGE_COLOR_TARGET
+  , sdl_GPU_TEXTURETYPE_2D
+  , sdl_GPU_FILTER_NEAREST
+  , sdl_GPU_FILTER_LINEAR
+  , sdl_GPU_SAMPLERMIPMAPMODE_NEAREST
+  , sdl_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE
   ) where
 
 #include <SDL3/SDL.h>
@@ -109,6 +127,8 @@ data SDL_Texture
 data SDL_GPUDevice
 
 data SDL_GPUShader
+
+data SDL_GPUSampler
 
 data SDL_GPUGraphicsPipeline
 
@@ -185,6 +205,30 @@ sdl_GPU_LOADOP_CLEAR = fromIntegral (#{const SDL_GPU_LOADOP_CLEAR} :: CInt)
 
 sdl_GPU_STOREOP_STORE :: SDL_GPUStoreOp
 sdl_GPU_STOREOP_STORE = fromIntegral (#{const SDL_GPU_STOREOP_STORE} :: CInt)
+
+sdl_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT :: SDL_GPUTextureFormat
+sdl_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT = #{const SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT}
+
+sdl_GPU_TEXTUREUSAGE_SAMPLER :: SDL_GPUTextureUsageFlags
+sdl_GPU_TEXTUREUSAGE_SAMPLER = #{const SDL_GPU_TEXTUREUSAGE_SAMPLER}
+
+sdl_GPU_TEXTUREUSAGE_COLOR_TARGET :: SDL_GPUTextureUsageFlags
+sdl_GPU_TEXTUREUSAGE_COLOR_TARGET = #{const SDL_GPU_TEXTUREUSAGE_COLOR_TARGET}
+
+sdl_GPU_TEXTURETYPE_2D :: SDL_GPUTextureType
+sdl_GPU_TEXTURETYPE_2D = fromIntegral (#{const SDL_GPU_TEXTURETYPE_2D} :: CInt)
+
+sdl_GPU_FILTER_NEAREST :: SDL_GPUFilter
+sdl_GPU_FILTER_NEAREST = fromIntegral (#{const SDL_GPU_FILTER_NEAREST} :: CInt)
+
+sdl_GPU_FILTER_LINEAR :: SDL_GPUFilter
+sdl_GPU_FILTER_LINEAR = fromIntegral (#{const SDL_GPU_FILTER_LINEAR} :: CInt)
+
+sdl_GPU_SAMPLERMIPMAPMODE_NEAREST :: SDL_GPUSamplerMipmapMode
+sdl_GPU_SAMPLERMIPMAPMODE_NEAREST = fromIntegral (#{const SDL_GPU_SAMPLERMIPMAPMODE_NEAREST} :: CInt)
+
+sdl_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE :: SDL_GPUSamplerAddressMode
+sdl_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE = fromIntegral (#{const SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE} :: CInt)
 
 -- Structs
 
@@ -286,6 +330,12 @@ instance Storable SDL_GPUColorTargetBlendState where
 
 
 type SDL_GPUTextureFormat = #{type SDL_GPUTextureFormat}
+
+type SDL_GPUTextureType = #{type SDL_GPUTextureType}
+type SDL_GPUTextureUsageFlags = #{type SDL_GPUTextureUsageFlags}
+type SDL_GPUFilter = #{type SDL_GPUFilter}
+type SDL_GPUSamplerMipmapMode = #{type SDL_GPUSamplerMipmapMode}
+type SDL_GPUSamplerAddressMode = #{type SDL_GPUSamplerAddressMode}
 type SDL_GPULoadOp = #{type SDL_GPULoadOp}
 type SDL_GPUStoreOp = #{type SDL_GPUStoreOp}
 
@@ -303,6 +353,117 @@ instance Storable SDL_GPUColorTargetDescription where
   peek ptr = SDL_GPUColorTargetDescription
     <$> peekByteOff ptr #{offset SDL_GPUColorTargetDescription, format}
     <*> peekByteOff ptr #{offset SDL_GPUColorTargetDescription, blend_state}
+
+
+data SDL_GPUTextureCreateInfo = SDL_GPUTextureCreateInfo
+  { texType :: SDL_GPUTextureType
+  , texFormat :: SDL_GPUTextureFormat
+  , texUsage :: SDL_GPUTextureUsageFlags
+  , texWidth :: Word32
+  , texHeight :: Word32
+  , texLayerCountOrDepth :: Word32
+  , texNumLevels :: Word32
+  , texSampleCount :: SDL_GPUSampleCount
+  , texProps :: Word32
+  } deriving (Eq, Show)
+
+instance Storable SDL_GPUTextureCreateInfo where
+  sizeOf _ = #{size SDL_GPUTextureCreateInfo}
+  alignment _ = #{alignment SDL_GPUTextureCreateInfo}
+  poke ptr SDL_GPUTextureCreateInfo{..} = do
+    pokeByteOff ptr #{offset SDL_GPUTextureCreateInfo, type} texType
+    pokeByteOff ptr #{offset SDL_GPUTextureCreateInfo, format} texFormat
+    pokeByteOff ptr #{offset SDL_GPUTextureCreateInfo, usage} texUsage
+    pokeByteOff ptr #{offset SDL_GPUTextureCreateInfo, width} texWidth
+    pokeByteOff ptr #{offset SDL_GPUTextureCreateInfo, height} texHeight
+    pokeByteOff ptr #{offset SDL_GPUTextureCreateInfo, layer_count_or_depth} texLayerCountOrDepth
+    pokeByteOff ptr #{offset SDL_GPUTextureCreateInfo, num_levels} texNumLevels
+    pokeByteOff ptr #{offset SDL_GPUTextureCreateInfo, sample_count} texSampleCount
+    pokeByteOff ptr #{offset SDL_GPUTextureCreateInfo, props} texProps
+  peek ptr = SDL_GPUTextureCreateInfo
+    <$> peekByteOff ptr #{offset SDL_GPUTextureCreateInfo, type}
+    <*> peekByteOff ptr #{offset SDL_GPUTextureCreateInfo, format}
+    <*> peekByteOff ptr #{offset SDL_GPUTextureCreateInfo, usage}
+    <*> peekByteOff ptr #{offset SDL_GPUTextureCreateInfo, width}
+    <*> peekByteOff ptr #{offset SDL_GPUTextureCreateInfo, height}
+    <*> peekByteOff ptr #{offset SDL_GPUTextureCreateInfo, layer_count_or_depth}
+    <*> peekByteOff ptr #{offset SDL_GPUTextureCreateInfo, num_levels}
+    <*> peekByteOff ptr #{offset SDL_GPUTextureCreateInfo, sample_count}
+    <*> peekByteOff ptr #{offset SDL_GPUTextureCreateInfo, props}
+
+
+data SDL_GPUSamplerCreateInfo = SDL_GPUSamplerCreateInfo
+  { sampMinFilter :: SDL_GPUFilter
+  , sampMagFilter :: SDL_GPUFilter
+  , sampMipmapMode :: SDL_GPUSamplerMipmapMode
+  , sampAddressModeU :: SDL_GPUSamplerAddressMode
+  , sampAddressModeV :: SDL_GPUSamplerAddressMode
+  , sampAddressModeW :: SDL_GPUSamplerAddressMode
+  , sampMipLodBias :: CFloat
+  , sampMaxAnisotropy :: CFloat
+  , sampCompareOp :: SDL_GPUCompareOp
+  , sampMinLod :: CFloat
+  , sampMaxLod :: CFloat
+  , sampEnableAnisotropy :: CBool
+  , sampEnableCompare :: CBool
+  , sampPadding1 :: Word8
+  , sampPadding2 :: Word8
+  , sampProps :: Word32
+  } deriving (Eq, Show)
+
+instance Storable SDL_GPUSamplerCreateInfo where
+  sizeOf _ = #{size SDL_GPUSamplerCreateInfo}
+  alignment _ = #{alignment SDL_GPUSamplerCreateInfo}
+  poke ptr SDL_GPUSamplerCreateInfo{..} = do
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, min_filter} sampMinFilter
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, mag_filter} sampMagFilter
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, mipmap_mode} sampMipmapMode
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, address_mode_u} sampAddressModeU
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, address_mode_v} sampAddressModeV
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, address_mode_w} sampAddressModeW
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, mip_lod_bias} sampMipLodBias
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, max_anisotropy} sampMaxAnisotropy
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, compare_op} sampCompareOp
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, min_lod} sampMinLod
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, max_lod} sampMaxLod
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, enable_anisotropy} sampEnableAnisotropy
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, enable_compare} sampEnableCompare
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, padding1} sampPadding1
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, padding2} sampPadding2
+    pokeByteOff ptr #{offset SDL_GPUSamplerCreateInfo, props} sampProps
+  peek ptr = SDL_GPUSamplerCreateInfo
+    <$> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, min_filter}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, mag_filter}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, mipmap_mode}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, address_mode_u}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, address_mode_v}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, address_mode_w}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, mip_lod_bias}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, max_anisotropy}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, compare_op}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, min_lod}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, max_lod}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, enable_anisotropy}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, enable_compare}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, padding1}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, padding2}
+    <*> peekByteOff ptr #{offset SDL_GPUSamplerCreateInfo, props}
+
+
+data SDL_GPUTextureSamplerBinding = SDL_GPUTextureSamplerBinding
+  { tsTexture :: Ptr SDL_GPUTexture
+  , tsSampler :: Ptr SDL_GPUSampler
+  } deriving (Eq, Show)
+
+instance Storable SDL_GPUTextureSamplerBinding where
+  sizeOf _ = #{size SDL_GPUTextureSamplerBinding}
+  alignment _ = #{alignment SDL_GPUTextureSamplerBinding}
+  poke ptr SDL_GPUTextureSamplerBinding{..} = do
+    pokeByteOff ptr #{offset SDL_GPUTextureSamplerBinding, texture} tsTexture
+    pokeByteOff ptr #{offset SDL_GPUTextureSamplerBinding, sampler} tsSampler
+  peek ptr = SDL_GPUTextureSamplerBinding
+    <$> peekByteOff ptr #{offset SDL_GPUTextureSamplerBinding, texture}
+    <*> peekByteOff ptr #{offset SDL_GPUTextureSamplerBinding, sampler}
 
 
 type SDL_GPUFillMode = #{type SDL_GPUFillMode}
@@ -694,6 +855,10 @@ foreign import ccall "SDL_GetGPUSwapchainTextureFormat" sdlGetGPUSwapchainTextur
 
 foreign import ccall "SDL_CreateGPUShader" sdlCreateGPUShader :: Ptr SDL_GPUDevice -> Ptr SDL_GPUShaderCreateInfo -> IO (Ptr SDL_GPUShader)
 foreign import ccall "SDL_ReleaseGPUShader" sdlReleaseGPUShader :: Ptr SDL_GPUDevice -> Ptr SDL_GPUShader -> IO ()
+foreign import ccall "SDL_CreateGPUTexture" sdlCreateGPUTexture :: Ptr SDL_GPUDevice -> Ptr SDL_GPUTextureCreateInfo -> IO (Ptr SDL_GPUTexture)
+foreign import ccall "SDL_ReleaseGPUTexture" sdlReleaseGPUTexture :: Ptr SDL_GPUDevice -> Ptr SDL_GPUTexture -> IO ()
+foreign import ccall "SDL_CreateGPUSampler" sdlCreateGPUSampler :: Ptr SDL_GPUDevice -> Ptr SDL_GPUSamplerCreateInfo -> IO (Ptr SDL_GPUSampler)
+foreign import ccall "SDL_ReleaseGPUSampler" sdlReleaseGPUSampler :: Ptr SDL_GPUDevice -> Ptr SDL_GPUSampler -> IO ()
 foreign import ccall "SDL_CreateGPUGraphicsPipeline" sdlCreateGPUGraphicsPipeline :: Ptr SDL_GPUDevice -> Ptr SDL_GPUGraphicsPipelineCreateInfo -> IO (Ptr SDL_GPUGraphicsPipeline)
 foreign import ccall "SDL_ReleaseGPUGraphicsPipeline" sdlReleaseGPUGraphicsPipeline :: Ptr SDL_GPUDevice -> Ptr SDL_GPUGraphicsPipeline -> IO ()
 
@@ -701,6 +866,7 @@ foreign import ccall "SDL_AcquireGPUCommandBuffer" sdlAcquireGPUCommandBuffer ::
 foreign import ccall "SDL_WaitAndAcquireGPUSwapchainTexture" sdlWaitAndAcquireGPUSwapchainTexture :: Ptr SDL_GPUCommandBuffer -> Ptr SDL_Window -> Ptr (Ptr SDL_GPUTexture) -> Ptr Word32 -> Ptr Word32 -> IO CBool
 foreign import ccall "SDL_BeginGPURenderPass" sdlBeginGPURenderPass :: Ptr SDL_GPUCommandBuffer -> Ptr SDL_GPUColorTargetInfo -> Word32 -> Ptr () -> IO (Ptr SDL_GPURenderPass)
 foreign import ccall "SDL_BindGPUGraphicsPipeline" sdlBindGPUGraphicsPipeline :: Ptr SDL_GPURenderPass -> Ptr SDL_GPUGraphicsPipeline -> IO ()
+foreign import ccall "SDL_BindGPUFragmentSamplers" sdlBindGPUFragmentSamplers :: Ptr SDL_GPURenderPass -> Word32 -> Ptr SDL_GPUTextureSamplerBinding -> Word32 -> IO ()
 foreign import ccall "SDL_SetGPUViewport" sdlSetGPUViewport :: Ptr SDL_GPURenderPass -> Ptr SDL_GPUViewport -> IO ()
 foreign import ccall "SDL_PushGPUFragmentUniformData" sdlPushGPUFragmentUniformData :: Ptr SDL_GPUCommandBuffer -> Word32 -> Ptr () -> Word32 -> IO ()
 foreign import ccall "SDL_DrawGPUPrimitives" sdlDrawGPUPrimitives :: Ptr SDL_GPURenderPass -> Word32 -> Word32 -> Word32 -> Word32 -> IO ()

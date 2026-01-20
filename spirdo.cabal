@@ -41,7 +41,11 @@ library
 executable spirdo
     import:           warnings
     main-is:          Main.hs
-    -- other-modules:
+    other-modules:
+        Examples.Compute
+        Examples.Fragments
+        Examples.Override
+        Examples.Vertex
     -- other-extensions:
     build-depends:
         base ^>=4.21.0.0,
