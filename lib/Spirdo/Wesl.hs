@@ -1431,7 +1431,7 @@ compileWeslToSpirvBytesWithDiagnostics opts src = do
   pure (bytes, diags)
 
 weslCacheVersion :: String
-weslCacheVersion = "wesl-cache-v1"
+weslCacheVersion = "wesl-cache-v3"
 
 weslCacheDir :: FilePath
 weslCacheDir = "dist-newstyle" </> ".wesl-cache"
@@ -7200,50 +7200,33 @@ emitConstExpr st expr =
           let layout = TLScalar I32 a sz
           Right (st2, Value layout cid)
         TLScalar U32 _ _ -> Left (CompileError "unary minus is not supported for u32 constants" Nothing Nothing)
-        _ -> Left (CompileError "unary minus expects an integer constant" Nothing Nothing)
+        TLScalar F32 _ _ -> do
+          key <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st1 (valId val))
+          v <- constKeyToFloat key
+          let (cid, st2) = emitConstF32 st1 (negate v)
+          let (a, sz) = scalarLayout F32
+          let layout = TLScalar F32 a sz
+          Right (st2, Value layout cid)
+        TLScalar F16 _ _ -> do
+          key <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st1 (valId val))
+          v <- constKeyToFloat key
+          let (cid, st2) = emitConstF16 st1 (negate v)
+          let (a, sz) = scalarLayout F16
+          let layout = TLScalar F16 a sz
+          Right (st2, Value layout cid)
+        _ -> Left (CompileError "unary minus expects a numeric constant" Nothing Nothing)
     EBinary op a b -> do
       (st1, v1) <- emitConstExpr st a
       (st2, v2) <- emitConstExpr st1 b
       case (valType v1, valType v2) of
-        (TLScalar s1 _ _, TLScalar s2 _ _) -> do
-          key1 <- maybe (Left (CompileError "constant integer literal required" Nothing Nothing)) Right (lookupConstKeyById st2 (valId v1))
-          key2 <- maybe (Left (CompileError "constant integer literal required" Nothing Nothing)) Right (lookupConstKeyById st2 (valId v2))
-          i1 <- constKeyToInt key1
-          i2 <- constKeyToInt key2
-          let (scalar, x, y) = coerceConstPair s1 i1 s2 i2
-          out <- case op of
-            OpAdd -> pure (x + y)
-            OpSub -> pure (x - y)
-            OpMul -> pure (x * y)
-            OpDiv ->
-              if y == 0 then Left (CompileError "division by zero in constant expression" Nothing Nothing) else pure (x `quot` y)
-            OpMod ->
-              if y == 0 then Left (CompileError "modulo by zero in constant expression" Nothing Nothing) else pure (x `rem` y)
-            OpBitAnd -> pure (x .&. y)
-            OpBitOr -> pure (x .|. y)
-            OpBitXor -> pure (xor x y)
-            OpShl ->
-              if y < 0 then Left (CompileError "shift amount must be non-negative" Nothing Nothing) else pure (shiftL x (fromIntegral y))
-            OpShr ->
-              if y < 0 then Left (CompileError "shift amount must be non-negative" Nothing Nothing) else pure (shiftR x (fromIntegral y))
-            _ -> Left (CompileError "unsupported constant integer operation" Nothing Nothing)
-          case scalar of
-            I32 -> do
-              let out' = out
-              when (out' < 0 || out' > 0x7FFFFFFF) $
-                Left (CompileError "constant i32 is out of range" Nothing Nothing)
-              (cid, st3) <- emitConstIntScalar I32 out' st2
-              let (a', sz') = scalarLayout I32
-              Right (st3, Value (TLScalar I32 a' sz') cid)
-            U32 -> do
-              let out' = out
-              when (out' < 0 || out' > fromIntegral (maxBound :: Word32)) $
-                Left (CompileError "constant u32 is out of range" Nothing Nothing)
-              (cid, st3) <- emitConstIntScalar U32 out' st2
-              let (a', sz') = scalarLayout U32
-              Right (st3, Value (TLScalar U32 a' sz') cid)
-            _ -> Left (CompileError "unsupported constant integer operation" Nothing Nothing)
-        _ -> Left (CompileError "constant integer operation expects scalar ints" Nothing Nothing)
+        (TLScalar s1 _ _, TLScalar s2 _ _) ->
+          case (s1, s2) of
+            (F32, F32) -> emitFloatBin op F32 st2 v1 v2
+            (F16, F16) -> emitFloatBin op F16 st2 v1 v2
+            (F32, F16) -> emitFloatBin op F32 st2 v1 v2
+            (F16, F32) -> emitFloatBin op F32 st2 v1 v2
+            _ -> emitIntBin op s1 s2 st2 v1 v2
+        _ -> Left (CompileError "constant operation expects scalar values" Nothing Nothing)
     EVar name ->
       case lookup name (gsConstValues st) of
         Just val -> Right (st, val)
@@ -7267,6 +7250,66 @@ emitConstExpr st expr =
                 Nothing -> Left (CompileError ("unsupported constant constructor: " <> textToString name) Nothing Nothing)
     _ -> Left (CompileError "unsupported constant expression" Nothing Nothing)
   where
+    emitFloatBin op' target st' v1 v2 = do
+      key1 <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st' (valId v1))
+      key2 <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st' (valId v2))
+      x <- constKeyToFloat key1
+      y <- constKeyToFloat key2
+      out <- case op' of
+        OpAdd -> pure (x + y)
+        OpSub -> pure (x - y)
+        OpMul -> pure (x * y)
+        OpDiv ->
+          if y == 0 then Left (CompileError "division by zero in constant expression" Nothing Nothing) else pure (x / y)
+        _ -> Left (CompileError "unsupported constant float operation" Nothing Nothing)
+      case target of
+        F32 -> do
+          let (cid, st3) = emitConstF32 st' out
+          let (a, sz) = scalarLayout F32
+          Right (st3, Value (TLScalar F32 a sz) cid)
+        F16 -> do
+          let (cid, st3) = emitConstF16 st' out
+          let (a, sz) = scalarLayout F16
+          Right (st3, Value (TLScalar F16 a sz) cid)
+        _ -> Left (CompileError "unsupported constant float operation" Nothing Nothing)
+    emitIntBin op' s1 s2 st' v1 v2 = do
+      key1 <- maybe (Left (CompileError "constant integer literal required" Nothing Nothing)) Right (lookupConstKeyById st' (valId v1))
+      key2 <- maybe (Left (CompileError "constant integer literal required" Nothing Nothing)) Right (lookupConstKeyById st' (valId v2))
+      i1 <- constKeyToInt key1
+      i2 <- constKeyToInt key2
+      let (scalar, x, y) = coerceConstPair s1 i1 s2 i2
+      out <- case op' of
+        OpAdd -> pure (x + y)
+        OpSub -> pure (x - y)
+        OpMul -> pure (x * y)
+        OpDiv ->
+          if y == 0 then Left (CompileError "division by zero in constant expression" Nothing Nothing) else pure (x `quot` y)
+        OpMod ->
+          if y == 0 then Left (CompileError "modulo by zero in constant expression" Nothing Nothing) else pure (x `rem` y)
+        OpBitAnd -> pure (x .&. y)
+        OpBitOr -> pure (x .|. y)
+        OpBitXor -> pure (xor x y)
+        OpShl ->
+          if y < 0 then Left (CompileError "shift amount must be non-negative" Nothing Nothing) else pure (shiftL x (fromIntegral y))
+        OpShr ->
+          if y < 0 then Left (CompileError "shift amount must be non-negative" Nothing Nothing) else pure (shiftR x (fromIntegral y))
+        _ -> Left (CompileError "unsupported constant integer operation" Nothing Nothing)
+      case scalar of
+        I32 -> do
+          let out' = out
+          when (out' < 0 || out' > 0x7FFFFFFF) $
+            Left (CompileError "constant i32 is out of range" Nothing Nothing)
+          (cid, st3) <- emitConstIntScalar I32 out' st'
+          let (a', sz') = scalarLayout I32
+          Right (st3, Value (TLScalar I32 a' sz') cid)
+        U32 -> do
+          let out' = out
+          when (out' < 0 || out' > fromIntegral (maxBound :: Word32)) $
+            Left (CompileError "constant u32 is out of range" Nothing Nothing)
+          (cid, st3) <- emitConstIntScalar U32 out' st'
+          let (a', sz') = scalarLayout U32
+          Right (st3, Value (TLScalar U32 a' sz') cid)
+        _ -> Left (CompileError "unsupported constant integer operation" Nothing Nothing)
     constKeyToInt key =
       case key of
         ConstI32 v -> Right (fromIntegral (fromIntegral v :: Int32))
@@ -8281,6 +8324,15 @@ opUMod = 137
 
 opSRem :: Word16
 opSRem = 138
+
+opVectorTimesMatrix :: Word16
+opVectorTimesMatrix = 144
+
+opMatrixTimesVector :: Word16
+opMatrixTimesVector = 145
+
+opMatrixTimesMatrix :: Word16
+opMatrixTimesMatrix = 146
 
 opDot :: Word16
 opDot = 148
@@ -9484,10 +9536,14 @@ emitMainFunction entry env entryInits outTargets st0 = do
   let fs0 = FuncState [] [] env [] False [] []
   (st6, fs1) <- emitEntryParamInits entryInits st5 fs0
   (st7, fs2) <- emitStatements entry outTargets st6 fs1
+  let tailInstrs =
+        if fsTerminated fs2
+          then [Instr opFunctionEnd []]
+          else [Instr opReturn [], Instr opFunctionEnd []]
   let funcInstrs =
         [ Instr opFunction [voidTy, fnId, functionControlNone, fnTy]
         , Instr opLabel [labelId]
-        ] <> fsLocals fs2 <> fsInstrs fs2 <> [Instr opReturn [], Instr opFunctionEnd []]
+        ] <> fsLocals fs2 <> fsInstrs fs2 <> tailInstrs
   let st8 = addFunctions funcInstrs st7
   let st9 = st8 { gsEntryPoint = Just fnId }
   pure st9
@@ -10068,7 +10124,9 @@ emitStmt entry outTargets st fs stmt
           case epStage entry of
             StageCompute ->
               case mexpr of
-                Nothing -> Right (st, fs { fsTerminated = True })
+                Nothing ->
+                  let fs1 = addTerminator (Instr opReturn []) fs
+                  in Right (st, fs1)
                 Just _ -> Left (CompileError "compute entry points cannot return a value" Nothing Nothing)
             StageFragment -> do
               expr <- case mexpr of
@@ -10076,14 +10134,16 @@ emitStmt entry outTargets st fs stmt
                 Just e -> Right e
               (st1, fs1, val) <- emitExpr st fs expr
               (st2, fs2) <- storeReturnValue outTargets (valType val) (valId val) st1 fs1
-              Right (st2, fs2 { fsTerminated = True })
+              let fs3 = addTerminator (Instr opReturn []) fs2
+              Right (st2, fs3)
             StageVertex -> do
               expr <- case mexpr of
                 Nothing -> Left (CompileError "vertex entry points must return a value" Nothing Nothing)
                 Just e -> Right e
               (st1, fs1, val) <- emitExpr st fs expr
               (st2, fs2) <- storeReturnValue outTargets (valType val) (valId val) st1 fs1
-              Right (st2, fs2 { fsTerminated = True })
+              let fs3 = addTerminator (Instr opReturn []) fs2
+              Right (st2, fs3)
 
 emitExprStmt :: GenState -> FuncState -> Expr -> Either CompileError (GenState, FuncState)
 emitExprStmt st fs expr =
@@ -10435,8 +10495,44 @@ emitExpr st fs expr =
     EBinary op lhs rhs -> do
       (st1, fs1, lval) <- emitExpr st fs lhs
       (st2, fs2, rval) <- emitExpr st1 fs1 rhs
-      (st3, fs3, lval', rval', layout) <- coerceBinaryOperands lval rval st2 fs2
-      emitBinary op layout (valId lval') (valId rval') st3 fs3
+      case op of
+        OpMul ->
+          case (valType lval, valType rval) of
+            (TLMatrix cols rows scalar _ _ _, TLVector n s _ _) -> do
+              if n /= cols || s /= scalar
+                then Left (CompileError "matrix times vector dimension mismatch" Nothing Nothing)
+                else do
+                  let (a, sz) = vectorLayout scalar rows
+                  let layout = TLVector rows scalar a sz
+                  let (tyId, st3) = emitTypeFromLayout st2 layout
+                  let (resId, st4) = freshId st3
+                  let fs3 = addFuncInstr (Instr opMatrixTimesVector [tyId, resId, valId lval, valId rval]) fs2
+                  Right (st4, fs3, Value layout resId)
+            (TLVector n s _ _, TLMatrix cols rows scalar _ _ _) -> do
+              if n /= rows || s /= scalar
+                then Left (CompileError "vector times matrix dimension mismatch" Nothing Nothing)
+                else do
+                  let (a, sz) = vectorLayout scalar cols
+                  let layout = TLVector cols scalar a sz
+                  let (tyId, st3) = emitTypeFromLayout st2 layout
+                  let (resId, st4) = freshId st3
+                  let fs3 = addFuncInstr (Instr opVectorTimesMatrix [tyId, resId, valId lval, valId rval]) fs2
+                  Right (st4, fs3, Value layout resId)
+            (TLMatrix colsA rowsA scalarA _ _ _, TLMatrix colsB rowsB scalarB _ _ _) -> do
+              if colsA /= rowsB || scalarA /= scalarB
+                then Left (CompileError "matrix times matrix dimension mismatch" Nothing Nothing)
+                else do
+                  let layout = matrixLayout colsB rowsA scalarA
+                  let (tyId, st3) = emitTypeFromLayout st2 layout
+                  let (resId, st4) = freshId st3
+                  let fs3 = addFuncInstr (Instr opMatrixTimesMatrix [tyId, resId, valId lval, valId rval]) fs2
+                  Right (st4, fs3, Value layout resId)
+            _ -> do
+              (st3, fs3, lval', rval', layout) <- coerceBinaryOperands lval rval st2 fs2
+              emitBinary op layout (valId lval') (valId rval') st3 fs3
+        _ -> do
+          (st3, fs3, lval', rval', layout) <- coerceBinaryOperands lval rval st2 fs2
+          emitBinary op layout (valId lval') (valId rval') st3 fs3
     ECall name args -> emitCall name args st fs
     EBitcast targetTy inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
@@ -11869,6 +11965,24 @@ coerceBinaryOperands lval rval st fs
               (st1, fs1, lval') <- coerceValueToLayout (valType rval) lval st fs
               Right (st1, fs1, lval', rval, valType rval)
             _ -> Left (CompileError "type mismatch" Nothing Nothing)
+        (TLVector n scalar _ _, TLScalar s _ _) -> do
+          (st1, fs1, scalarVal) <-
+            if s == scalar
+              then Right (st, fs, rval)
+              else emitScalarConvert s scalar rval st fs
+          let (a, sz) = vectorLayout scalar n
+          let layout = TLVector n scalar a sz
+          (st2, fs2, rvalVec) <- emitSplatVector layout (valId scalarVal) st1 fs1
+          Right (st2, fs2, lval, rvalVec, layout)
+        (TLScalar s _ _, TLVector n scalar _ _) -> do
+          (st1, fs1, scalarVal) <-
+            if s == scalar
+              then Right (st, fs, lval)
+              else emitScalarConvert s scalar lval st fs
+          let (a, sz) = vectorLayout scalar n
+          let layout = TLVector n scalar a sz
+          (st2, fs2, lvalVec) <- emitSplatVector layout (valId scalarVal) st1 fs1
+          Right (st2, fs2, lvalVec, rval, layout)
         _ -> Left (CompileError "type mismatch" Nothing Nothing)
 
 coerceConstValueToLayout :: TypeLayout -> Value -> GenState -> Either CompileError (GenState, Value)
