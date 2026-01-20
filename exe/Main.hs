@@ -5,6 +5,7 @@ module Main (main) where
 
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as BS
+import qualified Data.Map.Strict as Map
 import Foreign
 import Foreign.C.String (withCString, peekCString)
 import Foreign.C.Types (CBool(..), CFloat)
@@ -18,6 +19,7 @@ import Spirdo.Wesl
   , CompiledShader(..)
   , CompileOptions(..)
   , ToUniform(..)
+  , V2(..)
   , V4(..)
   , uniform
   , packUniform
@@ -52,7 +54,7 @@ data VariantState = VariantState
   , vsUniformCount :: Word32
   , vsUniformSlot :: Word32
   , vsInterface :: ShaderInterface
-  , vsUniformInfo :: Maybe BindingInfo
+  , vsUniformInfos :: [BindingInfo]
   }
 
 main :: IO ()
@@ -1031,15 +1033,33 @@ renderFrame renderer variant color t mode = do
           { time_res = V4 (realToFrac t) 800 600 (fromIntegral mode)
           , color = V4 (realToFrac cr) (realToFrac cg) (realToFrac cb) (realToFrac ca)
           }
-  case vsUniformInfo variant of
-    Nothing -> pure ()
-    Just info ->
-      case packUniform (biType info) (uniform params) of
-        Left err -> error ("uniform pack failed: " <> err)
-        Right bytes ->
-          BS.useAsCStringLen bytes $ \(paramPtr, len) ->
-            sdlCheckBool "sdlSetGPURenderStateFragmentUniforms" $
-              sdlSetGPURenderStateFragmentUniforms (vsState variant) (biBinding info) (castPtr paramPtr) (fromIntegral len)
+      globals =
+        GlobalsU
+          { time = realToFrac t
+          , resolution = V2 800 600
+          , frame = fromIntegral mode
+          }
+      material =
+        MaterialU
+          { baseColor = V4 (realToFrac cr) (realToFrac cg) (realToFrac cb) 1.0
+          , roughness = 0.35
+          }
+      uniformValues =
+        Map.fromList
+          [ ("params", uniform params)
+          , ("globals", uniform globals)
+          , ("material", uniform material)
+          ]
+  forM_ (vsUniformInfos variant) $ \info ->
+    case Map.lookup (biName info) uniformValues of
+      Nothing -> error ("no uniform values provided for binding: " <> biName info)
+      Just uval ->
+        case packUniform (biType info) uval of
+          Left err -> error ("uniform pack failed: " <> err)
+          Right bytes ->
+            BS.useAsCStringLen bytes $ \(paramPtr, len) ->
+              sdlCheckBool "sdlSetGPURenderStateFragmentUniforms" $
+                sdlSetGPURenderStateFragmentUniforms (vsState variant) (biBinding info) (castPtr paramPtr) (fromIntegral len)
   sdlCheckBool "sdlSetGPURenderState" (sdlSetGPURenderState renderer (vsState variant))
 
   let positions :: [CFloat]
@@ -1216,10 +1236,11 @@ createVariantState device renderer variant = do
     (svUniformCount variant)
     (svSpirv variant)
   state <- createRenderState renderer frag
-  let uniformInfo =
-        case [info | info <- siBindings (svInterface variant), biKind info == BUniform] of
-          (info:_) -> Just info
-          [] -> Nothing
+  let uniformInfos =
+        [ info
+        | info <- siBindings (svInterface variant)
+        , biKind info == BUniform
+        ]
   pure VariantState
     { vsName = svName variant
     , vsState = state
@@ -1227,7 +1248,7 @@ createVariantState device renderer variant = do
     , vsUniformCount = svUniformCount variant
     , vsUniformSlot = svUniformSlot variant
     , vsInterface = svInterface variant
-    , vsUniformInfo = uniformInfo
+    , vsUniformInfos = uniformInfos
     }
 
 destroyVariantState :: Ptr SDL_GPUDevice -> VariantState -> IO ()
@@ -1255,3 +1276,18 @@ data ParamsU = ParamsU
   } deriving (Eq, Show, Generic)
 
 instance ToUniform ParamsU
+
+data GlobalsU = GlobalsU
+  { time :: Float
+  , resolution :: V2 Float
+  , frame :: Float
+  } deriving (Eq, Show, Generic)
+
+instance ToUniform GlobalsU
+
+data MaterialU = MaterialU
+  { baseColor :: V4 Float
+  , roughness :: Float
+  } deriving (Eq, Show, Generic)
+
+instance ToUniform MaterialU
