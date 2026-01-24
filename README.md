@@ -49,6 +49,7 @@ import Spirdo.Wesl
   , CompiledShader
   , binding
   , bindingEither
+  , bindingMaybe
   , wesl
   )
 
@@ -80,6 +81,9 @@ sampler0 = binding @"sampler0" shader
 -- Total lookup if you prefer explicit error handling:
 paramsSafe :: Either String BindingDesc
 paramsSafe = bindingEither @"params" shader
+
+paramsMaybe :: Maybe BindingDesc
+paramsMaybe = bindingMaybe @"params" shader
 ```
 
 Each `BindingDesc` includes the name, group (set), and binding index you need
