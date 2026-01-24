@@ -164,8 +164,7 @@ renderFrame renderer variant color t mode = do
           , color = V4 (realToFrac cr) (realToFrac cg) (realToFrac cb) (realToFrac ca)
           }
       info = vsParamsInfo variant
-  packed <- packUniform (biType info) (uniform params)
-  case packed of
+  case packUniform (biType info) (uniform params) of
     Left err -> error ("uniform pack failed: " <> err)
     Right bytes ->
       BS.useAsCStringLen bytes $ \(paramPtr, len) ->
@@ -294,10 +293,7 @@ mkVariant name shader =
       storageTextureCount = bindingCount (storageTextureBindingsFor shader)
       uniformCount = fragmentUniformCount shader
       uniformSlot = fragmentUniformSlot shader
-      paramsDesc =
-        case binding @"params" shader of
-          Left err -> error ("variant " <> name <> ": " <> err)
-          Right desc -> desc
+      paramsDesc = binding @"params" shader
       paramsInfo =
         case find (\info -> biName info == descName paramsDesc) (siBindings (shaderInterface shader)) of
           Nothing -> error ("variant " <> name <> ": params binding not found")

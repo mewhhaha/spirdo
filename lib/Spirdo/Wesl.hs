@@ -24,22 +24,17 @@ module Spirdo.Wesl
   , Binding(..)
   , BindingDesc(..)
   , ReflectBindings(..)
-  , Bindings(..)
-  , bindingsFor
   , HasBinding
   , binding
   , HList(..)
   , InputFor
   , InputsOf
   , inputsFor
-  , inputsForEither
   , UniformValue(..)
   , ToUniform(..)
   , uniform
   , packUniform
   , packUniformFrom
-  , validateUniformStorable
-  , packUniformStorable
   , V2(..)
   , V3(..)
   , V4(..)
@@ -47,15 +42,15 @@ module Spirdo.Wesl
   , M3(..)
   , M4(..)
   , Half(..)
+  , SamplerHandle(..)
+  , TextureHandle(..)
+  , BufferHandle(..)
+  , UniformInput(..)
+  , SamplerInput(..)
+  , TextureInput(..)
+  , StorageBufferInput(..)
+  , StorageTextureInput(..)
   , ShaderInputs(..)
-  , SDLUniform(..)
-  , SDLSampler(..)
-  , SDLTexture(..)
-  , SDLStorageBuffer(..)
-  , SDLStorageTexture(..)
-  , SDLSamplerHandle(..)
-  , SDLTextureHandle(..)
-  , SDLBufferHandle(..)
   , emptyInputs
   , samplerBindings
   , uniformBindings

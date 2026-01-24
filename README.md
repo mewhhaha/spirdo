@@ -48,9 +48,6 @@ import Spirdo.Wesl
   ( BindingDesc(..)
   , CompiledShader
   , binding
-  , samplerBindingsFor
-  , storageBufferBindingsFor
-  , uniformBindingsFor
   , wesl
   )
 
@@ -73,15 +70,6 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 }
 |]
 
-uniforms :: [BindingDesc]
-uniforms = uniformBindingsFor shader
-
-samplers :: [BindingDesc]
-samplers = samplerBindingsFor shader
-
-storageBuffers :: [BindingDesc]
-storageBuffers = storageBufferBindingsFor shader
-
 params :: BindingDesc
 params = binding @"params" shader
 
@@ -92,10 +80,13 @@ sampler0 = binding @"sampler0" shader
 Each `BindingDesc` includes the name, group (set), and binding index you need
 to create descriptor layouts or bind resources on the CPU side.
 
+Convenience filters are available: `uniformBindingsFor`, `samplerBindingsFor`,
+`storageBufferBindingsFor`, and `storageTextureBindingsFor`.
+
 ### Uniform Packing Helpers
 If you want to pack CPU-side data into a uniform buffer layout (std140-like),
 use the `TypeLayout` from the compiled interface and the helpers in
-`Spirdo.Wesl`:
+`Spirdo.Wesl`.
 
 ```hs
 {-# LANGUAGE DeriveGeneric #-}
@@ -118,37 +109,16 @@ struct Params { time: f32; };
 data Params = Params { time :: Float } deriving (Generic)
 instance ToUniform Params
 
-packed :: IO (Either String BS.ByteString)
-packed = do
-  let iface = shaderInterface shader
-  let paramsInfo = find (\b -> biName b == "params") (siBindings iface)
-  case paramsInfo of
-    Nothing -> pure (Left "missing params binding")
+packed :: Either String BS.ByteString
+packed =
+  case find (\b -> biName b == "params") (siBindings (shaderInterface shader)) of
+    Nothing -> Left "missing params binding"
     Just bi -> packUniformFrom (biType bi) (Params 1.5)
 ```
 
-If you already have a `Storable` value that matches the exact layout, you can
-use `validateUniformStorable` and `packUniformStorable`:
-
-```hs
-packedStorable :: IO (Either String BS.ByteString)
-packedStorable = do
-  let iface = shaderInterface shader
-  case find (\b -> biName b == "params") (siBindings iface) of
-    Nothing -> pure (Left "missing params binding")
-    Just bi ->
-      case biType bi of
-        TLStruct _ fields _ _ ->
-          case find (\f -> flName f == "time") fields of
-            Nothing -> pure (Left "missing time field")
-            Just f -> packUniformStorable (flType f) (1.5 :: Float)
-        _ -> pure (Left "expected struct layout")
-```
-
-### SDL-Style Input Lists (Type-Safe)
-If you want simple lists of uniforms/samplers/textures to pass into an SDL3.4
-style API without naming each binding, you can use the derived input list type
-for the shader interface.
+### Typed Input Lists (Host-Agnostic)
+You can build a typed input list for the shader interface using `HList` and
+opaque handles. This stays host‑agnostic and still enforces ordering/types.
 
 ```hs
 {-# LANGUAGE DataKinds #-}
@@ -158,62 +128,32 @@ for the shader interface.
 import Spirdo.Wesl
   ( CompiledShader
   , HList(..)
-  , M4(..)
-  , SDLSamplerHandle(..)
-  , SDLTextureHandle(..)
+  , SamplerHandle(..)
+  , TextureHandle(..)
   , ShaderInputs
   , inputsFor
   , uniform
-  , ToUniform(..)
-  , V2(..)
-  , V4(..)
   , wesl
   )
-import GHC.Generics (Generic)
 
 shader :: CompiledShader iface
 shader = [wesl|
 struct Params { time_res: vec4<f32>; };
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var sampler0: sampler;
+@group(0) @binding(1) var samp0: sampler;
 @group(0) @binding(2) var tex0: texture_2d<f32>;
 @fragment
 fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
-  let uv = vec2(frag_coord.x / 800.0, frag_coord.y / 600.0);
-  return vec4(uv.x, uv.y, 0.4, 1.0);
+  return vec4(0.0, 0.0, 0.0, 1.0);
 }
 |]
 
-data Globals = Globals
-  { time :: Float
-  , resolution :: V2 Float
-  , viewProj :: M4 Float
-  } deriving (Generic)
-
-instance ToUniform Globals
-
-data Material = Material
-  { baseColor :: V4 Float
-  , roughness :: Float
-  , metallic :: Float
-  , pad0 :: V2 Float
-  } deriving (Generic)
-
-instance ToUniform Material
-
-globals :: Globals
-globals = ...
-
-material :: Material
-material = ...
-
-inputs :: IO (Either String (ShaderInputs iface))
+inputs :: Either String (ShaderInputs iface)
 inputs =
   inputsFor shader
-    ( uniform globals
-        :& uniform material
-        :& SDLSamplerHandle 1
-        :& SDLTextureHandle 2
+    ( uniform (V4 0.0 0.0 0.0 0.0 :: V4 Float)
+        :& SamplerHandle 1
+        :& TextureHandle 2
         :& HNil
     )
 ```
@@ -222,6 +162,8 @@ inputs =
 order and kinds are enforced at compile time. The resulting `ShaderInputs` lists
 (`siUniforms`, `siSamplers`, `siTextures`, ...) are ready to hand off to your
 SDL upload/bind code.
+
+`inputsFor` is pure; handle `Either` as you prefer.
 
 Notes:
 - Record field names must match the WESL struct field names.
