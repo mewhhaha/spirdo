@@ -1,6 +1,6 @@
 # Spirdo
 
-Haskell WESL compiler + SDL3 demo app that emits SPIR-V and renders shader variants.
+Haskell WESL compiler + SDL3 demo app that renders shader variants (optional SPIR-V output).
 
 ## Build and Run
 ```sh
@@ -30,6 +30,9 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     Left err -> error (show err)
     Right compiled -> BS.writeFile "example.spv" (shaderSpirv compiled)
 ```
+
+Note: the public API is exposed from `Spirdo.Wesl`. Internal modules are not
+part of the supported surface area.
 
 ## Type-Safe Binding Reflection
 Using the quasiquoter gives you a `CompiledShader iface` where the binding
@@ -88,6 +91,59 @@ sampler0 = binding @"sampler0" shader
 
 Each `BindingDesc` includes the name, group (set), and binding index you need
 to create descriptor layouts or bind resources on the CPU side.
+
+### Uniform Packing Helpers
+If you want to pack CPU-side data into a uniform buffer layout (std140-like),
+use the `TypeLayout` from the compiled interface and the helpers in
+`Spirdo.Wesl`:
+
+```hs
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE QuasiQuotes #-}
+
+import Data.List (find)
+import qualified Data.ByteString as BS
+import GHC.Generics (Generic)
+import Spirdo.Wesl
+
+shader :: CompiledShader iface
+shader = [wesl|
+struct Params { time: f32; };
+@group(0) @binding(0) var<uniform> params: Params;
+@fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+  return vec4(0.0, 0.0, 0.0, 1.0);
+}
+|]
+
+data Params = Params { time :: Float } deriving (Generic)
+instance ToUniform Params
+
+packed :: IO (Either String BS.ByteString)
+packed = do
+  let iface = shaderInterface shader
+  let paramsInfo = find (\b -> biName b == "params") (siBindings iface)
+  case paramsInfo of
+    Nothing -> pure (Left "missing params binding")
+    Just bi -> packUniformFrom (biType bi) (Params 1.5)
+```
+
+If you already have a `Storable` value that matches the exact layout, you can
+use `validateUniformStorable` and `packUniformStorable`:
+
+```hs
+packedStorable :: IO (Either String BS.ByteString)
+packedStorable = do
+  let iface = shaderInterface shader
+  case find (\b -> biName b == "params") (siBindings iface) of
+    Nothing -> pure (Left "missing params binding")
+    Just bi ->
+      case biType bi of
+        TLStruct _ fields _ _ ->
+          case find (\f -> flName f == "time") fields of
+            Nothing -> pure (Left "missing time field")
+            Just f -> packUniformStorable (flType f) (1.5 :: Float)
+        _ -> pure (Left "expected struct layout")
+```
 
 ### SDL-Style Input Lists (Type-Safe)
 If you want simple lists of uniforms/samplers/textures to pass into an SDL3.4
@@ -151,7 +207,7 @@ globals = ...
 material :: Material
 material = ...
 
-inputs :: ShaderInputs iface
+inputs :: IO (Either String (ShaderInputs iface))
 inputs =
   inputsFor shader
     ( uniform globals
@@ -169,8 +225,27 @@ SDL upload/bind code.
 
 Notes:
 - Record field names must match the WESL struct field names.
-- Use `inputsForEither` if you want to handle packing/layout mismatches instead
-  of throwing an error.
+- `inputsFor` and `inputsForEither` both return `IO (Either String ...)` so you
+  can decide how to surface packing/layout errors.
+
+### SDL3 Demo Helpers (exe only)
+The demo executable ships its own SDL3 helpers under `exe/Spirdo/SDL3/Safe.hs`
+and `exe/Spirdo/SDL3.hsc`. These are **not** part of the library API; they’re
+only used by `exe/Main.hs`.
+and consistent error handling.
+
+```hs
+import Spirdo.SDL3.Safe (withSDL, withWindow, withGPURenderer)
+import Spirdo.SDL3 (sdl_INIT_VIDEO, sdlGetGPURendererDevice)
+
+main :: IO ()
+main =
+  withSDL sdl_INIT_VIDEO $
+    withWindow "Spirdo SDL3" 800 600 0 $ \window ->
+      withGPURenderer window $ \renderer -> do
+        device <- sdlGetGPURendererDevice renderer
+        -- ...
+```
 
 
 ### Mapping To A Haskell Record
@@ -249,18 +324,23 @@ Fragment variants in `exe/Main.hs` (left/right to switch):
 - Mandelbrot
 - Override Stripes / Override Rings (specialization values)
 
-Compute examples emitted on build:
+Compute examples emitted when SPIR-V output is enabled:
 - `compute.spv`: storage buffer + storage texture sample
 - `compute-1.spv`: particle update on runtime array
 - `compute-2.spv`: tiled storage texture writer
 
-Vertex examples emitted on build:
+Vertex examples emitted when SPIR-V output is enabled:
 - `vertex.spv`: passthrough quad
 - `vertex-1.spv`: wave-displaced positions
 - `vertex-2.spv`: fullscreen triangle (vertex_index)
 
 ## SPIR-V Outputs
-On build/run, SPIR-V files are written to the repo root:
+SPIR-V output is opt-in. Set `SPIRDO_WRITE_SPV=1` before running the demo:
+```
+SPIRDO_WRITE_SPV=1 cabal run
+```
+
+When enabled, files are written to the repo root:
 - `fragment-*.spv` for each fragment variant
 - `compute*.spv` for compute examples
 - `vertex*.spv` for vertex examples

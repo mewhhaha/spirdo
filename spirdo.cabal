@@ -11,7 +11,8 @@ maintainer:         kopatheonlyone@hotmail.com
 category:           Graphics
 build-type:         Simple
 extra-doc-files:    CHANGELOG.md
--- extra-source-files:
+extra-source-files:
+    bench/fixtures/feature.wesl
 
 common warnings
     ghc-options: -Wall
@@ -20,8 +21,14 @@ library
     import:           warnings
     exposed-modules:
                      , Spirdo.Wesl
-                     , Spirdo.SDL3
-    -- other-modules:
+    other-modules:
+        Spirdo.Wesl.Types
+        Spirdo.Wesl.Compiler
+        Spirdo.Wesl.Syntax
+        Spirdo.Wesl.Util
+        Spirdo.Wesl.Parser
+        Spirdo.Wesl.Typecheck
+        Spirdo.Wesl.Emit
     -- other-extensions:
     build-depends:
         base ^>=4.21.0.0,
@@ -31,10 +38,6 @@ library
         filepath,
         text,
         template-haskell
-    build-tool-depends:
-        hsc2hs:hsc2hs
-    pkgconfig-depends:
-        sdl3
     hs-source-dirs:   lib
     default-language: GHC2024
 
@@ -46,6 +49,8 @@ executable spirdo
         Examples.Fragments
         Examples.Override
         Examples.Vertex
+        Spirdo.SDL3
+        Spirdo.SDL3.Safe
     -- other-extensions:
     build-depends:
         base ^>=4.21.0.0,
@@ -53,6 +58,8 @@ executable spirdo
         containers,
         filepath,
         spirdo
+    build-tool-depends:
+        hsc2hs:hsc2hs
     pkgconfig-depends:
         sdl3
 
