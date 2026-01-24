@@ -27,6 +27,8 @@ module Spirdo.Wesl
   , ReflectBindings(..)
   , HasBinding
   , binding
+  , bindingMaybe
+  , bindingEither
   , UniformValue(..)
   , ToUniform(..)
   , uniform

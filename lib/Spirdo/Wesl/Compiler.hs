@@ -135,6 +135,7 @@ compileFileResult opts wantDiagnostics path =
     filePath <- ExceptT (resolveInputPath path)
     src <- liftIO (readFile filePath)
     moduleAst0 <- ExceptT (pure (parseModuleWith (enabledFeatures opts) src))
+    -- resolveImports performs module linking and validateModuleScopes for file-based builds.
     linked <- ExceptT (resolveImports opts (dropExtension filePath) moduleAst0)
     linked' <- ExceptT (pure (resolveTypeAliases linked))
     let rootDir = takeDirectory filePath

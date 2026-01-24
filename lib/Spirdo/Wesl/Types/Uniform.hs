@@ -250,9 +250,18 @@ collectSegments ctx off layout value =
       Left (formatAt ctx ("uniform value does not match layout: " <> show layout))
 
 assembleSegments :: Int -> [Segment] -> Either String Builder
-assembleSegments size segs = go 0 (sortOn segOffset segs)
+assembleSegments size segs = go 0 (ensureSorted segs)
   where
     segOffset (Segment off _) = off
+    ensureSorted xs =
+      if isSorted xs
+        then xs
+        else sortOn segOffset xs
+    isSorted [] = True
+    isSorted (Segment a _ : rest) = isSortedFrom a rest
+    isSortedFrom _ [] = True
+    isSortedFrom prev (Segment off _ : rest) =
+      prev <= off && isSortedFrom off rest
     go pos [] =
       if pos > size
         then Left "uniform write out of bounds"
