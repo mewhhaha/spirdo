@@ -13,10 +13,13 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
+-- | Compiler pipeline and quasiquoter implementation.
 module Spirdo.Wesl.Compiler where
 
 import Control.Exception (SomeException, catch)
 import Control.Monad (when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE)
 import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -44,6 +47,13 @@ import Text.Read (readMaybe)
 overrideValuesText :: [(String, OverrideValue)] -> [(Text, OverrideValue)]
 overrideValuesText = map (\(k, v) -> (T.pack k, v))
 
+data CompileResult = CompileResult
+  { crAst :: !ModuleAst
+  , crInterface :: !ShaderInterface
+  , crSpirv :: !ByteString
+  , crDiagnostics :: ![Diagnostic]
+  }
+
 -- Public API
 
 compileWeslToSpirv :: String -> Either CompileError SomeCompiledShader
@@ -51,132 +61,50 @@ compileWeslToSpirv = compileWeslToSpirvWith defaultCompileOptions
 
 compileWeslToSpirvWith :: CompileOptions -> String -> Either CompileError SomeCompiledShader
 compileWeslToSpirvWith opts src = do
-  moduleAst0 <- parseModuleWith (enabledFeatures opts) src
-  moduleAst1 <- resolveTypeAliases moduleAst0
-  moduleAst <- lowerOverridesWith [] (overrideValuesText (overrideValues opts)) moduleAst1
-  when (not (null (modImports moduleAst))) $
-    Left (CompileError "imports require file-based compilation" Nothing Nothing)
-  let node = ModuleNode "<inline>" [] moduleAst []
-  let constIndex = buildConstIndex [node]
-  let fnIndex = buildFunctionIndex [node]
-  let structIndex = buildStructIndex [node]
-  let overrideIndex = buildOverrideIndex [node]
-  validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node]
-  iface <- buildInterface (overrideSpecMode opts) moduleAst
-  spirv <- emitSpirv opts moduleAst iface
-  let shader = CompiledShader spirv iface
+  result <- compileInlineResult opts False src
+  let shader = CompiledShader (crSpirv result) (crInterface result)
   pure (SomeCompiledShader shader)
 
 compileWeslToSpirvWithDiagnostics :: CompileOptions -> String -> Either CompileError (SomeCompiledShader, [Diagnostic])
 compileWeslToSpirvWithDiagnostics opts src = do
-  moduleAst0 <- parseModuleWith (enabledFeatures opts) src
-  moduleAst1 <- resolveTypeAliases moduleAst0
-  moduleAst <- lowerOverridesWith [] (overrideValuesText (overrideValues opts)) moduleAst1
-  when (not (null (modImports moduleAst))) $
-    Left (CompileError "imports require file-based compilation" Nothing Nothing)
-  let node = ModuleNode "<inline>" [] moduleAst []
-  let constIndex = buildConstIndex [node]
-  let fnIndex = buildFunctionIndex [node]
-  let structIndex = buildStructIndex [node]
-  let overrideIndex = buildOverrideIndex [node]
-  validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node]
-  iface <- buildInterface (overrideSpecMode opts) moduleAst
-  spirv <- emitSpirv opts moduleAst iface
-  diags <- collectDiagnosticsMerged opts [] moduleAst
-  let shader = CompiledShader spirv iface
-  pure (SomeCompiledShader shader, diags)
+  result <- compileInlineResult opts True src
+  let shader = CompiledShader (crSpirv result) (crInterface result)
+  pure (SomeCompiledShader shader, crDiagnostics result)
 
 compileWeslToSpirvFile :: FilePath -> IO (Either CompileError SomeCompiledShader)
 compileWeslToSpirvFile = compileWeslToSpirvFileWith defaultCompileOptions
 
 compileWeslToSpirvFileWith :: CompileOptions -> FilePath -> IO (Either CompileError SomeCompiledShader)
 compileWeslToSpirvFileWith opts path = do
-  inputPath <- resolveInputPath path
-  case inputPath of
-    Left err -> pure (Left err)
-    Right filePath -> do
-      src <- readFile filePath
-      case parseModuleWith (enabledFeatures opts) src of
-        Left err -> pure (Left err)
-        Right moduleAst0 -> do
-          resolved <- resolveImports opts (dropExtension filePath) moduleAst0
-          case resolved of
-            Left err -> pure (Left err)
-            Right linked -> do
-              case resolveTypeAliases linked of
-                Left err -> pure (Left err)
-                Right linked' -> do
-                  let rootDir = takeDirectory filePath
-                      rootPath = modulePathFromFile rootDir filePath
-                  case lowerOverridesWith rootPath (overrideValuesText (overrideValues opts)) linked' of
-                    Left err -> pure (Left err)
-                    Right lowered -> do
-                      case validateConstAssertsMerged opts rootPath lowered of
-                        Left err -> pure (Left err)
-                        Right () -> do
-                          let iface = buildInterface (overrideSpecMode opts) lowered
-                          case iface of
-                            Left err -> pure (Left err)
-                            Right iface' -> do
-                              case emitSpirv opts lowered iface' of
-                                Left err -> pure (Left err)
-                                Right spirv -> pure (Right (SomeCompiledShader (CompiledShader spirv iface')))
+  result <- compileFileResult opts False path
+  pure $ do
+    cr <- result
+    let shader = CompiledShader (crSpirv cr) (crInterface cr)
+    pure (SomeCompiledShader shader)
 
 compileWeslToSpirvFileWithDiagnostics :: CompileOptions -> FilePath -> IO (Either CompileError (SomeCompiledShader, [Diagnostic]))
 compileWeslToSpirvFileWithDiagnostics opts path = do
-  inputPath <- resolveInputPath path
-  case inputPath of
-    Left err -> pure (Left err)
-    Right filePath -> do
-      src <- readFile filePath
-      case parseModuleWith (enabledFeatures opts) src of
-        Left err -> pure (Left err)
-        Right moduleAst0 -> do
-          resolved <- resolveImports opts (dropExtension filePath) moduleAst0
-          case resolved of
-            Left err -> pure (Left err)
-            Right linked -> do
-              case resolveTypeAliases linked of
-                Left err -> pure (Left err)
-                Right linked' -> do
-                  let rootDir = takeDirectory filePath
-                      rootPath = modulePathFromFile rootDir filePath
-                  case lowerOverridesWith rootPath (overrideValuesText (overrideValues opts)) linked' of
-                    Left err -> pure (Left err)
-                    Right lowered -> do
-                      case collectDiagnosticsMerged opts rootPath lowered of
-                        Left err -> pure (Left err)
-                        Right diags -> do
-                          let iface = buildInterface (overrideSpecMode opts) lowered
-                          case iface of
-                            Left err -> pure (Left err)
-                            Right iface' -> do
-                              case emitSpirv opts lowered iface' of
-                                Left err -> pure (Left err)
-                                Right spirv ->
-                                  pure (Right (SomeCompiledShader (CompiledShader spirv iface'), diags))
+  result <- compileFileResult opts True path
+  pure $ do
+    cr <- result
+    let shader = CompiledShader (crSpirv cr) (crInterface cr)
+    pure (SomeCompiledShader shader, crDiagnostics cr)
 
 compileWeslToSpirvBytes :: String -> Either CompileError ByteString
 compileWeslToSpirvBytes src = compileWeslToSpirvBytesWith defaultCompileOptions src
 
 compileWeslToSpirvBytesWith :: CompileOptions -> String -> Either CompileError ByteString
 compileWeslToSpirvBytesWith opts src = do
-  moduleAst0 <- parseModuleWith (enabledFeatures opts) src
-  moduleAst1 <- resolveTypeAliases moduleAst0
-  moduleAst <- lowerOverridesWith [] (overrideValuesText (overrideValues opts)) moduleAst1
-  when (not (null (modImports moduleAst))) $
-    Left (CompileError "imports require file-based compilation" Nothing Nothing)
-  let node = ModuleNode "<inline>" [] moduleAst []
-  let constIndex = buildConstIndex [node]
-  let fnIndex = buildFunctionIndex [node]
-  let structIndex = buildStructIndex [node]
-  let overrideIndex = buildOverrideIndex [node]
-  validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node]
-  iface <- buildInterface (overrideSpecMode opts) moduleAst
-  emitSpirv opts moduleAst iface
+  result <- compileInlineResult opts False src
+  pure (crSpirv result)
 
 compileWeslToSpirvBytesWithDiagnostics :: CompileOptions -> String -> Either CompileError (ByteString, [Diagnostic])
 compileWeslToSpirvBytesWithDiagnostics opts src = do
+  result <- compileInlineResult opts True src
+  pure (crSpirv result, crDiagnostics result)
+
+compileInlineResult :: CompileOptions -> Bool -> String -> Either CompileError CompileResult
+compileInlineResult opts wantDiagnostics src = do
   moduleAst0 <- parseModuleWith (enabledFeatures opts) src
   moduleAst1 <- resolveTypeAliases moduleAst0
   moduleAst <- lowerOverridesWith [] (overrideValuesText (overrideValues opts)) moduleAst1
@@ -189,9 +117,44 @@ compileWeslToSpirvBytesWithDiagnostics opts src = do
   let overrideIndex = buildOverrideIndex [node]
   validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node]
   iface <- buildInterface (overrideSpecMode opts) moduleAst
-  bytes <- emitSpirv opts moduleAst iface
-  diags <- collectDiagnosticsMerged opts [] moduleAst
-  pure (bytes, diags)
+  spirv <- emitSpirv opts moduleAst iface
+  diags <-
+    if wantDiagnostics
+      then collectDiagnosticsMerged opts [] moduleAst
+      else Right []
+  pure CompileResult
+    { crAst = moduleAst
+    , crInterface = iface
+    , crSpirv = spirv
+    , crDiagnostics = diags
+    }
+
+compileFileResult :: CompileOptions -> Bool -> FilePath -> IO (Either CompileError CompileResult)
+compileFileResult opts wantDiagnostics path =
+  runExceptT $ do
+    filePath <- ExceptT (resolveInputPath path)
+    src <- liftIO (readFile filePath)
+    moduleAst0 <- ExceptT (pure (parseModuleWith (enabledFeatures opts) src))
+    linked <- ExceptT (resolveImports opts (dropExtension filePath) moduleAst0)
+    linked' <- ExceptT (pure (resolveTypeAliases linked))
+    let rootDir = takeDirectory filePath
+        rootPath = modulePathFromFile rootDir filePath
+    lowered <- ExceptT (pure (lowerOverridesWith rootPath (overrideValuesText (overrideValues opts)) linked'))
+    diags <-
+      if wantDiagnostics
+        then ExceptT (pure (collectDiagnosticsMerged opts rootPath lowered))
+        else do
+          case validateConstAssertsMerged opts rootPath lowered of
+            Left err -> throwE err
+            Right () -> pure []
+    iface <- ExceptT (pure (buildInterface (overrideSpecMode opts) lowered))
+    spirv <- ExceptT (pure (emitSpirv opts lowered iface))
+    pure CompileResult
+      { crAst = lowered
+      , crInterface = iface
+      , crSpirv = spirv
+      , crDiagnostics = diags
+      }
 
 weslCacheVersion :: String
 weslCacheVersion = "wesl-cache-v3"

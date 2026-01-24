@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Starfield.
 module Examples.Fragments.Starfield (fragmentStarfieldShader) where
 
 import Spirdo.Wesl (wesl)

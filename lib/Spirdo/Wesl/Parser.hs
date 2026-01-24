@@ -13,6 +13,7 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
+-- | Parser for WESL source.
 module Spirdo.Wesl.Parser where
 
 import Control.Monad (when)

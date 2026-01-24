@@ -1,5 +1,6 @@
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Fragment shader example registry.
 module Examples.Fragments
   ( fragmentFeatureShader
   , fragmentRaymarchShader

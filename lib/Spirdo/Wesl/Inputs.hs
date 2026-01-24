@@ -7,6 +7,7 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
+-- | Typed, host-agnostic shader input lists.
 module Spirdo.Wesl.Inputs
   ( HList(..)
   , InputFor

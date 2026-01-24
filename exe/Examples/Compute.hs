@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example compute shaders.
 module Examples.Compute
   ( computeShader
   , computeParticlesShader

@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example vertex shaders.
 module Examples.Vertex
   ( vertexShader
   , vertexWaveShader

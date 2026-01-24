@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Aurora.
 module Examples.Fragments.Aurora (fragmentAuroraShader) where
 
 import Spirdo.Wesl (wesl)

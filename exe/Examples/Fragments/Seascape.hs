@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Seascape.
 module Examples.Fragments.Seascape (fragmentSeascapeShader) where
 
 import Spirdo.Wesl (wesl)

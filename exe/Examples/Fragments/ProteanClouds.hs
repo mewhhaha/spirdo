@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: ProteanClouds.
 module Examples.Fragments.ProteanClouds (fragmentProteanCloudsShader) where
 
 import Spirdo.Wesl (wesl)

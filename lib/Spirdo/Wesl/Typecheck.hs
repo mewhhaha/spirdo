@@ -13,6 +13,7 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
+-- | Typechecking, validation, and import resolution.
 module Spirdo.Wesl.Typecheck where
 
 import Control.Monad (foldM, zipWithM, when)

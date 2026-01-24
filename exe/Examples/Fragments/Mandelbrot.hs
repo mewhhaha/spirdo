@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Mandelbrot.
 module Examples.Fragments.Mandelbrot (fragmentMandelbrotShader) where
 
 import Spirdo.Wesl (wesl)
