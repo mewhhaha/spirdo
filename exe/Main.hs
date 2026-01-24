@@ -7,7 +7,6 @@ module Main (main) where
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as BS
 import Data.Char (toLower)
-import Data.List (find)
 import Foreign
 import Foreign.C.String (peekCString, withCString)
 import Foreign.C.Types (CBool(..), CFloat)
@@ -24,6 +23,8 @@ import Spirdo.Wesl
   , ToUniform(..)
   , V4(..)
   , binding
+  , bindingInfoForMap
+  , bindingMap
   , HasBinding
   , uniform
   , packUniform
@@ -294,11 +295,12 @@ mkVariant name shader =
       uniformCount = fragmentUniformCount shader
       uniformSlot = fragmentUniformSlot shader
       paramsDesc = binding @"params" shader
+      iface = shaderInterface shader
       paramsInfo =
-        case find (\info -> biName info == descName paramsDesc) (siBindings (shaderInterface shader)) of
+        case bindingInfoForMap (descName paramsDesc) (bindingMap iface) of
           Nothing -> error ("variant " <> name <> ": params binding not found")
           Just info -> info
-  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot (shaderInterface shader) paramsInfo
+  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot iface paramsInfo
 
 mkVariantDynamic :: String -> SomeCompiledShader -> ShaderVariant
 mkVariantDynamic name (SomeCompiledShader shader) =
@@ -313,7 +315,7 @@ mkVariantDynamic name (SomeCompiledShader shader) =
           (b:_) -> b
           [] -> 0
       paramsInfo =
-        case find (\info -> biName info == "params") (siBindings iface) of
+        case bindingInfoForMap "params" (bindingMap iface) of
           Nothing -> error ("variant " <> name <> ": params binding not found")
           Just info -> info
   in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot iface paramsInfo

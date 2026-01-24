@@ -31,8 +31,8 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     Right compiled -> BS.writeFile "example.spv" (shaderSpirv compiled)
 ```
 
-Note: the public API is exposed from `Spirdo.Wesl`. Internal modules are not
-part of the supported surface area.
+Note: the public API is exposed from `Spirdo.Wesl` and `Spirdo.Wesl.Inputs`.
+Internal modules are not part of the supported surface area.
 
 ## Type-Safe Binding Reflection
 Using the quasiquoter gives you a `CompiledShader iface` where the binding
@@ -127,13 +127,15 @@ opaque handles. This stays host‑agnostic and still enforces ordering/types.
 
 import Spirdo.Wesl
   ( CompiledShader
-  , HList(..)
+  , uniform
+  , wesl
+  )
+import Spirdo.Wesl.Inputs
+  ( HList(..)
   , SamplerHandle(..)
   , TextureHandle(..)
   , ShaderInputs
   , inputsFor
-  , uniform
-  , wesl
   )
 
 shader :: CompiledShader iface
@@ -168,15 +170,13 @@ SDL upload/bind code.
 `inputsFor` is pure; handle `Either` as you prefer.
 
 Notes:
-- Record field names must match the WESL struct field names.
-- `inputsFor` and `inputsForEither` both return `IO (Either String ...)` so you
-  can decide how to surface packing/layout errors.
+- Record field names must match the WESL struct field names (extra or missing
+  fields are errors).
 
 ### SDL3 Demo Helpers (exe only)
 The demo executable ships its own SDL3 helpers under `exe/Spirdo/SDL3/Safe.hs`
 and `exe/Spirdo/SDL3.hsc`. These are **not** part of the library API; they’re
 only used by `exe/Main.hs`.
-and consistent error handling.
 
 ```hs
 import Spirdo.SDL3.Safe (withSDL, withWindow, withGPURenderer)
