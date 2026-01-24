@@ -21,6 +21,7 @@ library
     import:           warnings
     exposed-modules:
                      , Spirdo.Wesl
+                     , Spirdo.Wesl.Inputs
     other-modules:
         Spirdo.Wesl.Types
         Spirdo.Wesl.Compiler
@@ -47,6 +48,24 @@ executable spirdo
     other-modules:
         Examples.Compute
         Examples.Fragments
+        Examples.Fragments.Aurora
+        Examples.Fragments.Bits
+        Examples.Fragments.Clouds
+        Examples.Fragments.FeatureMix
+        Examples.Fragments.Grass
+        Examples.Fragments.Grid
+        Examples.Fragments.Mandelbrot
+        Examples.Fragments.Plasma
+        Examples.Fragments.Primitives
+        Examples.Fragments.ProteanClouds
+        Examples.Fragments.Raymarch
+        Examples.Fragments.SdfText
+        Examples.Fragments.Seascape
+        Examples.Fragments.Starfield
+        Examples.Fragments.Terrain
+        Examples.Fragments.Triangle
+        Examples.Fragments.Tunnel
+        Examples.Fragments.Voronoi
         Examples.Override
         Examples.Vertex
         Spirdo.SDL3

@@ -22,13 +22,12 @@ import Data.ByteString.Builder (Builder, byteString, toLazyByteString)
 import qualified Data.ByteString.Lazy as BSL
 import Data.Int (Int32)
 import Data.List (find, intercalate, sortOn)
-import qualified Data.Kind as K
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Proxy (Proxy(..))
 import Data.Text (Text)
-import Data.Word (Word8, Word16, Word32, Word64)
+import Data.Word (Word8, Word16, Word32)
 import GHC.TypeLits (KnownNat, KnownSymbol, Nat, Symbol, natVal, symbolVal)
 import GHC.Float (castFloatToWord32)
 import GHC.Generics (Generic, Rep, K1(..), M1(..), (:*:)(..), Selector, selName, S, from)
@@ -250,59 +249,6 @@ binding _ =
       Just b -> b
       Nothing -> error ("binding: missing " <> key <> " (impossible)")
 
-newtype SamplerHandle = SamplerHandle Word64
-  deriving (Eq, Show)
-
-newtype TextureHandle = TextureHandle Word64
-  deriving (Eq, Show)
-
-newtype BufferHandle = BufferHandle Word64
-  deriving (Eq, Show)
-
--- Typed inputs derived from the interface (host-agnostic handles).
-
-data HList (xs :: [K.Type]) where
-  HNil :: HList '[]
-  (:&) :: x -> HList xs -> HList (x ': xs)
-
-infixr 5 :&
-
-data BindingCategory
-  = CatUniform
-  | CatSampler
-  | CatTexture
-  | CatStorageBuffer
-  | CatStorageTexture
-
-type family CategoryOf (k :: BindingKind) :: BindingCategory where
-  CategoryOf 'BUniform = 'CatUniform
-  CategoryOf 'BSampler = 'CatSampler
-  CategoryOf 'BSamplerComparison = 'CatSampler
-  CategoryOf 'BStorageRead = 'CatStorageBuffer
-  CategoryOf 'BStorageReadWrite = 'CatStorageBuffer
-  CategoryOf 'BStorageTexture1D = 'CatStorageTexture
-  CategoryOf 'BStorageTexture2D = 'CatStorageTexture
-  CategoryOf 'BStorageTexture2DArray = 'CatStorageTexture
-  CategoryOf 'BStorageTexture3D = 'CatStorageTexture
-  CategoryOf _ = 'CatTexture
-
-type family InputForCategory (c :: BindingCategory) :: K.Type where
-  InputForCategory 'CatUniform = UniformValue
-  InputForCategory 'CatSampler = SamplerHandle
-  InputForCategory 'CatTexture = TextureHandle
-  InputForCategory 'CatStorageBuffer = BufferHandle
-  InputForCategory 'CatStorageTexture = TextureHandle
-
-type family InputForKind (k :: BindingKind) :: K.Type where
-  InputForKind k = InputForCategory (CategoryOf k)
-
-type family InputFor (b :: Binding) :: K.Type where
-  InputFor ('Binding _ kind _ _ _) = InputForKind kind
-
-type family InputsOf (iface :: [Binding]) :: [K.Type] where
-  InputsOf '[] = '[]
-  InputsOf (b ': bs) = InputFor b ': InputsOf bs
-
 -- | Typed uniform values for packing.
 data Half = Half !Word16
   deriving (Eq, Show)
@@ -425,67 +371,6 @@ instance {-# OVERLAPPING #-} (Selector s, ToUniform a) => GUniform (M1 S s (K1 i
     let name = selName m1
         safeName = if null name then "_unnamed" else name
     in [(safeName, toUniform (unK1 (unM1 m1)))]
-
-data UniformInput = UniformInput
-  { uiName :: !String
-  , uiGroup :: !Word32
-  , uiBinding :: !Word32
-  , uiBytes :: !ByteString
-  } deriving (Eq, Show)
-
-data SamplerInput = SamplerInput
-  { samplerName :: !String
-  , samplerGroup :: !Word32
-  , samplerBinding :: !Word32
-  , samplerHandle :: !SamplerHandle
-  } deriving (Eq, Show)
-
-data TextureInput = TextureInput
-  { textureName :: !String
-  , textureGroup :: !Word32
-  , textureBinding :: !Word32
-  , textureHandle :: !TextureHandle
-  } deriving (Eq, Show)
-
-data StorageBufferInput = StorageBufferInput
-  { storageBufferName :: !String
-  , storageBufferGroup :: !Word32
-  , storageBufferBinding :: !Word32
-  , storageBufferHandle :: !BufferHandle
-  } deriving (Eq, Show)
-
-data StorageTextureInput = StorageTextureInput
-  { storageTextureName :: !String
-  , storageTextureGroup :: !Word32
-  , storageTextureBinding :: !Word32
-  , storageTextureHandle :: !TextureHandle
-  } deriving (Eq, Show)
-
-data ShaderInputs (iface :: [Binding]) = ShaderInputs
-  { siShader :: !(CompiledShader iface)
-  , siUniforms :: ![UniformInput]
-  , siSamplers :: ![SamplerInput]
-  , siTextures :: ![TextureInput]
-  , siStorageBuffers :: ![StorageBufferInput]
-  , siStorageTextures :: ![StorageTextureInput]
-  }
-
-emptyInputs :: CompiledShader iface -> ShaderInputs iface
-emptyInputs shader =
-  ShaderInputs
-    { siShader = shader
-    , siUniforms = []
-    , siSamplers = []
-    , siTextures = []
-    , siStorageBuffers = []
-    , siStorageTextures = []
-    }
-
-lookupBindingInfo :: String -> ShaderInterface -> Either String BindingInfo
-lookupBindingInfo name iface =
-  case find (\b -> biName b == name) (siBindings iface) of
-    Just info -> Right info
-    Nothing -> Left ("binding not found in interface: " <> name)
 
 type UniformPath = String
 
@@ -637,105 +522,6 @@ word32LE w =
   , fromIntegral ((w `shiftR` 16) .&. 0xFF)
   , fromIntegral ((w `shiftR` 24) .&. 0xFF)
   ]
-
-class ApplyCategory (c :: BindingCategory) where
-  applyCategory :: BindingInfo -> InputForCategory c -> ShaderInputs iface -> Either String (ShaderInputs iface)
-
-instance ApplyCategory 'CatUniform where
-  applyCategory info val inputs =
-    case packUniform (biType info) val of
-      Left err -> Left err
-      Right bytes ->
-        let entry =
-              UniformInput
-                { uiName = biName info
-                , uiGroup = biGroup info
-                , uiBinding = biBinding info
-                , uiBytes = bytes
-                }
-        in Right inputs { siUniforms = entry : siUniforms inputs }
-
-instance ApplyCategory 'CatSampler where
-  applyCategory info handle inputs =
-    let entry =
-          SamplerInput
-            { samplerName = biName info
-            , samplerGroup = biGroup info
-            , samplerBinding = biBinding info
-            , samplerHandle = handle
-            }
-    in Right inputs { siSamplers = entry : siSamplers inputs }
-
-instance ApplyCategory 'CatTexture where
-  applyCategory info handle inputs =
-    let entry =
-          TextureInput
-            { textureName = biName info
-            , textureGroup = biGroup info
-            , textureBinding = biBinding info
-            , textureHandle = handle
-            }
-    in Right inputs { siTextures = entry : siTextures inputs }
-
-instance ApplyCategory 'CatStorageBuffer where
-  applyCategory info handle inputs =
-    let entry =
-          StorageBufferInput
-            { storageBufferName = biName info
-            , storageBufferGroup = biGroup info
-            , storageBufferBinding = biBinding info
-            , storageBufferHandle = handle
-            }
-    in Right inputs { siStorageBuffers = entry : siStorageBuffers inputs }
-
-instance ApplyCategory 'CatStorageTexture where
-  applyCategory info handle inputs =
-    let entry =
-          StorageTextureInput
-            { storageTextureName = biName info
-            , storageTextureGroup = biGroup info
-            , storageTextureBinding = biBinding info
-            , storageTextureHandle = handle
-            }
-    in Right inputs { siStorageTextures = entry : siStorageTextures inputs }
-
-class ApplyKind (k :: BindingKind) where
-  applyKind :: BindingInfo -> InputForKind k -> ShaderInputs iface -> Either String (ShaderInputs iface)
-
-instance ApplyCategory (CategoryOf k) => ApplyKind k where
-  applyKind = applyCategory @(CategoryOf k)
-
-class BuildInputsWith (iface :: [Binding]) (bs :: [Binding]) where
-  buildInputsWith :: CompiledShader iface -> HList (InputsOf bs) -> Either String (ShaderInputs iface)
-
-instance BuildInputsWith iface '[] where
-  buildInputsWith shader HNil = Right (emptyInputs shader)
-
-instance
-  forall iface name kind set binding ty bs.
-  ( KnownSymbol name
-  , KnownBindingKind kind
-  , KnownNat set
-  , KnownNat binding
-  , ApplyKind kind
-  , BuildInputsWith iface bs
-  ) =>
-  BuildInputsWith iface ('Binding name kind set binding ty ': bs)
-  where
-  buildInputsWith shader (x :& xs) =
-    case buildInputsWith @iface @bs shader xs of
-      Left err -> Left err
-      Right baseInputs ->
-        let name = symbolVal (Proxy @name)
-        in case lookupBindingInfo name (shaderInterface shader) of
-            Left err -> Left err
-            Right info ->
-              case applyKind @kind info x baseInputs of
-                Left err -> Left ("binding " <> name <> ": " <> err)
-                Right ok -> Right ok
-
-inputsFor :: forall iface. BuildInputsWith iface iface => CompiledShader iface -> HList (InputsOf iface) -> Either String (ShaderInputs iface)
-inputsFor shader xs = buildInputsWith @iface @iface shader xs
 
 samplerBindings :: forall iface. ReflectBindings iface => Proxy iface -> [BindingDesc]
 samplerBindings _ =
@@ -893,6 +679,21 @@ data BindingInfo = BindingInfo
   , biBinding :: !Word32
   , biType :: !TypeLayout
   } deriving (Eq, Show, Read)
+
+newtype BindingMap = BindingMap (Map.Map String BindingInfo)
+
+bindingMap :: ShaderInterface -> BindingMap
+bindingMap iface =
+  BindingMap (Map.fromList [(biName info, info) | info <- siBindings iface])
+
+bindingInfoFor :: String -> ShaderInterface -> Either String BindingInfo
+bindingInfoFor name iface =
+  case bindingInfoForMap name (bindingMap iface) of
+    Just info -> Right info
+    Nothing -> Left ("binding not found in interface: " <> name)
+
+bindingInfoForMap :: String -> BindingMap -> Maybe BindingInfo
+bindingInfoForMap name (BindingMap m) = Map.lookup name m
 
 data FieldLayout = FieldLayout
   { flName :: !String

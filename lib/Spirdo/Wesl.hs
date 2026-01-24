@@ -26,10 +26,6 @@ module Spirdo.Wesl
   , ReflectBindings(..)
   , HasBinding
   , binding
-  , HList(..)
-  , InputFor
-  , InputsOf
-  , inputsFor
   , UniformValue(..)
   , ToUniform(..)
   , uniform
@@ -42,16 +38,6 @@ module Spirdo.Wesl
   , M3(..)
   , M4(..)
   , Half(..)
-  , SamplerHandle(..)
-  , TextureHandle(..)
-  , BufferHandle(..)
-  , UniformInput(..)
-  , SamplerInput(..)
-  , TextureInput(..)
-  , StorageBufferInput(..)
-  , StorageTextureInput(..)
-  , ShaderInputs(..)
-  , emptyInputs
   , samplerBindings
   , uniformBindings
   , storageBufferBindings
@@ -65,8 +51,12 @@ module Spirdo.Wesl
   , ShaderInterface(..)
   , OverrideInfo(..)
   , BindingInfo(..)
+  , BindingMap(..)
   , TypeLayout(..)
   , FieldLayout(..)
+  , bindingMap
+  , bindingInfoFor
+  , bindingInfoForMap
   , specializableOverrides
   , CompileError(..)
   , CompileOptions(..)
