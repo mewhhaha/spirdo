@@ -1,23 +1,9 @@
 module Main (main) where
 
 import qualified Data.ByteString as BS
-import Data.List (findIndex, isPrefixOf, tails)
 import GHC.Clock (getMonotonicTimeNSec)
 import Spirdo.Wesl (compileWeslToSpirvBytes)
 import System.Exit (exitFailure)
-
-findSubstr :: String -> String -> Maybe Int
-findSubstr needle haystack = findIndex (isPrefixOf needle) (tails haystack)
-
-extractShaderBlock :: String -> String -> Either String String
-extractShaderBlock name src = do
-  let marker = "let " <> name
-  i <- maybe (Left ("missing marker: " <> marker)) Right (findSubstr marker src)
-  let afterMarker = drop (i + length marker) src
-  j <- maybe (Left "missing [wesl| after marker") Right (findSubstr "[wesl|" afterMarker)
-  let afterStart = drop (j + length "[wesl|") afterMarker
-  k <- maybe (Left "missing |] terminator") Right (findSubstr "|]" afterStart)
-  Right (take k afterStart)
 
 compileOnce :: String -> IO Int
 compileOnce src =
@@ -29,12 +15,7 @@ compileOnce src =
 
 main :: IO ()
 main = do
-  srcFile <- readFile "exe/Main.hs"
-  shaderSrc <- case extractShaderBlock "fragmentFeatureShader" srcFile of
-    Left msg -> do
-      putStrLn ("failed to extract shader: " <> msg)
-      exitFailure
-    Right s -> pure s
+  shaderSrc <- readFile "bench/fixtures/feature.wesl"
   _ <- compileOnce shaderSrc
   let iters :: Int
       iters = 50

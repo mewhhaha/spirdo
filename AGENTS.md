@@ -151,6 +151,7 @@
 - DONE: Feature Mix shader now exercises pointer ops (`&`/`*`)
 - DONE: Bits shader now exercises `countLeadingZeros`, `countTrailingZeros`, `dot4*`, and `bitcast`
 - DONE: Additional vertex/compute shader examples emitted to `vertex-1.spv`/`vertex-2.spv` and `compute-1.spv`/`compute-2.spv`
+- DONE: SPIR-V outputs are gated behind `SPIRDO_WRITE_SPV=1`
 
 ## Remaining WESL Parity Gap (Override Specialization)
 `spirv-val` rejects `SpecId` on `OpSpecConstantOp`, which is what derived overrides lower to when they depend on other overrides. We now support parity via an opt-in mode.
@@ -170,3 +171,7 @@ This keeps default builds fully validated while providing an opt-in path to stri
 ## Next Steps (Paused)
 - DONE: added `Bindings iface` + `binding @"name"` lookup with compile-time membership checks (no manual list plumbing).
 - DONE: README updated with zero-plumbing binding access examples.
+- DONE: finish refactor verification — `cabal build` and `cabal test`.
+- DONE: add golden SPIR-V tests (created `test/golden/`, update/compare logic in `test/Main.hs`, seeded 2 fixtures).
+- DONE: add tests for `packUniformFrom`, `validateUniformStorable`, and `packUniformStorable` in `test/Main.hs`.
+- DONE: update README to mention public API is `Spirdo.Wesl` only (no `Internal`), and document new uniform packing helpers.

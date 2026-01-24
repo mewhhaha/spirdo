@@ -1,14 +1,18 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Main (main) where
 
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as BS
-import qualified Data.Map.Strict as Map
+import Data.Char (toLower)
+import Data.List (find)
 import Foreign
-import Foreign.C.String (withCString, peekCString)
+import Foreign.C.String (peekCString, withCString)
 import Foreign.C.Types (CBool(..), CFloat)
 import GHC.Generics (Generic)
+import System.Environment (lookupEnv)
 
 import Spirdo.SDL3
 import Spirdo.Wesl
@@ -18,8 +22,9 @@ import Spirdo.Wesl
   , CompiledShader(..)
   , CompileOptions(..)
   , ToUniform(..)
-  , V2(..)
   , V4(..)
+  , binding
+  , HasBinding
   , uniform
   , packUniform
   , OverrideValue(..)
@@ -37,6 +42,7 @@ import Examples.Compute
 import Examples.Fragments
 import Examples.Override (fragmentOverrideSrc)
 import Examples.Vertex
+import Spirdo.SDL3.Safe (withSDL, withWindow, withGPURenderer)
 
 data ShaderVariant = ShaderVariant
   { svName :: String
@@ -47,6 +53,7 @@ data ShaderVariant = ShaderVariant
   , svUniformCount :: Word32
   , svUniformSlot :: Word32
   , svInterface :: ShaderInterface
+  , svParamsInfo :: BindingInfo
   }
 
 data VariantState = VariantState
@@ -56,7 +63,7 @@ data VariantState = VariantState
   , vsUniformCount :: Word32
   , vsUniformSlot :: Word32
   , vsInterface :: ShaderInterface
-  , vsUniformInfos :: [BindingInfo]
+  , vsParamsInfo :: BindingInfo
   }
 
 main :: IO ()
@@ -82,6 +89,7 @@ main = do
         , mkVariant "Seascape" fragmentSeascapeShader
         , mkVariant "Protean Clouds" fragmentProteanCloudsShader
         , mkVariant "Primitives" fragmentPrimitivesShader
+        , mkVariant "Grass" fragmentGrassShader
         , overrideVariant "Override Stripes" 0
         , overrideVariant "Override Rings" 1
         ]
@@ -95,41 +103,40 @@ main = do
         , SomeCompiledShader vertexWaveShader
         , SomeCompiledShader vertexFullscreenShader
         ]
-  forM_ (zip [0 :: Int ..] variants) $ \(ix, variant) ->
-    BS.writeFile ("fragment-" <> show ix <> ".spv") (svSpirv variant)
-  forM_ (zip [0 :: Int ..] computeShaders) $ \(ix, SomeCompiledShader shader) ->
-    let suffix = if ix == 0 then "" else "-" <> show ix
-    in BS.writeFile ("compute" <> suffix <> ".spv") (shaderSpirv shader)
-  forM_ (zip [0 :: Int ..] vertexShaders) $ \(ix, SomeCompiledShader shader) ->
-    let suffix = if ix == 0 then "" else "-" <> show ix
-    in BS.writeFile ("vertex" <> suffix <> ".spv") (shaderSpirv shader)
+  writeFlag <- lookupEnv "SPIRDO_WRITE_SPV"
+  let shouldWriteSpv =
+        case fmap (map toLower) writeFlag of
+          Just "1" -> True
+          Just "true" -> True
+          Just "yes" -> True
+          Just "on" -> True
+          _ -> False
+  when shouldWriteSpv $ do
+    forM_ (zip [0 :: Int ..] variants) $ \(ix, variant) ->
+      BS.writeFile ("fragment-" <> show ix <> ".spv") (svSpirv variant)
+    forM_ (zip [0 :: Int ..] computeShaders) $ \(ix, SomeCompiledShader shader) ->
+      let suffix = if ix == 0 then "" else "-" <> show ix
+      in BS.writeFile ("compute" <> suffix <> ".spv") (shaderSpirv shader)
+    forM_ (zip [0 :: Int ..] vertexShaders) $ \(ix, SomeCompiledShader shader) ->
+      let suffix = if ix == 0 then "" else "-" <> show ix
+      in BS.writeFile ("vertex" <> suffix <> ".spv") (shaderSpirv shader)
 
-  sdlCheckBool "sdlInit" (sdlInit sdl_INIT_VIDEO)
+  withSDL sdl_INIT_VIDEO $
+    withWindow "Spirdo SDL3" 800 600 0 $ \window ->
+      withGPURenderer window $ \renderer -> do
+        device <- sdlGetGPURendererDevice renderer
+        when (device == nullPtr) (sdlFail "sdlGetGPURendererDevice")
 
-  withCString "Spirdo SDL3" $ \title -> do
-    window <- sdlCreateWindow title 800 600 0
-    when (window == nullPtr) (sdlFail "sdlCreateWindow")
+        formats <- sdlGetGPUShaderFormats device
+        when ((formats .&. sdl_GPU_SHADERFORMAT_SPIRV) == 0) (sdlFail "SPIR-V not supported by SDL GPU renderer")
 
-    renderer <- sdlCreateGPURenderer nullPtr window
-    when (renderer == nullPtr) (sdlFail "sdlCreateGPURenderer")
+        variantStates <- mapM (createVariantState device renderer) variants
+        when (null variantStates) (sdlFail "no shaders available")
 
-    device <- sdlGetGPURendererDevice renderer
-    when (device == nullPtr) (sdlFail "sdlGetGPURendererDevice")
+        let color = SDL_FColor 0.15 0.55 1.0 1.0
+        loop renderer window device variantStates 0 color 0
 
-    formats <- sdlGetGPUShaderFormats device
-    when ((formats .&. sdl_GPU_SHADERFORMAT_SPIRV) == 0) (sdlFail "SPIR-V not supported by SDL GPU renderer")
-
-    variantStates <- mapM (createVariantState device renderer) variants
-    when (null variantStates) (sdlFail "no shaders available")
-
-    let color = SDL_FColor 0.15 0.55 1.0 1.0
-    loop renderer window device variantStates 0 color 0
-
-    mapM_ (destroyVariantState device) variantStates
-    sdlDestroyRenderer renderer
-    sdlDestroyWindow window
-
-  sdlQuit
+        mapM_ (destroyVariantState device) variantStates
 
 loop :: Ptr SDL_Renderer -> Ptr SDL_Window -> Ptr SDL_GPUDevice -> [VariantState] -> Int -> SDL_FColor -> CFloat -> IO ()
 loop renderer window device variants idx color t = do
@@ -156,33 +163,14 @@ renderFrame renderer variant color t mode = do
           { time_res = V4 (realToFrac t) 800 600 (fromIntegral mode)
           , color = V4 (realToFrac cr) (realToFrac cg) (realToFrac cb) (realToFrac ca)
           }
-      globals =
-        GlobalsU
-          { time = realToFrac t
-          , resolution = V2 800 600
-          , frame = fromIntegral mode
-          }
-      material =
-        MaterialU
-          { baseColor = V4 (realToFrac cr) (realToFrac cg) (realToFrac cb) 1.0
-          , roughness = 0.35
-          }
-      uniformValues =
-        Map.fromList
-          [ ("params", uniform params)
-          , ("globals", uniform globals)
-          , ("material", uniform material)
-          ]
-  forM_ (vsUniformInfos variant) $ \info ->
-    case Map.lookup (biName info) uniformValues of
-      Nothing -> error ("no uniform values provided for binding: " <> biName info)
-      Just uval ->
-        case packUniform (biType info) uval of
-          Left err -> error ("uniform pack failed: " <> err)
-          Right bytes ->
-            BS.useAsCStringLen bytes $ \(paramPtr, len) ->
-              sdlCheckBool "sdlSetGPURenderStateFragmentUniforms" $
-                sdlSetGPURenderStateFragmentUniforms (vsState variant) (biBinding info) (castPtr paramPtr) (fromIntegral len)
+      info = vsParamsInfo variant
+  packed <- packUniform (biType info) (uniform params)
+  case packed of
+    Left err -> error ("uniform pack failed: " <> err)
+    Right bytes ->
+      BS.useAsCStringLen bytes $ \(paramPtr, len) ->
+        sdlCheckBool "sdlSetGPURenderStateFragmentUniforms" $
+          sdlSetGPURenderStateFragmentUniforms (vsState variant) (biBinding info) (castPtr paramPtr) (fromIntegral len)
   sdlCheckBool "sdlSetGPURenderState" (sdlSetGPURenderState renderer (vsState variant))
 
   let positions :: [CFloat]
@@ -299,14 +287,22 @@ bindingCount :: [BindingDesc] -> Word32
 bindingCount [] = 0
 bindingCount bindings = 1 + maximum (map descBinding bindings)
 
-mkVariant :: ReflectBindings iface => String -> CompiledShader iface -> ShaderVariant
+mkVariant :: (ReflectBindings iface, HasBinding "params" iface ~ 'True) => String -> CompiledShader iface -> ShaderVariant
 mkVariant name shader =
   let samplerCount = bindingCount (samplerBindingsFor shader)
       storageBufferCount = bindingCount (storageBufferBindingsFor shader)
       storageTextureCount = bindingCount (storageTextureBindingsFor shader)
       uniformCount = fragmentUniformCount shader
       uniformSlot = fragmentUniformSlot shader
-  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot (shaderInterface shader)
+      paramsDesc =
+        case binding @"params" shader of
+          Left err -> error ("variant " <> name <> ": " <> err)
+          Right desc -> desc
+      paramsInfo =
+        case find (\info -> biName info == descName paramsDesc) (siBindings (shaderInterface shader)) of
+          Nothing -> error ("variant " <> name <> ": params binding not found")
+          Just info -> info
+  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot (shaderInterface shader) paramsInfo
 
 mkVariantDynamic :: String -> SomeCompiledShader -> ShaderVariant
 mkVariantDynamic name (SomeCompiledShader shader) =
@@ -320,7 +316,11 @@ mkVariantDynamic name (SomeCompiledShader shader) =
         case [biBinding info | info <- infos, biKind info == BUniform] of
           (b:_) -> b
           [] -> 0
-  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot iface
+      paramsInfo =
+        case find (\info -> biName info == "params") (siBindings iface) of
+          Nothing -> error ("variant " <> name <> ": params binding not found")
+          Just info -> info
+  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot iface paramsInfo
   where
     bindingCountInfo predKind xs =
       let bindings = [biBinding info | info <- xs, predKind (biKind info)]
@@ -359,11 +359,6 @@ createVariantState device renderer variant = do
     (svUniformCount variant)
     (svSpirv variant)
   state <- createRenderState renderer frag
-  let uniformInfos =
-        [ info
-        | info <- siBindings (svInterface variant)
-        , biKind info == BUniform
-        ]
   pure VariantState
     { vsName = svName variant
     , vsState = state
@@ -371,7 +366,7 @@ createVariantState device renderer variant = do
     , vsUniformCount = svUniformCount variant
     , vsUniformSlot = svUniformSlot variant
     , vsInterface = svInterface variant
-    , vsUniformInfos = uniformInfos
+    , vsParamsInfo = svParamsInfo variant
     }
 
 destroyVariantState :: Ptr SDL_GPUDevice -> VariantState -> IO ()
@@ -399,18 +394,3 @@ data ParamsU = ParamsU
   } deriving (Eq, Show, Generic)
 
 instance ToUniform ParamsU
-
-data GlobalsU = GlobalsU
-  { time :: Float
-  , resolution :: V2 Float
-  , frame :: Float
-  } deriving (Eq, Show, Generic)
-
-instance ToUniform GlobalsU
-
-data MaterialU = MaterialU
-  { baseColor :: V4 Float
-  , roughness :: Float
-  } deriving (Eq, Show, Generic)
-
-instance ToUniform MaterialU

@@ -1,18 +1,33 @@
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TypeApplications #-}
+
 module Main (main) where
 
 import Control.Monad (forM_, unless)
 import Data.Bits ((.|.), shiftL)
 import qualified Data.ByteString as BS
 import Data.List (find, isInfixOf, isPrefixOf)
+import Data.Maybe (isJust)
 import Data.Word (Word32)
 import GHC.Float (castFloatToWord32)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable, getTemporaryDirectory, listDirectory, removeFile)
+import System.Environment (lookupEnv)
 import System.FilePath ((</>), takeExtension)
-import System.Directory (doesDirectoryExist, findExecutable, getTemporaryDirectory, listDirectory, removeFile)
 import System.Exit (ExitCode(..))
 import System.IO (hClose, openBinaryTempFile)
 import System.Process (readProcessWithExitCode)
 
 import Spirdo.Wesl
+import GHC.Generics (Generic)
+
+data PayloadU = PayloadU
+  { a :: Float
+  , b :: V3 Float
+  , c :: M3 Float
+  , d :: [V2 Float]
+  } deriving (Generic)
+
+instance ToUniform PayloadU
 
 main :: IO ()
 main = do
@@ -72,6 +87,9 @@ main = do
   checkSamplerInterface
   checkPackUniformLayout
   checkPackUniformErrors
+  checkPackUniformFrom
+  checkPackUniformStorable
+  checkGoldenSpirv
   putStrLn "All tests passed."
 
 assertSpirv :: Maybe FilePath -> String -> BS.ByteString -> IO ()
@@ -136,9 +154,11 @@ checkPackUniformLayout =
               , ("c", uniform (M3 (V3 10.0 11.0 12.0) (V3 13.0 14.0 15.0) (V3 16.0 17.0 18.0) :: M3 Float))
               , ("d", uniform ([V2 21.0 22.0, V2 23.0 24.0] :: [V2 Float]))
               ]
-      bytes <- case packUniform (biType info) value of
-        Left err -> fail ("pack-uniform-layout: " <> err)
-        Right bs -> pure bs
+      bytes <- do
+        packed <- packUniform (biType info) value
+        case packed of
+          Left err -> fail ("pack-uniform-layout: " <> err)
+          Right bs -> pure bs
       case biType info of
         TLStruct _ fields _ size -> do
           unless (BS.length bytes == fromIntegral size) $
@@ -199,7 +219,8 @@ checkPackUniformErrors =
             UVStruct
               [ ("a", uniform (1.0 :: Float))
               ]
-      case packUniform (biType info) missing of
+      missingRes <- packUniform (biType info) missing
+      case missingRes of
         Left err ->
           unless ("missing struct field" `isInfixOf` err) $
             fail ("pack-uniform-errors: unexpected missing error: " <> err)
@@ -212,11 +233,91 @@ checkPackUniformErrors =
               , ("d", uniform ([V2 0.0 0.0, V2 0.0 0.0] :: [V2 Float]))
               , ("oops", uniform (0.0 :: Float))
               ]
-      case packUniform (biType info) extra of
+      extraRes <- packUniform (biType info) extra
+      case extraRes of
         Left err ->
           unless ("unexpected struct fields" `isInfixOf` err) $
             fail ("pack-uniform-errors: unexpected extra error: " <> err)
         Right _ -> fail "pack-uniform-errors: expected extra field failure"
+
+checkPackUniformFrom :: IO ()
+checkPackUniformFrom =
+  case compileWeslToSpirv packUniformShader of
+    Left err -> fail ("pack-uniform-from: " <> show err)
+    Right (SomeCompiledShader (CompiledShader _ iface)) -> do
+      info <- case find (\b -> biName b == "payload") (siBindings iface) of
+        Nothing -> fail "pack-uniform-from: missing payload binding"
+        Just bi -> pure bi
+      let payload =
+            PayloadU
+              { a = 1.0
+              , b = V3 2.0 3.0 4.0
+              , c = M3 (V3 10.0 11.0 12.0) (V3 13.0 14.0 15.0) (V3 16.0 17.0 18.0)
+              , d = [V2 21.0 22.0, V2 23.0 24.0]
+              }
+      packed <- packUniformFrom (biType info) payload
+      case packed of
+        Left err -> fail ("pack-uniform-from: " <> err)
+        Right _ -> pure ()
+
+checkPackUniformStorable :: IO ()
+checkPackUniformStorable = do
+  layout <- case compileWeslToSpirv storableShader of
+    Left err -> fail ("pack-uniform-storable: " <> show err)
+    Right (SomeCompiledShader (CompiledShader _ iface)) ->
+      case find (\b -> biName b == "payload") (siBindings iface) of
+        Nothing -> fail "pack-uniform-storable: missing payload binding"
+        Just bi ->
+          case biType bi of
+            TLStruct _ fields _ _ ->
+              case find (\fld -> flName fld == "value") fields of
+                Nothing -> fail "pack-uniform-storable: missing value field"
+                Just fld -> pure (flType fld)
+            _ -> fail "pack-uniform-storable: expected struct layout"
+  case validateUniformStorable @Float layout of
+    Left err -> fail ("pack-uniform-storable: " <> err)
+    Right () -> pure ()
+  packed <- packUniformStorable @Float layout 1.5
+  case packed of
+    Left err -> fail ("pack-uniform-storable: " <> err)
+    Right bs ->
+      unless (BS.length bs == 4) $
+        fail "pack-uniform-storable: expected 4 bytes"
+  let badLayout = case layout of
+        TLScalar s _ _ -> TLScalar s 8 8
+        _ -> layout
+  case validateUniformStorable @Float badLayout of
+    Left err ->
+      unless ("size mismatch" `isInfixOf` err) $
+        fail ("pack-uniform-storable: unexpected error: " <> err)
+    Right () -> fail "pack-uniform-storable: expected size mismatch"
+
+checkGoldenSpirv :: IO ()
+checkGoldenSpirv = do
+  update <- isJust <$> lookupEnv "SPIRDO_UPDATE_GOLDEN"
+  let dir = "test" </> "golden"
+  let fixtures =
+        [ ("compute-basic", goldenComputeShader)
+        , ("fragment-basic", goldenFragmentShader)
+        ]
+  whenUpdate update (createDirectoryIfMissing True dir)
+  forM_ fixtures $ \(label, src) -> do
+    bytes <- case compileWeslToSpirvBytes src of
+      Left err -> fail ("golden:" <> label <> ": " <> show err)
+      Right bs -> pure bs
+    let path = dir </> (label <> ".spv.golden")
+    if update
+      then BS.writeFile path bytes
+      else do
+        exists <- doesFileExist path
+        unless exists $
+          fail ("golden: missing " <> path <> " (set SPIRDO_UPDATE_GOLDEN=1 to generate)")
+        expected <- BS.readFile path
+        unless (expected == bytes) $
+          fail ("golden: mismatch for " <> label)
+  where
+    whenUpdate True act = act
+    whenUpdate False _ = pure ()
 
 checkIfTranslation :: IO ()
 checkIfTranslation = do
@@ -1226,6 +1327,40 @@ packUniformShader =
     , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
     , "  let _ = payload.a + payload.b.x + payload.c[0][0] + payload.d[0].x;"
     , "  return vec4(0.0, 0.0, 0.0, 1.0);"
+    , "}"
+    ]
+
+goldenComputeShader :: String
+goldenComputeShader =
+  unlines
+    [ "@compute @workgroup_size(1, 1, 1)"
+    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
+    , "  var x = 1;"
+    , "  x = x + i32(gid.x);"
+    , "}"
+    ]
+
+goldenFragmentShader :: String
+goldenFragmentShader =
+  unlines
+    [ "@fragment"
+    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
+    , "  let uv = pos.xy / vec2(800.0, 600.0);"
+    , "  return vec4(uv.x, uv.y, 0.2, 1.0);"
+    , "}"
+    ]
+
+storableShader :: String
+storableShader =
+  unlines
+    [ "struct Payload {"
+    , "  value: f32;"
+    , "};"
+    , "@group(0) @binding(0)"
+    , "var<uniform> payload: Payload;"
+    , "@fragment"
+    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
+    , "  return vec4(payload.value, 0.0, 0.0, 1.0);"
     , "}"
     ]
 
