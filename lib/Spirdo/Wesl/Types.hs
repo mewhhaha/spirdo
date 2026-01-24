@@ -15,13 +15,13 @@
 
 module Spirdo.Wesl.Types where
 
-import Control.Monad (forM_)
 import Data.Bits ((.&.), shiftR)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString.Internal as BSI
-import Data.IORef (newIORef, readIORef, writeIORef)
+import qualified Data.ByteString as BS
+import Data.ByteString.Builder (Builder, byteString, toLazyByteString)
+import qualified Data.ByteString.Lazy as BSL
 import Data.Int (Int32)
-import Data.List (find, intercalate)
+import Data.List (find, intercalate, sortOn)
 import qualified Data.Kind as K
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
@@ -29,9 +29,6 @@ import qualified Data.Set as Set
 import Data.Proxy (Proxy(..))
 import Data.Text (Text)
 import Data.Word (Word8, Word16, Word32, Word64)
-import Foreign.Marshal.Utils (fillBytes)
-import Foreign.Ptr (Ptr, castPtr)
-import Foreign.Storable (Storable, alignment, poke, pokeByteOff, sizeOf)
 import GHC.TypeLits (KnownNat, KnownSymbol, Nat, Symbol, natVal, symbolVal)
 import GHC.Float (castFloatToWord32)
 import GHC.Generics (Generic, Rep, K1(..), M1(..), (:*:)(..), Selector, selName, S, from)
@@ -241,27 +238,28 @@ instance ReflectBindings '[] where
 instance (ReflectBinding b, ReflectBindings bs) => ReflectBindings (b ': bs) where
   reflectBindings _ = reflectBinding (Proxy @b) : reflectBindings (Proxy @bs)
 
--- | Typed binding list for an interface.
-newtype Bindings (iface :: [Binding]) = Bindings
-  { unBindings :: [BindingDesc]
-  }
-
-bindingsFor :: forall iface. ReflectBindings iface => CompiledShader iface -> Bindings iface
-bindingsFor _ = Bindings (reflectBindings (Proxy @iface))
-
 type family HasBinding (name :: Symbol) (iface :: [Binding]) :: Bool where
   HasBinding _ '[] = 'False
   HasBinding name ('Binding name _ _ _ _ ': _) = 'True
   HasBinding name (_ ': rest) = HasBinding name rest
 
-binding :: forall name iface. (KnownSymbol name, HasBinding name iface ~ 'True, ReflectBindings iface) => CompiledShader iface -> Either String BindingDesc
+binding :: forall name iface. (KnownSymbol name, HasBinding name iface ~ 'True, ReflectBindings iface) => CompiledShader iface -> BindingDesc
 binding _ =
   let key = symbolVal (Proxy @name)
   in case find (\b -> descName b == key) (reflectBindings (Proxy @iface)) of
-      Just b -> Right b
-      Nothing -> Left ("binding: missing " <> key)
+      Just b -> b
+      Nothing -> error ("binding: missing " <> key <> " (impossible)")
 
--- Typed inputs derived from the interface.
+newtype SamplerHandle = SamplerHandle Word64
+  deriving (Eq, Show)
+
+newtype TextureHandle = TextureHandle Word64
+  deriving (Eq, Show)
+
+newtype BufferHandle = BufferHandle Word64
+  deriving (Eq, Show)
+
+-- Typed inputs derived from the interface (host-agnostic handles).
 
 data HList (xs :: [K.Type]) where
   HNil :: HList '[]
@@ -290,10 +288,10 @@ type family CategoryOf (k :: BindingKind) :: BindingCategory where
 
 type family InputForCategory (c :: BindingCategory) :: K.Type where
   InputForCategory 'CatUniform = UniformValue
-  InputForCategory 'CatSampler = SDLSamplerHandle
-  InputForCategory 'CatTexture = SDLTextureHandle
-  InputForCategory 'CatStorageBuffer = SDLBufferHandle
-  InputForCategory 'CatStorageTexture = SDLTextureHandle
+  InputForCategory 'CatSampler = SamplerHandle
+  InputForCategory 'CatTexture = TextureHandle
+  InputForCategory 'CatStorageBuffer = BufferHandle
+  InputForCategory 'CatStorageTexture = TextureHandle
 
 type family InputForKind (k :: BindingKind) :: K.Type where
   InputForKind k = InputForCategory (CategoryOf k)
@@ -428,58 +426,48 @@ instance {-# OVERLAPPING #-} (Selector s, ToUniform a) => GUniform (M1 S s (K1 i
         safeName = if null name then "_unnamed" else name
     in [(safeName, toUniform (unK1 (unM1 m1)))]
 
--- | Minimal SDL-like handles (replace with real SDL3.4 handles in your app).
-newtype SDLSamplerHandle = SDLSamplerHandle Word64
-  deriving (Eq, Show)
-
-newtype SDLTextureHandle = SDLTextureHandle Word64
-  deriving (Eq, Show)
-
-newtype SDLBufferHandle = SDLBufferHandle Word64
-  deriving (Eq, Show)
-
-data SDLUniform = SDLUniform
-  { sdlUniformName :: !String
-  , sdlUniformGroup :: !Word32
-  , sdlUniformBinding :: !Word32
-  , sdlUniformBytes :: !ByteString
+data UniformInput = UniformInput
+  { uiName :: !String
+  , uiGroup :: !Word32
+  , uiBinding :: !Word32
+  , uiBytes :: !ByteString
   } deriving (Eq, Show)
 
-data SDLSampler = SDLSampler
-  { sdlSamplerName :: !String
-  , sdlSamplerGroup :: !Word32
-  , sdlSamplerBinding :: !Word32
-  , sdlSamplerHandle :: !SDLSamplerHandle
+data SamplerInput = SamplerInput
+  { samplerName :: !String
+  , samplerGroup :: !Word32
+  , samplerBinding :: !Word32
+  , samplerHandle :: !SamplerHandle
   } deriving (Eq, Show)
 
-data SDLTexture = SDLTexture
-  { sdlTextureName :: !String
-  , sdlTextureGroup :: !Word32
-  , sdlTextureBinding :: !Word32
-  , sdlTextureHandle :: !SDLTextureHandle
+data TextureInput = TextureInput
+  { textureName :: !String
+  , textureGroup :: !Word32
+  , textureBinding :: !Word32
+  , textureHandle :: !TextureHandle
   } deriving (Eq, Show)
 
-data SDLStorageBuffer = SDLStorageBuffer
-  { sdlStorageBufferName :: !String
-  , sdlStorageBufferGroup :: !Word32
-  , sdlStorageBufferBinding :: !Word32
-  , sdlStorageBufferHandle :: !SDLBufferHandle
+data StorageBufferInput = StorageBufferInput
+  { storageBufferName :: !String
+  , storageBufferGroup :: !Word32
+  , storageBufferBinding :: !Word32
+  , storageBufferHandle :: !BufferHandle
   } deriving (Eq, Show)
 
-data SDLStorageTexture = SDLStorageTexture
-  { sdlStorageTextureName :: !String
-  , sdlStorageTextureGroup :: !Word32
-  , sdlStorageTextureBinding :: !Word32
-  , sdlStorageTextureHandle :: !SDLTextureHandle
+data StorageTextureInput = StorageTextureInput
+  { storageTextureName :: !String
+  , storageTextureGroup :: !Word32
+  , storageTextureBinding :: !Word32
+  , storageTextureHandle :: !TextureHandle
   } deriving (Eq, Show)
 
 data ShaderInputs (iface :: [Binding]) = ShaderInputs
   { siShader :: !(CompiledShader iface)
-  , siUniforms :: ![SDLUniform]
-  , siSamplers :: ![SDLSampler]
-  , siTextures :: ![SDLTexture]
-  , siStorageBuffers :: ![SDLStorageBuffer]
-  , siStorageTextures :: ![SDLStorageTexture]
+  , siUniforms :: ![UniformInput]
+  , siSamplers :: ![SamplerInput]
+  , siTextures :: ![TextureInput]
+  , siStorageBuffers :: ![StorageBufferInput]
+  , siStorageTextures :: ![StorageTextureInput]
   }
 
 emptyInputs :: CompiledShader iface -> ShaderInputs iface
@@ -501,128 +489,115 @@ lookupBindingInfo name iface =
 
 type UniformPath = String
 
-packUniform :: TypeLayout -> UniformValue -> IO (Either String ByteString)
+packUniform :: TypeLayout -> UniformValue -> Either String ByteString
 packUniform layout value = do
   let size = fromIntegral (layoutSize layout)
-  errRef <- newIORef (Right ())
-  bs <- BSI.create size $ \ptr -> do
-    fillBytes ptr 0 size
-    writeUniformM ptr "" 0 layout value >>= writeIORef errRef
-  res <- readIORef errRef
-  pure $ case res of
-    Left err -> Left err
-    Right () -> Right bs
-{-# NOINLINE packUniform #-}
+  segs <- collectSegments "" 0 layout value
+  builder <- assembleSegments size segs
+  pure (BSL.toStrict (toLazyByteString builder))
 
-packUniformFrom :: ToUniform a => TypeLayout -> a -> IO (Either String ByteString)
+packUniformFrom :: ToUniform a => TypeLayout -> a -> Either String ByteString
 packUniformFrom layout value = packUniform layout (uniform value)
 
-validateUniformStorable :: forall a. Storable a => TypeLayout -> Either String ()
-validateUniformStorable layout =
-  let expectedSize = layoutSize layout
-      expectedAlign = layoutAlign layout
-      actualSize = sizeOf (undefined :: a)
-      actualAlign = alignment (undefined :: a)
-  in if expectedSize == 0 || expectedAlign == 0
-       then Left "layout is not host-shareable"
-       else if fromIntegral expectedSize /= actualSize
-         then Left ("storable size mismatch: expected " <> show expectedSize <> ", got " <> show actualSize)
-         else if fromIntegral expectedAlign /= actualAlign
-           then Left ("storable alignment mismatch: expected " <> show expectedAlign <> ", got " <> show actualAlign)
-           else Right ()
+data Segment = Segment
+  { segOff :: !Int
+  , segBytes :: !ByteString
+  }
 
-packUniformStorable :: forall a. Storable a => TypeLayout -> a -> IO (Either String ByteString)
-packUniformStorable layout value =
-  case validateUniformStorable @a layout of
-    Left err -> pure (Left err)
-    Right () -> do
-      let size = sizeOf value
-      bs <- BSI.create size $ \ptr -> poke (castPtr ptr) value
-      pure (Right bs)
-
-writeUniformM :: Ptr Word8 -> UniformPath -> Int -> TypeLayout -> UniformValue -> IO (Either String ())
-writeUniformM ptr ctx off layout value =
+collectSegments :: UniformPath -> Int -> TypeLayout -> UniformValue -> Either String [Segment]
+collectSegments ctx off layout value =
   case (layout, value) of
     (TLScalar s _ _, UVScalar v) ->
-      writeScalarAtM ptr ctx off s v
+      case scalarValueBytes s v of
+        Left err -> Left (formatAt ctx err)
+        Right bytes -> Right [Segment off (BS.pack bytes)]
     (TLVector n s _ _, UVVector n' vals)
       | n == n' ->
-          writeAll (zip [0 ..] vals) $ \(ix, val) ->
-            writeScalarAtM ptr (ctxIndex ctx ix) (off + ix * scalarByteSize s) s val
+          fmap concat $
+            traverse
+              (\(ix, val) ->
+                case scalarValueBytes s val of
+                  Left err -> Left (formatAt (ctxIndex ctx ix) err)
+                  Right bytes -> Right [Segment (off + ix * scalarByteSize s) (BS.pack bytes)])
+              (zip [0 ..] vals)
       | otherwise ->
-          pure (Left (formatAt ctx ("vector length mismatch: expected " <> show n <> ", got " <> show n')))
+          Left (formatAt ctx ("vector length mismatch: expected " <> show n <> ", got " <> show n'))
     (TLMatrix cols rows s _ _ stride, UVMatrix c r vals)
       | cols == c && rows == r ->
-          writeMatrixM ptr ctx off cols rows s (fromIntegral stride) vals
+          let expected = cols * rows
+          in if length vals /= expected
+            then Left (formatAt ctx ("matrix value count mismatch: expected " <> show expected <> ", got " <> show (length vals)))
+            else
+              fmap concat $
+                traverse
+                  (\(ix, val) ->
+                    let col = ix `div` rows
+                        row = ix `mod` rows
+                        base = off + col * fromIntegral stride + row * scalarByteSize s
+                    in case scalarValueBytes s val of
+                        Left err -> Left (formatAt (ctxIndex (ctxIndex ctx col) row) err)
+                        Right bytes -> Right [Segment base (BS.pack bytes)])
+                  (zip [0 ..] vals)
       | otherwise ->
-          pure (Left (formatAt ctx ("matrix size mismatch: expected " <> show cols <> "x" <> show rows <> ", got " <> show c <> "x" <> show r)))
+          Left (formatAt ctx ("matrix size mismatch: expected " <> show cols <> "x" <> show rows <> ", got " <> show c <> "x" <> show r))
     (TLArray mlen stride elemLayout _ _, UVArray elems) ->
       case mlen of
         Just n | n /= length elems ->
-          pure (Left (formatAt ctx ("array length mismatch: expected " <> show n <> ", got " <> show (length elems))))
+          Left (formatAt ctx ("array length mismatch: expected " <> show n <> ", got " <> show (length elems)))
         _ ->
-          writeAll (zip [0 ..] elems) $ \(ix, el) ->
-            writeUniformM ptr (ctxIndex ctx ix) (off + ix * fromIntegral stride) elemLayout el
-    (TLStruct structName fields _ _, UVStruct vals) -> do
+          fmap concat $
+            traverse
+              (\(ix, el) ->
+                collectSegments (ctxIndex ctx ix) (off + ix * fromIntegral stride) elemLayout el)
+              (zip [0 ..] elems)
+    (TLStruct structName fields _ _, UVStruct vals) ->
       let structCtx = if null ctx then structName else ctx
-      let nameCounts = Map.fromListWith (+) [(n, 1 :: Int) | (n, _) <- vals]
-      let dupes = Map.keys (Map.filter (> 1) nameCounts)
-      if not (null dupes)
-        then pure (Left (formatAt structCtx ("duplicate struct fields: " <> intercalate ", " dupes)))
-        else do
+          nameCounts = Map.fromListWith (+) [(n, 1 :: Int) | (n, _) <- vals]
+          dupes = Map.keys (Map.filter (> 1) nameCounts)
+      in if not (null dupes)
+        then Left (formatAt structCtx ("duplicate struct fields: " <> intercalate ", " dupes))
+        else
           let fieldNames = map flName fields
-          let fieldSet = Set.fromList fieldNames
-          let extra = filter (`Set.notMember` fieldSet) (map fst vals)
-          if not (null extra)
-            then pure (Left (formatAt structCtx ("unexpected struct fields: " <> intercalate ", " extra)))
-            else do
+              fieldSet = Set.fromList fieldNames
+              extra = filter (`Set.notMember` fieldSet) (map fst vals)
+          in if not (null extra)
+            then Left (formatAt structCtx ("unexpected struct fields: " <> intercalate ", " extra))
+            else
               let valMap = Map.fromList vals
-              writeAll fields $ \fld ->
-                case Map.lookup (flName fld) valMap of
-                  Nothing -> pure (Left (formatAt structCtx ("missing struct field: " <> flName fld)))
-                  Just v ->
-                    writeUniformM ptr (ctxField structCtx (flName fld)) (off + fromIntegral (flOffset fld)) (flType fld) v
+              in fmap concat $
+                  traverse
+                    (\fld ->
+                      case Map.lookup (flName fld) valMap of
+                        Nothing -> Left (formatAt structCtx ("missing struct field: " <> flName fld))
+                        Just v ->
+                          collectSegments (ctxField structCtx (flName fld)) (off + fromIntegral (flOffset fld)) (flType fld) v)
+                    fields
     _ ->
-      pure (Left (formatAt ctx ("uniform value does not match layout: " <> show layout)))
+      Left (formatAt ctx ("uniform value does not match layout: " <> show layout))
 
-writeScalarAtM :: Ptr Word8 -> UniformPath -> Int -> Scalar -> ScalarValue -> IO (Either String ())
-writeScalarAtM ptr ctx off s val =
-  case scalarValueBytes s val of
-    Left err -> pure (Left (formatAt ctx err))
-    Right bs -> do
-      writeBytes ptr off bs
-      pure (Right ())
-
-writeMatrixM :: Ptr Word8 -> UniformPath -> Int -> Int -> Int -> Scalar -> Int -> [ScalarValue] -> IO (Either String ())
-writeMatrixM ptr ctx off cols rows scalar stride vals = do
-  let expected = cols * rows
-  if length vals /= expected
-    then pure (Left (formatAt ctx ("matrix value count mismatch: expected " <> show expected <> ", got " <> show (length vals))))
-    else
-      writeAll (zip [0 ..] vals) $ \(ix, val) -> do
-        let col = ix `div` rows
-        let row = ix `mod` rows
-        let base = off + col * stride + row * scalarByteSize scalar
-        writeScalarAtM ptr (ctxIndex (ctxIndex ctx col) row) base scalar val
-
-writeBytes :: Ptr Word8 -> Int -> [Word8] -> IO ()
-writeBytes ptr off bytes =
-  forM_ (zip [0 ..] bytes) $ \(ix, byte) ->
-    pokeByteOff ptr (off + ix) byte
+assembleSegments :: Int -> [Segment] -> Either String Builder
+assembleSegments size segs = go 0 (sortOn segOff segs)
+  where
+    go pos [] =
+      if pos > size
+        then Left "uniform write out of bounds"
+        else Right (pad (size - pos))
+    go pos (Segment off bytes : rest)
+      | off < pos = Left "uniform write overlap"
+      | off > size = Left "uniform write out of bounds"
+      | off + BS.length bytes > size = Left "uniform write out of bounds"
+      | otherwise = do
+          next <- go (off + BS.length bytes) rest
+          Right (pad (off - pos) <> byteString bytes <> next)
+    pad n
+      | n <= 0 = mempty
+      | otherwise = byteString (BS.replicate n 0)
 
 formatAt :: UniformPath -> String -> String
 formatAt ctx msg =
   if null ctx
     then msg
     else "at " <> ctx <> ": " <> msg
-
-writeAll :: [a] -> (a -> IO (Either String ())) -> IO (Either String ())
-writeAll [] _ = pure (Right ())
-writeAll (x:xs) action = do
-  result <- action x
-  case result of
-    Left err -> pure (Left err)
-    Right () -> writeAll xs action
 
 ctxField :: UniformPath -> String -> UniformPath
 ctxField ctx name =
@@ -664,78 +639,77 @@ word32LE w =
   ]
 
 class ApplyCategory (c :: BindingCategory) where
-  applyCategory :: BindingInfo -> InputForCategory c -> ShaderInputs iface -> IO (Either String (ShaderInputs iface))
+  applyCategory :: BindingInfo -> InputForCategory c -> ShaderInputs iface -> Either String (ShaderInputs iface)
 
 instance ApplyCategory 'CatUniform where
-  applyCategory info val inputs = do
-    packed <- packUniform (biType info) val
-    case packed of
-      Left err -> pure (Left err)
-      Right bytes -> do
+  applyCategory info val inputs =
+    case packUniform (biType info) val of
+      Left err -> Left err
+      Right bytes ->
         let entry =
-              SDLUniform
-                { sdlUniformName = biName info
-                , sdlUniformGroup = biGroup info
-                , sdlUniformBinding = biBinding info
-                , sdlUniformBytes = bytes
+              UniformInput
+                { uiName = biName info
+                , uiGroup = biGroup info
+                , uiBinding = biBinding info
+                , uiBytes = bytes
                 }
-        pure (Right inputs { siUniforms = entry : siUniforms inputs })
+        in Right inputs { siUniforms = entry : siUniforms inputs }
 
 instance ApplyCategory 'CatSampler where
   applyCategory info handle inputs =
     let entry =
-          SDLSampler
-            { sdlSamplerName = biName info
-            , sdlSamplerGroup = biGroup info
-            , sdlSamplerBinding = biBinding info
-            , sdlSamplerHandle = handle
+          SamplerInput
+            { samplerName = biName info
+            , samplerGroup = biGroup info
+            , samplerBinding = biBinding info
+            , samplerHandle = handle
             }
-    in pure (Right inputs { siSamplers = entry : siSamplers inputs })
+    in Right inputs { siSamplers = entry : siSamplers inputs }
 
 instance ApplyCategory 'CatTexture where
   applyCategory info handle inputs =
     let entry =
-          SDLTexture
-            { sdlTextureName = biName info
-            , sdlTextureGroup = biGroup info
-            , sdlTextureBinding = biBinding info
-            , sdlTextureHandle = handle
+          TextureInput
+            { textureName = biName info
+            , textureGroup = biGroup info
+            , textureBinding = biBinding info
+            , textureHandle = handle
             }
-    in pure (Right inputs { siTextures = entry : siTextures inputs })
+    in Right inputs { siTextures = entry : siTextures inputs }
 
 instance ApplyCategory 'CatStorageBuffer where
   applyCategory info handle inputs =
     let entry =
-          SDLStorageBuffer
-            { sdlStorageBufferName = biName info
-            , sdlStorageBufferGroup = biGroup info
-            , sdlStorageBufferBinding = biBinding info
-            , sdlStorageBufferHandle = handle
+          StorageBufferInput
+            { storageBufferName = biName info
+            , storageBufferGroup = biGroup info
+            , storageBufferBinding = biBinding info
+            , storageBufferHandle = handle
             }
-    in pure (Right inputs { siStorageBuffers = entry : siStorageBuffers inputs })
+    in Right inputs { siStorageBuffers = entry : siStorageBuffers inputs }
 
 instance ApplyCategory 'CatStorageTexture where
   applyCategory info handle inputs =
     let entry =
-          SDLStorageTexture
-            { sdlStorageTextureName = biName info
-            , sdlStorageTextureGroup = biGroup info
-            , sdlStorageTextureBinding = biBinding info
-            , sdlStorageTextureHandle = handle
+          StorageTextureInput
+            { storageTextureName = biName info
+            , storageTextureGroup = biGroup info
+            , storageTextureBinding = biBinding info
+            , storageTextureHandle = handle
             }
-    in pure (Right inputs { siStorageTextures = entry : siStorageTextures inputs })
+    in Right inputs { siStorageTextures = entry : siStorageTextures inputs }
 
 class ApplyKind (k :: BindingKind) where
-  applyKind :: BindingInfo -> InputForKind k -> ShaderInputs iface -> IO (Either String (ShaderInputs iface))
+  applyKind :: BindingInfo -> InputForKind k -> ShaderInputs iface -> Either String (ShaderInputs iface)
 
 instance ApplyCategory (CategoryOf k) => ApplyKind k where
   applyKind = applyCategory @(CategoryOf k)
 
 class BuildInputsWith (iface :: [Binding]) (bs :: [Binding]) where
-  buildInputsWith :: CompiledShader iface -> HList (InputsOf bs) -> IO (Either String (ShaderInputs iface))
+  buildInputsWith :: CompiledShader iface -> HList (InputsOf bs) -> Either String (ShaderInputs iface)
 
 instance BuildInputsWith iface '[] where
-  buildInputsWith shader HNil = pure (Right (emptyInputs shader))
+  buildInputsWith shader HNil = Right (emptyInputs shader)
 
 instance
   forall iface name kind set binding ty bs.
@@ -748,25 +722,20 @@ instance
   ) =>
   BuildInputsWith iface ('Binding name kind set binding ty ': bs)
   where
-  buildInputsWith shader (x :& xs) = do
-    base <- buildInputsWith @iface @bs shader xs
-    let name = symbolVal (Proxy @name)
-    case base of
-      Left err -> pure (Left err)
+  buildInputsWith shader (x :& xs) =
+    case buildInputsWith @iface @bs shader xs of
+      Left err -> Left err
       Right baseInputs ->
-        case lookupBindingInfo name (shaderInterface shader) of
-          Left err -> pure (Left err)
-          Right info -> do
-            applied <- applyKind @kind info x baseInputs
-            pure $ case applied of
-              Left err -> Left ("binding " <> name <> ": " <> err)
-              Right ok -> Right ok
+        let name = symbolVal (Proxy @name)
+        in case lookupBindingInfo name (shaderInterface shader) of
+            Left err -> Left err
+            Right info ->
+              case applyKind @kind info x baseInputs of
+                Left err -> Left ("binding " <> name <> ": " <> err)
+                Right ok -> Right ok
 
-inputsForEither :: forall iface. BuildInputsWith iface iface => CompiledShader iface -> HList (InputsOf iface) -> IO (Either String (ShaderInputs iface))
-inputsForEither shader xs = buildInputsWith @iface @iface shader xs
-
-inputsFor :: forall iface. BuildInputsWith iface iface => CompiledShader iface -> HList (InputsOf iface) -> IO (Either String (ShaderInputs iface))
-inputsFor = inputsForEither
+inputsFor :: forall iface. BuildInputsWith iface iface => CompiledShader iface -> HList (InputsOf iface) -> Either String (ShaderInputs iface)
+inputsFor shader xs = buildInputsWith @iface @iface shader xs
 
 samplerBindings :: forall iface. ReflectBindings iface => Proxy iface -> [BindingDesc]
 samplerBindings _ =

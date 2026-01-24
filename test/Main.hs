@@ -88,7 +88,6 @@ main = do
   checkPackUniformLayout
   checkPackUniformErrors
   checkPackUniformFrom
-  checkPackUniformStorable
   checkGoldenSpirv
   putStrLn "All tests passed."
 
@@ -154,9 +153,8 @@ checkPackUniformLayout =
               , ("c", uniform (M3 (V3 10.0 11.0 12.0) (V3 13.0 14.0 15.0) (V3 16.0 17.0 18.0) :: M3 Float))
               , ("d", uniform ([V2 21.0 22.0, V2 23.0 24.0] :: [V2 Float]))
               ]
-      bytes <- do
-        packed <- packUniform (biType info) value
-        case packed of
+      bytes <-
+        case packUniform (biType info) value of
           Left err -> fail ("pack-uniform-layout: " <> err)
           Right bs -> pure bs
       case biType info of
@@ -219,7 +217,7 @@ checkPackUniformErrors =
             UVStruct
               [ ("a", uniform (1.0 :: Float))
               ]
-      missingRes <- packUniform (biType info) missing
+      let missingRes = packUniform (biType info) missing
       case missingRes of
         Left err ->
           unless ("missing struct field" `isInfixOf` err) $
@@ -233,7 +231,7 @@ checkPackUniformErrors =
               , ("d", uniform ([V2 0.0 0.0, V2 0.0 0.0] :: [V2 Float]))
               , ("oops", uniform (0.0 :: Float))
               ]
-      extraRes <- packUniform (biType info) extra
+      let extraRes = packUniform (biType info) extra
       case extraRes of
         Left err ->
           unless ("unexpected struct fields" `isInfixOf` err) $
@@ -255,42 +253,9 @@ checkPackUniformFrom =
               , c = M3 (V3 10.0 11.0 12.0) (V3 13.0 14.0 15.0) (V3 16.0 17.0 18.0)
               , d = [V2 21.0 22.0, V2 23.0 24.0]
               }
-      packed <- packUniformFrom (biType info) payload
-      case packed of
+      case packUniformFrom (biType info) payload of
         Left err -> fail ("pack-uniform-from: " <> err)
         Right _ -> pure ()
-
-checkPackUniformStorable :: IO ()
-checkPackUniformStorable = do
-  layout <- case compileWeslToSpirv storableShader of
-    Left err -> fail ("pack-uniform-storable: " <> show err)
-    Right (SomeCompiledShader (CompiledShader _ iface)) ->
-      case find (\b -> biName b == "payload") (siBindings iface) of
-        Nothing -> fail "pack-uniform-storable: missing payload binding"
-        Just bi ->
-          case biType bi of
-            TLStruct _ fields _ _ ->
-              case find (\fld -> flName fld == "value") fields of
-                Nothing -> fail "pack-uniform-storable: missing value field"
-                Just fld -> pure (flType fld)
-            _ -> fail "pack-uniform-storable: expected struct layout"
-  case validateUniformStorable @Float layout of
-    Left err -> fail ("pack-uniform-storable: " <> err)
-    Right () -> pure ()
-  packed <- packUniformStorable @Float layout 1.5
-  case packed of
-    Left err -> fail ("pack-uniform-storable: " <> err)
-    Right bs ->
-      unless (BS.length bs == 4) $
-        fail "pack-uniform-storable: expected 4 bytes"
-  let badLayout = case layout of
-        TLScalar s _ _ -> TLScalar s 8 8
-        _ -> layout
-  case validateUniformStorable @Float badLayout of
-    Left err ->
-      unless ("size mismatch" `isInfixOf` err) $
-        fail ("pack-uniform-storable: unexpected error: " <> err)
-    Right () -> fail "pack-uniform-storable: expected size mismatch"
 
 checkGoldenSpirv :: IO ()
 checkGoldenSpirv = do
@@ -1347,20 +1312,6 @@ goldenFragmentShader =
     , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
     , "  let uv = pos.xy / vec2(800.0, 600.0);"
     , "  return vec4(uv.x, uv.y, 0.2, 1.0);"
-    , "}"
-    ]
-
-storableShader :: String
-storableShader =
-  unlines
-    [ "struct Payload {"
-    , "  value: f32;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<uniform> payload: Payload;"
-    , "@fragment"
-    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  return vec4(payload.value, 0.0, 0.0, 1.0);"
     , "}"
     ]
 
