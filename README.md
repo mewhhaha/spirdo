@@ -158,6 +158,8 @@ inputs =
     )
 ```
 
+Note: `SamplerHandle`/`TextureHandle` values are **your runtime resource IDs**, not shader binding indices. They must correspond to real resources in your renderer.
+
 `InputsOf iface` is a type-level list derived from the shader’s bindings, so the
 order and kinds are enforced at compile time. The resulting `ShaderInputs` lists
 (`siUniforms`, `siSamplers`, `siTextures`, ...) are ready to hand off to your
