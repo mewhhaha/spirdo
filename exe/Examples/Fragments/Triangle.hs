@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Triangle.
 module Examples.Fragments.Triangle (fragmentTriangleShader) where
 
 import Spirdo.Wesl (wesl)

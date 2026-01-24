@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Grass.
 module Examples.Fragments.Grass (fragmentGrassShader) where
 
 import Spirdo.Wesl (wesl)

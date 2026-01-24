@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Clouds.
 module Examples.Fragments.Clouds (fragmentCloudShader) where
 
 import Spirdo.Wesl (wesl)

@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: FeatureMix.
 module Examples.Fragments.FeatureMix (fragmentFeatureShader) where
 
 import Spirdo.Wesl (wesl)

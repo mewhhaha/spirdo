@@ -13,6 +13,7 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
+-- | Public API for compiling WESL to SPIR-V and reflecting shader interfaces.
 module Spirdo.Wesl
   ( -- * Compile-time interface types
     BindingKind(..)

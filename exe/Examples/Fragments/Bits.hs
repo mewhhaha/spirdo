@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Bits.
 module Examples.Fragments.Bits (fragmentBitsShader) where
 
 import Spirdo.Wesl (wesl)

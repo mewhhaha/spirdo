@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Tunnel.
 module Examples.Fragments.Tunnel (fragmentTunnelShader) where
 
 import Spirdo.Wesl (wesl)

@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE TypeApplications #-}
 
+-- | Executable entry point.
 module Main (main) where
 
 import Control.Monad (forM_, unless)

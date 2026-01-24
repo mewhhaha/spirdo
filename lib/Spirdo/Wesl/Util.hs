@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Internal utilities for diagnostics and formatting.
 module Spirdo.Wesl.Util
   ( errorAt
   , errorAtPos

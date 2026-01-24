@@ -1,4 +1,5 @@
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
+-- | Example fragment shader using overrides.
 module Examples.Override (fragmentOverrideSrc) where
 
 fragmentOverrideSrc =

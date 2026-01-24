@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: SdfText.
 module Examples.Fragments.SdfText (fragmentSdfTextShader) where
 
 import Spirdo.Wesl (wesl)

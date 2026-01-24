@@ -24,6 +24,9 @@ library
                      , Spirdo.Wesl.Inputs
     other-modules:
         Spirdo.Wesl.Types
+        Spirdo.Wesl.Types.Interface
+        Spirdo.Wesl.Types.Layout
+        Spirdo.Wesl.Types.Uniform
         Spirdo.Wesl.Compiler
         Spirdo.Wesl.Syntax
         Spirdo.Wesl.Util
@@ -38,6 +41,7 @@ library
         directory,
         filepath,
         text,
+        transformers,
         template-haskell
     hs-source-dirs:   lib
     default-language: GHC2024

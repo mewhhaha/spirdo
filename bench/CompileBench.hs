@@ -1,3 +1,4 @@
+-- | Executable entry point.
 module Main (main) where
 
 import qualified Data.ByteString as BS

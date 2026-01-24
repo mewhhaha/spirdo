@@ -1,3 +1,4 @@
+-- | Safe SDL3 wrapper helpers for the demo.
 module Spirdo.SDL3.Safe
   ( withSDL
   , withWindow

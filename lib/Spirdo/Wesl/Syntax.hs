@@ -1,3 +1,4 @@
+-- | AST definitions for WESL.
 module Spirdo.Wesl.Syntax
   ( SrcPos(..)
   , Token(..)

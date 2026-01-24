@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Terrain.
 module Examples.Fragments.Terrain (fragmentTerrainShader) where
 
 import Spirdo.Wesl (wesl)

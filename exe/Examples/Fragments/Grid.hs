@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Grid.
 module Examples.Fragments.Grid (fragmentGridShader) where
 
 import Spirdo.Wesl (wesl)

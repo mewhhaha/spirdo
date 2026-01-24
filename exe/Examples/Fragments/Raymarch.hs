@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Raymarch.
 module Examples.Fragments.Raymarch (fragmentRaymarchShader) where
 
 import Spirdo.Wesl (wesl)

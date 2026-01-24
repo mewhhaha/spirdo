@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Voronoi.
 module Examples.Fragments.Voronoi (fragmentVoronoiShader) where
 
 import Spirdo.Wesl (wesl)

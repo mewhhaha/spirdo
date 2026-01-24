@@ -13,6 +13,7 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
+-- | SPIR-V emission backend.
 module Spirdo.Wesl.Emit where
 
 import Control.Monad (foldM, zipWithM_, when)

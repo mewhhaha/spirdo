@@ -2,6 +2,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE CPP #-}
 
+-- | Low-level SDL3 FFI bindings for the demo.
 module Spirdo.SDL3
   ( SDL_Window
   , SDL_Renderer

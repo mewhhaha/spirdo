@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
+-- | Example fragment shader: Plasma.
 module Examples.Fragments.Plasma (fragmentPlasmaShader) where
 
 import Spirdo.Wesl (wesl)
