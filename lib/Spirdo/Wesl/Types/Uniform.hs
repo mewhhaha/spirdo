@@ -26,7 +26,7 @@ import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, byteString, toLazyByteString)
 import qualified Data.ByteString.Lazy as BSL
 import Data.Int (Int32)
-import Data.List (intercalate, sortOn)
+import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word8, Word16, Word32)
@@ -169,31 +169,29 @@ type UniformPath = String
 packUniform :: TypeLayout -> UniformValue -> Either String ByteString
 packUniform layout value = do
   let size = fromIntegral (layoutSize layout)
-  segs <- collectSegments "" 0 layout value
-  builder <- assembleSegments size segs
-  pure (BSL.toStrict (toLazyByteString builder))
+  (builder, pos) <- emitValue size "" 0 layout value 0
+  if pos > size
+    then Left "uniform write out of bounds"
+    else
+      let final = builder <> padBytes (size - pos)
+      in pure (BSL.toStrict (toLazyByteString final))
 
 packUniformFrom :: ToUniform a => TypeLayout -> a -> Either String ByteString
 packUniformFrom layout value = packUniform layout (uniform value)
 
-data Segment = Segment !Int !ByteString
-
-collectSegments :: UniformPath -> Int -> TypeLayout -> UniformValue -> Either String [Segment]
-collectSegments ctx off layout value =
+emitValue :: Int -> UniformPath -> Int -> TypeLayout -> UniformValue -> Int -> Either String (Builder, Int)
+emitValue size ctx off layout value pos =
   case (layout, value) of
     (TLScalar s _ _, UVScalar v) ->
       case scalarValueBytes s v of
         Left err -> Left (formatAt ctx err)
-        Right bytes -> Right [Segment off (BS.pack bytes)]
+        Right bytes -> emitSegment size off (BS.pack bytes) pos
     (TLVector n s _ _, UVVector n' vals)
       | n == n' ->
-          fmap concat $
-            traverse
-              (\(ix, val) ->
-                case scalarValueBytes s val of
-                  Left err -> Left (formatAt (ctxIndex ctx ix) err)
-                  Right bytes -> Right [Segment (off + ix * scalarByteSize s) (BS.pack bytes)])
-              (zip [0 ..] vals)
+          foldMBuilder pos (zip [0 ..] vals) $ \(ix, val) curPos ->
+            case scalarValueBytes s val of
+              Left err -> Left (formatAt (ctxIndex ctx ix) err)
+              Right bytes -> emitSegment size (off + ix * scalarByteSize s) (BS.pack bytes) curPos
       | otherwise ->
           Left (formatAt ctx ("vector length mismatch: expected " <> show n <> ", got " <> show n'))
     (TLMatrix cols rows s _ _ stride, UVMatrix c r vals)
@@ -202,16 +200,13 @@ collectSegments ctx off layout value =
           in if length vals /= expected
             then Left (formatAt ctx ("matrix value count mismatch: expected " <> show expected <> ", got " <> show (length vals)))
             else
-              fmap concat $
-                traverse
-                  (\(ix, val) ->
-                    let col = ix `div` rows
-                        row = ix `mod` rows
-                        base = off + col * fromIntegral stride + row * scalarByteSize s
-                    in case scalarValueBytes s val of
-                        Left err -> Left (formatAt (ctxIndex (ctxIndex ctx col) row) err)
-                        Right bytes -> Right [Segment base (BS.pack bytes)])
-                  (zip [0 ..] vals)
+              foldMBuilder pos (zip [0 ..] vals) $ \(ix, val) curPos ->
+                let col = ix `div` rows
+                    row = ix `mod` rows
+                    base = off + col * fromIntegral stride + row * scalarByteSize s
+                in case scalarValueBytes s val of
+                    Left err -> Left (formatAt (ctxIndex (ctxIndex ctx col) row) err)
+                    Right bytes -> emitSegment size base (BS.pack bytes) curPos
       | otherwise ->
           Left (formatAt ctx ("matrix size mismatch: expected " <> show cols <> "x" <> show rows <> ", got " <> show c <> "x" <> show r))
     (TLArray mlen stride elemLayout _ _, UVArray elems) ->
@@ -219,11 +214,8 @@ collectSegments ctx off layout value =
         Just n | n /= length elems ->
           Left (formatAt ctx ("array length mismatch: expected " <> show n <> ", got " <> show (length elems)))
         _ ->
-          fmap concat $
-            traverse
-              (\(ix, el) ->
-                collectSegments (ctxIndex ctx ix) (off + ix * fromIntegral stride) elemLayout el)
-              (zip [0 ..] elems)
+          foldMBuilder pos (zip [0 ..] elems) $ \(ix, el) curPos ->
+            emitValue size (ctxIndex ctx ix) (off + ix * fromIntegral stride) elemLayout el curPos
     (TLStruct structName fields _ _, UVStruct vals) ->
       let structCtx = if null ctx then structName else ctx
           nameCounts = Map.fromListWith (+) [(n, 1 :: Int) | (n, _) <- vals]
@@ -238,44 +230,36 @@ collectSegments ctx off layout value =
             then Left (formatAt structCtx ("unexpected struct fields: " <> intercalate ", " extra))
             else
               let valMap = Map.fromList vals
-              in fmap concat $
-                  traverse
-                    (\fld ->
-                      case Map.lookup (flName fld) valMap of
-                        Nothing -> Left (formatAt structCtx ("missing struct field: " <> flName fld))
-                        Just v ->
-                          collectSegments (ctxField structCtx (flName fld)) (off + fromIntegral (flOffset fld)) (flType fld) v)
-                    fields
+              in foldMBuilder pos fields $ \fld curPos ->
+                  case Map.lookup (flName fld) valMap of
+                    Nothing -> Left (formatAt structCtx ("missing struct field: " <> flName fld))
+                    Just v ->
+                      emitValue size (ctxField structCtx (flName fld)) (off + fromIntegral (flOffset fld)) (flType fld) v curPos
     _ ->
       Left (formatAt ctx ("uniform value does not match layout: " <> show layout))
 
-assembleSegments :: Int -> [Segment] -> Either String Builder
-assembleSegments size segs = go 0 (ensureSorted segs)
+emitSegment :: Int -> Int -> ByteString -> Int -> Either String (Builder, Int)
+emitSegment size off bytes pos
+  | off < pos = Left "uniform write overlap"
+  | off > size = Left "uniform write out of bounds"
+  | off + BS.length bytes > size = Left "uniform write out of bounds"
+  | otherwise =
+      let padding = padBytes (off - pos)
+          nextPos = off + BS.length bytes
+      in Right (padding <> byteString bytes, nextPos)
+
+padBytes :: Int -> Builder
+padBytes n
+  | n <= 0 = mempty
+  | otherwise = byteString (BS.replicate n 0)
+
+foldMBuilder :: Int -> [a] -> (a -> Int -> Either String (Builder, Int)) -> Either String (Builder, Int)
+foldMBuilder start items step = go mempty start items
   where
-    segOffset (Segment off _) = off
-    ensureSorted xs =
-      if isSorted xs
-        then xs
-        else sortOn segOffset xs
-    isSorted [] = True
-    isSorted (Segment a _ : rest) = isSortedFrom a rest
-    isSortedFrom _ [] = True
-    isSortedFrom prev (Segment off _ : rest) =
-      prev <= off && isSortedFrom off rest
-    go pos [] =
-      if pos > size
-        then Left "uniform write out of bounds"
-        else Right (pad (size - pos))
-    go pos (Segment off bytes : rest)
-      | off < pos = Left "uniform write overlap"
-      | off > size = Left "uniform write out of bounds"
-      | off + BS.length bytes > size = Left "uniform write out of bounds"
-      | otherwise = do
-          next <- go (off + BS.length bytes) rest
-          Right (pad (off - pos) <> byteString bytes <> next)
-    pad n
-      | n <= 0 = mempty
-      | otherwise = byteString (BS.replicate n 0)
+    go acc pos [] = Right (acc, pos)
+    go acc pos (x:xs) = do
+      (chunk, pos') <- step x pos
+      go (acc <> chunk) pos' xs
 
 formatAt :: UniformPath -> String -> String
 formatAt ctx msg =
