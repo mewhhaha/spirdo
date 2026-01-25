@@ -174,4 +174,4 @@ This keeps default builds fully validated while providing an opt-in path to stri
 - DONE: finish refactor verification — `cabal build` and `cabal test`.
 - DONE: add golden SPIR-V tests (created `test/golden/`, update/compare logic in `test/Main.hs`, seeded 2 fixtures).
 - DONE: add tests for `packUniformFrom`, `validateUniformStorable`, and `packUniformStorable` in `test/Main.hs`.
-- DONE: update README to mention public API is `Spirdo.Wesl` only (no `Internal`), and document new uniform packing helpers.
+- DONE: update README to mention public API is `Spirdo.Wesl` + `Spirdo.Wesl.Inputs`, and document uniform packing helpers.
