@@ -9,7 +9,8 @@ import Data.Bits ((.|.), shiftL)
 import qualified Data.ByteString as BS
 import Data.List (find, isInfixOf, isPrefixOf)
 import Data.Maybe (isJust)
-import Data.Word (Word32)
+import Data.Proxy (Proxy(..))
+import Data.Word (Word32, Word64)
 import GHC.Float (castFloatToWord32)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable, getTemporaryDirectory, listDirectory, removeFile)
 import System.Environment (lookupEnv)
@@ -89,6 +90,9 @@ main = do
   checkPackUniformLayout
   checkPackUniformErrors
   checkPackUniformFrom
+  checkUniformStorable
+  checkVertexAttributes
+  checkBindingPlan
   checkGoldenSpirv
   putStrLn "All tests passed."
 
@@ -257,6 +261,54 @@ checkPackUniformFrom =
       case packUniformFrom (biType info) payload of
         Left err -> fail ("pack-uniform-from: " <> err)
         Right _ -> pure ()
+
+checkUniformStorable :: IO ()
+checkUniformStorable = do
+  let layout = TLScalar F32 4 4
+  case validateUniformStorable layout (Proxy @Float) of
+    Left err -> fail ("uniform-storable: unexpected failure: " <> err)
+    Right () -> pure ()
+  case validateUniformStorable layout (Proxy @Word64) of
+    Left _ -> pure ()
+    Right () -> fail "uniform-storable: expected size mismatch for Word64"
+  packed <- packUniformStorable layout (1.0 :: Float)
+  case packed of
+    Left err -> fail ("uniform-storable: pack failed: " <> err)
+    Right bytes ->
+      unless (BS.length bytes == 4) $
+        fail "uniform-storable: expected 4 bytes"
+
+checkVertexAttributes :: IO ()
+checkVertexAttributes =
+  case compileWeslToSpirv vertexShader of
+    Left err -> fail ("vertex-attributes: " <> show err)
+    Right (SomeCompiledShader (CompiledShader _ iface)) ->
+      case vertexAttributes iface of
+        Left err -> fail ("vertex-attributes: " <> err)
+        Right attrs ->
+          case attrs of
+            [VertexAttribute _ loc fmt] -> do
+              unless (loc == 0) $
+                fail "vertex-attributes: expected location 0"
+              unless (fmt == VF32x2) $
+                fail ("vertex-attributes: expected VF32x2, got " <> show fmt)
+            _ -> fail ("vertex-attributes: expected 1 attribute, got " <> show (length attrs))
+
+checkBindingPlan :: IO ()
+checkBindingPlan =
+  case compileWeslToSpirv samplerShader of
+    Left err -> fail ("binding-plan: " <> show err)
+    Right (SomeCompiledShader (CompiledShader _ iface)) -> do
+      let plan = bindingPlan iface
+      unless (length (bpBindings plan) == length (siBindings iface)) $
+        fail "binding-plan: binding count mismatch"
+      let group0 = filter (\b -> biGroup b == 0) (bpBindings plan)
+      unless (length group0 == 2) $
+        fail "binding-plan: expected 2 bindings in group 0"
+      unless (length (bpSamplers plan) == 1) $
+        fail "binding-plan: expected 1 sampler binding"
+      unless (length (bpTextures plan) == 1) $
+        fail "binding-plan: expected 1 texture binding"
 
 checkGoldenSpirv :: IO ()
 checkGoldenSpirv = do

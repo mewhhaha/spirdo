@@ -17,6 +17,11 @@ extra-source-files:
 common warnings
     ghc-options: -Wall
 
+flag demo
+    description: Build the demo executable.
+    default: False
+    manual: True
+
 library
     import:           warnings
     exposed-modules:
@@ -74,17 +79,15 @@ executable spirdo
         Examples.Vertex
         Spirdo.SDL3
         Spirdo.SDL3.Safe
+    if !flag(demo)
+        buildable: False
     -- other-extensions:
+    build-tool-depends: hsc2hs:hsc2hs
+    pkgconfig-depends: sdl3
     build-depends:
         base ^>=4.21.0.0,
         bytestring,
-        containers,
-        filepath,
         spirdo
-    build-tool-depends:
-        hsc2hs:hsc2hs
-    pkgconfig-depends:
-        sdl3
 
     hs-source-dirs:   exe
     default-language: GHC2024

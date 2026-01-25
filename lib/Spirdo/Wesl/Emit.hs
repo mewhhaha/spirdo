@@ -24,7 +24,7 @@ import Data.Foldable (foldrM)
 import Data.Int (Int32)
 import Data.List (intercalate, mapAccumL)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -44,7 +44,114 @@ buildInterface specMode modAst = do
   let structEnv = [(sdName s, s) | s <- modStructs modAst]
   bindings <- mapM (layoutBinding structEnv) (modBindings modAst)
   overrides <- buildOverrideInfo specMode structEnv (modOverrides modAst)
-  pure (ShaderInterface bindings overrides)
+  stageInfo <- buildStageIO structEnv (modEntry modAst)
+  pure (ShaderInterface bindings overrides stageInfo Nothing)
+
+buildStageIO :: [(Text, StructDecl)] -> Maybe EntryPoint -> Either CompileError (Maybe StageIO)
+buildStageIO _ Nothing = Right Nothing
+buildStageIO structEnv (Just entry) = do
+  inputs <- collectStageInputs structEnv entry
+  outputs <- collectStageOutputs structEnv entry
+  let stage = toShaderStage (epStage entry)
+  let wgSize = epWorkgroupSize entry
+  pure (Just (StageIO stage wgSize inputs outputs))
+
+toShaderStage :: Stage -> ShaderStage
+toShaderStage st =
+  case st of
+    StageCompute -> ShaderStageCompute
+    StageFragment -> ShaderStageFragment
+    StageVertex -> ShaderStageVertex
+
+collectStageInputs :: [(Text, StructDecl)] -> EntryPoint -> Either CompileError [IOParam]
+collectStageInputs structEnv entry =
+  fmap concat (mapM (paramInputs structEnv) (epParams entry))
+
+paramInputs :: [(Text, StructDecl)] -> Param -> Either CompileError [IOParam]
+paramInputs structEnv param =
+  case paramType param of
+    TyStructRef structName -> do
+      structDecl <- lookupStruct structEnv structName
+      mapM (fieldInput (paramName param) structName) (sdFields structDecl)
+    ty -> do
+      layout <- resolveTypeLayout structEnv [] ty
+      fmap pure (mkIOParam (textToString (paramName param)) (paramAttrs param) layout)
+  where
+    fieldInput parentName structName field = do
+      layout <- resolveTypeLayout structEnv [] (fdType field)
+      let label = qualifyField parentName structName (fdName field)
+      mkIOParam label (fdAttrs field) layout
+
+collectStageOutputs :: [(Text, StructDecl)] -> EntryPoint -> Either CompileError [IOParam]
+collectStageOutputs structEnv entry =
+  case epStage entry of
+    StageCompute -> Right []
+    _ ->
+      case epReturnType entry of
+        Nothing -> Right []
+        Just ty ->
+          case ty of
+            TyStructRef structName -> do
+              structDecl <- lookupStruct structEnv structName
+              mapM (fieldOutput structName) (sdFields structDecl)
+            _ -> do
+              layout <- resolveTypeLayout structEnv [] ty
+              let builtin = epReturnBuiltin entry
+              let loc =
+                    if isNothing builtin && isNothing (epReturnLocation entry) && epStage entry == StageFragment
+                      then Just 0
+                      else epReturnLocation entry
+              fmap pure (mkReturnIOParam layout loc builtin)
+  where
+    fieldOutput structName field = do
+      layout <- resolveTypeLayout structEnv [] (fdType field)
+      let label = qualifyField structName structName (fdName field)
+      mkIOParam label (fdAttrs field) layout
+
+lookupStruct :: [(Text, StructDecl)] -> Text -> Either CompileError StructDecl
+lookupStruct structEnv structName =
+  case lookup structName structEnv of
+    Nothing -> Left (CompileError ("unknown struct: " <> textToString structName) Nothing Nothing)
+    Just decl -> Right decl
+
+qualifyField :: Text -> Text -> Text -> String
+qualifyField parentName structName fieldName =
+  let parent =
+        if parentName == structName
+          then textToString structName
+          else textToString parentName
+  in parent <> "." <> textToString fieldName
+
+mkIOParam :: String -> [Attr] -> TypeLayout -> Either CompileError IOParam
+mkIOParam label attrs layout = do
+  let loc = attrLocation attrs
+  let builtin = attrBuiltin attrs
+  when (isJust loc && isJust builtin) $
+    Left (CompileError "input/output cannot use both @location and @builtin" Nothing Nothing)
+  when (isNothing loc && isNothing builtin) $
+    Left (CompileError "input/output is missing @location or @builtin" Nothing Nothing)
+  pure
+    IOParam
+      { ioName = label
+      , ioLocation = loc
+      , ioBuiltin = textToString <$> builtin
+      , ioType = layout
+      }
+
+mkReturnIOParam :: TypeLayout -> Maybe Word32 -> Maybe Text -> Either CompileError IOParam
+mkReturnIOParam layout loc builtin = do
+  let builtinStr = textToString <$> builtin
+  when (isJust loc && isJust builtin) $
+    Left (CompileError "return value cannot use both @location and @builtin" Nothing Nothing)
+  when (isNothing loc && isNothing builtin) $
+    Left (CompileError "return value is missing @location or @builtin" Nothing Nothing)
+  pure
+    IOParam
+      { ioName = "return"
+      , ioLocation = loc
+      , ioBuiltin = builtinStr
+      , ioType = layout
+      }
 
 buildOverrideInfo :: OverrideSpecMode -> [(Text, StructDecl)] -> [OverrideDecl] -> Either CompileError [OverrideInfo]
 buildOverrideInfo specMode structEnv decls = do
@@ -7354,10 +7461,19 @@ bytesToExp bytes = do
   pure (TH.AppE (TH.VarE 'BS.pack) listSig)
 
 interfaceToExp :: ShaderInterface -> Q Exp
-interfaceToExp (ShaderInterface bindings overrides) = do
+interfaceToExp (ShaderInterface bindings overrides stageInfo pushConst) = do
   bindingsExp <- TH.listE (map bindingToExp bindings)
   overridesExp <- TH.listE (map overrideToExp overrides)
-  pure (TH.AppE (TH.AppE (TH.ConE 'ShaderInterface) bindingsExp) overridesExp)
+  stageExp <- maybeStageIOToExp stageInfo
+  pushExp <- maybeLayoutToExp pushConst
+  pure
+    (TH.AppE
+      (TH.AppE
+        (TH.AppE
+          (TH.AppE (TH.ConE 'ShaderInterface) bindingsExp)
+          overridesExp)
+        stageExp)
+      pushExp)
 
 bindingToExp :: BindingInfo -> Q Exp
 bindingToExp info =
@@ -7383,6 +7499,59 @@ maybeToExp val =
   case val of
     Nothing -> TH.conE 'Nothing
     Just v -> TH.appE (TH.conE 'Just) (TH.litE (TH.integerL (fromIntegral v)))
+
+maybeLayoutToExp :: Maybe TypeLayout -> Q Exp
+maybeLayoutToExp val =
+  case val of
+    Nothing -> TH.conE 'Nothing
+    Just layout -> TH.appE (TH.conE 'Just) (typeLayoutToExp layout)
+
+maybeStageIOToExp :: Maybe StageIO -> Q Exp
+maybeStageIOToExp val =
+  case val of
+    Nothing -> TH.conE 'Nothing
+    Just sio -> TH.appE (TH.conE 'Just) (stageIOToExp sio)
+
+stageIOToExp :: StageIO -> Q Exp
+stageIOToExp sio =
+  TH.recConE 'StageIO
+    [ TH.fieldExp 'sioStage (shaderStageToExp (sioStage sio))
+    , TH.fieldExp 'sioWorkgroupSize (maybeWorkgroupToExp (sioWorkgroupSize sio))
+    , TH.fieldExp 'sioInputs (TH.listE (map ioParamToExp (sioInputs sio)))
+    , TH.fieldExp 'sioOutputs (TH.listE (map ioParamToExp (sioOutputs sio)))
+    ]
+
+shaderStageToExp :: ShaderStage -> Q Exp
+shaderStageToExp st =
+  TH.conE $
+    case st of
+      ShaderStageCompute -> 'ShaderStageCompute
+      ShaderStageFragment -> 'ShaderStageFragment
+      ShaderStageVertex -> 'ShaderStageVertex
+
+maybeWorkgroupToExp :: Maybe (Word32, Word32, Word32) -> Q Exp
+maybeWorkgroupToExp val =
+  case val of
+    Nothing -> TH.conE 'Nothing
+    Just (x, y, z) -> do
+      let lit n = TH.litE (TH.integerL (fromIntegral n))
+      tup <- TH.tupE [lit x, lit y, lit z]
+      TH.appE (TH.conE 'Just) (pure tup)
+
+ioParamToExp :: IOParam -> Q Exp
+ioParamToExp param =
+  TH.recConE 'IOParam
+    [ TH.fieldExp 'ioName (TH.litE (TH.stringL (ioName param)))
+    , TH.fieldExp 'ioLocation (maybeToExp (ioLocation param))
+    , TH.fieldExp 'ioBuiltin (maybeStringToExp (ioBuiltin param))
+    , TH.fieldExp 'ioType (typeLayoutToExp (ioType param))
+    ]
+
+maybeStringToExp :: Maybe String -> Q Exp
+maybeStringToExp val =
+  case val of
+    Nothing -> TH.conE 'Nothing
+    Just s -> TH.appE (TH.conE 'Just) (TH.litE (TH.stringL s))
 
 bindingKindCon :: BindingKind -> TH.Name
 bindingKindCon kind = case kind of
@@ -7549,7 +7718,7 @@ storageAccessToExp :: StorageAccess -> Q Exp
 storageAccessToExp access = TH.conE (storageAccessCon access)
 
 interfaceToType :: ShaderInterface -> Either String TH.Type
-interfaceToType (ShaderInterface bindings _) =
+interfaceToType (ShaderInterface bindings _ _ _) =
   foldrM
     (\b acc -> do
       bTy <- bindingToType b

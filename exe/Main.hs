@@ -15,36 +15,36 @@ import GHC.Generics (Generic)
 import System.Environment (lookupEnv)
 
 import Spirdo.SDL3
+import Spirdo.SDL3.Safe (withSDL, withWindow, withGPURenderer)
 import Spirdo.Wesl
   ( BindingDesc(..)
   , BindingInfo(..)
   , BindingKind(..)
   , CompiledShader(..)
   , CompileOptions(..)
+  , HasBinding
+  , OverrideValue(..)
+  , ReflectBindings
+  , ShaderInterface(..)
+  , SomeCompiledShader(..)
   , ToUniform(..)
   , V4(..)
   , binding
   , bindingInfoForMap
   , bindingMap
-  , HasBinding
-  , uniform
-  , packUniform
-  , OverrideValue(..)
-  , ReflectBindings
-  , ShaderInterface(..)
-  , SomeCompiledShader(..)
   , compileWeslToSpirvWith
   , defaultCompileOptions
+  , packUniform
   , samplerBindingsFor
   , storageBufferBindingsFor
   , storageTextureBindingsFor
+  , uniform
   , uniformBindingsFor
   )
 import Examples.Compute
 import Examples.Fragments
 import Examples.Override (fragmentOverrideSrc)
 import Examples.Vertex
-import Spirdo.SDL3.Safe (withSDL, withWindow, withGPURenderer)
 
 data ShaderVariant = ShaderVariant
   { svName :: String
@@ -136,12 +136,12 @@ main = do
         when (null variantStates) (sdlFail "no shaders available")
 
         let color = SDL_FColor 0.15 0.55 1.0 1.0
-        loop renderer window device variantStates 0 color 0
+        loop renderer variantStates 0 color 0
 
         mapM_ (destroyVariantState device) variantStates
 
-loop :: Ptr SDL_Renderer -> Ptr SDL_Window -> Ptr SDL_GPUDevice -> [VariantState] -> Int -> SDL_FColor -> CFloat -> IO ()
-loop renderer window device variants idx color t = do
+loop :: Ptr SDL_Renderer -> [VariantState] -> Int -> SDL_FColor -> CFloat -> IO ()
+loop renderer variants idx color t = do
   (quit, delta) <- pollInput
   let count = length variants
       idx' = if count == 0 then 0 else (idx + delta + count) `mod` count
@@ -152,7 +152,7 @@ loop renderer window device variants idx color t = do
     let current = variants !! idx'
     renderFrame renderer current color t idx'
     sdlDelay 16
-    loop renderer window device variants idx' color (t + 0.016)
+    loop renderer variants idx' color (t + 0.016)
 
 renderFrame :: Ptr SDL_Renderer -> VariantState -> SDL_FColor -> CFloat -> Int -> IO ()
 renderFrame renderer variant color t mode = do

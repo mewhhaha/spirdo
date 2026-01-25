@@ -1,14 +1,39 @@
 # Spirdo
 
-Haskell WESL compiler + SDL3 demo app that renders shader variants (optional SPIR-V output).
+Haskell WESL compiler with an optional SDL3 demo that renders shader variants (optional SPIR-V output).
+
+## Features
+- WESL/WGSL coverage: control flow, functions, modules/imports, attributes, and diagnostics.
+- Full binding/resource model: uniforms, storage buffers, samplers, textures, storage textures.
+- Builtins: math, bit ops, packing, texture queries/sampling, derivatives.
+- Override specialization constants with `SpecStrict` (validator‑friendly) and `SpecParity` (full WESL parity).
+- Diagnostics surfaced as warnings (unused/shadowing/constant conditions/unreachable/duplicate cases).
+- Typed interface reflection with binding metadata and ordering helpers.
+- Host‑agnostic HList inputs for type‑safe binding submission.
+- Uniform packing with layout validation + Storable packing helpers.
+- Vertex input reflection (`vertexAttributes`) for pipeline setup.
+- Optional SPIR‑V validation (tests use `spirv-val` when available).
+- Minimal `wesl.toml` package metadata parsing.
 
 ## Build and Run
+Library/test builds (no demo):
 ```sh
 cabal build
-cabal run
+cabal test
 ```
 
-Use left/right arrow keys to cycle fragment shader variants in the demo window.
+Demo app (disabled by default):
+```sh
+cabal build -f demo
+cabal run -f demo
+```
+
+The demo uses the SDL3 GPU renderer (FFI in `exe/Spirdo/SDL3.hsc`) and requires
+SDL3 to be installed. Use left/right arrow keys to cycle fragment shader
+variants in the demo window.
+
+Set `SPIRDO_WRITE_SPV=1` to emit SPIR-V files (`fragment-*.spv`, `vertex*.spv`,
+`compute*.spv`) for inspection.
 
 ## Example Usage (Quasiquoter)
 ```hs
@@ -92,6 +117,9 @@ to create descriptor layouts or bind resources on the CPU side.
 Convenience filters are available: `uniformBindingsFor`, `samplerBindingsFor`,
 `storageBufferBindingsFor`, and `storageTextureBindingsFor`.
 
+For actual input submission, prefer the typed HList helpers below; they enforce
+order and kind at compile time.
+
 ### Uniform Packing Helpers
 If you want to pack CPU-side data into a uniform buffer layout (std140-like),
 use the `TypeLayout` from the compiled interface and the helpers in
@@ -125,6 +153,31 @@ packed =
     Just bi -> packUniformFrom (biType bi) (Params 1.5)
 ```
 
+If you already have a `Storable` record that matches the WGSL layout, you can
+validate it and pack bytes directly:
+
+```hs
+import Data.Proxy (Proxy(..))
+import Spirdo.Wesl
+  ( TypeLayout(..)
+  , Scalar(..)
+  , validateUniformStorable
+  , packUniformStorable
+  )
+
+layout :: TypeLayout
+layout = TLScalar F32 4 4
+
+ok :: Either String ()
+ok = validateUniformStorable layout (Proxy @Float)
+
+bytesIO :: IO (Either String BS.ByteString)
+bytesIO = packUniformStorable layout (1.0 :: Float)
+```
+
+Note: `validateUniformStorable` checks size/alignment only. Field ordering and
+padding are still your responsibility.
+
 ### Typed Input Lists (Host-Agnostic)
 You can build a typed input list for the shader interface using `HList` and
 opaque handles. This stays host‑agnostic and still enforces ordering/types.
@@ -143,6 +196,7 @@ import Spirdo.Wesl.Inputs
   ( HList(..)
   , SamplerHandle(..)
   , TextureHandle(..)
+  , StorageTextureHandle(..)
   , ShaderInputs
   , inputsFor
   )
@@ -171,6 +225,9 @@ inputs =
 
 Note: `SamplerHandle`/`TextureHandle` values are **your runtime resource IDs**, not shader binding indices. They must correspond to real resources in your renderer.
 
+Storage textures use `StorageTextureHandle` to keep sampled vs. storage bindings
+distinct at the type level.
+
 `InputsOf iface` is a type-level list derived from the shader’s bindings, so the
 order and kinds are enforced at compile time. The resulting `ShaderInputs` lists
 (`siUniforms`, `siSamplers`, `siTextures`, ...) are ready to hand off to your
@@ -182,83 +239,32 @@ Notes:
 - Record field names must match the WESL struct field names (extra or missing
   fields are errors).
 
-### SDL3 Demo Helpers (exe only)
-The demo executable ships its own SDL3 helpers under `exe/Spirdo/SDL3/Safe.hs`
-and `exe/Spirdo/SDL3.hsc`. These are **not** part of the library API; they’re
-only used by `exe/Main.hs`.
+### Binding Plans and Vertex Attributes
+You can derive a binding plan (sorted by set/binding) and vertex attributes from
+the reflected interface. This is useful when building your own graphics pipeline
+layout in SDL or another renderer.
 
 ```hs
-import Spirdo.SDL3.Safe (withSDL, withWindow, withGPURenderer)
-import Spirdo.SDL3 (sdl_INIT_VIDEO, sdlGetGPURendererDevice)
-
-main :: IO ()
-main =
-  withSDL sdl_INIT_VIDEO $
-    withWindow "Spirdo SDL3" 800 600 0 $ \window ->
-      withGPURenderer window $ \renderer -> do
-        device <- sdlGetGPURendererDevice renderer
-        -- ...
-```
-
-
-### Mapping To A Haskell Record
-If you still want an explicit record in your app, you can map reflected
-bindings into a concrete type:
-
-```hs
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE QuasiQuotes #-}
-{-# LANGUAGE TypeApplications #-}
-
-import Data.List (find)
 import Spirdo.Wesl
-  ( BindingDesc(..)
-  , CompiledShader
-  , reflectBindings
-  , wesl
+  ( bindingPlan
+  , vertexAttributes
   )
-import Data.Proxy (Proxy(..))
 
-data MyBindings = MyBindings
-  { bParams   :: BindingDesc
-  , bSampler0 :: BindingDesc
-  }
+plan = bindingPlan (shaderInterface shader)
 
-mkBindings :: [BindingDesc] -> Either String MyBindings
-mkBindings bs = do
-  params <- byName "params"
-  samp0  <- byName "sampler0"
-  pure MyBindings { bParams = params, bSampler0 = samp0 }
-  where
-    byName n =
-      case find (\b -> descName b == n) bs of
-        Just b -> Right b
-        Nothing -> Left ("missing binding: " <> n)
-
-shader :: CompiledShader iface
-shader = [wesl|
-struct Params {
-  time_res: vec4<f32>;
-};
-
-@group(0) @binding(0)
-var<uniform> params: Params;
-
-@group(0) @binding(1)
-var sampler0: sampler;
-
-@fragment
-fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
-  let uv = vec2(frag_coord.x / 800.0, frag_coord.y / 600.0);
-  return vec4(uv.x, uv.y, 0.4, 1.0);
-}
-|]
-
-bindings :: Either String MyBindings
-bindings = mkBindings (reflectBindings (Proxy @iface))
+attrs = vertexAttributes (shaderInterface shader)
 ```
 
-This gives you a strongly-typed `MyBindings` record to pass around your renderer.
+`vertexAttributes` returns only `@location` inputs; builtins are ignored. If the
+shader uses non-scalar/vector inputs, you’ll get an error.
+
+`pushConstantLayout (shaderInterface shader)` currently returns `Nothing` because
+WESL does not expose push constants yet, but the API is in place.
+
+### Demo (exe only)
+The demo executable is gated behind the `demo` flag and is not part of the
+library API. It uses SDL3 to render a full-screen quad with fragment shaders.
+
 
 ## Example Shaders in the Demo
 Fragment variants in `exe/Main.hs` (left/right to switch):
