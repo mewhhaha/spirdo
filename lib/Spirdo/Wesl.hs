@@ -19,11 +19,16 @@ module Spirdo.Wesl
     BindingKind(..)
   , StorageAccess(..)
   , StorageFormat(..)
+  , Scalar(..)
   , ScalarType(..)
   , Field(..)
   , Ty(..)
   , Binding(..)
   , BindingDesc(..)
+  , ShaderStage(..)
+  , IOParam(..)
+  , StageIO(..)
+  , BindingPlan(..)
   , ReflectBindings(..)
   , HasBinding
   , binding
@@ -34,6 +39,8 @@ module Spirdo.Wesl
   , uniform
   , packUniform
   , packUniformFrom
+  , validateUniformStorable
+  , packUniformStorable
   , V2(..)
   , V3(..)
   , V4(..)
@@ -41,6 +48,22 @@ module Spirdo.Wesl
   , M3(..)
   , M4(..)
   , Half(..)
+  , stageIO
+  , stageInputs
+  , stageOutputs
+  , vertexInputs
+  , vertexOutputs
+  , vertexAttributes
+  , VertexFormat(..)
+  , VertexAttribute(..)
+  , bindingPlan
+  , bindingPlanFor
+  , isUniformKind
+  , isSamplerKind
+  , isTextureKind
+  , isStorageBufferKind
+  , isStorageTextureKind
+  , pushConstantLayout
   , samplerBindings
   , uniformBindings
   , storageBufferBindings

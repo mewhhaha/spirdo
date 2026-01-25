@@ -15,6 +15,7 @@ module Spirdo.Wesl.Inputs
   , SamplerHandle(..)
   , TextureHandle(..)
   , BufferHandle(..)
+  , StorageTextureHandle(..)
   , UniformInput(..)
   , SamplerInput(..)
   , TextureInput(..)
@@ -73,7 +74,7 @@ type family InputForCategory (c :: BindingCategory) :: K.Type where
   InputForCategory 'CatSampler = SamplerHandle
   InputForCategory 'CatTexture = TextureHandle
   InputForCategory 'CatStorageBuffer = BufferHandle
-  InputForCategory 'CatStorageTexture = TextureHandle
+  InputForCategory 'CatStorageTexture = StorageTextureHandle
 
 type family InputForKind (k :: BindingKind) :: K.Type where
   InputForKind k = InputForCategory (CategoryOf k)
@@ -92,6 +93,9 @@ newtype TextureHandle = TextureHandle Word64
   deriving (Eq, Show)
 
 newtype BufferHandle = BufferHandle Word64
+  deriving (Eq, Show)
+
+newtype StorageTextureHandle = StorageTextureHandle Word64
   deriving (Eq, Show)
 
 data UniformInput = UniformInput
@@ -126,7 +130,7 @@ data StorageTextureInput = StorageTextureInput
   { storageTextureName :: !String
   , storageTextureGroup :: !Word32
   , storageTextureBinding :: !Word32
-  , storageTextureHandle :: !TextureHandle
+  , storageTextureHandle :: !StorageTextureHandle
   } deriving (Eq, Show)
 
 data ShaderInputs (iface :: [Binding]) = ShaderInputs

@@ -18,6 +18,8 @@ module Spirdo.Wesl.Types.Uniform
   , uniform
   , packUniform
   , packUniformFrom
+  , validateUniformStorable
+  , packUniformStorable
   ) where
 
 import Data.Bits ((.&.), shiftR)
@@ -30,6 +32,10 @@ import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word8, Word16, Word32)
+import Data.Proxy (Proxy(..))
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (castPtr)
+import Foreign.Storable (Storable(..))
 import GHC.Float (castFloatToWord32)
 import GHC.Generics (Generic, Rep, K1(..), M1(..), (:*:)(..), Selector, selName, S, from)
 
@@ -37,6 +43,7 @@ import Spirdo.Wesl.Types.Layout
   ( FieldLayout(..)
   , Scalar(..)
   , TypeLayout(..)
+  , layoutAlign
   , layoutSize
   )
 
@@ -178,6 +185,29 @@ packUniform layout value = do
 
 packUniformFrom :: ToUniform a => TypeLayout -> a -> Either String ByteString
 packUniformFrom layout value = packUniform layout (uniform value)
+
+validateUniformStorable :: forall a. Storable a => TypeLayout -> Proxy a -> Either String ()
+validateUniformStorable layout _ =
+  let wantSize = fromIntegral (layoutSize layout)
+      wantAlign = fromIntegral (layoutAlign layout)
+      gotSize = sizeOf (undefined :: a)
+      gotAlign = alignment (undefined :: a)
+  in if gotSize /= wantSize
+      then Left ("storable size mismatch: expected " <> show wantSize <> ", got " <> show gotSize)
+      else if wantAlign > gotAlign
+        then Left ("storable alignment mismatch: expected >= " <> show wantAlign <> ", got " <> show gotAlign)
+        else Right ()
+
+packUniformStorable :: forall a. Storable a => TypeLayout -> a -> IO (Either String ByteString)
+packUniformStorable layout value =
+  case validateUniformStorable layout (Proxy @a) of
+    Left err -> pure (Left err)
+    Right () -> do
+      let size = fromIntegral (layoutSize layout)
+      alloca $ \ptr -> do
+        poke ptr value
+        bytes <- BS.packCStringLen (castPtr ptr, size)
+        pure (Right bytes)
 
 emitValue :: Int -> UniformPath -> Int -> TypeLayout -> UniformValue -> Int -> Either String (Builder, Int)
 emitValue size ctx off layout value pos =
