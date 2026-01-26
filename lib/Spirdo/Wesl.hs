@@ -32,8 +32,6 @@ module Spirdo.Wesl
   , ReflectBindings(..)
   , HasBinding
   , binding
-  , bindingMaybe
-  , bindingEither
   , shaderStage
   , VertexShader(..)
   , FragmentShader(..)

@@ -23,8 +23,6 @@ module Spirdo.Wesl.Types.Interface
   , ReflectBindings(..)
   , HasBinding
   , binding
-  , bindingMaybe
-  , bindingEither
   , shaderStage
   , VertexShader(..)
   , FragmentShader(..)
@@ -282,21 +280,11 @@ type family HasBinding (name :: Symbol) (iface :: [Binding]) :: Bool where
   HasBinding name (_ ': rest) = HasBinding name rest
 
 binding :: forall name iface. (KnownSymbol name, HasBinding name iface ~ 'True, ReflectBindings iface) => CompiledShader iface -> BindingDesc
-binding shader =
-  case bindingEither @name shader of
-    Right b -> b
-    Left err -> error ("binding: " <> err <> " (impossible)")
-
-bindingMaybe :: forall name iface. (KnownSymbol name, HasBinding name iface ~ 'True, ReflectBindings iface) => CompiledShader iface -> Maybe BindingDesc
-bindingMaybe _ =
+binding _ =
   let key = symbolVal (Proxy @name)
-  in find (\b -> descName b == key) (reflectBindings (Proxy @iface))
-
-bindingEither :: forall name iface. (KnownSymbol name, HasBinding name iface ~ 'True, ReflectBindings iface) => CompiledShader iface -> Either String BindingDesc
-bindingEither shader =
-  case bindingMaybe @name shader of
-    Just b -> Right b
-    Nothing -> Left ("missing " <> symbolVal (Proxy @name))
+  in case find (\b -> descName b == key) (reflectBindings (Proxy @iface)) of
+      Just b -> b
+      Nothing -> error ("binding: missing " <> key <> " (impossible)")
 
 samplerBindings :: forall iface. ReflectBindings iface => Proxy iface -> [BindingDesc]
 samplerBindings _ =
