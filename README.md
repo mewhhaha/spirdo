@@ -307,6 +307,115 @@ submitInputs inputs = do
 If you need a *deterministic bind order*, use `bindingPlan`/`bindingPlanFor` and
 sort by `(group, binding)` or use `bpBindings` directly.
 
+### SDL (Example‑only, Not in the Library)
+Spirdo stays SDL‑agnostic, but SDL integration can be very declarative. The
+demo (`exe/Main.hs`) is a reference. The pattern below is intentionally short:
+
+#### Declarative SDL wiring (minimal)
+```hs
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE QuasiQuotes #-}
+
+import Spirdo.Wesl
+  ( PreparedShader(..)
+  , ToUniform(..)
+  , V4(..)
+  , prepareShader
+  , uniform
+  , wesl
+  )
+import Spirdo.Wesl.Inputs (HList(..), inputsForPrepared, orderedUniforms)
+
+fragment = [wesl|
+struct Params { time_res: vec4<f32>; };
+@group(0) @binding(0) var<uniform> params: Params;
+@fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = p.xy / vec2(800.0, 600.0);
+  return vec4(uv, 0.2, 1.0);
+}
+|]
+
+data ParamsU = ParamsU { time_res :: V4 Float }
+instance ToUniform ParamsU
+
+-- 1) Prepare once
+Right prepared = prepareShader fragment
+
+-- 2) Create SDL shader using BindingPlan counts
+let plan = psPlan prepared
+    mkShaderInfo bytes stage =
+      SDL_GPUShaderCreateInfo
+        { shaderCode = bytesPtr, shaderCodeSize = bytesLen
+        , shaderStage = stage
+        , shaderNumSamplers = fromIntegral (length (bpSamplers plan))
+        , shaderNumStorageTextures = fromIntegral (length (bpStorageTextures plan))
+        , shaderNumStorageBuffers = fromIntegral (length (bpStorageBuffers plan))
+        , shaderNumUniformBuffers = fromIntegral (length (bpUniforms plan))
+        }
+
+-- 3) Frame inputs (type‑safe + ordered)
+Right si =
+  inputsForPrepared prepared
+    ( uniform (ParamsU (V4 t 800 600 mode)) :& HNil )
+
+-- 4) Upload uniform (first/only in this shader)
+case orderedUniforms si of
+  (u:_) -> sdlSetGPURenderStateFragmentUniforms rs (uiBinding u) (bytesPtr u) (bytesLen u)
+  [] -> pure ()
+```
+
+Notes:
+- `inputsForPrepared` already normalizes ordering; you can bind `siSamplers`,
+  `siTextures`, etc. directly in `(group, binding)` order.
+- `SamplerHandle`/`TextureHandle` are *your* runtime IDs, not shader bindings.
+
+#### Vertex + Pipeline sketch (SDL GPU)
+```hs
+{-# LANGUAGE QuasiQuotes #-}
+
+import Spirdo.Wesl
+  ( PreparedShader(..)
+  , prepareShader
+  , vertexAttributes
+  , wesl
+  )
+
+vertex = [wesl|
+struct VSIn { @location(0) pos: vec2<f32>; };
+struct VSOut { @builtin(position) pos: vec4<f32>; };
+@vertex fn main(v: VSIn) -> VSOut {
+  var o: VSOut;
+  o.pos = vec4(v.pos, 0.0, 1.0);
+  return o;
+}
+|]
+
+Right vprep = prepareShader vertex
+Right vattrs = vertexAttributes (shaderInterface (psShader vprep))
+
+-- Use vattrs to fill SDL_GPUVertexInputState
+-- Then create SDL_GPUGraphicsPipeline with vs+fs shaders.
+```
+
+#### Compute sketch (SDL GPU)
+```hs
+{-# LANGUAGE QuasiQuotes #-}
+
+import Spirdo.Wesl (prepareShader, wesl)
+
+compute = [wesl|
+@group(0) @binding(0) var<storage, read_write> data: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  data[i] = data[i] * 2u;
+}
+|]
+
+Right cprep = prepareShader compute
+-- Use psPlan cprep to size descriptor bindings and create SDL GPU shader.
+```
+
 ### Binding Plans and Vertex Attributes
 You can derive a binding plan (sorted by set/binding) and vertex attributes from
 the reflected interface. This is useful when building your own graphics pipeline
