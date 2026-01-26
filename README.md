@@ -9,7 +9,7 @@ Haskell WESL compiler with an optional SDL3 demo that renders shader variants (o
 - Override specialization constants with `SpecStrict` (validator‑friendly) and `SpecParity` (full WESL parity).
 - Diagnostics surfaced as warnings (unused/shadowing/constant conditions/unreachable/duplicate cases).
 - Typed interface reflection with binding metadata and ordering helpers.
-- Host‑agnostic HList inputs for type‑safe binding submission.
+- Declarative input builder and HList inputs for type‑safe binding submission.
 - Uniform packing with layout validation + Storable packing helpers.
 - Vertex input reflection (`vertexAttributes`) for pipeline setup.
 - Optional SPIR‑V validation (tests use `spirv-val` when available).
@@ -67,39 +67,44 @@ You can control it via `CompileOptions`:
 defaultCompileOptions
   { cacheEnabled = True
   , cacheVerbose = False
+  , timingVerbose = False
   }
 ```
 
 Set `cacheVerbose = True` to print basic timing output (cache read/write).
+Set `timingVerbose = True` to print per‑phase compiler timings (parse/validate/emit).
+
+You can also time a single compile in code:
+```hs
+import Spirdo.Wesl (compileWeslToSpirvBytesWithTimings, defaultCompileOptions)
+
+_ <- compileWeslToSpirvBytesWithTimings defaultCompileOptions shaderSrc
+```
 
 ## Declarative Binding Flow (Preferred)
-The recommended path is: **prepare → inputsForPrepared → submit**.
+The recommended path is: **prepare → inputsFromPrepared → submit**.
 It’s concise, type‑safe, and renderer‑agnostic.
 
-### Typed Input Lists (Host-Agnostic)
-You can build a typed input list for the shader interface using `HList` and
-opaque handles. This stays host‑agnostic and still enforces ordering/types.
+### Minimal, Declarative Inputs (Host-Agnostic)
+Use the small input builder DSL to keep callsites short while preserving
+type‑level checks on binding names and kinds.
 
 ```hs
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 
-import Spirdo.Wesl
-  ( CompiledShader
-  , PreparedShader
-  , prepareShader
-  , uniform
-  , wesl
-  )
 import Spirdo.Wesl.Inputs
-  ( HList(..)
+  ( InputsBuilder
   , SamplerHandle(..)
-  , TextureHandle(..)
-  , StorageTextureHandle(..)
   , ShaderInputs
-  , inputsForPrepared
+  , TextureHandle(..)
+  , inputsFromPrepared
+  , sampler
+  , texture
+  , uniform
   )
+import Spirdo.Wesl (CompiledShader, prepareShader, wesl)
 
 shader :: CompiledShader iface
 shader = [wesl|
@@ -116,12 +121,10 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 inputs :: Either String (ShaderInputs iface)
 inputs = do
   prep <- prepareShader shader
-  inputsForPrepared prep
-    ( uniform (V4 0.0 0.0 0.0 0.0 :: V4 Float)
-        :& SamplerHandle 1
-        :& TextureHandle 2
-        :& HNil
-    )
+  inputsFromPrepared prep $
+    uniform @"params" (V4 0.0 0.0 0.0 0.0 :: V4 Float)
+    <> sampler @"samp0" (SamplerHandle 1)
+    <> texture @"tex0" (TextureHandle 2)
 ```
 
 Note: `SamplerHandle`/`TextureHandle` values are **your runtime resource IDs**, not shader binding indices. They must correspond to real resources in your renderer.
@@ -129,17 +132,15 @@ Note: `SamplerHandle`/`TextureHandle` values are **your runtime resource IDs**, 
 Storage textures use `StorageTextureHandle` to keep sampled vs. storage bindings
 distinct at the type level.
 
-`InputsOf iface` is a type-level list derived from the shader’s bindings, so the
-order and kinds are enforced at compile time. The resulting `ShaderInputs` lists
-(`siUniforms`, `siSamplers`, `siTextures`, ...) are ready to hand off to your
-SDL upload/bind code.
+`inputsFromPrepared` uses the shader interface to order everything by
+`(group, binding, name)` and pack uniforms for you. The resulting `ShaderInputs`
+lists (`siUniforms`, `siSamplers`, `siTextures`, ...) are ready to hand off to your
+renderer.
 
 If you need deterministic uniform ordering (by group/binding/name), use
 `orderedUniforms` (or `uniformSlots` for a tiny, backend‑ready view).
 
-`inputsForPrepared` normalizes all input lists to `(group, binding, name)` order.
-
-`inputsForPrepared` is pure; handle `Either` as you prefer.
+`inputsFromPrepared` is pure; handle `Either` as you prefer.
 
 Notes:
 - Record field names must match the WESL struct field names (extra or missing
@@ -147,8 +148,24 @@ Notes:
  - `PreparedShader` is the preferred entrypoint; it caches stage, binding plan,
    and vertex attributes.
 
+### Storage Buffers & Storage Textures (Builder)
+```hs
+import Spirdo.Wesl.Inputs
+  ( inputsFromPrepared
+  , storageBuffer
+  , storageTexture
+  , BufferHandle(..)
+  , StorageTextureHandle(..)
+  )
+
+Right si =
+  inputsFromPrepared prepared $
+    storageBuffer @"particles" (BufferHandle 7)
+    <> storageTexture @"outImage" (StorageTextureHandle 3)
+```
+
 ### Uniform Packing Helpers (Advanced)
-The high‑level path (`inputsForPrepared`) already packs uniforms for you.
+The high‑level path (`inputsFromPrepared`) already packs uniforms for you.
 Use these only if you need raw layout control:
 - `packUniformFrom` for `ToUniform` values
 - `packUniformStorable` for pre‑laid‑out `Storable` records
@@ -220,6 +237,29 @@ submitInputs inputs = do
   mapM_ bindStorageTexture (siStorageTextures inputs)
 ```
 
+### Compilation API (Common Paths)
+```hs
+import Spirdo.Wesl
+  ( compileWeslToSpirvWith
+  , compileWeslToSpirvFileWith
+  , compileWeslToSpirvBytesWith
+  , compileWeslToSpirvWithDiagnostics
+  , defaultCompileOptions
+  )
+
+-- Inline source
+Right shader = compileWeslToSpirvWith defaultCompileOptions src
+
+-- File-based (supports imports)
+Right shaderFile <- compileWeslToSpirvFileWith defaultCompileOptions "shaders/main.wesl"
+
+-- Bytes only
+Right bytes = compileWeslToSpirvBytesWith defaultCompileOptions src
+
+-- Diagnostics
+Right (shaderDiag, diags) = compileWeslToSpirvWithDiagnostics defaultCompileOptions src
+```
+
 If you need a *deterministic bind order*, use `bindingPlan` and
 sort by `(group, binding)` or use `bpBindings` directly.
 
@@ -237,10 +277,9 @@ import Spirdo.Wesl
   , ToUniform(..)
   , V4(..)
   , prepareShader
-  , uniform
   , wesl
   )
-import Spirdo.Wesl.Inputs (HList(..), inputsForPrepared, uniformSlots)
+import Spirdo.Wesl.Inputs (inputsFromPrepared, uniform, uniformSlots)
 
 fragment = [wesl|
 struct Params { time_res: vec4<f32>; };
@@ -271,8 +310,8 @@ let plan = psPlan prepared
 
 -- 3) Frame inputs (type‑safe + ordered)
 Right si =
-  inputsForPrepared prepared
-    ( uniform (ParamsU (V4 t 800 600 mode)) :& HNil )
+  inputsFromPrepared prepared
+    ( uniform @"params" (ParamsU (V4 t 800 600 mode)) )
 
 -- 4) Upload uniform (first/only in this shader)
 case uniformSlots si of
@@ -281,7 +320,7 @@ case uniformSlots si of
 ```
 
 Notes:
-- `inputsForPrepared` already normalizes ordering; you can bind `siSamplers`,
+- `inputsFromPrepared` already normalizes ordering; you can bind `siSamplers`,
   `siTextures`, etc. directly in `(group, binding)` order.
 - `SamplerHandle`/`TextureHandle` are *your* runtime IDs, not shader bindings.
 
