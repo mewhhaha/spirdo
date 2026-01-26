@@ -1,4 +1,6 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 
 -- | Executable entry point.
@@ -20,6 +22,12 @@ import System.IO (hClose, openBinaryTempFile)
 import System.Process (readProcessWithExitCode)
 
 import Spirdo.Wesl
+import Spirdo.Wesl.Inputs
+  ( HList(..)
+  , ShaderInputs(..)
+  , UniformInput(..)
+  , inputsFor
+  )
 import GHC.Generics (Generic)
 
 data PayloadU = PayloadU
@@ -30,6 +38,12 @@ data PayloadU = PayloadU
   } deriving (Generic)
 
 instance ToUniform PayloadU
+
+data ParamsU = ParamsU
+  { v :: V4 Float
+  } deriving (Generic)
+
+instance ToUniform ParamsU
 
 main :: IO ()
 main = do
@@ -93,6 +107,8 @@ main = do
   checkUniformStorable
   checkVertexAttributes
   checkBindingPlan
+  checkInputOrdering
+  checkDuplicateBindings
   checkGoldenSpirv
   putStrLn "All tests passed."
 
@@ -309,6 +325,52 @@ checkBindingPlan =
         fail "binding-plan: expected 1 sampler binding"
       unless (length (bpTextures plan) == 1) $
         fail "binding-plan: expected 1 texture binding"
+
+checkInputOrdering :: IO ()
+checkInputOrdering =
+  case inputsFor orderingShader (uniform (ParamsU (V4 1 2 3 4) :: ParamsU) :& uniform (ParamsU (V4 0 0 0 0) :: ParamsU) :& HNil) of
+    Left err -> fail ("input-ordering: " <> err)
+    Right inputs -> do
+      let names = map uiName (siUniforms inputs)
+      unless (names == ["a", "b"]) $
+        fail ("input-ordering: expected [\"a\",\"b\"], got " <> show names)
+
+checkDuplicateBindings :: IO ()
+checkDuplicateBindings =
+  case compileWeslToSpirv duplicateBindingShader of
+    Left (CompileError msg _ _) ->
+      unless ("duplicate binding" `isInfixOf` msg) $
+        fail ("duplicate-bindings: unexpected error: " <> msg)
+    Right _ -> fail "duplicate-bindings: expected failure"
+
+orderingShader :: CompiledShader
+  '[ 'Binding "b" 'BUniform 0 1 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
+   , 'Binding "a" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
+   ]
+orderingShader = [wesl|
+struct Params { v: vec4<f32>; };
+
+@group(0) @binding(1) var<uniform> b: Params;
+@group(0) @binding(0) var<uniform> a: Params;
+
+@fragment
+fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
+  return a.v + b.v;
+}
+|]
+
+duplicateBindingShader :: String
+duplicateBindingShader =
+  unlines
+    [ "struct Params { v: vec4<f32>; };"
+    , "@group(0) @binding(0) var<uniform> a: Params;"
+    , "@group(0) @binding(1) var<uniform> a: Params;"
+    , ""
+    , "@fragment"
+    , "fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {"
+    , "  return vec4(0.0, 0.0, 0.0, 1.0);"
+    , "}"
+    ]
 
 checkGoldenSpirv :: IO ()
 checkGoldenSpirv = do

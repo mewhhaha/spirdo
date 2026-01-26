@@ -43,9 +43,26 @@ buildInterface :: OverrideSpecMode -> ModuleAst -> Either CompileError ShaderInt
 buildInterface specMode modAst = do
   let structEnv = [(sdName s, s) | s <- modStructs modAst]
   bindings <- mapM (layoutBinding structEnv) (modBindings modAst)
+  checkBindingInvariants bindings
   overrides <- buildOverrideInfo specMode structEnv (modOverrides modAst)
   stageInfo <- buildStageIO structEnv (modEntry modAst)
   pure (ShaderInterface bindings overrides stageInfo Nothing)
+
+checkBindingInvariants :: [BindingInfo] -> Either CompileError ()
+checkBindingInvariants bindings = do
+  let dupNames = duplicates biName bindings
+  when (not (null dupNames)) $
+    Left (CompileError ("duplicate binding names: " <> intercalate ", " dupNames) Nothing Nothing)
+  let dupLocs = duplicates (\b -> (biGroup b, biBinding b)) bindings
+  when (not (null dupLocs)) $
+    Left (CompileError ("duplicate binding locations: " <> intercalate ", " (map showLoc dupLocs)) Nothing Nothing)
+  pure ()
+  where
+    duplicates :: Ord k => (BindingInfo -> k) -> [BindingInfo] -> [k]
+    duplicates key xs =
+      [k | (k, count) <- Map.toList (Map.fromListWith (+) [(key x, (1 :: Int)) | x <- xs]), count > 1]
+
+    showLoc (g, b) = "group " <> show g <> " binding " <> show b
 
 buildStageIO :: [(Text, StructDecl)] -> Maybe EntryPoint -> Either CompileError (Maybe StageIO)
 buildStageIO _ Nothing = Right Nothing
