@@ -30,6 +30,7 @@ import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word64)
+import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Language.Haskell.TH (Exp, Q)
 import qualified Language.Haskell.TH as TH
 import Language.Haskell.TH.Quote (QuasiQuoter(..))
@@ -194,29 +195,35 @@ weslCachePaths opts src =
   in (base <.> "spv", base <.> "iface")
 
 loadWeslCache :: CompileOptions -> String -> IO (Maybe (ByteString, ShaderInterface))
-loadWeslCache opts src = do
-  let (spvPath, ifacePath) = weslCachePaths opts src
-  okSpv <- doesFileExist spvPath
-  okIface <- doesFileExist ifacePath
-  if not (okSpv && okIface)
+loadWeslCache opts src =
+  if not (cacheEnabled opts)
     then pure Nothing
-    else
-      (do
-        bytes <- BS.readFile spvPath
-        ifaceText <- readFile ifacePath
-        case readMaybe ifaceText of
-          Just iface -> pure (Just (bytes, iface))
-          Nothing -> pure Nothing
-      ) `catch` \(_ :: SomeException) -> pure Nothing
+    else do
+      let (spvPath, ifacePath) = weslCachePaths opts src
+      okSpv <- doesFileExist spvPath
+      okIface <- doesFileExist ifacePath
+      if not (okSpv && okIface)
+        then pure Nothing
+        else
+          (do
+            bytes <- BS.readFile spvPath
+            ifaceText <- readFile ifacePath
+            case readMaybe ifaceText of
+              Just iface -> pure (Just (bytes, iface))
+              Nothing -> pure Nothing
+          ) `catch` \(_ :: SomeException) -> pure Nothing
 
 writeWeslCache :: CompileOptions -> String -> ByteString -> ShaderInterface -> IO ()
 writeWeslCache opts src bytes iface =
-  let (spvPath, ifacePath) = weslCachePaths opts src
-  in (do
-        createDirectoryIfMissing True (takeDirectory spvPath)
-        BS.writeFile spvPath bytes
-        writeFile ifacePath (show iface)
-     ) `catch` \(_ :: SomeException) -> pure ()
+  if not (cacheEnabled opts)
+    then pure ()
+    else
+      let (spvPath, ifacePath) = weslCachePaths opts src
+      in (do
+            createDirectoryIfMissing True (takeDirectory spvPath)
+            BS.writeFile spvPath bytes
+            writeFile ifacePath (show iface)
+         ) `catch` \(_ :: SomeException) -> pure ()
 
 -- Quasiquoter
 
@@ -232,14 +239,14 @@ wesl =
 weslExp :: String -> Q Exp
 weslExp src = do
   let opts = defaultCompileOptions
-  cached <- TH.runIO (loadWeslCache opts src)
+  cached <- TH.runIO (timed opts "cache-read" (loadWeslCache opts src))
   case cached of
     Just (bytes, iface) -> emitWeslExp bytes iface
     Nothing ->
       case compileWeslToSpirvWith opts src of
         Left err -> fail (renderError err)
         Right (SomeCompiledShader (CompiledShader bytes iface)) -> do
-          TH.runIO (writeWeslCache opts src bytes iface)
+          TH.runIO (timed opts "cache-write" (writeWeslCache opts src bytes iface))
           emitWeslExp bytes iface
   where
     emitWeslExp bytes iface = do
@@ -250,6 +257,17 @@ weslExp src = do
         Right ty -> pure ty
       let shaderExp = TH.AppE (TH.AppE (TH.ConE 'CompiledShader) bytesExp) ifaceExp
       pure (TH.SigE shaderExp (TH.AppT (TH.ConT ''CompiledShader) ifaceTy))
+
+timed :: CompileOptions -> String -> IO a -> IO a
+timed opts label action =
+  if not (cacheVerbose opts)
+    then action
+    else do
+      t0 <- getCurrentTime
+      result <- action
+      t1 <- getCurrentTime
+      putStrLn ("[spirdo] " <> label <> ": " <> show (diffUTCTime t1 t0))
+      pure result
 
 -- Package metadata
 

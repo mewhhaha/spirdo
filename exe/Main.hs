@@ -29,15 +29,11 @@ import Spirdo.Wesl
   , V4(..)
   , compileWeslToSpirvWith
   , defaultCompileOptions
+  , packUniformFrom
   , prepareShader
   , uniform
   )
-import Spirdo.Wesl.Inputs
-  ( HList(..)
-  , UniformInput(..)
-  , inputsForPrepared
-  , orderedUniforms
-  )
+import Spirdo.Wesl.Inputs (UniformInput(..))
 import Examples.Compute
 import Examples.Fragments
 import Examples.Override (fragmentOverrideSrc)
@@ -109,7 +105,7 @@ main = do
           _ -> False
   when shouldWriteSpv $ do
     forM_ (zip [0 :: Int ..] variants) $ \(ix, variant) ->
-      BS.writeFile ("fragment-" <> show ix <> ".spv") (shaderSpirv (psShader (svPrepared variant)))
+      BS.writeFile ("fragment-" <> show ix <> ".spv") (variantSpirv variant)
     forM_ (zip [0 :: Int ..] computeShaders) $ \(ix, SomeCompiledShader shader) ->
       let suffix = if ix == 0 then "" else "-" <> show ix
       in BS.writeFile ("compute" <> suffix <> ".spv") (shaderSpirv shader)
@@ -283,13 +279,18 @@ mkVariant name shader =
           storageBufferCount = bindingCountInfo (bpStorageBuffers plan)
           storageTextureCount = bindingCountInfo (bpStorageTextures plan)
           uniformCount = bindingCountInfo (bpUniforms plan)
-          paramsUniform params =
-            case inputsForPrepared prepared (uniform params :& HNil) of
-              Left err -> Left err
-              Right inputs ->
-                case orderedUniforms inputs of
-                  (u:_) -> Right u
-                  [] -> Left "params uniform not found"
+          paramsInfo =
+            case [bi | bi <- bpUniforms plan, biName bi == "params"] of
+              (bi:_) -> bi
+              [] -> error ("variant " <> name <> ": params uniform not found")
+          paramsUniform params = do
+            bytes <- packUniformFrom (biType paramsInfo) params
+            pure UniformInput
+              { uiName = biName paramsInfo
+              , uiGroup = biGroup paramsInfo
+              , uiBinding = biBinding paramsInfo
+              , uiBytes = bytes
+              }
       in ShaderVariant name prepared samplerCount storageTextureCount storageBufferCount uniformCount paramsUniform
 
 mkVariantDynamic :: String -> SomeCompiledShader -> ShaderVariant
@@ -303,7 +304,7 @@ createVariantState device renderer variant = do
     (svStorageTextureCount variant)
     (svStorageBufferCount variant)
     (svUniformCount variant)
-    (shaderSpirv (psShader (svPrepared variant)))
+    (variantSpirv variant)
   state <- createRenderState renderer frag
   pure VariantState
     { vsName = svName variant
@@ -312,6 +313,10 @@ createVariantState device renderer variant = do
     , vsUniformCount = svUniformCount variant
     , vsParamsUniform = svParamsUniform variant
     }
+
+variantSpirv :: ShaderVariant -> BS.ByteString
+variantSpirv ShaderVariant{svPrepared = prepared} =
+  shaderSpirv (psShader prepared)
 
 destroyVariantState :: Ptr SDL_GPUDevice -> VariantState -> IO ()
 destroyVariantState device variant = do
