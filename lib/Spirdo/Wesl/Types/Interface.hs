@@ -41,7 +41,6 @@ module Spirdo.Wesl.Types.Interface
   , VertexFormat(..)
   , VertexAttribute(..)
   , bindingPlan
-  , bindingPlanFor
   , isUniformKind
   , isSamplerKind
   , isTextureKind
@@ -62,10 +61,6 @@ module Spirdo.Wesl.Types.Interface
   , uniformBindings
   , storageBufferBindings
   , storageTextureBindings
-  , samplerBindingsFor
-  , uniformBindingsFor
-  , storageBufferBindingsFor
-  , storageTextureBindingsFor
   ) where
 
 import Data.ByteString (ByteString)
@@ -321,17 +316,6 @@ storageTextureBindings :: forall iface. ReflectBindings iface => Proxy iface -> 
 storageTextureBindings _ =
   filter (\b -> descKind b `elem` [BStorageTexture1D, BStorageTexture2D, BStorageTexture2DArray, BStorageTexture3D]) (reflectBindings (Proxy @iface))
 
-samplerBindingsFor :: forall iface. ReflectBindings iface => CompiledShader iface -> [BindingDesc]
-samplerBindingsFor _ = samplerBindings (Proxy @iface)
-
-uniformBindingsFor :: forall iface. ReflectBindings iface => CompiledShader iface -> [BindingDesc]
-uniformBindingsFor _ = uniformBindings (Proxy @iface)
-
-storageBufferBindingsFor :: forall iface. ReflectBindings iface => CompiledShader iface -> [BindingDesc]
-storageBufferBindingsFor _ = storageBufferBindings (Proxy @iface)
-
-storageTextureBindingsFor :: forall iface. ReflectBindings iface => CompiledShader iface -> [BindingDesc]
-storageTextureBindingsFor _ = storageTextureBindings (Proxy @iface)
 
 -- Runtime interface representation
 
@@ -487,9 +471,6 @@ bindingPlan iface =
         , bpStorageBuffers = filter (isStorageBufferKind . biKind) sorted
         , bpStorageTextures = filter (isStorageTextureKind . biKind) sorted
         }
-
-bindingPlanFor :: CompiledShader iface -> BindingPlan
-bindingPlanFor shader = bindingPlan (shaderInterface shader)
 
 isUniformKind :: BindingKind -> Bool
 isUniformKind BUniform = True
