@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeApplications #-}
 
 -- | Executable entry point.
@@ -17,55 +18,48 @@ import System.Environment (lookupEnv)
 import Spirdo.SDL3
 import Spirdo.SDL3.Safe (withSDL, withWindow, withGPURenderer)
 import Spirdo.Wesl
-  ( BindingDesc(..)
-  , BindingInfo(..)
-  , BindingKind(..)
+  ( BindingInfo(..)
+  , BindingPlan(..)
   , CompiledShader(..)
   , CompileOptions(..)
-  , HasBinding
   , OverrideValue(..)
-  , ReflectBindings
-  , ShaderInterface(..)
+  , PreparedShader(..)
   , SomeCompiledShader(..)
   , ToUniform(..)
   , V4(..)
-  , binding
-  , bindingInfoForMap
-  , bindingMap
   , compileWeslToSpirvWith
   , defaultCompileOptions
-  , packUniform
-  , samplerBindingsFor
-  , storageBufferBindingsFor
-  , storageTextureBindingsFor
+  , prepareShader
   , uniform
-  , uniformBindingsFor
+  )
+import Spirdo.Wesl.Inputs
+  ( HList(..)
+  , UniformInput(..)
+  , inputsForPrepared
+  , orderedUniforms
   )
 import Examples.Compute
 import Examples.Fragments
 import Examples.Override (fragmentOverrideSrc)
 import Examples.Vertex
 
-data ShaderVariant = ShaderVariant
-  { svName :: String
-  , svSpirv :: BS.ByteString
-  , svSamplerCount :: Word32
-  , svStorageTextureCount :: Word32
-  , svStorageBufferCount :: Word32
-  , svUniformCount :: Word32
-  , svUniformSlot :: Word32
-  , svInterface :: ShaderInterface
-  , svParamsInfo :: BindingInfo
-  }
+data ShaderVariant where
+  ShaderVariant ::
+    { svName :: String
+    , svPrepared :: PreparedShader iface
+    , svSamplerCount :: Word32
+    , svStorageTextureCount :: Word32
+    , svStorageBufferCount :: Word32
+    , svUniformCount :: Word32
+    , svParamsUniform :: ParamsU -> Either String UniformInput
+    } -> ShaderVariant
 
 data VariantState = VariantState
   { vsName :: String
   , vsState :: Ptr SDL_GPURenderState
   , vsShader :: Ptr SDL_GPUShader
   , vsUniformCount :: Word32
-  , vsUniformSlot :: Word32
-  , vsInterface :: ShaderInterface
-  , vsParamsInfo :: BindingInfo
+  , vsParamsUniform :: ParamsU -> Either String UniformInput
   }
 
 main :: IO ()
@@ -115,7 +109,7 @@ main = do
           _ -> False
   when shouldWriteSpv $ do
     forM_ (zip [0 :: Int ..] variants) $ \(ix, variant) ->
-      BS.writeFile ("fragment-" <> show ix <> ".spv") (svSpirv variant)
+      BS.writeFile ("fragment-" <> show ix <> ".spv") (shaderSpirv (psShader (svPrepared variant)))
     forM_ (zip [0 :: Int ..] computeShaders) $ \(ix, SomeCompiledShader shader) ->
       let suffix = if ix == 0 then "" else "-" <> show ix
       in BS.writeFile ("compute" <> suffix <> ".spv") (shaderSpirv shader)
@@ -165,13 +159,12 @@ renderFrame renderer variant color t mode = do
           { time_res = V4 (realToFrac t) 800 600 (fromIntegral mode)
           , color = V4 (realToFrac cr) (realToFrac cg) (realToFrac cb) (realToFrac ca)
           }
-      info = vsParamsInfo variant
-  case packUniform (biType info) (uniform params) of
+  case vsParamsUniform variant params of
     Left err -> error ("uniform pack failed: " <> err)
-    Right bytes ->
-      BS.useAsCStringLen bytes $ \(paramPtr, len) ->
+    Right input ->
+      BS.useAsCStringLen (uiBytes input) $ \(paramPtr, len) ->
         sdlCheckBool "sdlSetGPURenderStateFragmentUniforms" $
-          sdlSetGPURenderStateFragmentUniforms (vsState variant) (biBinding info) (castPtr paramPtr) (fromIntegral len)
+          sdlSetGPURenderStateFragmentUniforms (vsState variant) (uiBinding input) (castPtr paramPtr) (fromIntegral len)
   sdlCheckBool "sdlSetGPURenderState" (sdlSetGPURenderState renderer (vsState variant))
 
   let positions :: [CFloat]
@@ -275,79 +268,33 @@ createRenderState renderer frag = do
     when (state == nullPtr) (sdlFail "sdlCreateGPURenderState")
     pure state
 
-fragmentUniformCount :: ReflectBindings iface => CompiledShader iface -> Word32
-fragmentUniformCount shader = case uniformBindingsFor shader of
-  bindings -> bindingCount bindings
+bindingCountInfo :: [BindingInfo] -> Word32
+bindingCountInfo infos =
+  let bindings = map biBinding infos
+  in if null bindings then 0 else 1 + maximum bindings
 
-fragmentUniformSlot :: ReflectBindings iface => CompiledShader iface -> Word32
-fragmentUniformSlot shader = case uniformBindingsFor shader of
-  (b:_) -> descBinding b
-  [] -> 0
-
-bindingCount :: [BindingDesc] -> Word32
-bindingCount [] = 0
-bindingCount bindings = 1 + maximum (map descBinding bindings)
-
-mkVariant :: (ReflectBindings iface, HasBinding "params" iface ~ 'True) => String -> CompiledShader iface -> ShaderVariant
+mkVariant :: String -> CompiledShader iface -> ShaderVariant
 mkVariant name shader =
-  let samplerCount = bindingCount (samplerBindingsFor shader)
-      storageBufferCount = bindingCount (storageBufferBindingsFor shader)
-      storageTextureCount = bindingCount (storageTextureBindingsFor shader)
-      uniformCount = fragmentUniformCount shader
-      uniformSlot = fragmentUniformSlot shader
-      paramsDesc = binding @"params" shader
-      iface = shaderInterface shader
-      paramsInfo =
-        case bindingInfoForMap (descName paramsDesc) (bindingMap iface) of
-          Nothing -> error ("variant " <> name <> ": params binding not found")
-          Just info -> info
-  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot iface paramsInfo
+  case prepareShader shader of
+    Left err -> error ("variant " <> name <> ": " <> err)
+    Right prepared ->
+      let plan = psPlan prepared
+          samplerCount = bindingCountInfo (bpSamplers plan)
+          storageBufferCount = bindingCountInfo (bpStorageBuffers plan)
+          storageTextureCount = bindingCountInfo (bpStorageTextures plan)
+          uniformCount = bindingCountInfo (bpUniforms plan)
+          paramsUniform params =
+            case inputsForPrepared prepared (uniform params :& HNil) of
+              Left err -> Left err
+              Right inputs ->
+                case orderedUniforms inputs of
+                  (u:_) -> Right u
+                  [] -> Left "params uniform not found"
+      in ShaderVariant name prepared samplerCount storageTextureCount storageBufferCount uniformCount paramsUniform
 
 mkVariantDynamic :: String -> SomeCompiledShader -> ShaderVariant
 mkVariantDynamic name (SomeCompiledShader shader) =
-  let iface = shaderInterface shader
-      infos = siBindings iface
-      samplerCount = bindingCountInfo isSamplerKind infos
-      storageBufferCount = bindingCountInfo isStorageBufferKind infos
-      storageTextureCount = bindingCountInfo isStorageTextureKind infos
-      uniformCount = bindingCountInfo (== BUniform) infos
-      uniformSlot =
-        case [biBinding info | info <- infos, biKind info == BUniform] of
-          (b:_) -> b
-          [] -> 0
-      paramsInfo =
-        case bindingInfoForMap "params" (bindingMap iface) of
-          Nothing -> error ("variant " <> name <> ": params binding not found")
-          Just info -> info
-  in ShaderVariant name (shaderSpirv shader) samplerCount storageTextureCount storageBufferCount uniformCount uniformSlot iface paramsInfo
-  where
-    bindingCountInfo predKind xs =
-      let bindings = [biBinding info | info <- xs, predKind (biKind info)]
-      in if null bindings then 0 else 1 + maximum bindings
-
-    isSamplerKind k =
-      k `elem`
-        [ BSampler
-        , BSamplerComparison
-        , BTexture1D
-        , BTexture1DArray
-        , BTexture2D
-        , BTexture2DArray
-        , BTexture3D
-        , BTextureCube
-        , BTextureCubeArray
-        , BTextureMultisampled2D
-        , BTextureDepth2D
-        , BTextureDepth2DArray
-        , BTextureDepthCube
-        , BTextureDepthCubeArray
-        , BTextureDepthMultisampled2D
-        ]
-
-    isStorageBufferKind k = k == BStorageRead || k == BStorageReadWrite
-
-    isStorageTextureKind k =
-      k `elem` [BStorageTexture1D, BStorageTexture2D, BStorageTexture2DArray, BStorageTexture3D]
+  mkVariant name shader
 
 createVariantState :: Ptr SDL_GPUDevice -> Ptr SDL_Renderer -> ShaderVariant -> IO VariantState
 createVariantState device renderer variant = do
@@ -356,16 +303,14 @@ createVariantState device renderer variant = do
     (svStorageTextureCount variant)
     (svStorageBufferCount variant)
     (svUniformCount variant)
-    (svSpirv variant)
+    (shaderSpirv (psShader (svPrepared variant)))
   state <- createRenderState renderer frag
   pure VariantState
     { vsName = svName variant
     , vsState = state
     , vsShader = frag
     , vsUniformCount = svUniformCount variant
-    , vsUniformSlot = svUniformSlot variant
-    , vsInterface = svInterface variant
-    , vsParamsInfo = svParamsInfo variant
+    , vsParamsUniform = svParamsUniform variant
     }
 
 destroyVariantState :: Ptr SDL_GPUDevice -> VariantState -> IO ()

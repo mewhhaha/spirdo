@@ -73,8 +73,6 @@ import Spirdo.Wesl
   ( BindingDesc(..)
   , CompiledShader
   , binding
-  , bindingEither
-  , bindingMaybe
   , wesl
   )
 
@@ -102,13 +100,6 @@ params = binding @"params" shader
 
 sampler0 :: BindingDesc
 sampler0 = binding @"sampler0" shader
-
--- Total lookup if you prefer explicit error handling:
-paramsSafe :: Either String BindingDesc
-paramsSafe = bindingEither @"params" shader
-
-paramsMaybe :: Maybe BindingDesc
-paramsMaybe = bindingMaybe @"params" shader
 ```
 
 Each `BindingDesc` includes the name, group (set), and binding index you need
@@ -243,6 +234,8 @@ If you need deterministic uniform ordering (by group/binding/name), use
 Notes:
 - Record field names must match the WESL struct field names (extra or missing
   fields are errors).
+ - If you already have a `PreparedShader`, use `inputsForPrepared` to reuse the
+   precomputed interface data.
 
 ### Pipeline Integration (Renderer‑Agnostic)
 Spirdo does **not** bind you to any graphics API. The idea is:
