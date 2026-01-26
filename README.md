@@ -59,6 +59,19 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 Note: the public API is exposed from `Spirdo.Wesl` and `Spirdo.Wesl.Inputs`.
 Internal modules are not part of the supported surface area.
 
+### Compile-Time Cache & Timings
+WESL quasiquotes use an on-disk cache under `dist-newstyle/.wesl-cache`.
+You can control it via `CompileOptions`:
+
+```hs
+defaultCompileOptions
+  { cacheEnabled = True
+  , cacheVerbose = False
+  }
+```
+
+Set `cacheVerbose = True` to print basic timing output (cache read/write).
+
 ## Declarative Binding Flow (Preferred)
 The recommended path is: **prepare → inputsForPrepared → submit**.
 It’s concise, type‑safe, and renderer‑agnostic.

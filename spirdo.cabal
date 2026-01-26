@@ -45,6 +45,7 @@ library
         containers,
         directory,
         filepath,
+        time,
         text,
         transformers,
         template-haskell
