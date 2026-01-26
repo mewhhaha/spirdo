@@ -42,10 +42,11 @@ import Spirdo.Wesl.Util
 buildInterface :: OverrideSpecMode -> ModuleAst -> Either CompileError ShaderInterface
 buildInterface specMode modAst = do
   let structEnv = [(sdName s, s) | s <- modStructs modAst]
-  bindings <- mapM (layoutBinding structEnv) (modBindings modAst)
+  structLayouts <- resolveStructLayouts structEnv
+  bindings <- mapM (layoutBinding structLayouts) (modBindings modAst)
   checkBindingInvariants bindings
-  overrides <- buildOverrideInfo specMode structEnv (modOverrides modAst)
-  stageInfo <- buildStageIO structEnv (modEntry modAst)
+  overrides <- buildOverrideInfo specMode structLayouts (modOverrides modAst)
+  stageInfo <- buildStageIO structLayouts structEnv (modEntry modAst)
   pure (ShaderInterface bindings overrides stageInfo Nothing)
 
 checkBindingInvariants :: [BindingInfo] -> Either CompileError ()
@@ -64,11 +65,11 @@ checkBindingInvariants bindings = do
 
     showLoc (g, b) = "group " <> show g <> " binding " <> show b
 
-buildStageIO :: [(Text, StructDecl)] -> Maybe EntryPoint -> Either CompileError (Maybe StageIO)
-buildStageIO _ Nothing = Right Nothing
-buildStageIO structEnv (Just entry) = do
-  inputs <- collectStageInputs structEnv entry
-  outputs <- collectStageOutputs structEnv entry
+buildStageIO :: StructLayoutCache -> [(Text, StructDecl)] -> Maybe EntryPoint -> Either CompileError (Maybe StageIO)
+buildStageIO _ _ Nothing = Right Nothing
+buildStageIO layoutCache structEnv (Just entry) = do
+  inputs <- collectStageInputs layoutCache structEnv entry
+  outputs <- collectStageOutputs layoutCache structEnv entry
   let stage = toShaderStage (epStage entry)
   let wgSize = epWorkgroupSize entry
   pure (Just (StageIO stage wgSize inputs outputs))
@@ -80,27 +81,27 @@ toShaderStage st =
     StageFragment -> ShaderStageFragment
     StageVertex -> ShaderStageVertex
 
-collectStageInputs :: [(Text, StructDecl)] -> EntryPoint -> Either CompileError [IOParam]
-collectStageInputs structEnv entry =
-  fmap concat (mapM (paramInputs structEnv) (epParams entry))
+collectStageInputs :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> Either CompileError [IOParam]
+collectStageInputs layoutCache structEnv entry =
+  fmap concat (mapM (paramInputs layoutCache structEnv) (epParams entry))
 
-paramInputs :: [(Text, StructDecl)] -> Param -> Either CompileError [IOParam]
-paramInputs structEnv param =
+paramInputs :: StructLayoutCache -> [(Text, StructDecl)] -> Param -> Either CompileError [IOParam]
+paramInputs layoutCache structEnv param =
   case paramType param of
     TyStructRef structName -> do
       structDecl <- lookupStruct structEnv structName
       mapM (fieldInput (paramName param) structName) (sdFields structDecl)
     ty -> do
-      layout <- resolveTypeLayout structEnv [] ty
+      layout <- resolveTypeLayoutWithCache layoutCache ty
       fmap pure (mkIOParam (textToString (paramName param)) (paramAttrs param) layout)
   where
     fieldInput parentName structName field = do
-      layout <- resolveTypeLayout structEnv [] (fdType field)
+      layout <- resolveTypeLayoutWithCache layoutCache (fdType field)
       let label = qualifyField parentName structName (fdName field)
       mkIOParam label (fdAttrs field) layout
 
-collectStageOutputs :: [(Text, StructDecl)] -> EntryPoint -> Either CompileError [IOParam]
-collectStageOutputs structEnv entry =
+collectStageOutputs :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> Either CompileError [IOParam]
+collectStageOutputs layoutCache structEnv entry =
   case epStage entry of
     StageCompute -> Right []
     _ ->
@@ -112,7 +113,7 @@ collectStageOutputs structEnv entry =
               structDecl <- lookupStruct structEnv structName
               mapM (fieldOutput structName) (sdFields structDecl)
             _ -> do
-              layout <- resolveTypeLayout structEnv [] ty
+              layout <- resolveTypeLayoutWithCache layoutCache ty
               let builtin = epReturnBuiltin entry
               let loc =
                     if isNothing builtin && isNothing (epReturnLocation entry) && epStage entry == StageFragment
@@ -121,7 +122,7 @@ collectStageOutputs structEnv entry =
               fmap pure (mkReturnIOParam layout loc builtin)
   where
     fieldOutput structName field = do
-      layout <- resolveTypeLayout structEnv [] (fdType field)
+      layout <- resolveTypeLayoutWithCache layoutCache (fdType field)
       let label = qualifyField structName structName (fdName field)
       mkIOParam label (fdAttrs field) layout
 
@@ -170,16 +171,16 @@ mkReturnIOParam layout loc builtin = do
       , ioType = layout
       }
 
-buildOverrideInfo :: OverrideSpecMode -> [(Text, StructDecl)] -> [OverrideDecl] -> Either CompileError [OverrideInfo]
-buildOverrideInfo specMode structEnv decls = do
+buildOverrideInfo :: OverrideSpecMode -> StructLayoutCache -> [OverrideDecl] -> Either CompileError [OverrideInfo]
+buildOverrideInfo specMode layoutCache decls = do
   specIds <- assignOverrideSpecIds decls
   let depsMap = overrideDependencies decls
   _ <- topoSortOverrides (map odName decls) depsMap
-  mapM (layoutOverride specMode specIds depsMap structEnv) decls
+  mapM (layoutOverride specMode specIds depsMap layoutCache) decls
 
-layoutOverride :: OverrideSpecMode -> Map.Map Text Word32 -> Map.Map Text (Set.Set Text) -> [(Text, StructDecl)] -> OverrideDecl -> Either CompileError OverrideInfo
-layoutOverride specMode specIds depsMap structEnv decl = do
-  layout <- resolveTypeLayout structEnv [] (odType decl)
+layoutOverride :: OverrideSpecMode -> Map.Map Text Word32 -> Map.Map Text (Set.Set Text) -> StructLayoutCache -> OverrideDecl -> Either CompileError OverrideInfo
+layoutOverride specMode specIds depsMap layoutCache decl = do
+  layout <- resolveTypeLayoutWithCache layoutCache (odType decl)
   let deps = Map.findWithDefault Set.empty (odName decl) depsMap
   specId <-
     case specMode of
@@ -267,8 +268,8 @@ topoSortOverrides order depsMap = go Set.empty Set.empty [] order
           let perm'' = Set.insert n perm'
           Right (perm'', n : acc')
 
-layoutBinding :: [(Text, StructDecl)] -> BindingDecl -> Either CompileError BindingInfo
-layoutBinding env decl = do
+layoutBinding :: StructLayoutCache -> BindingDecl -> Either CompileError BindingInfo
+layoutBinding layoutCache decl = do
   case bdKind decl of
     BUniform -> ensureStructBinding
     BStorageRead -> ensureStructBinding
@@ -349,7 +350,7 @@ layoutBinding env decl = do
       case bdType decl of
         TyStorageTexture3D _ _ -> pure ()
         _ -> Left (CompileError "storage texture bindings must use type texture_storage_3d<format, access>" Nothing Nothing)
-  tyLayout <- resolveTypeLayout env [] (bdType decl)
+  tyLayout <- resolveTypeLayoutWithCache layoutCache (bdType decl)
   when (containsPointer tyLayout) $
     Left (CompileError "bindings cannot contain pointer types" Nothing Nothing)
   case bdKind decl of
@@ -367,8 +368,17 @@ layoutBinding env decl = do
         TyStructRef _ -> pure ()
         _ -> Left (CompileError "bindings must use a struct type (wrap arrays in a struct)" Nothing Nothing)
 
-resolveTypeLayout :: [(Text, StructDecl)] -> [Text] -> Type -> Either CompileError TypeLayout
-resolveTypeLayout env stack ty =
+type StructLayoutCache = Map.Map Text TypeLayout
+
+resolveStructLayouts :: [(Text, StructDecl)] -> Either CompileError StructLayoutCache
+resolveStructLayouts env = foldM step Map.empty env
+  where
+    step cache (name, _) = do
+      (_, cache') <- resolveTypeLayoutCached env cache Set.empty (TyStructRef name)
+      Right cache'
+
+resolveTypeLayoutWithCache :: StructLayoutCache -> Type -> Either CompileError TypeLayout
+resolveTypeLayoutWithCache cache ty =
   case ty of
     TyScalar s ->
       let (a, sz) = scalarLayout s
@@ -382,7 +392,7 @@ resolveTypeLayout env stack ty =
           total = stride * fromIntegral cols
       in Right (TLMatrix cols rows s a total stride)
     TyArray elemTy mlen -> do
-      elemLayout <- resolveTypeLayout env stack elemTy
+      elemLayout <- resolveTypeLayoutWithCache cache elemTy
       let elemAlign = layoutAlign elemLayout
       let elemSize = layoutSize elemLayout
       let stride = roundUp elemSize elemAlign
@@ -411,7 +421,7 @@ resolveTypeLayout env stack ty =
     TyStorageTexture3D fmt access -> Right (TLStorageTexture3D fmt access)
     TyAtomic s -> Right (TLAtomic s)
     TyPtr addr access elemTy -> do
-      elemLayout <- resolveTypeLayout env stack elemTy
+      elemLayout <- resolveTypeLayoutWithCache cache elemTy
       when (containsResource elemLayout) $
         Left (CompileError "pointer element types cannot be resources" Nothing Nothing)
       storageClass <- case addr of
@@ -440,48 +450,128 @@ resolveTypeLayout env stack ty =
         _ -> Right access
       Right (TLPointer storageClass access' elemLayout)
     TyStructRef name ->
-      if name `elem` stack
-        then Left (CompileError ("recursive struct: " <> textToString name) Nothing Nothing)
-        else case lookup name env of
-          Nothing -> Left (CompileError ("unknown struct: " <> textToString name) Nothing Nothing)
-          Just decl -> do
-            let stack' = name : stack
-            fields <- resolveFields env stack' (sdFields decl)
-            let align = maximum (1 : map flAlign fields)
-            let size = structSize fields align
-            Right (TLStruct (textToString name) fields align size)
+      case Map.lookup name cache of
+        Nothing -> Left (CompileError ("unknown struct: " <> textToString name) Nothing Nothing)
+        Just layout -> Right layout
 
-resolveFields :: [(Text, StructDecl)] -> [Text] -> [FieldDecl] -> Either CompileError [FieldLayout]
-resolveFields env stack fields =
-  let go _ acc [] = Right (reverse acc)
-      go offset acc (FieldDecl name fty attrs : rest) = do
-        fLayout <- resolveTypeLayout env stack fty
+resolveTypeLayoutCached :: [(Text, StructDecl)] -> StructLayoutCache -> Set.Set Text -> Type -> Either CompileError (TypeLayout, StructLayoutCache)
+resolveTypeLayoutCached env cache visiting ty =
+  case ty of
+    TyScalar s ->
+      let (a, sz) = scalarLayout s
+      in Right (TLScalar s a sz, cache)
+    TyVector n s ->
+      let (a, sz) = vectorLayout s n
+      in Right (TLVector n s a sz, cache)
+    TyMatrix cols rows s ->
+      let (a, sz) = vectorLayout s rows
+          stride = roundUp sz a
+          total = stride * fromIntegral cols
+      in Right (TLMatrix cols rows s a total stride, cache)
+    TyArray elemTy mlen -> do
+      (elemLayout, cache1) <- resolveTypeLayoutCached env cache visiting elemTy
+      let elemAlign = layoutAlign elemLayout
+      let elemSize = layoutSize elemLayout
+      let stride = roundUp elemSize elemAlign
+      let total = case mlen of
+            Nothing -> stride
+            Just n -> stride * fromIntegral n
+      Right (TLArray mlen stride elemLayout elemAlign total, cache1)
+    TySampler -> Right (TLSampler, cache)
+    TySamplerComparison -> Right (TLSamplerComparison, cache)
+    TyTexture1D s -> Right (TLTexture1D s, cache)
+    TyTexture1DArray s -> Right (TLTexture1DArray s, cache)
+    TyTexture2D s -> Right (TLTexture2D s, cache)
+    TyTexture2DArray s -> Right (TLTexture2DArray s, cache)
+    TyTexture3D s -> Right (TLTexture3D s, cache)
+    TyTextureCube s -> Right (TLTextureCube s, cache)
+    TyTextureCubeArray s -> Right (TLTextureCubeArray s, cache)
+    TyTextureMultisampled2D s -> Right (TLTextureMultisampled2D s, cache)
+    TyTextureDepth2D -> Right (TLTextureDepth2D, cache)
+    TyTextureDepth2DArray -> Right (TLTextureDepth2DArray, cache)
+    TyTextureDepthCube -> Right (TLTextureDepthCube, cache)
+    TyTextureDepthCubeArray -> Right (TLTextureDepthCubeArray, cache)
+    TyTextureDepthMultisampled2D -> Right (TLTextureDepthMultisampled2D, cache)
+    TyStorageTexture1D fmt access -> Right (TLStorageTexture1D fmt access, cache)
+    TyStorageTexture2D fmt access -> Right (TLStorageTexture2D fmt access, cache)
+    TyStorageTexture2DArray fmt access -> Right (TLStorageTexture2DArray fmt access, cache)
+    TyStorageTexture3D fmt access -> Right (TLStorageTexture3D fmt access, cache)
+    TyAtomic s -> Right (TLAtomic s, cache)
+    TyPtr addr access elemTy -> do
+      (elemLayout, cache1) <- resolveTypeLayoutCached env cache visiting elemTy
+      when (containsResource elemLayout) $
+        Left (CompileError "pointer element types cannot be resources" Nothing Nothing)
+      storageClass <- case addr of
+        "function" -> Right storageClassFunction
+        "private" -> Right storageClassPrivate
+        "workgroup" -> Right storageClassWorkgroup
+        "uniform" -> Right storageClassUniform
+        "storage" -> Right storageClassStorageBuffer
+        _ -> Left (CompileError ("unsupported pointer address space: " <> textToString addr) Nothing Nothing)
+      access' <- case addr of
+        "storage" ->
+          case access of
+            Nothing -> Right (Just StorageRead)
+            Just a -> Right (Just a)
+        "uniform" ->
+          case access of
+            Nothing -> Right (Just StorageRead)
+            Just StorageRead -> Right (Just StorageRead)
+            _ -> Left (CompileError "uniform pointers must be read-only" Nothing Nothing)
+        "function" ->
+          if access == Nothing then Right Nothing else Left (CompileError "function pointers cannot specify access" Nothing Nothing)
+        "private" ->
+          if access == Nothing then Right Nothing else Left (CompileError "private pointers cannot specify access" Nothing Nothing)
+        "workgroup" ->
+          if access == Nothing then Right Nothing else Left (CompileError "workgroup pointers cannot specify access" Nothing Nothing)
+        _ -> Right access
+      Right (TLPointer storageClass access' elemLayout, cache1)
+    TyStructRef name ->
+      case Map.lookup name cache of
+        Just layout -> Right (layout, cache)
+        Nothing ->
+          if Set.member name visiting
+            then Left (CompileError ("recursive struct: " <> textToString name) Nothing Nothing)
+            else case lookup name env of
+              Nothing -> Left (CompileError ("unknown struct: " <> textToString name) Nothing Nothing)
+              Just decl -> do
+                (fields, cache1) <- resolveFieldsCached env cache (Set.insert name visiting) (sdFields decl)
+                let align = maximum (1 : map flAlign fields)
+                let size = structSize fields align
+                let layout = TLStruct (textToString name) fields align size
+                Right (layout, Map.insert name layout cache1)
+
+resolveFieldsCached :: [(Text, StructDecl)] -> StructLayoutCache -> Set.Set Text -> [FieldDecl] -> Either CompileError ([FieldLayout], StructLayoutCache)
+resolveFieldsCached env cache visiting fields =
+  let go _ acc stCache [] = Right (reverse acc, stCache)
+      go offset acc stCache (FieldDecl name fty attrs : rest) = do
+        (fLayout, cache1) <- resolveTypeLayoutCached env stCache visiting fty
         if containsResource fLayout
           then Left (CompileError "resource types are not allowed in struct fields" Nothing Nothing)
           else if containsPointer fLayout
             then Left (CompileError "pointer types are not allowed in struct fields" Nothing Nothing)
-          else do
-            alignAttr <- parseFieldAlign attrs
-            sizeAttr <- parseFieldSize attrs
-            let baseAlign = layoutAlign fLayout
-            let baseSize = layoutSize fLayout
-            let requestedAlign = fromMaybe baseAlign alignAttr
-            when (requestedAlign < baseAlign) $
-              Left (CompileError "@align must be at least the natural alignment" Nothing Nothing)
-            let fieldAlign = max baseAlign requestedAlign
-            fieldSize <- case sizeAttr of
-              Nothing -> Right baseSize
-              Just sz ->
-                if sz < baseSize
-                  then Left (CompileError "field @size must be at least the natural size" Nothing Nothing)
-                  else if sz `mod` fieldAlign /= 0
-                    then Left (CompileError "field @size must be a multiple of its alignment" Nothing Nothing)
-                  else Right sz
-            let aligned = roundUp offset fieldAlign
-            let entry = FieldLayout (textToString name) aligned fLayout fieldAlign fieldSize
-            let offset' = aligned + fieldSize
-            go offset' (entry:acc) rest
-  in go 0 [] fields
+            else do
+              alignAttr <- parseFieldAlign attrs
+              sizeAttr <- parseFieldSize attrs
+              let baseAlign = layoutAlign fLayout
+              let baseSize = layoutSize fLayout
+              let requestedAlign = fromMaybe baseAlign alignAttr
+              when (requestedAlign < baseAlign) $
+                Left (CompileError "@align must be at least the natural alignment" Nothing Nothing)
+              let fieldAlign = max baseAlign requestedAlign
+              fieldSize <- case sizeAttr of
+                Nothing -> Right baseSize
+                Just sz ->
+                  if sz < baseSize
+                    then Left (CompileError "field @size must be at least the natural size" Nothing Nothing)
+                    else if sz `mod` fieldAlign /= 0
+                      then Left (CompileError "field @size must be a multiple of its alignment" Nothing Nothing)
+                      else Right sz
+              let aligned = roundUp offset fieldAlign
+              let entry = FieldLayout (textToString name) aligned fLayout fieldAlign fieldSize
+              let offset' = aligned + fieldSize
+              go offset' (entry:acc) cache1 rest
+  in go 0 [] cache fields
 
 parseFieldAlign :: [Attr] -> Either CompileError (Maybe Word32)
 parseFieldAlign attrs = do
@@ -584,11 +674,12 @@ emitSpirv opts modAst iface = do
     Just e -> Right e
   validateEntry entry
   let structEnv = [(sdName s, s) | s <- modStructs modAst]
-  structLayouts <- mapM (resolveStructLayout structEnv) (modStructs modAst)
+  structLayoutsMap <- resolveStructLayouts structEnv
+  let structLayouts = Map.toList structLayoutsMap
   retLayout <- case (epStage entry, epReturnType entry) of
-    (StageFragment, Just ty) -> Just <$> resolveTypeLayout structEnv [] ty
+    (StageFragment, Just ty) -> Just <$> resolveTypeLayoutWithCache structLayoutsMap ty
     (StageFragment, Nothing) -> Left (CompileError "fragment entry point missing return type" Nothing Nothing)
-    (StageVertex, Just ty) -> Just <$> resolveTypeLayout structEnv [] ty
+    (StageVertex, Just ty) -> Just <$> resolveTypeLayoutWithCache structLayoutsMap ty
     (StageVertex, Nothing) -> Left (CompileError "vertex entry point missing return type" Nothing Nothing)
     _ -> Right Nothing
   let blockStructs = [T.pack name | BindingInfo _ _ _ _ (TLStruct name _ _ _) <- siBindings iface]
@@ -599,17 +690,17 @@ emitSpirv opts modAst iface = do
   let fnIndex = buildFunctionIndex [node]
   let structIndex = buildStructIndex [node]
   let ctx = buildModuleContext [] "" node
-  state2 <- emitModuleOverrides ctx constIndex fnIndex structIndex (overrideSpecMode opts) structEnv (modOverrides modAst) state1
+  state2 <- emitModuleOverrides ctx constIndex fnIndex structIndex (overrideSpecMode opts) structLayoutsMap structEnv (modOverrides modAst) state1
   state3 <- emitModuleConstants (modConsts modAst) state2
-  (envGlobals, entryInits, _ifaceIds, outTargets, state4) <- emitGlobals structEnv iface entry retLayout (modGlobals modAst) state3
-  state5 <- registerFunctions structEnv (modFunctions modAst) state4
-  state6 <- emitFunctionBodies structEnv (modFunctions modAst) state5
+  (envGlobals, entryInits, _ifaceIds, outTargets, state4) <- emitGlobals structLayoutsMap structEnv iface entry retLayout (modGlobals modAst) state3
+  state5 <- registerFunctions structLayoutsMap (modFunctions modAst) state4
+  state6 <- emitFunctionBodies structLayoutsMap (modFunctions modAst) state5
   state7 <- emitMainFunction entry envGlobals entryInits outTargets state6
   let spirvWords = buildSpirvWords opts entry state7
   pure (spirvToBytes spirvWords)
 
-emitModuleOverrides :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideSpecMode -> [(Text, StructDecl)] -> [OverrideDecl] -> GenState -> Either CompileError GenState
-emitModuleOverrides ctx constIndex fnIndex structIndex specMode structEnv decls st0 =
+emitModuleOverrides :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideSpecMode -> StructLayoutCache -> [(Text, StructDecl)] -> [OverrideDecl] -> GenState -> Either CompileError GenState
+emitModuleOverrides ctx constIndex fnIndex structIndex specMode layoutCache structEnv decls st0 =
   case decls of
     [] -> Right st0
     _ -> do
@@ -620,7 +711,7 @@ emitModuleOverrides ctx constIndex fnIndex structIndex specMode structEnv decls 
       foldM (emitOne specIds depsMap) st0 (map (\n -> declMap Map.! n) order)
   where
     emitOne specIds depsMap st decl = do
-      layout <- resolveTypeLayout structEnv [] (odType decl)
+      layout <- resolveTypeLayoutWithCache layoutCache (odType decl)
       let deps = Map.findWithDefault Set.empty (odName decl) depsMap
       (st2, val) <- case odExpr decl of
         Just expr ->
@@ -1589,11 +1680,6 @@ constKeyToU32 key =
     ConstF16 bits -> Right (fromIntegral (truncate (halfBitsToFloat bits) :: Integer))
     ConstBool _ -> Left (CompileError "cannot convert bool literal to u32" Nothing Nothing)
 
-resolveStructLayout :: [(Text, StructDecl)] -> StructDecl -> Either CompileError (Text, TypeLayout)
-resolveStructLayout env decl = do
-  layout <- resolveTypeLayout env [] (TyStructRef (sdName decl))
-  Right (sdName decl, layout)
-
 -- SPIR-V builder types
 
 data Instr = Instr Word16 [Word32] deriving (Eq, Show)
@@ -2525,12 +2611,12 @@ data FuncState = FuncState
   , fsBreakStack :: ![Word32]
   } deriving (Eq, Show)
 
-emitGlobals :: [(Text, StructDecl)] -> ShaderInterface -> EntryPoint -> Maybe TypeLayout -> [GlobalVarDecl] -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], [OutputTarget], GenState)
-emitGlobals structEnv iface entry retLayout globals st0 = do
+emitGlobals :: StructLayoutCache -> [(Text, StructDecl)] -> ShaderInterface -> EntryPoint -> Maybe TypeLayout -> [GlobalVarDecl] -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], [OutputTarget], GenState)
+emitGlobals layoutCache structEnv iface entry retLayout globals st0 = do
   let (envBindings, idsBindings, st1) = foldl' emitBinding ([], [], st0) (siBindings iface)
-  (envGlobals, st2) <- emitModuleGlobals structEnv globals st1
-  (envInputs, entryInits, idsInputs, st3) <- emitEntryInputs structEnv entry st2
-  (outTargets, idsOut, st4) <- emitStageOutput structEnv entry retLayout st3
+  (envGlobals, st2) <- emitModuleGlobals layoutCache globals st1
+  (envInputs, entryInits, idsInputs, st3) <- emitEntryInputs layoutCache structEnv entry st2
+  (outTargets, idsOut, st4) <- emitStageOutput layoutCache structEnv entry retLayout st3
   let envAll = envBindings <> envGlobals <> envInputs
   let idsGlobals = map (viPtrId . snd) envGlobals
   let ifaceIds = idsBindings <> idsInputs <> idsOut <> idsGlobals
@@ -2573,11 +2659,11 @@ emitGlobals structEnv iface entry retLayout globals st0 = do
           info = VarInfo (biType bindInfo) varId storageClass access
       in (envAcc <> [(T.pack (biName bindInfo), info)], idAcc <> [varId], st6)
 
-emitModuleGlobals :: [(Text, StructDecl)] -> [GlobalVarDecl] -> GenState -> Either CompileError ([(Text, VarInfo)], GenState)
-emitModuleGlobals structEnv decls st0 = foldM emitOne ([], st0) decls
+emitModuleGlobals :: StructLayoutCache -> [GlobalVarDecl] -> GenState -> Either CompileError ([(Text, VarInfo)], GenState)
+emitModuleGlobals layoutCache decls st0 = foldM emitOne ([], st0) decls
   where
     emitOne (envAcc, st) decl = do
-      layout <- resolveTypeLayout structEnv [] (gvType decl)
+      layout <- resolveTypeLayoutWithCache layoutCache (gvType decl)
       when (containsResource layout) $
         Left (CompileError "global variables cannot contain resource types" Nothing Nothing)
       when (containsAtomic layout) $
@@ -2608,29 +2694,29 @@ emitModuleGlobals structEnv decls st0 = foldM emitOne ([], st0) decls
       let info = VarInfo layout varId storageClass ReadWrite
       Right (envAcc <> [(gvName decl, info)], st6)
 
-emitEntryInputs :: [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
-emitEntryInputs structEnv entry st0 =
+emitEntryInputs :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
+emitEntryInputs layoutCache structEnv entry st0 =
   case epStage entry of
-    StageCompute -> emitComputeInputs structEnv entry st0
-    StageFragment -> emitFragmentInputs structEnv entry st0
-    StageVertex -> emitVertexInputs structEnv entry st0
+    StageCompute -> emitComputeInputs layoutCache structEnv entry st0
+    StageFragment -> emitFragmentInputs layoutCache structEnv entry st0
+    StageVertex -> emitVertexInputs layoutCache structEnv entry st0
 
-emitComputeInputs :: [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
-emitComputeInputs structEnv entry st0 =
-  emitStageInputs StageCompute structEnv entry st0
+emitComputeInputs :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
+emitComputeInputs layoutCache structEnv entry st0 =
+  emitStageInputs layoutCache StageCompute structEnv entry st0
 
-emitFragmentInputs :: [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
-emitFragmentInputs structEnv entry st0 = do
-  emitStageInputs StageFragment structEnv entry st0
+emitFragmentInputs :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
+emitFragmentInputs layoutCache structEnv entry st0 = do
+  emitStageInputs layoutCache StageFragment structEnv entry st0
 
-emitVertexInputs :: [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
-emitVertexInputs structEnv entry st0 =
-  emitStageInputs StageVertex structEnv entry st0
+emitVertexInputs :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
+emitVertexInputs layoutCache structEnv entry st0 =
+  emitStageInputs layoutCache StageVertex structEnv entry st0
 
 data InputDecoration = InputBuiltin Word32 | InputLocation Word32
 
-emitStageInputs :: Stage -> [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
-emitStageInputs stage structEnv entry st0 = do
+emitStageInputs :: StructLayoutCache -> Stage -> [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
+emitStageInputs layoutCache stage structEnv entry st0 = do
   let params = epParams entry
   let go envAcc initAcc idAcc _ _ st [] =
         Right (reverse envAcc, reverse initAcc, reverse idAcc, st)
@@ -2647,17 +2733,17 @@ emitStageInputs stage structEnv entry st0 = do
           structDecl <- case lookup structName env of
             Nothing -> Left (CompileError ("unknown struct: " <> textToString structName) Nothing Nothing)
             Just decl -> Right decl
-          structLayout <- resolveTypeLayout env [] ty
+          structLayout <- resolveTypeLayoutWithCache layoutCache ty
           when (containsResource structLayout) $
             Left (CompileError "resource types are not allowed as stage inputs" Nothing Nothing)
           when (containsAtomic structLayout) $
             Left (CompileError "atomic types are not allowed as stage inputs" Nothing Nothing)
           let fields = sdFields structDecl
-          (fieldVars, usedLocs', usedBuiltins', ids', st') <- emitStructFields stg name env fields usedLocs usedBuiltins idAcc st
+          (fieldVars, usedLocs', usedBuiltins', ids', st') <- emitStructFields stg name fields usedLocs usedBuiltins idAcc st
           let initEntry = EntryParamInit name structLayout fieldVars
           pure (envAcc, initEntry:initAcc, ids', usedLocs', usedBuiltins', st')
         _ -> do
-          layout <- resolveTypeLayout env [] ty
+          layout <- resolveTypeLayoutWithCache layoutCache ty
           when (containsResource layout) $
             Left (CompileError "resource types are not allowed as stage inputs" Nothing Nothing)
           when (containsAtomic layout) $
@@ -2693,14 +2779,14 @@ emitStageInputs stage structEnv entry st0 = do
               (info, varId, st1) <- emitInputVar name layout (InputLocation loc) st
               pure ((name, info):envAcc, initAcc, varId:idAcc, loc:usedLocs, usedBuiltins, st1)
 
-    emitStructFields stg paramName env fields usedLocs usedBuiltins idAcc st = do
+    emitStructFields stg paramName fields usedLocs usedBuiltins idAcc st = do
       let go accVars accIds accLocs accBuiltins st' [] = Right (reverse accVars, accLocs, accBuiltins, accIds, st')
           go accVars accIds accLocs accBuiltins st' (field:rest) = do
             let fieldName = fdName field
                 fullName = paramName <> "_" <> fieldName
                 attrs = fdAttrs field
                 fty = fdType field
-            layout <- resolveTypeLayout env [] fty
+            layout <- resolveTypeLayoutWithCache layoutCache fty
             when (containsResource layout) $
               Left (CompileError "resource types are not allowed as stage inputs" Nothing Nothing)
             when (containsAtomic layout) $
@@ -2753,8 +2839,8 @@ emitInputVar name layout deco st0 = do
   let info = VarInfo layout varId storageClassInput ReadOnly
   pure (info, varId, st6)
 
-emitStageOutput :: [(Text, StructDecl)] -> EntryPoint -> Maybe TypeLayout -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
-emitStageOutput structEnv entry retLayout st0 =
+emitStageOutput :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> Maybe TypeLayout -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
+emitStageOutput _ structEnv entry retLayout st0 =
   case epStage entry of
     StageCompute ->
       case retLayout of
@@ -2955,17 +3041,17 @@ emitLoadVar st fs info = do
   let fs1 = addFuncInstr (Instr opLoad [tyId, resId, viPtrId info]) fs
   pure (st2, fs1, Value (viType info) resId)
 
-registerFunctions :: [(Text, StructDecl)] -> [FunctionDecl] -> GenState -> Either CompileError GenState
-registerFunctions structEnv decls st0 = foldM registerOne st0 decls
+registerFunctions :: StructLayoutCache -> [FunctionDecl] -> GenState -> Either CompileError GenState
+registerFunctions layoutCache decls st0 = foldM registerOne st0 decls
   where
     registerOne st decl =
       do
-        paramLayouts <- mapM (resolveTypeLayout structEnv []) (map paramType (fnParams decl))
+        paramLayouts <- mapM (resolveTypeLayoutWithCache layoutCache) (map paramType (fnParams decl))
         mapM_ (ensureNoResources "function parameter") paramLayouts
         retLayout <- case fnReturnType decl of
           Nothing -> Right Nothing
           Just ty -> do
-            layout <- resolveTypeLayout structEnv [] ty
+            layout <- resolveTypeLayoutWithCache layoutCache ty
             ensureNoResources "function return type" layout
             Right (Just layout)
         let existing = [fi | fi <- gsFunctionTable st, fiName fi == fnName decl]
@@ -2982,11 +3068,11 @@ registerFunctions structEnv decls st0 = foldM registerOne st0 decls
         let st5 = st4 { gsFunctionTable = info : gsFunctionTable st4 }
         pure st5
 
-emitFunctionBodies :: [(Text, StructDecl)] -> [FunctionDecl] -> GenState -> Either CompileError GenState
-emitFunctionBodies structEnv decls st0 = foldM emitOne st0 decls
+emitFunctionBodies :: StructLayoutCache -> [FunctionDecl] -> GenState -> Either CompileError GenState
+emitFunctionBodies layoutCache decls st0 = foldM emitOne st0 decls
   where
     emitOne st decl = do
-      paramLayouts <- mapM (resolveTypeLayout structEnv []) (map paramType (fnParams decl))
+      paramLayouts <- mapM (resolveTypeLayoutWithCache layoutCache) (map paramType (fnParams decl))
       case findFunctionInfo (fnName decl) paramLayouts (gsFunctionTable st) of
         Nothing -> Left (CompileError ("missing function info for " <> textToString (fnName decl)) Nothing Nothing)
         Just info -> emitFunctionBody info decl st

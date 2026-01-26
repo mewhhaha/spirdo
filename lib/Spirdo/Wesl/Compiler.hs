@@ -1,4 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE ExistentialQuantification #-}
@@ -16,10 +17,10 @@
 -- | Compiler pipeline and quasiquoter implementation.
 module Spirdo.Wesl.Compiler where
 
-import Control.Exception (SomeException, catch)
+import Control.Exception (SomeException, catch, evaluate)
 import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE)
+import Control.Monad.Trans.Except (ExceptT(..), runExceptT)
 import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -30,11 +31,12 @@ import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word64)
-import Data.Time.Clock (getCurrentTime, diffUTCTime)
+import Data.Time.Clock (diffUTCTime, getCurrentTime)
+import GHC.Clock (getMonotonicTimeNSec)
 import Language.Haskell.TH (Exp, Q)
 import qualified Language.Haskell.TH as TH
 import Language.Haskell.TH.Quote (QuasiQuoter(..))
-import Numeric (showHex)
+import Numeric (showFFloat, showHex)
 import Spirdo.Wesl.Emit
 import Spirdo.Wesl.Parser
 import Spirdo.Wesl.Syntax
@@ -72,6 +74,13 @@ compileWeslToSpirvWithDiagnostics opts src = do
   let shader = CompiledShader (crSpirv result) (crInterface result)
   pure (SomeCompiledShader shader, crDiagnostics result)
 
+compileWeslToSpirvWithTimings :: CompileOptions -> String -> IO (Either CompileError SomeCompiledShader)
+compileWeslToSpirvWithTimings opts src = do
+  result <- compileInlineResultIO (opts { timingVerbose = True }) False src
+  pure (fmap toSome result)
+  where
+    toSome cr = SomeCompiledShader (CompiledShader (crSpirv cr) (crInterface cr))
+
 compileWeslToSpirvFile :: FilePath -> IO (Either CompileError SomeCompiledShader)
 compileWeslToSpirvFile = compileWeslToSpirvFileWith defaultCompileOptions
 
@@ -104,6 +113,11 @@ compileWeslToSpirvBytesWithDiagnostics opts src = do
   result <- compileInlineResult opts True src
   pure (crSpirv result, crDiagnostics result)
 
+compileWeslToSpirvBytesWithTimings :: CompileOptions -> String -> IO (Either CompileError ByteString)
+compileWeslToSpirvBytesWithTimings opts src = do
+  result <- compileInlineResultIO (opts { timingVerbose = True }) False src
+  pure (fmap crSpirv result)
+
 compileInlineResult :: CompileOptions -> Bool -> String -> Either CompileError CompileResult
 compileInlineResult opts wantDiagnostics src = do
   moduleAst0 <- parseModuleWith (enabledFeatures opts) src
@@ -130,27 +144,77 @@ compileInlineResult opts wantDiagnostics src = do
     , crDiagnostics = diags
     }
 
+compileInlineResultIO :: CompileOptions -> Bool -> String -> IO (Either CompileError CompileResult)
+compileInlineResultIO opts wantDiagnostics src = do
+  moduleAst0 <- timedPhase opts "parse" (evaluate (parseModuleWith (enabledFeatures opts) src))
+  case moduleAst0 of
+    Left err -> pure (Left err)
+    Right ast0 -> do
+      moduleAst1 <- timedPhase opts "type-aliases" (evaluate (resolveTypeAliases ast0))
+      case moduleAst1 of
+        Left err -> pure (Left err)
+        Right ast1 -> do
+          moduleAst2 <- timedPhase opts "overrides" (evaluate (lowerOverridesWith [] (overrideValuesText (overrideValues opts)) ast1))
+          case moduleAst2 of
+            Left err -> pure (Left err)
+            Right moduleAst -> do
+              if not (null (modImports moduleAst))
+                then pure (Left (CompileError "imports require file-based compilation" Nothing Nothing))
+                else do
+                  let node = ModuleNode "<inline>" [] moduleAst []
+                  let constIndex = buildConstIndex [node]
+                  let fnIndex = buildFunctionIndex [node]
+                  let structIndex = buildStructIndex [node]
+                  let overrideIndex = buildOverrideIndex [node]
+                  validation <- timedPhase opts "validate" (evaluate (validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node]))
+                  case validation of
+                    Left err -> pure (Left err)
+                    Right () -> do
+                      ifaceRes <- timedPhase opts "interface" (evaluate (buildInterface (overrideSpecMode opts) moduleAst))
+                      case ifaceRes of
+                        Left err -> pure (Left err)
+                        Right iface -> do
+                          spirvRes <- timedPhase opts "emit" (evaluate (emitSpirv opts moduleAst iface))
+                          case spirvRes of
+                            Left err -> pure (Left err)
+                            Right spirv -> do
+                              diags <-
+                                if wantDiagnostics
+                                  then timedPhase opts "diagnostics" (evaluate (collectDiagnosticsMerged opts [] moduleAst))
+                                  else pure (Right [])
+                              case diags of
+                                Left err -> pure (Left err)
+                                Right diagList ->
+                                  pure
+                                    ( Right
+                                        CompileResult
+                                          { crAst = moduleAst
+                                          , crInterface = iface
+                                          , crSpirv = spirv
+                                          , crDiagnostics = diagList
+                                          }
+                                    )
+
 compileFileResult :: CompileOptions -> Bool -> FilePath -> IO (Either CompileError CompileResult)
 compileFileResult opts wantDiagnostics path =
   runExceptT $ do
     filePath <- ExceptT (resolveInputPath path)
-    src <- liftIO (readFile filePath)
-    moduleAst0 <- ExceptT (pure (parseModuleWith (enabledFeatures opts) src))
+    src <- liftIO (timedPhase opts "read-file" (readFile filePath))
+    moduleAst0 <- ExceptT (timedPhase opts "parse" (evaluate (parseModuleWith (enabledFeatures opts) src)))
     -- resolveImports performs module linking and validateModuleScopes for file-based builds.
-    linked <- ExceptT (resolveImports opts (dropExtension filePath) moduleAst0)
-    linked' <- ExceptT (pure (resolveTypeAliases linked))
+    linked <- ExceptT (timedPhase opts "imports" (resolveImports opts (dropExtension filePath) moduleAst0))
+    linked' <- ExceptT (timedPhase opts "type-aliases" (evaluate (resolveTypeAliases linked)))
     let rootDir = takeDirectory filePath
         rootPath = modulePathFromFile rootDir filePath
-    lowered <- ExceptT (pure (lowerOverridesWith rootPath (overrideValuesText (overrideValues opts)) linked'))
+    lowered <- ExceptT (timedPhase opts "overrides" (evaluate (lowerOverridesWith rootPath (overrideValuesText (overrideValues opts)) linked')))
     diags <-
       if wantDiagnostics
-        then ExceptT (pure (collectDiagnosticsMerged opts rootPath lowered))
+        then ExceptT (timedPhase opts "diagnostics" (evaluate (collectDiagnosticsMerged opts rootPath lowered)))
         else do
-          case validateConstAssertsMerged opts rootPath lowered of
-            Left err -> throwE err
-            Right () -> pure []
-    iface <- ExceptT (pure (buildInterface (overrideSpecMode opts) lowered))
-    spirv <- ExceptT (pure (emitSpirv opts lowered iface))
+          _ <- ExceptT (timedPhase opts "const-asserts" (evaluate (validateConstAssertsMerged opts rootPath lowered)))
+          pure []
+    iface <- ExceptT (timedPhase opts "interface" (evaluate (buildInterface (overrideSpecMode opts) lowered)))
+    spirv <- ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts lowered iface)))
     pure CompileResult
       { crAst = lowered
       , crInterface = iface
@@ -268,6 +332,22 @@ timed opts label action =
       t1 <- getCurrentTime
       putStrLn ("[spirdo] " <> label <> ": " <> show (diffUTCTime t1 t0))
       pure result
+
+timedPhase :: CompileOptions -> String -> IO a -> IO a
+timedPhase opts label action =
+  if not (timingVerbose opts)
+    then action
+    else do
+      t0 <- getMonotonicTimeNSec
+      !result <- action
+      t1 <- getMonotonicTimeNSec
+      putStrLn ("[spirdo] " <> label <> ": " <> formatNs (t1 - t0))
+      pure result
+
+formatNs :: Word64 -> String
+formatNs ns =
+  let ms = fromIntegral ns / (1000 * 1000) :: Double
+  in showFFloat (Just 3) ms "ms"
 
 -- Package metadata
 

@@ -67,6 +67,7 @@ data CompileOptions = CompileOptions
   , overrideSpecMode :: OverrideSpecMode
   , cacheEnabled :: Bool
   , cacheVerbose :: Bool
+  , timingVerbose :: Bool
   }
 
 data OverrideSpecMode
@@ -85,7 +86,7 @@ data OverrideValue
 
 -- Default to SPIR-V 1.6 (0x00010600). Override if needed.
 defaultCompileOptions :: CompileOptions
-defaultCompileOptions = CompileOptions 0x00010600 [] [] SpecStrict True False
+defaultCompileOptions = CompileOptions 0x00010600 [] [] SpecStrict True False False
 
 data FieldDecl = FieldDecl
   { fdName :: !Text

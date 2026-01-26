@@ -3,8 +3,9 @@ module Main (main) where
 
 import qualified Data.ByteString as BS
 import GHC.Clock (getMonotonicTimeNSec)
-import Spirdo.Wesl (compileWeslToSpirvBytes)
+import Spirdo.Wesl (CompileOptions(..), compileWeslToSpirvBytes, compileWeslToSpirvBytesWithTimings, defaultCompileOptions)
 import System.Exit (exitFailure)
+import System.Environment (lookupEnv)
 
 compileOnce :: String -> IO Int
 compileOnce src =
@@ -14,10 +15,24 @@ compileOnce src =
       exitFailure
     Right bs -> pure (BS.length bs)
 
+compileOnceTimed :: String -> IO Int
+compileOnceTimed src = do
+  result <- compileWeslToSpirvBytesWithTimings (defaultCompileOptions { timingVerbose = True }) src
+  case result of
+    Left err -> do
+      putStrLn ("compile failed: " <> show err)
+      exitFailure
+    Right bs -> pure (BS.length bs)
+
 main :: IO ()
 main = do
   shaderSrc <- readFile "bench/fixtures/feature.wesl"
-  _ <- compileOnce shaderSrc
+  timing <- lookupEnv "SPIRDO_TIMING"
+  _ <-
+    case timing of
+      Just "1" -> compileOnceTimed shaderSrc
+      Just "true" -> compileOnceTimed shaderSrc
+      _ -> compileOnce shaderSrc
   let iters :: Int
       iters = 50
   t0 <- getMonotonicTimeNSec

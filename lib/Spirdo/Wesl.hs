@@ -102,6 +102,8 @@ module Spirdo.Wesl
   , compileWeslToSpirvWithDiagnostics
   , compileWeslToSpirvFileWithDiagnostics
   , compileWeslToSpirvBytesWithDiagnostics
+  , compileWeslToSpirvWithTimings
+  , compileWeslToSpirvBytesWithTimings
   , PackageInfo(..)
   , PackageDependency(..)
   , discoverPackageInfo
