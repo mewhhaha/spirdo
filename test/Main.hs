@@ -23,11 +23,11 @@ import System.Process (readProcessWithExitCode)
 
 import Spirdo.Wesl
 import Spirdo.Wesl.Inputs
-  ( HList(..)
-  , ShaderInputs(..)
+  ( ShaderInputs(..)
   , UniformInput(..)
-  , inputsFor
+  , inputsFrom
   )
+import qualified Spirdo.Wesl.Inputs as Inputs
 import GHC.Generics (Generic)
 
 data PayloadU = PayloadU
@@ -328,7 +328,7 @@ checkBindingPlan =
 
 checkInputOrdering :: IO ()
 checkInputOrdering =
-  case inputsFor orderingShader (uniform (ParamsU (V4 1 2 3 4) :: ParamsU) :& uniform (ParamsU (V4 0 0 0 0) :: ParamsU) :& HNil) of
+  case inputsFrom orderingShader (Inputs.uniform @"b" (ParamsU (V4 1 2 3 4) :: ParamsU) <> Inputs.uniform @"a" (ParamsU (V4 0 0 0 0) :: ParamsU)) of
     Left err -> fail ("input-ordering: " <> err)
     Right inputs -> do
       let names = map uiName (siUniforms inputs)

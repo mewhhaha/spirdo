@@ -10,13 +10,16 @@
 
 -- | Typed, host-agnostic shader input lists.
 module Spirdo.Wesl.Inputs
-  ( HList(..)
-  , InputFor
-  , InputsOf
-  , SamplerHandle(..)
+  ( SamplerHandle(..)
   , TextureHandle(..)
   , BufferHandle(..)
   , StorageTextureHandle(..)
+  , RequireBinding
+  , RequireUniform
+  , RequireSampler
+  , RequireTexture
+  , RequireStorageBuffer
+  , RequireStorageTexture
   , UniformInput(..)
   , SamplerInput(..)
   , TextureInput(..)
@@ -40,8 +43,6 @@ module Spirdo.Wesl.Inputs
   , ShaderInputs(..)
   , emptyInputs
   , orderedUniforms
-  , inputsForPrepared
-  , inputsFor
   ) where
 
 import Control.Monad (foldM)
@@ -70,48 +71,6 @@ import Spirdo.Wesl.Types
   , isUniformKind
   , packUniform
   )
-
-data HList (xs :: [K.Type]) where
-  HNil :: HList '[]
-  (:&) :: x -> HList xs -> HList (x ': xs)
-
-infixr 5 :&
-
-data BindingCategory
-  = CatUniform
-  | CatSampler
-  | CatTexture
-  | CatStorageBuffer
-  | CatStorageTexture
-
-type family CategoryOf (k :: BindingKind) :: BindingCategory where
-  CategoryOf 'BUniform = 'CatUniform
-  CategoryOf 'BSampler = 'CatSampler
-  CategoryOf 'BSamplerComparison = 'CatSampler
-  CategoryOf 'BStorageRead = 'CatStorageBuffer
-  CategoryOf 'BStorageReadWrite = 'CatStorageBuffer
-  CategoryOf 'BStorageTexture1D = 'CatStorageTexture
-  CategoryOf 'BStorageTexture2D = 'CatStorageTexture
-  CategoryOf 'BStorageTexture2DArray = 'CatStorageTexture
-  CategoryOf 'BStorageTexture3D = 'CatStorageTexture
-  CategoryOf _ = 'CatTexture
-
-type family InputForCategory (c :: BindingCategory) :: K.Type where
-  InputForCategory 'CatUniform = UniformValue
-  InputForCategory 'CatSampler = SamplerHandle
-  InputForCategory 'CatTexture = TextureHandle
-  InputForCategory 'CatStorageBuffer = BufferHandle
-  InputForCategory 'CatStorageTexture = StorageTextureHandle
-
-type family InputForKind (k :: BindingKind) :: K.Type where
-  InputForKind k = InputForCategory (CategoryOf k)
-
-type family InputFor (b :: Binding) :: K.Type where
-  InputFor ('Binding _ kind _ _ _) = InputForKind kind
-
-type family InputsOf (iface :: [Binding]) :: [K.Type] where
-  InputsOf '[] = '[]
-  InputsOf (b ': bs) = InputFor b ': InputsOf bs
 
 type family RequireBinding (name :: Symbol) (iface :: [Binding]) :: K.Constraint where
   RequireBinding name '[] =
@@ -455,105 +414,3 @@ itemName item =
     InputTexture name _ -> name
     InputStorageBuffer name _ -> name
     InputStorageTexture name _ -> name
-
-class ApplyCategory (c :: BindingCategory) where
-  applyCategory :: BindingInfo -> InputForCategory c -> ShaderInputs iface -> Either String (ShaderInputs iface)
-
-instance ApplyCategory 'CatUniform where
-  applyCategory info val inputs =
-    case packUniform (biType info) val of
-      Left err -> Left err
-      Right bytes ->
-        let entry =
-              UniformInput
-                { uiName = biName info
-                , uiGroup = biGroup info
-                , uiBinding = biBinding info
-                , uiBytes = bytes
-                }
-        in Right inputs { siUniforms = entry : siUniforms inputs }
-
-instance ApplyCategory 'CatSampler where
-  applyCategory info handle inputs =
-    let entry =
-          SamplerInput
-            { samplerName = biName info
-            , samplerGroup = biGroup info
-            , samplerBinding = biBinding info
-            , samplerHandle = handle
-            }
-    in Right inputs { siSamplers = entry : siSamplers inputs }
-
-instance ApplyCategory 'CatTexture where
-  applyCategory info handle inputs =
-    let entry =
-          TextureInput
-            { textureName = biName info
-            , textureGroup = biGroup info
-            , textureBinding = biBinding info
-            , textureHandle = handle
-            }
-    in Right inputs { siTextures = entry : siTextures inputs }
-
-instance ApplyCategory 'CatStorageBuffer where
-  applyCategory info handle inputs =
-    let entry =
-          StorageBufferInput
-            { storageBufferName = biName info
-            , storageBufferGroup = biGroup info
-            , storageBufferBinding = biBinding info
-            , storageBufferHandle = handle
-            }
-    in Right inputs { siStorageBuffers = entry : siStorageBuffers inputs }
-
-instance ApplyCategory 'CatStorageTexture where
-  applyCategory info handle inputs =
-    let entry =
-          StorageTextureInput
-            { storageTextureName = biName info
-            , storageTextureGroup = biGroup info
-            , storageTextureBinding = biBinding info
-            , storageTextureHandle = handle
-            }
-    in Right inputs { siStorageTextures = entry : siStorageTextures inputs }
-
-class ApplyKind (k :: BindingKind) where
-  applyKind :: BindingInfo -> InputForKind k -> ShaderInputs iface -> Either String (ShaderInputs iface)
-
-instance ApplyCategory (CategoryOf k) => ApplyKind k where
-  applyKind = applyCategory @(CategoryOf k)
-
-class BuildInputsWith (iface :: [Binding]) (bs :: [Binding]) where
-  buildInputsWith :: BindingMap -> CompiledShader iface -> HList (InputsOf bs) -> Either String (ShaderInputs iface)
-
-instance BuildInputsWith iface '[] where
-  buildInputsWith _ shader HNil = Right (emptyInputs shader)
-
-instance
-  forall iface name kind set binding ty bs.
-  ( KnownSymbol name
-  , ApplyKind kind
-  , BuildInputsWith iface bs
-  ) =>
-  BuildInputsWith iface ('Binding name kind set binding ty ': bs)
-  where
-  buildInputsWith bmap shader (x :& xs) =
-    case buildInputsWith @iface @bs bmap shader xs of
-      Left err -> Left err
-      Right baseInputs ->
-        let name = symbolVal (Proxy @name)
-        in case bindingInfoForMap name bmap of
-            Nothing -> Left ("binding not found in interface: " <> name)
-            Just info ->
-              case applyKind @kind info x baseInputs of
-                Left err -> Left ("binding " <> name <> ": " <> err)
-                Right ok -> Right ok
-
-inputsFor :: forall iface. BuildInputsWith iface iface => CompiledShader iface -> HList (InputsOf iface) -> Either String (ShaderInputs iface)
-inputsFor shader xs =
-  let bmap = bindingMap (shaderInterface shader)
-  in fmap normalizeInputs (buildInputsWith @iface @iface bmap shader xs)
-
-inputsForPrepared :: forall iface. BuildInputsWith iface iface => PreparedShader iface -> HList (InputsOf iface) -> Either String (ShaderInputs iface)
-inputsForPrepared prepared xs =
-  inputsFor (psShader prepared) xs

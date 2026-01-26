@@ -17,7 +17,7 @@ extra-source-files:
 common warnings
     ghc-options: -Wall
 
-flag demo
+flag spirdo-demo
     description: Build the demo executable.
     default: False
     manual: True
@@ -78,16 +78,13 @@ executable spirdo
         Examples.Fragments.Voronoi
         Examples.Override
         Examples.Vertex
-        Spirdo.SDL3
-        Spirdo.SDL3.Safe
-    if !flag(demo)
+    if !flag(spirdo-demo)
         buildable: False
     -- other-extensions:
-    build-tool-depends: hsc2hs:hsc2hs
-    pkgconfig-depends: sdl3
     build-depends:
         base ^>=4.21.0.0,
         bytestring,
+        slop,
         spirdo
 
     hs-source-dirs:   exe
