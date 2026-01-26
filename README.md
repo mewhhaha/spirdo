@@ -233,11 +233,86 @@ order and kinds are enforced at compile time. The resulting `ShaderInputs` lists
 (`siUniforms`, `siSamplers`, `siTextures`, ...) are ready to hand off to your
 SDL upload/bind code.
 
+If you need deterministic uniform ordering (by group/binding/name), use
+`orderedUniforms`.
+
+`inputsFor` now normalizes all input lists to `(group, binding, name)` order.
+
 `inputsFor` is pure; handle `Either` as you prefer.
 
 Notes:
 - Record field names must match the WESL struct field names (extra or missing
   fields are errors).
+
+### Pipeline Integration (Renderer‑Agnostic)
+Spirdo does **not** bind you to any graphics API. The idea is:
+1) use the interface reflection to build *your* backend’s pipeline descriptor,
+2) use `ShaderInputs` to feed uniform bytes + resource handles into your backend.
+
+```hs
+{-# LANGUAGE DataKinds #-}
+
+import Spirdo.Wesl
+  ( CompiledShader
+  , PreparedShader
+  , ShaderInterface(..)
+  , bindingPlanFor
+  , prepareShader
+  , vertexAttributes
+  )
+import Spirdo.Wesl.Types.Interface
+  ( BindingPlan(..)
+  , VertexAttribute(..)
+  )
+import Spirdo.Wesl.Inputs (ShaderInputs(..))
+
+-- Your backend descriptor (renderer‑agnostic example).
+data PipelineDesc = PipelineDesc
+  { pdVertexAttributes :: [VertexAttribute]
+  , pdUniformCount :: Int
+  , pdSamplerCount :: Int
+  , pdTextureCount :: Int
+  , pdStorageBufferCount :: Int
+  , pdStorageTextureCount :: Int
+  }
+
+buildPipelineDesc
+  :: CompiledShader vIface
+  -> CompiledShader fIface
+  -> Either String PipelineDesc
+buildPipelineDesc vShader fShader = do
+  let vIface = shaderInterface vShader
+      fPlan = bindingPlanFor fShader
+  vAttrs <- vertexAttributes vIface
+  pure PipelineDesc
+    { pdVertexAttributes = vAttrs
+    , pdUniformCount = length (bpUniforms fPlan)
+    , pdSamplerCount = length (bpSamplers fPlan)
+    , pdTextureCount = length (bpTextures fPlan)
+    , pdStorageBufferCount = length (bpStorageBuffers fPlan)
+    , pdStorageTextureCount = length (bpStorageTextures fPlan)
+    }
+
+-- Optional: precompute interface data once.
+preparedExample :: CompiledShader iface -> Either String (PreparedShader iface)
+preparedExample = prepareShader
+
+-- Feeding inputs into your backend (pseudo‑API).
+submitInputs
+  :: ShaderInputs iface
+  -> IO ()
+submitInputs inputs = do
+  -- upload uniforms (each has name/group/binding + bytes)
+  mapM_ uploadUniform (siUniforms inputs)
+  -- bind resources using your own handle types
+  mapM_ bindSampler (siSamplers inputs)
+  mapM_ bindTexture (siTextures inputs)
+  mapM_ bindStorageBuffer (siStorageBuffers inputs)
+  mapM_ bindStorageTexture (siStorageTextures inputs)
+```
+
+If you need a *deterministic bind order*, use `bindingPlan`/`bindingPlanFor` and
+sort by `(group, binding)` or use `bpBindings` directly.
 
 ### Binding Plans and Vertex Attributes
 You can derive a binding plan (sorted by set/binding) and vertex attributes from

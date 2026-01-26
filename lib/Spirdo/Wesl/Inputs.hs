@@ -23,10 +23,13 @@ module Spirdo.Wesl.Inputs
   , StorageTextureInput(..)
   , ShaderInputs(..)
   , emptyInputs
+  , orderedUniforms
+  , inputsForPrepared
   , inputsFor
   ) where
 
 import Data.ByteString (ByteString)
+import Data.List (sortOn)
 import qualified Data.Kind as K
 import Data.Proxy (Proxy(..))
 import Data.Word (Word32, Word64)
@@ -38,6 +41,7 @@ import Spirdo.Wesl.Types
   , BindingKind(..)
   , BindingMap
   , CompiledShader(..)
+  , PreparedShader(..)
   , UniformValue
   , bindingInfoForMap
   , bindingMap
@@ -153,6 +157,35 @@ emptyInputs shader =
     , siStorageTextures = []
     }
 
+orderedUniforms :: ShaderInputs iface -> [UniformInput]
+orderedUniforms inputs =
+  orderUniforms (siUniforms inputs)
+
+normalizeInputs :: ShaderInputs iface -> ShaderInputs iface
+normalizeInputs inputs =
+  inputs
+    { siUniforms = orderUniforms (siUniforms inputs)
+    , siSamplers = orderSamplers (siSamplers inputs)
+    , siTextures = orderTextures (siTextures inputs)
+    , siStorageBuffers = orderStorageBuffers (siStorageBuffers inputs)
+    , siStorageTextures = orderStorageTextures (siStorageTextures inputs)
+    }
+
+orderUniforms :: [UniformInput] -> [UniformInput]
+orderUniforms = sortOn (\u -> (uiGroup u, uiBinding u, uiName u))
+
+orderSamplers :: [SamplerInput] -> [SamplerInput]
+orderSamplers = sortOn (\s -> (samplerGroup s, samplerBinding s, samplerName s))
+
+orderTextures :: [TextureInput] -> [TextureInput]
+orderTextures = sortOn (\t -> (textureGroup t, textureBinding t, textureName t))
+
+orderStorageBuffers :: [StorageBufferInput] -> [StorageBufferInput]
+orderStorageBuffers = sortOn (\b -> (storageBufferGroup b, storageBufferBinding b, storageBufferName b))
+
+orderStorageTextures :: [StorageTextureInput] -> [StorageTextureInput]
+orderStorageTextures = sortOn (\t -> (storageTextureGroup t, storageTextureBinding t, storageTextureName t))
+
 class ApplyCategory (c :: BindingCategory) where
   applyCategory :: BindingInfo -> InputForCategory c -> ShaderInputs iface -> Either String (ShaderInputs iface)
 
@@ -249,4 +282,8 @@ instance
 inputsFor :: forall iface. BuildInputsWith iface iface => CompiledShader iface -> HList (InputsOf iface) -> Either String (ShaderInputs iface)
 inputsFor shader xs =
   let bmap = bindingMap (shaderInterface shader)
-  in buildInputsWith @iface @iface bmap shader xs
+  in fmap normalizeInputs (buildInputsWith @iface @iface bmap shader xs)
+
+inputsForPrepared :: forall iface. BuildInputsWith iface iface => PreparedShader iface -> HList (InputsOf iface) -> Either String (ShaderInputs iface)
+inputsForPrepared prepared xs =
+  inputsFor (psShader prepared) xs

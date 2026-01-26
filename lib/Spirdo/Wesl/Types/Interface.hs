@@ -25,6 +25,15 @@ module Spirdo.Wesl.Types.Interface
   , binding
   , bindingMaybe
   , bindingEither
+  , shaderStage
+  , VertexShader(..)
+  , FragmentShader(..)
+  , ComputeShader(..)
+  , asVertexShader
+  , asFragmentShader
+  , asComputeShader
+  , PreparedShader(..)
+  , prepareShader
   , stageIO
   , stageInputs
   , stageOutputs
@@ -382,6 +391,9 @@ specializableOverrides iface =
 stageIO :: ShaderInterface -> Maybe StageIO
 stageIO = siStageIO
 
+shaderStage :: ShaderInterface -> Maybe ShaderStage
+shaderStage iface = sioStage <$> siStageIO iface
+
 stageInputs :: ShaderInterface -> [IOParam]
 stageInputs iface = maybe [] sioInputs (siStageIO iface)
 
@@ -534,3 +546,54 @@ data CompiledShader (iface :: [Binding]) = CompiledShader
 
 -- | Existential wrapper for runtime compilation.
 data SomeCompiledShader = forall iface. SomeCompiledShader (CompiledShader iface)
+
+newtype VertexShader iface = VertexShader { unVertexShader :: CompiledShader iface }
+newtype FragmentShader iface = FragmentShader { unFragmentShader :: CompiledShader iface }
+newtype ComputeShader iface = ComputeShader { unComputeShader :: CompiledShader iface }
+
+asVertexShader :: CompiledShader iface -> Either String (VertexShader iface)
+asVertexShader shader =
+  case shaderStage (shaderInterface shader) of
+    Just ShaderStageVertex -> Right (VertexShader shader)
+    Just ShaderStageFragment -> Left "expected vertex shader, found fragment shader"
+    Just ShaderStageCompute -> Left "expected vertex shader, found compute shader"
+    Nothing -> Left "expected vertex shader, but shader has no entry point"
+
+asFragmentShader :: CompiledShader iface -> Either String (FragmentShader iface)
+asFragmentShader shader =
+  case shaderStage (shaderInterface shader) of
+    Just ShaderStageFragment -> Right (FragmentShader shader)
+    Just ShaderStageVertex -> Left "expected fragment shader, found vertex shader"
+    Just ShaderStageCompute -> Left "expected fragment shader, found compute shader"
+    Nothing -> Left "expected fragment shader, but shader has no entry point"
+
+asComputeShader :: CompiledShader iface -> Either String (ComputeShader iface)
+asComputeShader shader =
+  case shaderStage (shaderInterface shader) of
+    Just ShaderStageCompute -> Right (ComputeShader shader)
+    Just ShaderStageVertex -> Left "expected compute shader, found vertex shader"
+    Just ShaderStageFragment -> Left "expected compute shader, found fragment shader"
+    Nothing -> Left "expected compute shader, but shader has no entry point"
+
+data PreparedShader iface = PreparedShader
+  { psShader :: CompiledShader iface
+  , psStage :: ShaderStage
+  , psPlan :: BindingPlan
+  , psVertexAttributes :: Maybe [VertexAttribute]
+  }
+
+prepareShader :: CompiledShader iface -> Either String (PreparedShader iface)
+prepareShader shader =
+  case shaderStage (shaderInterface shader) of
+    Nothing -> Left "shader has no entry point"
+    Just stage -> do
+      let iface = shaderInterface shader
+      vattrs <- case stage of
+        ShaderStageVertex -> Just <$> vertexAttributes iface
+        _ -> Right Nothing
+      pure PreparedShader
+        { psShader = shader
+        , psStage = stage
+        , psPlan = bindingPlan iface
+        , psVertexAttributes = vattrs
+        }

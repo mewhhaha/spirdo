@@ -34,6 +34,15 @@ module Spirdo.Wesl
   , binding
   , bindingMaybe
   , bindingEither
+  , shaderStage
+  , VertexShader(..)
+  , FragmentShader(..)
+  , ComputeShader(..)
+  , asVertexShader
+  , asFragmentShader
+  , asComputeShader
+  , PreparedShader(..)
+  , prepareShader
   , UniformValue(..)
   , ToUniform(..)
   , uniform
