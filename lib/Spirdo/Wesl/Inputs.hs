@@ -21,6 +21,8 @@ module Spirdo.Wesl.Inputs
   , TextureInput(..)
   , StorageBufferInput(..)
   , StorageTextureInput(..)
+  , UniformSlot(..)
+  , uniformSlots
   , ShaderInputs(..)
   , emptyInputs
   , orderedUniforms
@@ -109,6 +111,12 @@ data UniformInput = UniformInput
   , uiBytes :: !ByteString
   } deriving (Eq, Show)
 
+data UniformSlot = UniformSlot
+  { usGroup :: !Word32
+  , usBinding :: !Word32
+  , usBytes :: !ByteString
+  } deriving (Eq, Show)
+
 data SamplerInput = SamplerInput
   { samplerName :: !String
   , samplerGroup :: !Word32
@@ -160,6 +168,12 @@ emptyInputs shader =
 orderedUniforms :: ShaderInputs iface -> [UniformInput]
 orderedUniforms inputs =
   orderUniforms (siUniforms inputs)
+
+uniformSlots :: ShaderInputs iface -> [UniformSlot]
+uniformSlots inputs =
+  [ UniformSlot (uiGroup u) (uiBinding u) (uiBytes u)
+  | u <- orderedUniforms inputs
+  ]
 
 normalizeInputs :: ShaderInputs iface -> ShaderInputs iface
 normalizeInputs inputs =

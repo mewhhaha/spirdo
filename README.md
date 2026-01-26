@@ -59,115 +59,9 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 Note: the public API is exposed from `Spirdo.Wesl` and `Spirdo.Wesl.Inputs`.
 Internal modules are not part of the supported surface area.
 
-## Type-Safe Binding Reflection
-Using the quasiquoter gives you a `CompiledShader iface` where the binding
-interface is captured in the type. You can then derive the exact bindings
-needed by the shader in a type-safe way without manual plumbing.
-
-```hs
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE QuasiQuotes #-}
-{-# LANGUAGE TypeApplications #-}
-
-import Spirdo.Wesl
-  ( BindingDesc(..)
-  , CompiledShader
-  , binding
-  , wesl
-  )
-
-shader :: CompiledShader iface
-shader = [wesl|
-struct Params {
-  time_res: vec4<f32>;
-};
-
-@group(0) @binding(0)
-var<uniform> params: Params;
-
-@group(0) @binding(1)
-var sampler0: sampler;
-
-@fragment
-fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
-  let uv = vec2(frag_coord.x / 800.0, frag_coord.y / 600.0);
-  return vec4(uv.x, uv.y, 0.4, 1.0);
-}
-|]
-
-params :: BindingDesc
-params = binding @"params" shader
-
-sampler0 :: BindingDesc
-sampler0 = binding @"sampler0" shader
-```
-
-Each `BindingDesc` includes the name, group (set), and binding index you need
-to create descriptor layouts or bind resources on the CPU side.
-
-Convenience filters are available: `uniformBindingsFor`, `samplerBindingsFor`,
-`storageBufferBindingsFor`, and `storageTextureBindingsFor`.
-
-For actual input submission, prefer the typed HList helpers below; they enforce
-order and kind at compile time.
-
-### Uniform Packing Helpers
-If you want to pack CPU-side data into a uniform buffer layout (std140-like),
-use the `TypeLayout` from the compiled interface and the helpers in
-`Spirdo.Wesl`.
-
-```hs
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE QuasiQuotes #-}
-
-import Data.List (find)
-import qualified Data.ByteString as BS
-import GHC.Generics (Generic)
-import Spirdo.Wesl
-
-shader :: CompiledShader iface
-shader = [wesl|
-struct Params { time: f32; };
-@group(0) @binding(0) var<uniform> params: Params;
-@fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-  return vec4(0.0, 0.0, 0.0, 1.0);
-}
-|]
-
-data Params = Params { time :: Float } deriving (Generic)
-instance ToUniform Params
-
-packed :: Either String BS.ByteString
-packed =
-  case find (\b -> biName b == "params") (siBindings (shaderInterface shader)) of
-    Nothing -> Left "missing params binding"
-    Just bi -> packUniformFrom (biType bi) (Params 1.5)
-```
-
-If you already have a `Storable` record that matches the WGSL layout, you can
-validate it and pack bytes directly:
-
-```hs
-import Data.Proxy (Proxy(..))
-import Spirdo.Wesl
-  ( TypeLayout(..)
-  , Scalar(..)
-  , validateUniformStorable
-  , packUniformStorable
-  )
-
-layout :: TypeLayout
-layout = TLScalar F32 4 4
-
-ok :: Either String ()
-ok = validateUniformStorable layout (Proxy @Float)
-
-bytesIO :: IO (Either String BS.ByteString)
-bytesIO = packUniformStorable layout (1.0 :: Float)
-```
-
-Note: `validateUniformStorable` checks size/alignment only. Field ordering and
-padding are still your responsibility.
+## Declarative Binding Flow (Preferred)
+The recommended path is: **prepare → inputsForPrepared → submit**.
+It’s concise, type‑safe, and renderer‑agnostic.
 
 ### Typed Input Lists (Host-Agnostic)
 You can build a typed input list for the shader interface using `HList` and
@@ -180,6 +74,8 @@ opaque handles. This stays host‑agnostic and still enforces ordering/types.
 
 import Spirdo.Wesl
   ( CompiledShader
+  , PreparedShader
+  , prepareShader
   , uniform
   , wesl
   )
@@ -189,7 +85,7 @@ import Spirdo.Wesl.Inputs
   , TextureHandle(..)
   , StorageTextureHandle(..)
   , ShaderInputs
-  , inputsFor
+  , inputsForPrepared
   )
 
 shader :: CompiledShader iface
@@ -205,8 +101,9 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 |]
 
 inputs :: Either String (ShaderInputs iface)
-inputs =
-  inputsFor shader
+inputs = do
+  prep <- prepareShader shader
+  inputsForPrepared prep
     ( uniform (V4 0.0 0.0 0.0 0.0 :: V4 Float)
         :& SamplerHandle 1
         :& TextureHandle 2
@@ -225,17 +122,23 @@ order and kinds are enforced at compile time. The resulting `ShaderInputs` lists
 SDL upload/bind code.
 
 If you need deterministic uniform ordering (by group/binding/name), use
-`orderedUniforms`.
+`orderedUniforms` (or `uniformSlots` for a tiny, backend‑ready view).
 
-`inputsFor` now normalizes all input lists to `(group, binding, name)` order.
+`inputsForPrepared` normalizes all input lists to `(group, binding, name)` order.
 
-`inputsFor` is pure; handle `Either` as you prefer.
+`inputsForPrepared` is pure; handle `Either` as you prefer.
 
 Notes:
 - Record field names must match the WESL struct field names (extra or missing
   fields are errors).
- - If you already have a `PreparedShader`, use `inputsForPrepared` to reuse the
-   precomputed interface data.
+ - `PreparedShader` is the preferred entrypoint; it caches stage, binding plan,
+   and vertex attributes.
+
+### Uniform Packing Helpers (Advanced)
+The high‑level path (`inputsForPrepared`) already packs uniforms for you.
+Use these only if you need raw layout control:
+- `packUniformFrom` for `ToUniform` values
+- `packUniformStorable` for pre‑laid‑out `Storable` records
 
 ### Pipeline Integration (Renderer‑Agnostic)
 Spirdo does **not** bind you to any graphics API. The idea is:
@@ -249,7 +152,7 @@ import Spirdo.Wesl
   ( CompiledShader
   , PreparedShader
   , ShaderInterface(..)
-  , bindingPlanFor
+  , bindingPlan
   , prepareShader
   , vertexAttributes
   )
@@ -275,7 +178,7 @@ buildPipelineDesc
   -> Either String PipelineDesc
 buildPipelineDesc vShader fShader = do
   let vIface = shaderInterface vShader
-      fPlan = bindingPlanFor fShader
+      fPlan = bindingPlan (shaderInterface fShader)
   vAttrs <- vertexAttributes vIface
   pure PipelineDesc
     { pdVertexAttributes = vAttrs
@@ -304,7 +207,7 @@ submitInputs inputs = do
   mapM_ bindStorageTexture (siStorageTextures inputs)
 ```
 
-If you need a *deterministic bind order*, use `bindingPlan`/`bindingPlanFor` and
+If you need a *deterministic bind order*, use `bindingPlan` and
 sort by `(group, binding)` or use `bpBindings` directly.
 
 ### SDL (Example‑only, Not in the Library)
@@ -324,7 +227,7 @@ import Spirdo.Wesl
   , uniform
   , wesl
   )
-import Spirdo.Wesl.Inputs (HList(..), inputsForPrepared, orderedUniforms)
+import Spirdo.Wesl.Inputs (HList(..), inputsForPrepared, uniformSlots)
 
 fragment = [wesl|
 struct Params { time_res: vec4<f32>; };
@@ -359,8 +262,8 @@ Right si =
     ( uniform (ParamsU (V4 t 800 600 mode)) :& HNil )
 
 -- 4) Upload uniform (first/only in this shader)
-case orderedUniforms si of
-  (u:_) -> sdlSetGPURenderStateFragmentUniforms rs (uiBinding u) (bytesPtr u) (bytesLen u)
+case uniformSlots si of
+  (u:_) -> sdlSetGPURenderStateFragmentUniforms rs (usBinding u) (usBytes u)
   [] -> pure ()
 ```
 
@@ -416,27 +319,14 @@ Right cprep = prepareShader compute
 -- Use psPlan cprep to size descriptor bindings and create SDL GPU shader.
 ```
 
-### Binding Plans and Vertex Attributes
-You can derive a binding plan (sorted by set/binding) and vertex attributes from
-the reflected interface. This is useful when building your own graphics pipeline
-layout in SDL or another renderer.
+### Binding Plans and Vertex Attributes (Advanced)
+If you need explicit layout info, use `bindingPlan` and `vertexAttributes` on
+the prepared shader’s interface:
 
 ```hs
-import Spirdo.Wesl
-  ( bindingPlan
-  , vertexAttributes
-  )
-
-plan = bindingPlan (shaderInterface shader)
-
-attrs = vertexAttributes (shaderInterface shader)
+plan = bindingPlan (shaderInterface (psShader prepared))
+attrs = vertexAttributes (shaderInterface (psShader prepared))
 ```
-
-`vertexAttributes` returns only `@location` inputs; builtins are ignored. If the
-shader uses non-scalar/vector inputs, you’ll get an error.
-
-`pushConstantLayout (shaderInterface shader)` currently returns `Nothing` because
-WESL does not expose push constants yet, but the API is in place.
 
 ### Demo (exe only)
 The demo executable is gated behind the `demo` flag and is not part of the

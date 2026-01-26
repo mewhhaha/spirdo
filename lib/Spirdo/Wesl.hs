@@ -64,7 +64,6 @@ module Spirdo.Wesl
   , VertexFormat(..)
   , VertexAttribute(..)
   , bindingPlan
-  , bindingPlanFor
   , isUniformKind
   , isSamplerKind
   , isTextureKind
@@ -75,10 +74,6 @@ module Spirdo.Wesl
   , uniformBindings
   , storageBufferBindings
   , storageTextureBindings
-  , samplerBindingsFor
-  , uniformBindingsFor
-  , storageBufferBindingsFor
-  , storageTextureBindingsFor
   , CompiledShader(..)
   , SomeCompiledShader(..)
   , ShaderInterface(..)
