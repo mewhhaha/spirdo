@@ -1,6 +1,6 @@
 # Spirdo
 
-Haskell WESL compiler with an optional SDL3 demo that renders shader variants (optional SPIR-V output).
+Haskell WESL compiler with an optional Slop/SDL3 demo that renders shader variants (optional SPIR-V output).
 
 ## Features
 - WESL/WGSL coverage: control flow, functions, modules/imports, attributes, and diagnostics.
@@ -9,7 +9,7 @@ Haskell WESL compiler with an optional SDL3 demo that renders shader variants (o
 - Override specialization constants with `SpecStrict` (validator‑friendly) and `SpecParity` (full WESL parity).
 - Diagnostics surfaced as warnings (unused/shadowing/constant conditions/unreachable/duplicate cases).
 - Typed interface reflection with binding metadata and ordering helpers.
-- Declarative input builder and HList inputs for type‑safe binding submission.
+- Declarative input builder for type‑safe binding submission.
 - Uniform packing with layout validation + Storable packing helpers.
 - Vertex input reflection (`vertexAttributes`) for pipeline setup.
 - Optional SPIR‑V validation (tests use `spirv-val` when available).
@@ -24,13 +24,13 @@ cabal test
 
 Demo app (disabled by default):
 ```sh
-cabal build -f demo
-cabal run -f demo
+cabal build -f spirdo-demo
+cabal run -f spirdo-demo
 ```
 
-The demo uses the SDL3 GPU renderer (FFI in `exe/Spirdo/SDL3.hsc`) and requires
-SDL3 to be installed. Use left/right arrow keys to cycle fragment shader
-variants in the demo window.
+The demo uses the Slop SDL3 renderer (`slop` dependency) and requires SDL3 to be
+installed. Use left/right arrow keys to cycle fragment shader variants in the
+demo window.
 
 Set `SPIRDO_WRITE_SPV=1` to emit SPIR-V files (`fragment-*.spv`, `vertex*.spv`,
 `compute*.spv`) for inspection.
@@ -265,7 +265,8 @@ sort by `(group, binding)` or use `bpBindings` directly.
 
 ### SDL (Example‑only, Not in the Library)
 Spirdo stays SDL‑agnostic, but SDL integration can be very declarative. The
-demo (`exe/Main.hs`) is a reference. The pattern below is intentionally short:
+demo (`exe/Main.hs`) is a Slop‑based reference; the pattern below shows a
+direct SDL GPU wiring variant in minimal form:
 
 #### Declarative SDL wiring (minimal)
 ```hs
@@ -368,7 +369,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 |]
 
 Right cprep = prepareShader compute
--- Use psPlan cprep to size descriptor bindings and create SDL GPU shader.
+-- Use psPlan cprep to size descriptor bindings and create your graphics pipeline.
 ```
 
 ### Binding Plans and Vertex Attributes (Advanced)
@@ -381,8 +382,8 @@ attrs = vertexAttributes (shaderInterface (psShader prepared))
 ```
 
 ### Demo (exe only)
-The demo executable is gated behind the `demo` flag and is not part of the
-library API. It uses SDL3 to render a full-screen quad with fragment shaders.
+The demo executable is gated behind the `spirdo-demo` flag and is not part of
+the library API. It uses Slop to render a full-screen quad with fragment shaders.
 
 
 ## Example Shaders in the Demo
@@ -415,7 +416,7 @@ Vertex examples emitted when SPIR-V output is enabled:
 ## SPIR-V Outputs
 SPIR-V output is opt-in. Set `SPIRDO_WRITE_SPV=1` before running the demo:
 ```
-SPIRDO_WRITE_SPV=1 cabal run
+SPIRDO_WRITE_SPV=1 cabal run -f spirdo-demo
 ```
 
 When enabled, files are written to the repo root:
