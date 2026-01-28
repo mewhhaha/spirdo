@@ -12,6 +12,7 @@ module Spirdo.Wesl.Types
   , CompileError(..)
   , Diagnostic(..)
   , CompileOptions(..)
+  , SamplerBindingMode(..)
   , OverrideSpecMode(..)
   , OverrideValue(..)
   , defaultCompileOptions
@@ -65,6 +66,7 @@ data CompileOptions = CompileOptions
   , enabledFeatures :: [String]
   , overrideValues :: [(String, OverrideValue)]
   , overrideSpecMode :: OverrideSpecMode
+  , samplerBindingMode :: SamplerBindingMode
   , cacheEnabled :: Bool
   , cacheVerbose :: Bool
   , timingVerbose :: Bool
@@ -86,7 +88,7 @@ data OverrideValue
 
 -- Default to SPIR-V 1.6 (0x00010600). Override if needed.
 defaultCompileOptions :: CompileOptions
-defaultCompileOptions = CompileOptions 0x00010600 [] [] SpecStrict True False False
+defaultCompileOptions = CompileOptions 0x00010600 [] [] SpecStrict SamplerSeparate True False False
 
 data FieldDecl = FieldDecl
   { fdName :: !Text

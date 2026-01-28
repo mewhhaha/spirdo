@@ -11,6 +11,7 @@
 -- | Type-level interface and reflection types.
 module Spirdo.Wesl.Types.Interface
   ( BindingKind(..)
+  , SamplerBindingMode(..)
   , ScalarType(..)
   , Field(..)
   , Ty(..)
@@ -52,6 +53,13 @@ module Spirdo.Wesl.Types.Interface
   , bindingMap
   , bindingInfoFor
   , bindingInfoForMap
+  , Layout(..)
+  , LayoutBinding(..)
+  , layoutFromPrepared
+  , layoutFromShader
+  , BindingTable(..)
+  , bindingTable
+  , bindingTableFromPrepared
   , OverrideInfo(..)
   , ShaderInterface(..)
   , specializableOverrides
@@ -104,6 +112,11 @@ data BindingKind
   | BStorageTexture2D
   | BStorageTexture2DArray
   | BStorageTexture3D
+  deriving (Eq, Show, Read)
+
+data SamplerBindingMode
+  = SamplerSeparate
+  | SamplerCombined
   deriving (Eq, Show, Read)
 
 data ScalarType = SI32 | SU32 | SF16 | SF32 | SBool
@@ -342,6 +355,66 @@ bindingInfoFor name iface =
 bindingInfoForMap :: String -> BindingMap -> Maybe BindingInfo
 bindingInfoForMap name (BindingMap m) = Map.lookup name m
 
+data LayoutBinding = LayoutBinding
+  { lbStage :: !ShaderStage
+  , lbName :: !String
+  , lbKind :: !BindingKind
+  , lbGroup :: !Word32
+  , lbBinding :: !Word32
+  , lbType :: !TypeLayout
+  } deriving (Eq, Show, Read)
+
+newtype Layout = Layout
+  { layoutBindings :: [LayoutBinding]
+  } deriving (Eq, Show, Read)
+
+layoutFromShader :: CompiledShader iface -> Either String Layout
+layoutFromShader shader =
+  case shaderStage (shaderInterface shader) of
+    Nothing -> Left "shader has no entry point"
+    Just stage -> Right (layoutFromStage stage (shaderInterface shader))
+
+layoutFromPrepared :: PreparedShader iface -> Layout
+layoutFromPrepared prepared =
+  layoutFromStage (psStage prepared) (shaderInterface (psShader prepared))
+
+layoutFromStage :: ShaderStage -> ShaderInterface -> Layout
+layoutFromStage stage iface =
+  Layout
+    [ LayoutBinding
+        { lbStage = stage
+        , lbName = biName info
+        , lbKind = biKind info
+        , lbGroup = biGroup info
+        , lbBinding = biBinding info
+        , lbType = biType info
+        }
+    | info <- siBindings iface
+    ]
+
+data BindingTable = BindingTable
+  { btUniforms :: [(String, Word32, Word32)]
+  , btSamplers :: [(String, Word32, Word32)]
+  , btTextures :: [(String, Word32, Word32)]
+  , btStorageBuffers :: [(String, Word32, Word32)]
+  , btStorageTextures :: [(String, Word32, Word32)]
+  } deriving (Eq, Show, Read)
+
+bindingTable :: ShaderInterface -> BindingTable
+bindingTable iface =
+  let uniforms = [slot info | info <- siBindings iface, isUniformKind (biKind info)]
+      samplers = [slot info | info <- siBindings iface, isSamplerKind (biKind info)]
+      textures = [slot info | info <- siBindings iface, isTextureKind (biKind info)]
+      storageBuffers = [slot info | info <- siBindings iface, isStorageBufferKind (biKind info)]
+      storageTextures = [slot info | info <- siBindings iface, isStorageTextureKind (biKind info)]
+  in BindingTable uniforms samplers textures storageBuffers storageTextures
+  where
+    slot info = (biName info, biGroup info, biBinding info)
+
+bindingTableFromPrepared :: PreparedShader iface -> BindingTable
+bindingTableFromPrepared prepared =
+  bindingTable (shaderInterface (psShader prepared))
+
 data OverrideInfo = OverrideInfo
   { oiName :: !String
   , oiId :: !(Maybe Word32)
@@ -354,6 +427,7 @@ data ShaderInterface = ShaderInterface
   , siOverrides :: ![OverrideInfo]
   , siStageIO :: !(Maybe StageIO)
   , siPushConstants :: !(Maybe TypeLayout)
+  , siSamplerMode :: !SamplerBindingMode
   } deriving (Eq, Show, Read)
 
 specializableOverrides :: ShaderInterface -> [OverrideInfo]

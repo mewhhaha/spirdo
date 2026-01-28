@@ -80,6 +80,13 @@ module Spirdo.Wesl
   , OverrideInfo(..)
   , BindingInfo(..)
   , BindingMap(..)
+  , Layout(..)
+  , LayoutBinding(..)
+  , layoutFromPrepared
+  , layoutFromShader
+  , BindingTable(..)
+  , bindingTable
+  , bindingTableFromPrepared
   , TypeLayout(..)
   , FieldLayout(..)
   , bindingMap
@@ -88,6 +95,7 @@ module Spirdo.Wesl
   , specializableOverrides
   , CompileError(..)
   , CompileOptions(..)
+  , SamplerBindingMode(..)
   , OverrideSpecMode(..)
   , OverrideValue(..)
   , Diagnostic(..)
@@ -108,6 +116,8 @@ module Spirdo.Wesl
   , PackageDependency(..)
   , discoverPackageInfo
   , wesl
+  , weslc
+  , weslWith
   ) where
 
 import Spirdo.Wesl.Compiler

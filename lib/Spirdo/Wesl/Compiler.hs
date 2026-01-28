@@ -131,7 +131,7 @@ compileInlineResult opts wantDiagnostics src = do
   let structIndex = buildStructIndex [node]
   let overrideIndex = buildOverrideIndex [node]
   validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node]
-  iface <- buildInterface (overrideSpecMode opts) moduleAst
+  iface <- buildInterface opts moduleAst
   spirv <- emitSpirv opts moduleAst iface
   diags <-
     if wantDiagnostics
@@ -170,7 +170,7 @@ compileInlineResultIO opts wantDiagnostics src = do
                   case validation of
                     Left err -> pure (Left err)
                     Right () -> do
-                      ifaceRes <- timedPhase opts "interface" (evaluate (buildInterface (overrideSpecMode opts) moduleAst))
+                      ifaceRes <- timedPhase opts "interface" (evaluate (buildInterface opts moduleAst))
                       case ifaceRes of
                         Left err -> pure (Left err)
                         Right iface -> do
@@ -213,7 +213,7 @@ compileFileResult opts wantDiagnostics path =
         else do
           _ <- ExceptT (timedPhase opts "const-asserts" (evaluate (validateConstAssertsMerged opts rootPath lowered)))
           pure []
-    iface <- ExceptT (timedPhase opts "interface" (evaluate (buildInterface (overrideSpecMode opts) lowered)))
+    iface <- ExceptT (timedPhase opts "interface" (evaluate (buildInterface opts lowered)))
     spirv <- ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts lowered iface)))
     pure CompileResult
       { crAst = lowered
@@ -223,7 +223,7 @@ compileFileResult opts wantDiagnostics path =
       }
 
 weslCacheVersion :: String
-weslCacheVersion = "wesl-cache-v3"
+weslCacheVersion = "wesl-cache-v4"
 
 weslCacheDir :: FilePath
 weslCacheDir = "dist-newstyle" </> ".wesl-cache"
@@ -238,6 +238,7 @@ weslCacheKey opts src =
           , "features=" <> show (enabledFeatures opts)
           , "overrides=" <> show (overrideValues opts)
           , "spec=" <> show (overrideSpecMode opts)
+          , "samplerMode=" <> show (samplerBindingMode opts)
           , src
           ]
       bytes = BS.pack (map (fromIntegral . ord) keySrc)
@@ -292,17 +293,23 @@ writeWeslCache opts src bytes iface =
 -- Quasiquoter
 
 wesl :: QuasiQuoter
-wesl =
+wesl = weslWith defaultCompileOptions
+
+weslc :: QuasiQuoter
+weslc = weslWith (defaultCompileOptions { samplerBindingMode = SamplerCombined })
+
+
+weslWith :: CompileOptions -> QuasiQuoter
+weslWith opts =
   QuasiQuoter
-    { quoteExp = weslExp
+    { quoteExp = weslExpWith opts
     , quotePat = const (fail "wesl: pattern context not supported")
     , quoteType = const (fail "wesl: type context not supported")
     , quoteDec = const (fail "wesl: declaration context not supported")
     }
 
-weslExp :: String -> Q Exp
-weslExp src = do
-  let opts = defaultCompileOptions
+weslExpWith :: CompileOptions -> String -> Q Exp
+weslExpWith opts src = do
   cached <- TH.runIO (timed opts "cache-read" (loadWeslCache opts src))
   case cached of
     Just (bytes, iface) -> emitWeslExp bytes iface

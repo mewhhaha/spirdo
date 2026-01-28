@@ -9,10 +9,12 @@ Haskell WESL compiler with an optional Slop/SDL3 demo that renders shader varian
 - Override specialization constants with `SpecStrict` (validator‑friendly) and `SpecParity` (full WESL parity).
 - Diagnostics surfaced as warnings (unused/shadowing/constant conditions/unreachable/duplicate cases).
 - Typed interface reflection with binding metadata and ordering helpers.
+- Layout extraction (`layoutFromPrepared`) and name→slot tables (`bindingTable`).
 - Declarative input builder for type‑safe binding submission.
 - Uniform packing with layout validation + Storable packing helpers.
 - Vertex input reflection (`vertexAttributes`) for pipeline setup.
 - Optional SPIR‑V validation (tests use `spirv-val` when available).
+- Optional combined‑sampler emission for backends that require it (`weslc` / `weslWith` + `SamplerCombined`).
 - Minimal `wesl.toml` package metadata parsing.
 
 ## Build and Run
@@ -68,7 +70,18 @@ defaultCompileOptions
   { cacheEnabled = True
   , cacheVerbose = False
   , timingVerbose = False
+  , samplerBindingMode = SamplerSeparate
   }
+```
+
+For SDL/Slop-style combined samplers, you can use the `weslc` quasiquoter:
+
+```hs
+import Spirdo.Wesl (weslc)
+
+shader = [weslc|
+// WESL...
+|]
 ```
 
 Set `cacheVerbose = True` to print basic timing output (cache read/write).
@@ -147,6 +160,69 @@ Notes:
   fields are errors).
  - `PreparedShader` is the preferred entrypoint; it caches stage, binding plan,
    and vertex attributes.
+
+### Layout & Binding Tables
+If you need a renderer‑friendly view of bindings (stage, group, slot, kind),
+use the layout helpers. They are pure and derived from the prepared shader.
+
+```hs
+import Spirdo.Wesl (layoutFromPrepared, bindingTableFromPrepared)
+
+Right prep = prepareShader shader
+let layout = layoutFromPrepared prep        -- [LayoutBinding]
+let table  = bindingTableFromPrepared prep  -- name -> (group, binding)
+```
+
+### Combined Samplers (SDL/Slop-Friendly)
+Some backends expose **combined image+sampler** slots. For those, compile with
+`SamplerCombined` and pass samplers *inline* with textures.
+
+```hs
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TypeApplications #-}
+
+import Spirdo.Wesl (prepareShader, weslc)
+import Spirdo.Wesl.Inputs
+  ( InputsBuilder
+  , SamplerHandle(..)
+  , TextureHandle(..)
+  , inputsFromPrepared
+  , sampledTexture
+  , uniform
+  )
+
+shader = [weslc|
+struct Params { time_res: vec4<f32>; };
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(0) var tex0: texture_2d<f32>;
+@group(0) @binding(1) var tex1: texture_2d<f32>;
+@group(0) @binding(3) var samp0: sampler;
+@group(0) @binding(4) var samp1: sampler;
+@fragment
+fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = frag_coord.xy / 800.0;
+  let a = textureSample(tex0, samp0, uv).x;
+  let b = textureSample(tex1, samp1, uv).x;
+  return vec4(a, b, 0.0, 1.0);
+}
+|]
+
+inputs = do
+  prep <- prepareShader shader
+  inputsFromPrepared prep $
+    uniform @"params" (V4 0 0 0 0 :: V4 Float)
+    <> sampledTexture @"tex0" (TextureHandle 1) (SamplerHandle 7)
+    <> sampledTexture @"tex1" (TextureHandle 2) (SamplerHandle 7)
+```
+
+In `SamplerCombined` mode, **sampler bindings are not part of the interface
+type**, so you provide samplers via `sampledTexture`. If your backend expects
+contiguous sampler slots (like Slop), make sure your *texture* bindings are
+contiguous starting at 0.
+
+If you need to customize compile options, use `weslWith` and set
+`samplerBindingMode = SamplerCombined`.
 
 ### Storage Buffers & Storage Textures (Builder)
 ```hs
