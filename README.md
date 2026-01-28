@@ -14,7 +14,7 @@ Haskell WESL compiler with an optional Slop/SDL3 demo that renders shader varian
 - Uniform packing with layout validation + Storable packing helpers.
 - Vertex input reflection (`vertexAttributes`) for pipeline setup.
 - Optional SPIR‑V validation (tests use `spirv-val` when available).
-- Optional combined‑sampler emission for backends that require it (`weslc` / `weslWith` + `SamplerCombined`).
+- Optional combined‑sampler emission for backends that require it (inline pragma or `weslWith` + `SamplerCombined`).
 - Minimal `wesl.toml` package metadata parsing.
 
 ## Build and Run
@@ -74,12 +74,13 @@ defaultCompileOptions
   }
 ```
 
-For SDL/Slop-style combined samplers, you can use the `weslc` quasiquoter:
+For SDL/Slop-style combined samplers, use an inline pragma with the normal `wesl` quasiquoter:
 
 ```hs
-import Spirdo.Wesl (weslc)
+import Spirdo.Wesl (wesl)
 
-shader = [weslc|
+shader = [wesl|
+// spirdo:sampler=combined
 // WESL...
 |]
 ```
@@ -182,7 +183,7 @@ Some backends expose **combined image+sampler** slots. For those, compile with
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 
-import Spirdo.Wesl (prepareShader, weslc)
+import Spirdo.Wesl (prepareShader, wesl)
 import Spirdo.Wesl.Inputs
   ( InputsBuilder
   , SamplerHandle(..)
@@ -192,7 +193,8 @@ import Spirdo.Wesl.Inputs
   , uniform
   )
 
-shader = [weslc|
+shader = [wesl|
+// spirdo:sampler=combined
 struct Params { time_res: vec4<f32>; };
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(0) var tex0: texture_2d<f32>;
