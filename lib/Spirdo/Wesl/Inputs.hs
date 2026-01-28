@@ -30,6 +30,7 @@ module Spirdo.Wesl.Inputs
   , InputsBuilder
   , uniform
   , sampler
+  , sampledTexture
   , texture
   , storageBuffer
   , storageTexture
@@ -47,7 +48,7 @@ module Spirdo.Wesl.Inputs
 
 import Control.Monad (foldM)
 import Data.ByteString (ByteString)
-import Data.List (sortOn)
+import Data.List (intercalate, sortOn)
 import qualified Data.Kind as K
 import Data.Proxy (Proxy(..))
 import Data.Word (Word32, Word64)
@@ -60,6 +61,8 @@ import Spirdo.Wesl.Types
   , BindingMap
   , CompiledShader(..)
   , PreparedShader(..)
+  , ShaderInterface(..)
+  , SamplerBindingMode(..)
   , UniformValue
   , ToUniform(..)
   , bindingInfoForMap
@@ -206,6 +209,7 @@ data TextureInput = TextureInput
   , textureGroup :: !Word32
   , textureBinding :: !Word32
   , textureHandle :: !TextureHandle
+  , textureSampler :: !(Maybe SamplerHandle)
   } deriving (Eq, Show)
 
 data StorageBufferInput = StorageBufferInput
@@ -281,6 +285,7 @@ data InputItem
   = InputUniform !String !UniformValue
   | InputSampler !String !SamplerHandle
   | InputTexture !String !TextureHandle
+  | InputSampledTexture !String !TextureHandle !SamplerHandle
   | InputStorageBuffer !String !BufferHandle
   | InputStorageTexture !String !StorageTextureHandle
   deriving (Eq, Show)
@@ -302,6 +307,10 @@ sampler handle = InputsBuilder [InputSampler (symbolVal (Proxy @name)) handle]
 
 texture :: forall name iface. (KnownSymbol name, RequireTexture name iface) => TextureHandle -> InputsBuilder iface
 texture handle = InputsBuilder [InputTexture (symbolVal (Proxy @name)) handle]
+
+sampledTexture :: forall name iface. (KnownSymbol name, RequireTexture name iface) => TextureHandle -> SamplerHandle -> InputsBuilder iface
+sampledTexture texHandle samplerHandle =
+  InputsBuilder [InputSampledTexture (symbolVal (Proxy @name)) texHandle samplerHandle]
 
 storageBuffer :: forall name iface. (KnownSymbol name, RequireStorageBuffer name iface) => BufferHandle -> InputsBuilder iface
 storageBuffer handle = InputsBuilder [InputStorageBuffer (symbolVal (Proxy @name)) handle]
@@ -328,7 +337,16 @@ inputsFrom :: forall iface. CompiledShader iface -> InputsBuilder iface -> Eithe
 inputsFrom shader (InputsBuilder items) =
   let bmap = bindingMap (shaderInterface shader)
       initInputs = emptyInputs shader
-  in fmap normalizeInputs (foldM (applyItem bmap) initInputs items)
+  in do
+      inputs <- foldM (applyItem bmap) initInputs items
+      let normalized = normalizeInputs inputs
+      case siSamplerMode (shaderInterface shader) of
+        SamplerCombined ->
+          case [textureName t | t <- siTextures normalized, textureSampler t == Nothing] of
+            [] -> Right normalized
+            missing ->
+              Left ("missing sampler for textures: " <> intercalate ", " missing)
+        SamplerSeparate -> Right normalized
 
 inputsFromPrepared :: forall iface. PreparedShader iface -> InputsBuilder iface -> Either String (ShaderInputs iface)
 inputsFromPrepared prepared inputs =
@@ -377,6 +395,20 @@ applyItem bmap inputs item = do
                   , textureGroup = biGroup info
                   , textureBinding = biBinding info
                   , textureHandle = handle
+                  , textureSampler = Nothing
+                  }
+                  : siTextures inputs
+            }
+    (InputSampledTexture _ handle sampHandle, kind)
+      | isTextureKind kind ->
+          Right inputs
+            { siTextures =
+                TextureInput
+                  { textureName = biName info
+                  , textureGroup = biGroup info
+                  , textureBinding = biBinding info
+                  , textureHandle = handle
+                  , textureSampler = Just sampHandle
                   }
                   : siTextures inputs
             }
@@ -412,5 +444,6 @@ itemName item =
     InputUniform name _ -> name
     InputSampler name _ -> name
     InputTexture name _ -> name
+    InputSampledTexture name _ _ -> name
     InputStorageBuffer name _ -> name
     InputStorageTexture name _ -> name

@@ -39,15 +39,19 @@ import Spirdo.Wesl.Util
 
 -- Interface and layout
 
-buildInterface :: OverrideSpecMode -> ModuleAst -> Either CompileError ShaderInterface
-buildInterface specMode modAst = do
+buildInterface :: CompileOptions -> ModuleAst -> Either CompileError ShaderInterface
+buildInterface opts modAst = do
   let structEnv = [(sdName s, s) | s <- modStructs modAst]
   structLayouts <- resolveStructLayouts structEnv
-  bindings <- mapM (layoutBinding structLayouts) (modBindings modAst)
+  bindings0 <- mapM (layoutBinding structLayouts) (modBindings modAst)
+  let bindings =
+        case samplerBindingMode opts of
+          SamplerCombined -> filter (not . isSamplerKind . biKind) bindings0
+          SamplerSeparate -> bindings0
   checkBindingInvariants bindings
-  overrides <- buildOverrideInfo specMode structLayouts (modOverrides modAst)
+  overrides <- buildOverrideInfo (overrideSpecMode opts) structLayouts (modOverrides modAst)
   stageInfo <- buildStageIO structLayouts structEnv (modEntry modAst)
-  pure (ShaderInterface bindings overrides stageInfo Nothing)
+  pure (ShaderInterface bindings overrides stageInfo Nothing (samplerBindingMode opts))
 
 checkBindingInvariants :: [BindingInfo] -> Either CompileError ()
 checkBindingInvariants bindings = do
@@ -368,6 +372,12 @@ layoutBinding layoutCache decl = do
         TyStructRef _ -> pure ()
         _ -> Left (CompileError "bindings must use a struct type (wrap arrays in a struct)" Nothing Nothing)
 
+collectSamplerLayouts :: StructLayoutCache -> [BindingDecl] -> Either CompileError (Map.Map Text TypeLayout)
+collectSamplerLayouts layoutCache decls = do
+  infos <- mapM (layoutBinding layoutCache) decls
+  let samplerInfos = filter (isSamplerKind . biKind) infos
+  pure (Map.fromList [(T.pack (biName info), biType info) | info <- samplerInfos])
+
 type StructLayoutCache = Map.Map Text TypeLayout
 
 resolveStructLayouts :: [(Text, StructDecl)] -> Either CompileError StructLayoutCache
@@ -676,6 +686,7 @@ emitSpirv opts modAst iface = do
   let structEnv = [(sdName s, s) | s <- modStructs modAst]
   structLayoutsMap <- resolveStructLayouts structEnv
   let structLayouts = Map.toList structLayoutsMap
+  samplerLayouts <- collectSamplerLayouts structLayoutsMap (modBindings modAst)
   retLayout <- case (epStage entry, epReturnType entry) of
     (StageFragment, Just ty) -> Just <$> resolveTypeLayoutWithCache structLayoutsMap ty
     (StageFragment, Nothing) -> Left (CompileError "fragment entry point missing return type" Nothing Nothing)
@@ -683,7 +694,7 @@ emitSpirv opts modAst iface = do
     (StageVertex, Nothing) -> Left (CompileError "vertex entry point missing return type" Nothing Nothing)
     _ -> Right Nothing
   let blockStructs = [T.pack name | BindingInfo _ _ _ _ (TLStruct name _ _ _) <- siBindings iface]
-  let state0 = emptyGenState (epStage entry) structLayouts blockStructs
+  let state0 = emptyGenState (samplerBindingMode opts) (epStage entry) structLayouts blockStructs samplerLayouts
   let ((), state1) = emitStructs state0
   let node = ModuleNode "<merged>" [] modAst []
   let constIndex = buildConstIndex [node]
@@ -1876,6 +1887,9 @@ opImageRead = 98
 opImageWrite :: Word16
 opImageWrite = 99
 
+opImage :: Word16
+opImage = 100
+
 opImageQuerySizeLod :: Word16
 opImageQuerySizeLod = 103
 
@@ -2450,10 +2464,12 @@ data GenState = GenState
   , gsFunctions :: [Instr]
   , gsEntryPoint :: Maybe Word32
   , gsInterfaceIds :: [Word32]
+  , gsSamplerMode :: SamplerBindingMode
+  , gsSamplerLayouts :: Map.Map Text TypeLayout
   }
 
-emptyGenState :: Stage -> [(Text, TypeLayout)] -> [Text] -> GenState
-emptyGenState stage structLayouts blockStructs =
+emptyGenState :: SamplerBindingMode -> Stage -> [(Text, TypeLayout)] -> [Text] -> Map.Map Text TypeLayout -> GenState
+emptyGenState samplerMode stage structLayouts blockStructs samplerLayouts =
   let (ids, nextId) = assignStructIds 1 structLayouts
   in GenState
       { gsNextId = nextId
@@ -2477,6 +2493,8 @@ emptyGenState stage structLayouts blockStructs =
       , gsFunctions = []
       , gsEntryPoint = Nothing
       , gsInterfaceIds = []
+      , gsSamplerMode = samplerMode
+      , gsSamplerLayouts = samplerLayouts
       }
 
 assignStructIds :: Word32 -> [(Text, TypeLayout)] -> ([(Text, Word32)], Word32)
@@ -3900,7 +3918,11 @@ emitExpr st fs expr =
         Nothing ->
           case lookup name (gsConstValues st) of
             Just val -> Right (st, fs, val)
-            Nothing -> emitLoadFromExpr st fs expr
+            Nothing ->
+              case Map.lookup name (gsSamplerLayouts st) of
+                Just samplerLayout | gsSamplerMode st == SamplerCombined ->
+                  Right (st, fs, Value samplerLayout 0)
+                _ -> emitLoadFromExpr st fs expr
     EField base field -> emitFieldExpr st fs base field
     EIndex _ _ -> emitLoadFromExpr st fs expr
     EUnary OpNeg inner -> do
@@ -5547,6 +5569,12 @@ emitVec4FromVec3Scalar vecVal scalarVal st fs =
       Right (st6, fs5, Value layout resId)
     _ -> Left (CompileError "expected vec3 value" Nothing Nothing)
 
+emitSamplerExpr :: TypeLayout -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
+emitSamplerExpr expected expr st fs =
+  if gsSamplerMode st == SamplerCombined
+    then Right (st, fs, Value expected 0)
+    else emitExpr st fs expr
+
 emitTextureSample :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitTextureSample args st fs =
   case args of
@@ -5558,7 +5586,7 @@ emitTextureSample args st fs =
   where
     emitSample texExpr samplerExpr coordExpr mArray st0 fs0 = do
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
-      (st2, fs2, sampVal) <- emitExpr st1 fs1 samplerExpr
+      (st2, fs2, sampVal) <- emitSamplerExpr TLSampler samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       case valType sampVal of
         TLSampler -> Right ()
@@ -5595,12 +5623,15 @@ emitTextureSample args st fs =
           Left (CompileError "textureSample is not supported for multisampled textures" Nothing Nothing)
         _ -> Left (CompileError "textureSample expects a sampled texture binding" Nothing Nothing)
 
-    buildSampledImage texVal sampVal st0 fs0 = do
-      let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
-      let (sampledTy, st2) = emitSampledImageType imageTy st1
-      let (sampledId, st3) = freshId st2
-      let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
-      Right (st3, fs1, sampledId)
+    buildSampledImage texVal sampVal st0 fs0 =
+      if gsSamplerMode st0 == SamplerCombined
+        then Right (st0, fs0, valId texVal)
+        else do
+          let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
+          let (sampledTy, st2) = emitSampledImageType imageTy st1
+          let (sampledId, st3) = freshId st2
+          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
+          Right (st3, fs1, sampledId)
 
     sampleColorCoord scalar coordVal texVal sampVal st0 fs0 = do
       (st1, fs1, sampledId) <- buildSampledImage texVal sampVal st0 fs0
@@ -5682,7 +5713,7 @@ emitTextureSampleCompare args st fs =
   where
     emitCompareSample texExpr samplerExpr coordExpr mArray depthExpr st0 fs0 = do
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
-      (st2, fs2, sampVal) <- emitExpr st1 fs1 samplerExpr
+      (st2, fs2, sampVal) <- emitSamplerExpr TLSamplerComparison samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, depthVal) <- emitExpr st3 fs3 depthExpr
       case valType sampVal of
@@ -5719,13 +5750,18 @@ emitTextureSampleCompare args st fs =
           TLScalar F32 _ _ -> Right (st5, fs5, depthVal)
           TLScalar F16 _ _ -> emitScalarConvert F16 F32 depthVal st5 fs5
           _ -> Left (CompileError "depth reference must be f32 or f16" Nothing Nothing)
-      let (imageTy, st7) = emitTypeFromLayout st6 (valType texVal)
-      let (sampledTy, st8) = emitSampledImageType imageTy st7
-      let (sampledId, st9) = freshId st8
-      let fs7 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs6
+      (st7, fs7, sampledId) <-
+        if gsSamplerMode st6 == SamplerCombined
+          then Right (st6, fs6, valId texVal)
+          else do
+            let (imageTy, st7') = emitTypeFromLayout st6 (valType texVal)
+            let (sampledTy, st8) = emitSampledImageType imageTy st7'
+            let (sampledId, st9) = freshId st8
+            let fs7' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs6
+            Right (st9, fs7', sampledId)
       let (a, sz) = scalarLayout F32
       let outLayout = TLScalar F32 a sz
-      let (outTy, st10) = emitTypeFromLayout st9 outLayout
+      let (outTy, st10) = emitTypeFromLayout st7 outLayout
       let (resId, st11) = freshId st10
       let fs8 = addFuncInstr (Instr opImageSampleDrefImplicitLod [outTy, resId, sampledId, valId coordVal', valId depthVal']) fs7
       Right (st11, fs8, Value outLayout resId)
@@ -5741,7 +5777,7 @@ emitTextureSampleLevel args st fs =
   where
     emitSample texExpr samplerExpr coordExpr mArray levelExpr st0 fs0 = do
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
-      (st2, fs2, sampVal) <- emitExpr st1 fs1 samplerExpr
+      (st2, fs2, sampVal) <- emitSamplerExpr TLSampler samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, levelVal) <- emitExpr st3 fs3 levelExpr
       case valType sampVal of
@@ -5783,12 +5819,15 @@ emitTextureSampleLevel args st fs =
           Left (CompileError "textureSampleLevel is not supported for multisampled textures" Nothing Nothing)
         _ -> Left (CompileError "textureSampleLevel expects a sampled texture binding" Nothing Nothing)
 
-    buildSampledImage texVal sampVal st0 fs0 = do
-      let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
-      let (sampledTy, st2) = emitSampledImageType imageTy st1
-      let (sampledId, st3) = freshId st2
-      let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
-      Right (st3, fs1, sampledId)
+    buildSampledImage texVal sampVal st0 fs0 =
+      if gsSamplerMode st0 == SamplerCombined
+        then Right (st0, fs0, valId texVal)
+        else do
+          let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
+          let (sampledTy, st2) = emitSampledImageType imageTy st1
+          let (sampledId, st3) = freshId st2
+          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
+          Right (st3, fs1, sampledId)
 
     sampleColorCoordLod scalar coordVal texVal sampVal lodVal st0 fs0 = do
       (st1, fs1, sampledId) <- buildSampledImage texVal sampVal st0 fs0
@@ -5870,7 +5909,7 @@ emitTextureSampleBias args st fs =
   where
     emitSample texExpr samplerExpr coordExpr mArray biasExpr st0 fs0 = do
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
-      (st2, fs2, sampVal) <- emitExpr st1 fs1 samplerExpr
+      (st2, fs2, sampVal) <- emitSamplerExpr TLSampler samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, biasVal) <- emitExpr st3 fs3 biasExpr
       case valType sampVal of
@@ -5912,12 +5951,15 @@ emitTextureSampleBias args st fs =
           Left (CompileError "textureSampleBias is not supported for multisampled textures" Nothing Nothing)
         _ -> Left (CompileError "textureSampleBias expects a sampled texture binding" Nothing Nothing)
 
-    buildSampledImage texVal sampVal st0 fs0 = do
-      let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
-      let (sampledTy, st2) = emitSampledImageType imageTy st1
-      let (sampledId, st3) = freshId st2
-      let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
-      Right (st3, fs1, sampledId)
+    buildSampledImage texVal sampVal st0 fs0 =
+      if gsSamplerMode st0 == SamplerCombined
+        then Right (st0, fs0, valId texVal)
+        else do
+          let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
+          let (sampledTy, st2) = emitSampledImageType imageTy st1
+          let (sampledId, st3) = freshId st2
+          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
+          Right (st3, fs1, sampledId)
 
     sampleColorCoordBias scalar coordVal texVal sampVal biasVal st0 fs0 = do
       (st1, fs1, sampledId) <- buildSampledImage texVal sampVal st0 fs0
@@ -5999,7 +6041,7 @@ emitTextureSampleGrad args st fs =
   where
     emitSample texExpr samplerExpr coordExpr mArray ddxExpr ddyExpr st0 fs0 = do
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
-      (st2, fs2, sampVal) <- emitExpr st1 fs1 samplerExpr
+      (st2, fs2, sampVal) <- emitSamplerExpr TLSampler samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, ddxVal) <- emitExpr st3 fs3 ddxExpr
       (st5, fs5, ddyVal) <- emitExpr st4 fs4 ddyExpr
@@ -6040,12 +6082,15 @@ emitTextureSampleGrad args st fs =
           Left (CompileError "textureSampleGrad is not supported for multisampled textures" Nothing Nothing)
         _ -> Left (CompileError "textureSampleGrad expects a sampled texture binding" Nothing Nothing)
 
-    buildSampledImage texVal sampVal st0 fs0 = do
-      let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
-      let (sampledTy, st2) = emitSampledImageType imageTy st1
-      let (sampledId, st3) = freshId st2
-      let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
-      Right (st3, fs1, sampledId)
+    buildSampledImage texVal sampVal st0 fs0 =
+      if gsSamplerMode st0 == SamplerCombined
+        then Right (st0, fs0, valId texVal)
+        else do
+          let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
+          let (sampledTy, st2) = emitSampledImageType imageTy st1
+          let (sampledId, st3) = freshId st2
+          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
+          Right (st3, fs1, sampledId)
 
     sampleColorCoordGrad scalar coordVal texVal sampVal ddxVal ddyVal st0 fs0 = do
       (st1, fs1, sampledId) <- buildSampledImage texVal sampVal st0 fs0
@@ -6127,7 +6172,7 @@ emitTextureSampleCompareLevel args st fs =
   where
     emitCompareSample texExpr samplerExpr coordExpr mArray depthExpr levelExpr st0 fs0 = do
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
-      (st2, fs2, sampVal) <- emitExpr st1 fs1 samplerExpr
+      (st2, fs2, sampVal) <- emitSamplerExpr TLSamplerComparison samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, depthVal) <- emitExpr st3 fs3 depthExpr
       (st5, fs5, levelVal) <- emitExpr st4 fs4 levelExpr
@@ -6169,13 +6214,18 @@ emitTextureSampleCompareLevel args st fs =
           TLScalar F32 _ _ -> Right (st7, fs7, depthVal)
           TLScalar F16 _ _ -> emitScalarConvert F16 F32 depthVal st7 fs7
           _ -> Left (CompileError "depth reference must be f32 or f16" Nothing Nothing)
-      let (imageTy, st9) = emitTypeFromLayout st8 (valType texVal)
-      let (sampledTy, st10) = emitSampledImageType imageTy st9
-      let (sampledId, st11) = freshId st10
-      let fs9 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs8
+      (st9, fs9, sampledId) <-
+        if gsSamplerMode st8 == SamplerCombined
+          then Right (st8, fs8, valId texVal)
+          else do
+            let (imageTy, st9') = emitTypeFromLayout st8 (valType texVal)
+            let (sampledTy, st10) = emitSampledImageType imageTy st9'
+            let (sampledId, st11) = freshId st10
+            let fs9' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs8
+            Right (st11, fs9', sampledId)
       let (a, sz) = scalarLayout F32
       let outLayout = TLScalar F32 a sz
-      let (outTy, st12) = emitTypeFromLayout st11 outLayout
+      let (outTy, st12) = emitTypeFromLayout st9 outLayout
       let (resId, st13) = freshId st12
       let fs10 = addFuncInstr (Instr opImageSampleDrefExplicitLod [outTy, resId, sampledId, valId coordVal', valId depthVal', imageOperandsLod, valId lodVal]) fs9
       Right (st13, fs10, Value outLayout resId)
@@ -6193,7 +6243,7 @@ emitTextureGather args st fs =
   where
     emitGather texExpr samplerExpr coordExpr mArrayOrComp mComp st0 fs0 = do
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
-      (st2, fs2, sampVal) <- emitExpr st1 fs1 samplerExpr
+      (st2, fs2, sampVal) <- emitSamplerExpr TLSampler samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       case valType sampVal of
         TLSampler -> Right ()
@@ -6247,13 +6297,18 @@ emitTextureGather args st fs =
             TLScalar U32 _ _ -> Right (stA, fsA, compVal0)
             TLScalar I32 _ _ -> emitScalarConvert I32 U32 compVal0 stA fsA
             _ -> Left (CompileError "textureGather component must be i32 or u32" Nothing Nothing)
-      let (imageTy, st7) = emitTypeFromLayout st6 (valType texVal)
-      let (sampledTy, st8) = emitSampledImageType imageTy st7
-      let (sampledId, st9) = freshId st8
-      let fs7 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs6
+      (st7, fs7, sampledId) <-
+        if gsSamplerMode st6 == SamplerCombined
+          then Right (st6, fs6, valId texVal)
+          else do
+            let (imageTy, st7') = emitTypeFromLayout st6 (valType texVal)
+            let (sampledTy, st8) = emitSampledImageType imageTy st7'
+            let (sampledId, st9) = freshId st8
+            let fs7' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs6
+            Right (st9, fs7', sampledId)
       let (align, size) = vectorLayout scalar 4
       let outLayout = TLVector 4 scalar align size
-      let (outTy, st10) = emitTypeFromLayout st9 outLayout
+      let (outTy, st10) = emitTypeFromLayout st7 outLayout
       let (resId, st11) = freshId st10
       let fs8 = addFuncInstr (Instr opImageGather [outTy, resId, sampledId, valId coordValFinal, valId compVal]) fs7
       Right (st11, fs8, Value outLayout resId)
@@ -6269,7 +6324,7 @@ emitTextureGatherCompare args st fs =
   where
     emitGather texExpr samplerExpr coordExpr mArray depthExpr st0 fs0 = do
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
-      (st2, fs2, sampVal) <- emitExpr st1 fs1 samplerExpr
+      (st2, fs2, sampVal) <- emitSamplerExpr TLSamplerComparison samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, depthVal) <- emitExpr st3 fs3 depthExpr
       case valType sampVal of
@@ -6306,13 +6361,18 @@ emitTextureGatherCompare args st fs =
           TLScalar F32 _ _ -> Right (st5, fs5, depthVal)
           TLScalar F16 _ _ -> emitScalarConvert F16 F32 depthVal st5 fs5
           _ -> Left (CompileError "depth reference must be f32 or f16" Nothing Nothing)
-      let (imageTy, st7) = emitTypeFromLayout st6 (valType texVal)
-      let (sampledTy, st8) = emitSampledImageType imageTy st7
-      let (sampledId, st9) = freshId st8
-      let fs7 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs6
+      (st7, fs7, sampledId) <-
+        if gsSamplerMode st6 == SamplerCombined
+          then Right (st6, fs6, valId texVal)
+          else do
+            let (imageTy, st7') = emitTypeFromLayout st6 (valType texVal)
+            let (sampledTy, st8) = emitSampledImageType imageTy st7'
+            let (sampledId, st9) = freshId st8
+            let fs7' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs6
+            Right (st9, fs7', sampledId)
       let (align, size) = vectorLayout F32 4
       let outLayout = TLVector 4 F32 align size
-      let (outTy, st10) = emitTypeFromLayout st9 outLayout
+      let (outTy, st10) = emitTypeFromLayout st7 outLayout
       let (resId, st11) = freshId st10
       let fs8 = addFuncInstr (Instr opImageDrefGather [outTy, resId, sampledId, valId coordVal', valId depthVal']) fs7
       Right (st11, fs8, Value outLayout resId)
@@ -6326,10 +6386,11 @@ emitTextureDimensions args st fs =
   where
     emitDim texExpr mLevel st0 fs0 = do
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
+      (stImage, fsImage, texId) <- emitImageFromTextureValue st1 fs1 texVal
       (st2, fs2, mLevelVal) <- case mLevel of
-        Nothing -> Right (st1, fs1, Nothing)
+        Nothing -> Right (stImage, fsImage, Nothing)
         Just levelExpr -> do
-          (stA, fsA, levelVal) <- emitExpr st1 fs1 levelExpr
+          (stA, fsA, levelVal) <- emitExpr stImage fsImage levelExpr
           ensureIndexType (valType levelVal)
           Right (stA, fsA, Just levelVal)
       let texLayout = valType texVal
@@ -6361,9 +6422,9 @@ emitTextureDimensions args st fs =
                 let layout = TLScalar U32 a sz
                 Right (st', fs2, Just (Value layout cid))
       let fs6 = case lodVal of
-            Nothing -> addFuncInstr (Instr opImageQuerySize [queryTy, resId, valId texVal]) fs5
+            Nothing -> addFuncInstr (Instr opImageQuerySize [queryTy, resId, texId]) fs5
             Just lod ->
-              addFuncInstr (Instr opImageQuerySizeLod [queryTy, resId, valId texVal, valId lod]) fs5
+              addFuncInstr (Instr opImageQuerySizeLod [queryTy, resId, texId, valId lod]) fs5
       let queryVal = Value queryLayout resId
       adjustQueryValue texLayout queryVal st5 fs6
 
@@ -6411,6 +6472,7 @@ emitTextureNumLevels args st fs =
   case args of
     [texExpr] -> do
       (st1, fs1, texVal) <- emitExpr st fs texExpr
+      (stImage, fsImage, texId) <- emitImageFromTextureValue st1 fs1 texVal
       case valType texVal of
         TLTextureMultisampled2D _ -> Left (CompileError "textureNumLevels is not valid for multisampled textures" Nothing Nothing)
         TLTextureDepthMultisampled2D -> Left (CompileError "textureNumLevels is not valid for multisampled textures" Nothing Nothing)
@@ -6421,10 +6483,10 @@ emitTextureNumLevels args st fs =
         _ -> do
           let (a, sz) = scalarLayout U32
           let outLayout = TLScalar U32 a sz
-          let (outTy, st2) = emitTypeFromLayout st1 outLayout
+          let (outTy, st2) = emitTypeFromLayout stImage outLayout
           let (resId, st3) = freshId st2
           let st3' = addCapability capabilityImageQuery st3
-          let fs2 = addFuncInstr (Instr opImageQueryLevels [outTy, resId, valId texVal]) fs1
+          let fs2 = addFuncInstr (Instr opImageQueryLevels [outTy, resId, texId]) fsImage
           Right (st3', fs2, Value outLayout resId)
     _ -> Left (CompileError "textureNumLevels expects (texture)" Nothing Nothing)
 
@@ -6433,6 +6495,7 @@ emitTextureNumLayers args st fs =
   case args of
     [texExpr] -> do
       (st1, fs1, texVal) <- emitExpr st fs texExpr
+      (stImage, fsImage, texId) <- emitImageFromTextureValue st1 fs1 texVal
       let texLayout = valType texVal
       let isArray = case texLayout of
             TLTexture1DArray _ -> True
@@ -6447,7 +6510,7 @@ emitTextureNumLayers args st fs =
       let queryLayout = case texLayout of
             TLTexture1DArray _ -> let (va, vsz) = vectorLayout U32 2 in TLVector 2 U32 va vsz
             _ -> let (va, vsz) = vectorLayout U32 3 in TLVector 3 U32 va vsz
-      let (outTy, st2) = emitTypeFromLayout st1 queryLayout
+      let (outTy, st2) = emitTypeFromLayout stImage queryLayout
       let (resId, st3) = freshId st2
       let st3' = addCapability capabilityImageQuery st3
       let isStorage = case texLayout of
@@ -6455,12 +6518,12 @@ emitTextureNumLayers args st fs =
             _ -> False
       (st4, fs2) <-
         if isStorage
-          then Right (st3', addFuncInstr (Instr opImageQuerySize [outTy, resId, valId texVal]) fs1)
+          then Right (st3', addFuncInstr (Instr opImageQuerySize [outTy, resId, texId]) fsImage)
           else do
             let (cid, st') = emitConstU32 st3' 0
                 (a, sz) = scalarLayout U32
                 lodVal = Value (TLScalar U32 a sz) cid
-            Right (st', addFuncInstr (Instr opImageQuerySizeLod [outTy, resId, valId texVal, valId lodVal]) fs1)
+            Right (st', addFuncInstr (Instr opImageQuerySizeLod [outTy, resId, texId, valId lodVal]) fsImage)
       let queryVal = Value queryLayout resId
       let layerIx = case texLayout of
             TLTexture1DArray _ -> 1
@@ -6480,12 +6543,13 @@ emitTextureNumSamples args st fs =
     _ -> Left (CompileError "textureNumSamples expects (texture)" Nothing Nothing)
   where
     querySamples texVal st0 fs0 = do
+      (stImage, fsImage, texId) <- emitImageFromTextureValue st0 fs0 texVal
       let (a, sz) = scalarLayout U32
       let outLayout = TLScalar U32 a sz
-      let (outTy, st1) = emitTypeFromLayout st0 outLayout
+      let (outTy, st1) = emitTypeFromLayout stImage outLayout
       let (resId, st2) = freshId st1
       let st2' = addCapability capabilityImageQuery st2
-      let fs1 = addFuncInstr (Instr opImageQuerySamples [outTy, resId, valId texVal]) fs0
+      let fs1 = addFuncInstr (Instr opImageQuerySamples [outTy, resId, texId]) fsImage
       Right (st2', fs1, Value outLayout resId)
 
 emitTextureLoad :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -6532,7 +6596,8 @@ emitTextureLoad args st fs =
       Right (st4, fs3, Value outLayout resId)
 
     emitSampledLoad texVal coordExpr mArray levelExpr st0 fs0 = do
-      (st1, fs1, coordVal) <- emitExpr st0 fs0 coordExpr
+      (stImage, fsImage, texId) <- emitImageFromTextureValue st0 fs0 texVal
+      (st1, fs1, coordVal) <- emitExpr stImage fsImage coordExpr
       (st2, fs2, levelVal) <- emitExpr st1 fs1 levelExpr
       ensureIndexType (valType levelVal)
       (st3, fs3, coordVal') <-
@@ -6620,14 +6685,15 @@ emitTextureLoad args st fs =
               _ -> let (a, sz) = vectorLayout F32 4 in (TLVector 4 F32 a sz, TLVector 4 F32 a sz)
       let (outTy, st4) = emitTypeFromLayout st3 fetchLayout
       let (resId, st5) = freshId st4
-      let fs4 = addFuncInstr (Instr opImageFetch [outTy, resId, valId texVal, valId coordVal', imageOperandsLod, valId levelVal]) fs3
+      let fs4 = addFuncInstr (Instr opImageFetch [outTy, resId, texId, valId coordVal', imageOperandsLod, valId levelVal]) fs3
       let fetchVal = Value fetchLayout resId
       if fetchLayout == resultLayout
         then Right (st5, fs4, fetchVal)
         else emitVectorComponent fetchVal 0 st5 fs4
 
     emitMultisampledLoad texVal coordExpr sampleExpr st0 fs0 = do
-      (st1, fs1, coordVal) <- emitExpr st0 fs0 coordExpr
+      (stImage, fsImage, texId) <- emitImageFromTextureValue st0 fs0 texVal
+      (st1, fs1, coordVal) <- emitExpr stImage fsImage coordExpr
       (st2, fs2, sampleVal) <- emitExpr st1 fs1 sampleExpr
       ensureIndexType (valType sampleVal)
       case valType texVal of
@@ -6643,7 +6709,7 @@ emitTextureLoad args st fs =
               _ -> let (a, sz) = vectorLayout F32 4 in (TLVector 4 F32 a sz, TLVector 4 F32 a sz)
       let (outTy, st3) = emitTypeFromLayout st2 fetchLayout
       let (resId, st4) = freshId st3
-      let fs3 = addFuncInstr (Instr opImageFetch [outTy, resId, valId texVal, valId coordVal, imageOperandsSample, valId sampleVal]) fs2
+      let fs3 = addFuncInstr (Instr opImageFetch [outTy, resId, texId, valId coordVal, imageOperandsSample, valId sampleVal]) fs2
       let fetchVal = Value fetchLayout resId
       if fetchLayout == resultLayout
         then Right (st4, fs3, fetchVal)
@@ -7196,19 +7262,45 @@ emitTypeFromLayout st layout =
       in emitTypeCached st2 key instr
     TLSampler -> emitSamplerType st
     TLSamplerComparison -> emitSamplerType st
-    TLTexture1D s -> emitImage1DType s st
-    TLTexture1DArray s -> emitImage1DArrayType s st
-    TLTexture2D s -> emitImage2DType s st
-    TLTexture2DArray s -> emitImage2DArrayType s st
-    TLTexture3D s -> emitImage3DType s st
-    TLTextureCube s -> emitImageCubeType s st
-    TLTextureCubeArray s -> emitImageCubeArrayType s st
-    TLTextureMultisampled2D s -> emitImage2DMultisampledType s st
-    TLTextureDepth2D -> emitImageDepth2DType st
-    TLTextureDepth2DArray -> emitImageDepth2DArrayType st
-    TLTextureDepthCube -> emitImageDepthCubeType st
-    TLTextureDepthCubeArray -> emitImageDepthCubeArrayType st
-    TLTextureDepthMultisampled2D -> emitImageDepth2DMultisampledType st
+    TLTexture1D s ->
+      let (imageId, st1) = emitImage1DType s st
+      in emitSampledImageIfNeeded imageId st1
+    TLTexture1DArray s ->
+      let (imageId, st1) = emitImage1DArrayType s st
+      in emitSampledImageIfNeeded imageId st1
+    TLTexture2D s ->
+      let (imageId, st1) = emitImage2DType s st
+      in emitSampledImageIfNeeded imageId st1
+    TLTexture2DArray s ->
+      let (imageId, st1) = emitImage2DArrayType s st
+      in emitSampledImageIfNeeded imageId st1
+    TLTexture3D s ->
+      let (imageId, st1) = emitImage3DType s st
+      in emitSampledImageIfNeeded imageId st1
+    TLTextureCube s ->
+      let (imageId, st1) = emitImageCubeType s st
+      in emitSampledImageIfNeeded imageId st1
+    TLTextureCubeArray s ->
+      let (imageId, st1) = emitImageCubeArrayType s st
+      in emitSampledImageIfNeeded imageId st1
+    TLTextureMultisampled2D s ->
+      let (imageId, st1) = emitImage2DMultisampledType s st
+      in emitSampledImageIfNeeded imageId st1
+    TLTextureDepth2D ->
+      let (imageId, st1) = emitImageDepth2DType st
+      in emitSampledImageIfNeeded imageId st1
+    TLTextureDepth2DArray ->
+      let (imageId, st1) = emitImageDepth2DArrayType st
+      in emitSampledImageIfNeeded imageId st1
+    TLTextureDepthCube ->
+      let (imageId, st1) = emitImageDepthCubeType st
+      in emitSampledImageIfNeeded imageId st1
+    TLTextureDepthCubeArray ->
+      let (imageId, st1) = emitImageDepthCubeArrayType st
+      in emitSampledImageIfNeeded imageId st1
+    TLTextureDepthMultisampled2D ->
+      let (imageId, st1) = emitImageDepth2DMultisampledType st
+      in emitSampledImageIfNeeded imageId st1
     TLStorageTexture1D fmt _ -> emitStorageImage1DType fmt st
     TLStorageTexture2D fmt _ -> emitStorageImage2DType fmt st
     TLStorageTexture2DArray fmt _ -> emitStorageImage2DArrayType fmt st
@@ -7247,11 +7339,65 @@ emitTypeFromLayout st layout =
     emitFieldType st' field =
       let (tyId, st'') = emitTypeFromLayout st' (flType field)
       in (st'', tyId)
+    emitSampledImageIfNeeded imageId st' =
+      if gsSamplerMode st' == SamplerCombined
+        then emitSampledImageType imageId st'
+        else (imageId, st')
     emitMemberDecorate structId st' (ix, field) =
       let offset = flOffset field
       in addDecoration (Instr opMemberDecorate [structId, fromIntegral ix, decorationOffset, offset]) st'
     emitMemberName structId st' (ix, field) =
       addName (Instr opMemberName (structId : fromIntegral ix : encodeString (flName field))) st'
+
+isSampledTextureLayout :: TypeLayout -> Bool
+isSampledTextureLayout layout =
+  case layout of
+    TLTexture1D _ -> True
+    TLTexture1DArray _ -> True
+    TLTexture2D _ -> True
+    TLTexture2DArray _ -> True
+    TLTexture3D _ -> True
+    TLTextureCube _ -> True
+    TLTextureCubeArray _ -> True
+    TLTextureMultisampled2D _ -> True
+    TLTextureDepth2D -> True
+    TLTextureDepth2DArray -> True
+    TLTextureDepthCube -> True
+    TLTextureDepthCubeArray -> True
+    TLTextureDepthMultisampled2D -> True
+    _ -> False
+
+emitImageTypeFromTextureLayout :: GenState -> TypeLayout -> Either CompileError (Word32, GenState)
+emitImageTypeFromTextureLayout st layout =
+  case layout of
+    TLTexture1D s -> Right (emitImage1DType s st)
+    TLTexture1DArray s -> Right (emitImage1DArrayType s st)
+    TLTexture2D s -> Right (emitImage2DType s st)
+    TLTexture2DArray s -> Right (emitImage2DArrayType s st)
+    TLTexture3D s -> Right (emitImage3DType s st)
+    TLTextureCube s -> Right (emitImageCubeType s st)
+    TLTextureCubeArray s -> Right (emitImageCubeArrayType s st)
+    TLTextureMultisampled2D s -> Right (emitImage2DMultisampledType s st)
+    TLTextureDepth2D -> Right (emitImageDepth2DType st)
+    TLTextureDepth2DArray -> Right (emitImageDepth2DArrayType st)
+    TLTextureDepthCube -> Right (emitImageDepthCubeType st)
+    TLTextureDepthCubeArray -> Right (emitImageDepthCubeArrayType st)
+    TLTextureDepthMultisampled2D -> Right (emitImageDepth2DMultisampledType st)
+    TLStorageTexture1D fmt _ -> Right (emitStorageImage1DType fmt st)
+    TLStorageTexture2D fmt _ -> Right (emitStorageImage2DType fmt st)
+    TLStorageTexture2DArray fmt _ -> Right (emitStorageImage2DArrayType fmt st)
+    TLStorageTexture3D fmt _ -> Right (emitStorageImage3DType fmt st)
+    _ -> Left (CompileError "expected a texture type" Nothing Nothing)
+
+emitImageFromTextureValue :: GenState -> FuncState -> Value -> Either CompileError (GenState, FuncState, Word32)
+emitImageFromTextureValue st fs texVal
+  | gsSamplerMode st == SamplerCombined && isSampledTextureLayout (valType texVal) = do
+      (imageTy, st1) <- emitImageTypeFromTextureLayout st (valType texVal)
+      let (resId, st2) = freshId st1
+      let fs1 = addFuncInstr (Instr opImage [imageTy, resId, valId texVal]) fs
+      Right (st2, fs1, resId)
+  | otherwise =
+      Right (st, fs, valId texVal)
 
 emitPointerForBinding :: GenState -> BindingKind -> TypeLayout -> (Word32, GenState)
 emitPointerForBinding st kind layout =
@@ -7564,19 +7710,28 @@ bytesToExp bytes = do
   pure (TH.AppE (TH.VarE 'BS.pack) listSig)
 
 interfaceToExp :: ShaderInterface -> Q Exp
-interfaceToExp (ShaderInterface bindings overrides stageInfo pushConst) = do
+interfaceToExp (ShaderInterface bindings overrides stageInfo pushConst samplerMode) = do
   bindingsExp <- TH.listE (map bindingToExp bindings)
   overridesExp <- TH.listE (map overrideToExp overrides)
   stageExp <- maybeStageIOToExp stageInfo
   pushExp <- maybeLayoutToExp pushConst
+  samplerModeExp <- samplerModeToExp samplerMode
   pure
     (TH.AppE
       (TH.AppE
         (TH.AppE
-          (TH.AppE (TH.ConE 'ShaderInterface) bindingsExp)
-          overridesExp)
-        stageExp)
-      pushExp)
+          (TH.AppE
+            (TH.AppE (TH.ConE 'ShaderInterface) bindingsExp)
+            overridesExp)
+          stageExp)
+        pushExp)
+      samplerModeExp)
+
+samplerModeToExp :: SamplerBindingMode -> Q Exp
+samplerModeToExp mode =
+  case mode of
+    SamplerSeparate -> TH.conE 'SamplerSeparate
+    SamplerCombined -> TH.conE 'SamplerCombined
 
 bindingToExp :: BindingInfo -> Q Exp
 bindingToExp info =
@@ -7821,7 +7976,7 @@ storageAccessToExp :: StorageAccess -> Q Exp
 storageAccessToExp access = TH.conE (storageAccessCon access)
 
 interfaceToType :: ShaderInterface -> Either String TH.Type
-interfaceToType (ShaderInterface bindings _ _ _) =
+interfaceToType (ShaderInterface bindings _ _ _ _) =
   foldrM
     (\b acc -> do
       bTy <- bindingToType b
