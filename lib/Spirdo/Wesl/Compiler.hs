@@ -24,10 +24,10 @@ import Control.Monad.Trans.Except (ExceptT(..), runExceptT)
 import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Char (isSpace, ord)
-import Data.List (intercalate, isPrefixOf)
+import Data.Char (isSpace, ord, toLower)
+import Data.List (intercalate, isPrefixOf, tails)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word64)
@@ -295,10 +295,6 @@ writeWeslCache opts src bytes iface =
 wesl :: QuasiQuoter
 wesl = weslWith defaultCompileOptions
 
-weslc :: QuasiQuoter
-weslc = weslWith (defaultCompileOptions { samplerBindingMode = SamplerCombined })
-
-
 weslWith :: CompileOptions -> QuasiQuoter
 weslWith opts =
   QuasiQuoter
@@ -310,14 +306,15 @@ weslWith opts =
 
 weslExpWith :: CompileOptions -> String -> Q Exp
 weslExpWith opts src = do
-  cached <- TH.runIO (timed opts "cache-read" (loadWeslCache opts src))
+  let opts' = applyInlinePragmas opts src
+  cached <- TH.runIO (timed opts' "cache-read" (loadWeslCache opts' src))
   case cached of
     Just (bytes, iface) -> emitWeslExp bytes iface
     Nothing ->
-      case compileWeslToSpirvWith opts src of
+      case compileWeslToSpirvWith opts' src of
         Left err -> fail (renderError err)
         Right (SomeCompiledShader (CompiledShader bytes iface)) -> do
-          TH.runIO (timed opts "cache-write" (writeWeslCache opts src bytes iface))
+          TH.runIO (timed opts' "cache-write" (writeWeslCache opts' src bytes iface))
           emitWeslExp bytes iface
   where
     emitWeslExp bytes iface = do
@@ -355,6 +352,32 @@ formatNs :: Word64 -> String
 formatNs ns =
   let ms = fromIntegral ns / (1000 * 1000) :: Double
   in showFFloat (Just 3) ms "ms"
+
+applyInlinePragmas :: CompileOptions -> String -> CompileOptions
+applyInlinePragmas opts src =
+  case samplerDirective src of
+    Just "combined" -> opts { samplerBindingMode = SamplerCombined }
+    Just "separate" -> opts { samplerBindingMode = SamplerSeparate }
+    _ -> opts
+  where
+    samplerDirective text =
+      let ls = lines text
+          hit = listToMaybe [l | l <- ls, hasDirective l]
+      in hit >>= parseValue
+    key = "spirdo:sampler="
+    hasDirective line =
+      case extractDirective line of
+        Just _ -> True
+        Nothing -> False
+    extractDirective line =
+      listToMaybe [drop (length key) t | t <- tails line, key `isPrefixOf` t]
+    parseValue line =
+      case extractDirective line of
+        Nothing -> Nothing
+        Just rest ->
+          let trimmed = dropWhile isSpace rest
+              val = takeWhile (\c -> c /= ';' && not (isSpace c)) trimmed
+          in if null val then Nothing else Just (map toLower val)
 
 -- Package metadata
 

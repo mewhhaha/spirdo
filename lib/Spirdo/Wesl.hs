@@ -116,7 +116,6 @@ module Spirdo.Wesl
   , PackageDependency(..)
   , discoverPackageInfo
   , wesl
-  , weslc
   , weslWith
   ) where
 

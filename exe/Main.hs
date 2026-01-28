@@ -95,10 +95,21 @@ quadVertices = fmap Vertex
   ]
 
 data Variant where
-  Variant :: RequireUniform "params" iface => String -> Pipeline -> PreparedShader iface -> (ParamsU -> InputsBuilder iface) -> Variant
+  Variant :: RequireUniform "params" iface => String -> BlendMode -> Pipeline -> PreparedShader iface -> (ParamsU -> InputsBuilder iface) -> Variant
 
 data FragmentVariant where
-  FragmentVariant :: RequireUniform "params" iface => String -> CompiledShader iface -> (ParamsU -> InputsBuilder iface) -> FragmentVariant
+  FragmentVariant :: RequireUniform "params" iface => String -> BlendMode -> CompiledShader iface -> (ParamsU -> InputsBuilder iface) -> FragmentVariant
+
+data History = History
+  { historyTarget :: RenderTarget
+  , historySize :: (Int, Int)
+  , historyValid :: Bool
+  }
+
+data DemoState = DemoState
+  { stateIndex :: Int
+  , stateHistory :: Maybe History
+  }
 
 main :: IO ()
 main = do
@@ -115,62 +126,94 @@ main = do
     vshader <- createVertexShader (shaderSpirv (psShader vprep)) (countsFromPrepared vprep)
 
     noiseSampler <- createSampler (defaultSamplerDesc { samplerAddressU = SamplerRepeat, samplerAddressV = SamplerRepeat, samplerAddressW = SamplerRepeat })
-    noise3D <- createNoiseTexture3D 128 128 128 (loopNoise3D 128 128 128 (defaultNoiseSettings { noiseType = NoisePerlin, noiseScale = 32, noiseOctaves = 4 }))
+    baseNoise3D <-
+      createNoiseTexture3D 128 128 128
+        (loopNoise3D 128 128 128 (defaultNoiseSettings { noiseType = NoisePerlin, noiseScale = 48, noiseOctaves = 4 }))
+    detailNoise3D <-
+      createNoiseTexture3D 96 96 96
+        (loopNoise3D 96 96 96 (defaultNoiseSettings { noiseType = NoiseVoronoi, noiseScale = 24, noiseOctaves = 1, noiseVoronoiJitter = 1 }))
+    weather2D <-
+      createNoiseTexture2D 512 512
+        (loopNoise2D 512 512 (defaultNoiseSettings { noiseType = NoisePerlin, noiseScale = 128, noiseOctaves = 5, noiseGain = 0.5 }))
     let noiseSamplerHandle = samplerHandleFromSlop noiseSampler
-    let noise3DHandle = textureHandleFromSlop noise3D
+    let baseNoiseHandle = textureHandleFromSlop baseNoise3D
+    let detailNoiseHandle = textureHandleFromSlop detailNoise3D
+    let weatherHandle = textureHandleFromSlop weather2D
 
     let baseVariants =
-          [ FragmentVariant "Feature Mix" fragmentFeatureShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Raymarch" fragmentRaymarchShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Triangle" fragmentTriangleShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Plasma" fragmentPlasmaShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Grid" fragmentGridShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "SDF Text" fragmentSdfTextShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Clouds" fragmentCloudShader
+          [ FragmentVariant "Feature Mix" BlendNone fragmentFeatureShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Raymarch" BlendNone fragmentRaymarchShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Triangle" BlendNone fragmentTriangleShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Plasma" BlendNone fragmentPlasmaShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Grid" BlendNone fragmentGridShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "SDF Text" BlendNone fragmentSdfTextShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Clouds" BlendAlpha fragmentCloudShader
               (\params ->
                 Inputs.uniform @"params" params
-                  <> Inputs.sampledTexture @"noiseTex3D" noise3DHandle noiseSamplerHandle
+                  <> Inputs.sampledTexture @"baseNoise" baseNoiseHandle noiseSamplerHandle
+                  <> Inputs.sampledTexture @"detailNoise" detailNoiseHandle noiseSamplerHandle
+                  <> Inputs.sampledTexture @"weatherTex" weatherHandle noiseSamplerHandle
               )
-          , FragmentVariant "Bits" fragmentBitsShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Aurora" fragmentAuroraShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Starfield" fragmentStarfieldShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Tunnel" fragmentTunnelShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Voronoi" fragmentVoronoiShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Mandelbrot" fragmentMandelbrotShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Terrain" fragmentTerrainShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Seascape" fragmentSeascapeShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Protean Clouds" fragmentProteanCloudsShader
+          , FragmentVariant "Bits" BlendNone fragmentBitsShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Aurora" BlendNone fragmentAuroraShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Starfield" BlendNone fragmentStarfieldShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Tunnel" BlendNone fragmentTunnelShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Voronoi" BlendNone fragmentVoronoiShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Mandelbrot" BlendNone fragmentMandelbrotShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Terrain" BlendNone fragmentTerrainShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Seascape" BlendNone fragmentSeascapeShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Protean Clouds" BlendAlpha fragmentProteanCloudsShader
               (\params ->
                 Inputs.uniform @"params" params
-                  <> Inputs.sampledTexture @"noiseTex3D" noise3DHandle noiseSamplerHandle
+                  <> Inputs.sampledTexture @"baseNoise" baseNoiseHandle noiseSamplerHandle
+                  <> Inputs.sampledTexture @"detailNoise" detailNoiseHandle noiseSamplerHandle
+                  <> Inputs.sampledTexture @"weatherTex" weatherHandle noiseSamplerHandle
               )
-          , FragmentVariant "Primitives" fragmentPrimitivesShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Grass" fragmentGrassShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Primitives" BlendNone fragmentPrimitivesShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Grass" BlendNone fragmentGrassShader (\params -> Inputs.uniform @"params" params)
           ]
 
-    variants <- mapM (\(FragmentVariant name shader mkInputs) -> mkVariant name shader mkInputs vshader) baseVariants
+    variants <- mapM (\(FragmentVariant name blend shader mkInputs) -> mkVariant name blend shader mkInputs vshader) baseVariants
 
-    _ <- loop (0 :: Int) $ \frame idx -> do
+    _ <- loop (DemoState 0 Nothing) $ \frame state -> do
       let count = length variants
       let delta
             | keyPressed KeyLeft frame.input = -1
             | keyPressed KeyRight frame.input = 1
             | otherwise = 0
-      let idx' = if count == 0 then 0 else (idx + delta + count) `mod` count
+      let idx' = if count == 0 then 0 else (state.stateIndex + delta + count) `mod` count
       case variants !! idx' of
-        Variant vName vPipeline fprep mkInputs -> do
+        Variant vName vBlend vPipeline fprep mkInputs -> do
           let (w, h) = frame.renderSize
+          let size = (w, h)
+          let useTemporal = vBlend == BlendAlpha
+          historyOpt <-
+            if useTemporal
+              then liftLoop (Just <$> ensureHistory size state.stateHistory)
+              else pure (resetHistory state.stateHistory)
+          let mixFactor = if useTemporal && historyValidFrom historyOpt then 0.8 else 0.0
           let params =
                 ParamsU
-                  { time_res = V4 frame.time (fromIntegral w) (fromIntegral h) 0.0
+                  { time_res = V4 frame.time (fromIntegral w) (fromIntegral h) mixFactor
                   , color = V4 1 1 1 1
                   }
           case inputsFromPrepared fprep (mkInputs params) of
             Left err -> error (vName <> ": " <> err)
             Right inputs -> do
-              clear (rgb 0.06 0.07 0.1)
-              drawMesh vPipeline mesh (bindingsFromInputs inputs)
-              pure (Continue idx')
+              if useTemporal
+                then do
+                  let target = historyTargetFrom historyOpt
+                  render target $ do
+                    if historyValidFrom historyOpt
+                      then pure ()
+                      else clear (rgb 0.0 0.0 0.0)
+                    drawMesh vPipeline mesh (bindingsFromInputs inputs)
+                  drawRender target Nothing (fullscreenRect size)
+                  pure (Continue (DemoState idx' (Just (historyUpdated historyOpt True))))
+                else do
+                  clear (rgb 0.06 0.07 0.1)
+                  drawMesh vPipeline mesh (bindingsFromInputs inputs)
+                  pure (Continue (DemoState idx' historyOpt))
     pure ()
 
 unsafePrepare :: String -> CompiledShader iface -> WindowM (PreparedShader iface)
@@ -179,8 +222,8 @@ unsafePrepare label shader =
     Left err -> error (label <> ": " <> err)
     Right value -> pure value
 
-mkVariant :: RequireUniform "params" iface => String -> CompiledShader iface -> (ParamsU -> InputsBuilder iface) -> VertexShader -> WindowM Variant
-mkVariant name fragShader mkInputs vshader = do
+mkVariant :: RequireUniform "params" iface => String -> BlendMode -> CompiledShader iface -> (ParamsU -> InputsBuilder iface) -> VertexShader -> WindowM Variant
+mkVariant name blend fragShader mkInputs vshader = do
   prep <- unsafePrepare ("fragment:" <> name) fragShader
   fshader <- createFragmentShader (shaderSpirv (psShader prep)) (countsFromPrepared prep)
   pipeline <- graphicsPipeline
@@ -190,11 +233,41 @@ mkVariant name fragShader mkInputs vshader = do
       , gfxLayout = vertexLayout
       , gfxPrimitive = PrimTriangles
       , gfxTarget = TargetSwapchain
-      , gfxBlend = BlendNone
+      , gfxBlend = blend
       , gfxDepth = DepthNone
       , gfxDepthFormat = 0
       }
-  pure (Variant name pipeline prep mkInputs)
+  pure (Variant name blend pipeline prep mkInputs)
+
+ensureHistory :: (Int, Int) -> Maybe History -> WindowM History
+ensureHistory size existing =
+  case existing of
+    Just h | h.historySize == size -> pure h
+    Just h -> do
+      destroyTarget h.historyTarget
+      target <- createRenderTarget (fst size) (snd size)
+      pure (History target size False)
+    Nothing -> do
+      target <- createRenderTarget (fst size) (snd size)
+      pure (History target size False)
+
+resetHistory :: Maybe History -> Maybe History
+resetHistory = fmap (\h -> h { historyValid = False })
+
+historyValidFrom :: Maybe History -> Bool
+historyValidFrom = maybe False historyValid
+
+historyTargetFrom :: Maybe History -> RenderTarget
+historyTargetFrom history =
+  case history of
+    Just h -> h.historyTarget
+    Nothing -> error "missing history render target"
+
+historyUpdated :: Maybe History -> Bool -> History
+historyUpdated history valid =
+  case history of
+    Just h -> h { historyValid = valid }
+    Nothing -> error "missing history render target"
 
 
 countsFromPrepared :: PreparedShader iface -> ShaderCounts
