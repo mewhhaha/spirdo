@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -24,11 +25,11 @@ import Test.QuickCheck (Gen, arbitrary, generate)
 
 import Spirdo.Wesl
 import Spirdo.Wesl.Inputs
-  ( ShaderInputs(..)
-  , SamplerHandle(..)
+  ( SamplerHandle(..)
   , TextureHandle(..)
   , UniformInput(..)
   , inputsFromPrepared
+  , inputsUniforms
   )
 import qualified Spirdo.Wesl.Inputs as Inputs
 import GHC.Generics (Generic)
@@ -47,6 +48,64 @@ data ParamsU = ParamsU
   } deriving (Generic)
 
 instance ToUniform ParamsU
+
+data PayloadMissingU = PayloadMissingU
+  { a :: Float
+  } deriving (Generic)
+
+instance ToUniform PayloadMissingU
+
+data PayloadExtraU = PayloadExtraU
+  { a :: Float
+  , b :: V3 Float
+  , c :: M3 Float
+  , d :: [V2 Float]
+  , oops :: Float
+  } deriving (Generic)
+
+instance ToUniform PayloadExtraU
+
+data InnerU = InnerU
+  { a :: V2 Float
+  , b :: Float
+  } deriving (Generic)
+
+instance ToUniform InnerU
+
+data ParamsExtendedU = ParamsExtendedU
+  { m3 :: M3 Float
+  , m4 :: M4 Float
+  , arr2 :: [V2 Float]
+  , arr3 :: [V3 Float]
+  , inner :: InnerU
+  } deriving (Generic)
+
+instance ToUniform ParamsExtendedU
+
+data Inner2U = Inner2U
+  { v :: V3 Float
+  , w :: Float
+  } deriving (Generic)
+
+instance ToUniform Inner2U
+
+data Outer2U = Outer2U
+  { inners :: [Inner2U]
+  } deriving (Generic)
+
+instance ToUniform Outer2U
+
+data ParamsExtended2U = ParamsExtended2U
+  { m34 :: M3x4 Float
+  , m43 :: M4x3 Float
+  , mats :: [M2 Float]
+  , nested :: Outer2U
+  , h :: Half
+  , hv :: V3 Half
+  , hv4 :: V4 Half
+  } deriving (Generic)
+
+instance ToUniform ParamsExtended2U
 
 
 defaultOpts :: CompileOptions
@@ -187,7 +246,7 @@ checkSamplerInterface =
   case prepareWeslWith separateOpts samplerShader of
     Left err -> fail ("sampler-interface: " <> show err)
     Right (SomePreparedShader prep) -> do
-      let kinds = map biKind (siBindings (preparedInterface prep))
+      let kinds = map (.biKind) (preparedInterface prep).siBindings
       unless (BTexture2D `elem` kinds && BSampler `elem` kinds) $
         fail "sampler-interface: expected texture_2d and sampler bindings"
 
@@ -196,7 +255,7 @@ checkCombinedSamplerInterface =
   case prepareWesl samplerShader of
     Left err -> fail ("sampler-combined-interface: " <> show err)
     Right (SomePreparedShader prep) -> do
-      let kinds = map biKind (siBindings (preparedInterface prep))
+      let kinds = map (.biKind) (preparedInterface prep).siBindings
       when (BSampler `elem` kinds) $
         fail "sampler-combined-interface: sampler binding should be omitted in combined mode"
 
@@ -214,21 +273,21 @@ checkPackUniformLayout =
   case prepareWesl packUniformShader of
     Left err -> fail ("pack-uniform-layout: " <> show err)
     Right (SomePreparedShader prep) -> do
-      info <- case find (\b -> biName b == "payload") (siBindings (preparedInterface prep)) of
+      info <- case find (\b -> b.biName == "payload") (preparedInterface prep).siBindings of
         Nothing -> fail "pack-uniform-layout: missing payload binding"
         Just bi -> pure bi
       let value =
-            UVStruct
-              [ ("a", uniform (1.25 :: Float))
-              , ("b", uniform (V3 2.0 3.0 4.0 :: V3 Float))
-              , ("c", uniform (M3 (V3 10.0 11.0 12.0) (V3 13.0 14.0 15.0) (V3 16.0 17.0 18.0) :: M3 Float))
-              , ("d", uniform ([V2 21.0 22.0, V2 23.0 24.0] :: [V2 Float]))
-              ]
+            PayloadU
+              { a = 1.25
+              , b = V3 2.0 3.0 4.0
+              , c = M3 (V3 10.0 11.0 12.0) (V3 13.0 14.0 15.0) (V3 16.0 17.0 18.0)
+              , d = [V2 21.0 22.0, V2 23.0 24.0]
+              }
       bytes <-
-        case packUniform (biType info) value of
+        case packUniformFrom info.biType value of
           Left err -> fail ("pack-uniform-layout: " <> err)
           Right bs -> pure bs
-      case biType info of
+      case info.biType of
         TLStruct _ fields _ size -> do
           unless (BS.length bytes == fromIntegral size) $
             fail "pack-uniform-layout: byte size mismatch"
@@ -243,17 +302,17 @@ checkPackUniformLayout =
           let paddingBytes = [BS.index bytes (bOffset + 12 + i) | i <- [0 .. 3]]
           unless (all (== 0) paddingBytes) $
             fail "pack-uniform-layout: vec3 padding not zeroed"
-          case flType cField of
+          case cField.flType of
             TLMatrix _ rows _ _ _ stride -> do
-              let cOffset = fromIntegral (flOffset cField)
+              let cOffset = fromIntegral cField.flOffset
               let stride' = fromIntegral stride
               assertFloatAt "pack-uniform-layout:c00" bytes (cOffset + 0 * stride' + 0 * 4) 10.0
               assertFloatAt "pack-uniform-layout:c11" bytes (cOffset + 1 * stride' + 1 * 4) 14.0
               assertFloatAt "pack-uniform-layout:c22" bytes (cOffset + 2 * stride' + (rows - 1) * 4) 18.0
             _ -> fail "pack-uniform-layout: expected matrix layout for c"
-          case flType dField of
+          case dField.flType of
             TLArray _ stride _ _ _ -> do
-              let dOffset = fromIntegral (flOffset dField)
+              let dOffset = fromIntegral dField.flOffset
               let stride' = fromIntegral stride
               assertFloatAt "pack-uniform-layout:d0x" bytes dOffset 21.0
               assertFloatAt "pack-uniform-layout:d0y" bytes (dOffset + 4) 22.0
@@ -263,11 +322,11 @@ checkPackUniformLayout =
         _ -> fail "pack-uniform-layout: expected struct layout"
   where
     fieldOffset name fields =
-      case find (\fld -> flName fld == name) fields of
-        Just fld -> pure (fromIntegral (flOffset fld))
+      case find (\fld -> fld.flName == name) fields of
+        Just fld -> pure (fromIntegral fld.flOffset)
         Nothing -> fail ("pack-uniform-layout: missing field " <> name)
     fieldLayout name fields =
-      case find (\fld -> flName fld == name) fields of
+      case find (\fld -> fld.flName == name) fields of
         Just fld -> pure fld
         Nothing -> fail ("pack-uniform-layout: missing field " <> name)
     assertFloatAt label bytes offset value = do
@@ -281,28 +340,28 @@ checkPackUniformErrors =
   case prepareWesl packUniformShader of
     Left err -> fail ("pack-uniform-errors: " <> show err)
     Right (SomePreparedShader prep) -> do
-      info <- case find (\b -> biName b == "payload") (siBindings (preparedInterface prep)) of
+      info <- case find (\b -> b.biName == "payload") (preparedInterface prep).siBindings of
         Nothing -> fail "pack-uniform-errors: missing payload binding"
         Just bi -> pure bi
       let missing =
-            UVStruct
-              [ ("a", uniform (1.0 :: Float))
-              ]
-      let missingRes = packUniform (biType info) missing
+            PayloadMissingU
+              { a = 1.0
+              }
+      let missingRes = packUniformFrom info.biType missing
       case missingRes of
         Left err ->
           unless ("missing struct field" `isInfixOf` err) $
             fail ("pack-uniform-errors: unexpected missing error: " <> err)
         Right _ -> fail "pack-uniform-errors: expected missing field failure"
       let extra =
-            UVStruct
-              [ ("a", uniform (1.0 :: Float))
-              , ("b", uniform (V3 0.0 0.0 0.0 :: V3 Float))
-              , ("c", uniform (M3 (V3 0.0 0.0 0.0) (V3 0.0 0.0 0.0) (V3 0.0 0.0 0.0) :: M3 Float))
-              , ("d", uniform ([V2 0.0 0.0, V2 0.0 0.0] :: [V2 Float]))
-              , ("oops", uniform (0.0 :: Float))
-              ]
-      let extraRes = packUniform (biType info) extra
+            PayloadExtraU
+              { a = 1.0
+              , b = V3 0.0 0.0 0.0
+              , c = M3 (V3 0.0 0.0 0.0) (V3 0.0 0.0 0.0) (V3 0.0 0.0 0.0)
+              , d = [V2 0.0 0.0, V2 0.0 0.0]
+              , oops = 0.0
+              }
+      let extraRes = packUniformFrom info.biType extra
       case extraRes of
         Left err ->
           unless ("unexpected struct fields" `isInfixOf` err) $
@@ -314,7 +373,7 @@ checkPackUniformFrom =
   case prepareWesl packUniformShader of
     Left err -> fail ("pack-uniform-from: " <> show err)
     Right (SomePreparedShader prep) -> do
-      info <- case find (\b -> biName b == "payload") (siBindings (preparedInterface prep)) of
+      info <- case find (\b -> b.biName == "payload") (preparedInterface prep).siBindings of
         Nothing -> fail "pack-uniform-from: missing payload binding"
         Just bi -> pure bi
       let payload =
@@ -324,7 +383,7 @@ checkPackUniformFrom =
               , c = M3 (V3 10.0 11.0 12.0) (V3 13.0 14.0 15.0) (V3 16.0 17.0 18.0)
               , d = [V2 21.0 22.0, V2 23.0 24.0]
               }
-      case packUniformFrom (biType info) payload of
+      case packUniformFrom info.biType payload of
         Left err -> fail ("pack-uniform-from: " <> err)
         Right _ -> pure ()
 
@@ -367,14 +426,14 @@ checkBindingPlan =
     Right (SomePreparedShader prep) -> do
       let iface = preparedInterface prep
       let plan = preparedPlan prep
-      unless (length (bpBindings plan) == length (siBindings iface)) $
+      unless (length plan.bpBindings == length iface.siBindings) $
         fail "binding-plan: binding count mismatch"
-      let group0 = filter (\b -> biGroup b == 0) (bpBindings plan)
+      let group0 = filter (\b -> b.biGroup == 0) plan.bpBindings
       unless (length group0 == 2) $
         fail "binding-plan: expected 2 bindings in group 0"
-      unless (length (bpSamplers plan) == 1) $
+      unless (length plan.bpSamplers == 1) $
         fail "binding-plan: expected 1 sampler binding"
-      unless (length (bpTextures plan) == 1) $
+      unless (length plan.bpTextures == 1) $
         fail "binding-plan: expected 1 texture binding"
 
 checkInputOrdering :: IO ()
@@ -382,7 +441,7 @@ checkInputOrdering =
   case inputsFromPrepared orderingShader (Inputs.uniform @"b" (ParamsU (V4 1 2 3 4) :: ParamsU) <> Inputs.uniform @"a" (ParamsU (V4 0 0 0 0) :: ParamsU)) of
     Left err -> fail ("input-ordering: " <> err)
     Right inputs -> do
-      let names = map uiName (siUniforms inputs)
+      let names = map (.uiName) (inputsUniforms inputs)
       unless (names == ["a", "b"]) $
         fail ("input-ordering: expected [\"a\",\"b\"], got " <> show names)
 
@@ -546,10 +605,10 @@ checkPackUniformExtendedRandom =
   case prepareWesl packUniformExtendedShader of
     Left err -> fail ("quickcheck: pack-uniform-extended: " <> show err)
     Right (SomePreparedShader prep) -> do
-      info <- case find (\b -> biName b == "params") (siBindings (preparedInterface prep)) of
+      info <- case find (\b -> b.biName == "params") (preparedInterface prep).siBindings of
         Nothing -> fail "quickcheck: pack-uniform-extended: missing params binding"
         Just bi -> pure bi
-      case biType info of
+      case info.biType of
         TLStruct _ fields _ size -> do
           fieldM3 <- findFieldLayout "m3" fields
           fieldM4 <- findFieldLayout "m4" fields
@@ -563,15 +622,15 @@ checkPackUniformExtendedRandom =
             arr3 <- generate (sequence [genV3, genV3, genV3])
             (innerA, innerB) <- generate genInner
             let value =
-                  UVStruct
-                    [ ("m3", uniform m3)
-                    , ("m4", uniform m4)
-                    , ("arr2", uniform arr2)
-                    , ("arr3", uniform arr3)
-                    , ("inner", UVStruct [("a", uniform innerA), ("b", uniform innerB)])
-                    ]
+                  ParamsExtendedU
+                    { m3 = m3
+                    , m4 = m4
+                    , arr2 = arr2
+                    , arr3 = arr3
+                    , inner = InnerU innerA innerB
+                    }
             bytes <-
-              case packUniform (biType info) value of
+              case packUniformFrom info.biType value of
                 Left err -> fail ("quickcheck: pack-uniform-extended: " <> err)
                 Right bs -> pure bs
             unless (BS.length bytes == fromIntegral size) $
@@ -584,14 +643,14 @@ checkPackUniformExtendedRandom =
         _ -> fail "quickcheck: pack-uniform-extended: expected struct layout"
   where
     findFieldLayout name fields =
-      case find (\fld -> flName fld == name) fields of
+      case find (\fld -> fld.flName == name) fields of
         Just fld -> pure fld
         Nothing -> fail ("quickcheck: pack-uniform-extended missing field " <> name)
 
     assertMatrix3 label bytes field mat =
-      case flType field of
+      case field.flType of
         TLMatrix cols rows _ _ _ stride -> do
-          let base = fromIntegral (flOffset field)
+          let base = fromIntegral field.flOffset
           case mat of
             M3 c0 c1 c2 | cols == 3 && rows == 3 -> do
               assertVec3At (label <> ":c0") bytes base stride c0
@@ -601,9 +660,9 @@ checkPackUniformExtendedRandom =
         _ -> fail ("quickcheck: pack-uniform-extended: expected matrix for " <> label)
 
     assertMatrix4 label bytes field mat =
-      case flType field of
+      case field.flType of
         TLMatrix cols rows _ _ _ stride -> do
-          let base = fromIntegral (flOffset field)
+          let base = fromIntegral field.flOffset
           case mat of
             M4 c0 c1 c2 c3 | cols == 4 && rows == 4 -> do
               assertVec4At (label <> ":c0") bytes base c0
@@ -614,36 +673,36 @@ checkPackUniformExtendedRandom =
         _ -> fail ("quickcheck: pack-uniform-extended: expected matrix for " <> label)
 
     assertArrayVec2 label bytes field values =
-      case flType field of
+      case field.flType of
         TLArray (Just len) stride _ _ _ -> do
           unless (len == length values) $
             fail ("quickcheck: pack-uniform-extended: " <> label <> " length mismatch")
-          let base = fromIntegral (flOffset field)
+          let base = fromIntegral field.flOffset
           forM_ (zip [0 ..] values) $ \(ix, v) ->
             assertVec2At (label <> ":" <> show ix) bytes (base + fromIntegral stride * ix) v
         _ -> fail ("quickcheck: pack-uniform-extended: expected array for " <> label)
 
     assertArrayVec3 label bytes field values =
-      case flType field of
+      case field.flType of
         TLArray (Just len) stride _ _ _ -> do
           unless (len == length values) $
             fail ("quickcheck: pack-uniform-extended: " <> label <> " length mismatch")
-          let base = fromIntegral (flOffset field)
+          let base = fromIntegral field.flOffset
           forM_ (zip [0 ..] values) $ \(ix, v) ->
             assertVec3At (label <> ":" <> show ix) bytes (base + fromIntegral stride * ix) stride v
         _ -> fail ("quickcheck: pack-uniform-extended: expected array for " <> label)
 
     assertInner label bytes field innerA innerB =
-      case flType field of
+      case field.flType of
         TLStruct _ innerFields _ size -> do
           fieldA <- findFieldLayout "a" innerFields
           fieldB <- findFieldLayout "b" innerFields
-          let base = fromIntegral (flOffset field)
-          let offA = base + fromIntegral (flOffset fieldA)
-          let offB = base + fromIntegral (flOffset fieldB)
+          let base = fromIntegral field.flOffset
+          let offA = base + fromIntegral fieldA.flOffset
+          let offB = base + fromIntegral fieldB.flOffset
           assertVec2At (label <> ".a") bytes offA innerA
           assertScalarAt (label <> ".b") bytes offB innerB
-          let used = fromIntegral (flOffset fieldB) + 4
+          let used = fromIntegral fieldB.flOffset + 4
           let padBytes = [BS.index bytes (base + used + i) | i <- [0 .. fromIntegral size - used - 1], size > fromIntegral used]
           unless (all (== 0) padBytes) $
             fail ("quickcheck: pack-uniform-extended: " <> label <> " padding not zeroed")
@@ -676,10 +735,10 @@ checkPackUniformExtended2 =
   case prepareWesl packUniformExtendedShader2 of
     Left err -> fail ("quickcheck: pack-uniform-extended2: " <> show err)
     Right (SomePreparedShader prep) -> do
-      info <- case find (\b -> biName b == "params2") (siBindings (preparedInterface prep)) of
+      info <- case find (\b -> b.biName == "params2") (preparedInterface prep).siBindings of
         Nothing -> fail "quickcheck: pack-uniform-extended2: missing params2 binding"
         Just bi -> pure bi
-      case biType info of
+      case info.biType of
         TLStruct _ fields _ size -> do
           fieldM34 <- findFieldLayout "m34" fields
           fieldM43 <- findFieldLayout "m43" fields
@@ -699,23 +758,21 @@ checkPackUniformExtended2 =
             h3 <- generate arbitrary
             h4 <- generate arbitrary
             h5 <- generate arbitrary
-            let innerValues =
-                  UVArray
-                    [ UVStruct [("v", uniform v0), ("w", uniform w0)]
-                    | (v0, w0) <- inners
-                    ]
+            let m34 = m3x4FromList m34Vals
+            let m43 = m4x3FromList m43Vals
+            let innerValues = [Inner2U v0 w0 | (v0, w0) <- inners]
             let value =
-                  UVStruct
-                    [ ("m34", UVMatrix 3 4 (map SVF32 m34Vals))
-                    , ("m43", UVMatrix 4 3 (map SVF32 m43Vals))
-                    , ("mats", uniform mats)
-                    , ("nested", UVStruct [("inners", innerValues)])
-                    , ("h", uniform (Half h0))
-                    , ("hv", uniform (V3 (Half h1) (Half h2) (Half h3)))
-                    , ("hv4", uniform (V4 (Half h2) (Half h3) (Half h4) (Half h5)))
-                    ]
+                  ParamsExtended2U
+                    { m34 = m34
+                    , m43 = m43
+                    , mats = mats
+                    , nested = Outer2U innerValues
+                    , h = Half h0
+                    , hv = V3 (Half h1) (Half h2) (Half h3)
+                    , hv4 = V4 (Half h2) (Half h3) (Half h4) (Half h5)
+                    }
             bytes <-
-              case packUniform (biType info) value of
+              case packUniformFrom info.biType value of
                 Left err -> fail ("quickcheck: pack-uniform-extended2: " <> err)
                 Right bs -> pure bs
             unless (BS.length bytes == fromIntegral size) $
@@ -730,15 +787,27 @@ checkPackUniformExtended2 =
         _ -> fail "quickcheck: pack-uniform-extended2: expected struct layout"
   where
     findFieldLayout name fields =
-      case find (\fld -> flName fld == name) fields of
+      case find (\fld -> fld.flName == name) fields of
         Just fld -> pure fld
         Nothing -> fail ("quickcheck: pack-uniform-extended2 missing field " <> name)
 
+    m3x4FromList vals =
+      case vals of
+        [a,b,c,d,e,f,g,h,i,j,k,l] ->
+          M3x4 (V4 a b c d) (V4 e f g h) (V4 i j k l)
+        _ -> error "expected 12 values for M3x4"
+
+    m4x3FromList vals =
+      case vals of
+        [a,b,c,d,e,f,g,h,i,j,k,l] ->
+          M4x3 (V3 a b c) (V3 d e f) (V3 g h i) (V3 j k l)
+        _ -> error "expected 12 values for M4x3"
+
     assertMatrixF32 label bytes field cols rows vals =
-      case flType field of
+      case field.flType of
         TLMatrix c r _ _ _ stride
           | c == cols && r == rows -> do
-              let base = fromIntegral (flOffset field)
+              let base = fromIntegral field.flOffset
               unless (length vals == cols * rows) $
                 fail ("quickcheck: pack-uniform-extended2: " <> label <> " value count mismatch")
               forM_ (zip [0 ..] vals) $ \(ix, v) -> do
@@ -751,11 +820,11 @@ checkPackUniformExtended2 =
         _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected matrix")
 
     assertArrayMat2 label bytes field mats =
-      case flType field of
+      case field.flType of
         TLArray (Just len) stride elemLayout _ _ -> do
           unless (len == length mats) $
             fail ("quickcheck: pack-uniform-extended2: " <> label <> " length mismatch")
-          let base = fromIntegral (flOffset field)
+          let base = fromIntegral field.flOffset
           forM_ (zip [0 ..] mats) $ \(ix, mat) ->
             case elemLayout of
               TLMatrix 2 2 _ _ _ elemStride -> do
@@ -774,28 +843,28 @@ checkPackUniformExtended2 =
         _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected array")
 
     assertNestedArray label bytes field inners =
-      case flType field of
+      case field.flType of
         TLStruct _ nestedFields _ _ -> do
           innerField <- findFieldLayout "inners" nestedFields
-          case flType innerField of
+          case innerField.flType of
             TLArray (Just len) stride elemLayout _ _ -> do
               unless (len == length inners) $
                 fail ("quickcheck: pack-uniform-extended2: " <> label <> " inner length mismatch")
-              let base = fromIntegral (flOffset field) + fromIntegral (flOffset innerField)
+              let base = fromIntegral field.flOffset + fromIntegral innerField.flOffset
               forM_ (zip [0 ..] inners) $ \(ix, (v0, w0)) ->
                 case elemLayout of
                   TLStruct _ innerFields _ innerSize -> do
                     let off = base + fromIntegral stride * ix
                     fieldV <- findFieldLayout "v" innerFields
                     fieldW <- findFieldLayout "w" innerFields
-                    let offV = off + fromIntegral (flOffset fieldV)
-                    let offW = off + fromIntegral (flOffset fieldW)
-                    let vStride = case flType fieldV of
+                    let offV = off + fromIntegral fieldV.flOffset
+                    let offW = off + fromIntegral fieldW.flOffset
+                    let vStride = case fieldV.flType of
                           TLVector _ _ _ s -> fromIntegral s
                           _ -> 16
                     assertVec3At (label <> ".inners[" <> show ix <> "].v") bytes offV vStride v0
                     assertScalarAt (label <> ".inners[" <> show ix <> "].w") bytes offW w0
-                    let used = maximum (map (\fld -> fromIntegral (flOffset fld + flSize fld)) innerFields)
+                    let used = maximum (map (\fld -> fromIntegral (fld.flOffset + fld.flSize)) innerFields)
                     let paddingBytes =
                           [BS.index bytes (off + used + j) | j <- [0 .. fromIntegral innerSize - used - 1], innerSize > fromIntegral used]
                     unless (all (== 0) paddingBytes) $
@@ -817,17 +886,17 @@ checkPackUniformExtended2 =
         fail ("quickcheck: pack-uniform-extended2: " <> label <> " padding not zeroed")
 
     assertHalfScalar label bytes field val =
-      case flType field of
+      case field.flType of
         TLScalar F16 _ _ -> do
-          let off = fromIntegral (flOffset field)
+          let off = fromIntegral field.flOffset
           unless (word16At bytes off == val) $
             fail ("quickcheck: pack-uniform-extended2: " <> label <> " half bits mismatch")
         _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected f16 scalar")
 
     assertHalfVector label bytes field vals =
-      case flType field of
+      case field.flType of
         TLVector n F16 _ size -> do
-          let off = fromIntegral (flOffset field)
+          let off = fromIntegral field.flOffset
           unless (n == length vals) $
             fail ("quickcheck: pack-uniform-extended2: " <> label <> " length mismatch")
           forM_ (zip [0 ..] vals) $ \(ix, v) -> do
@@ -988,7 +1057,7 @@ checkOverrideDefault spirvVal =
     Left err -> fail ("override-default: " <> show err)
     Right (SomePreparedShader prep) -> do
       assertSpirv spirvVal "override-default" (preparedSpirv prep)
-      let overrides = siOverrides (preparedInterface prep)
+      let overrides = (preparedInterface prep).siOverrides
       case find (\o -> oiName o == "scale") overrides of
         Nothing -> fail "override-default: missing scale override"
         Just info -> do
@@ -1017,7 +1086,7 @@ checkOverrideMissing =
   case prepareWesl overrideShader of
     Left err -> fail ("override-missing: " <> show err)
     Right (SomePreparedShader prep) -> do
-      let overrides = siOverrides (preparedInterface prep)
+      let overrides = (preparedInterface prep).siOverrides
       unless (any (\o -> oiName o == "scale") overrides) $
         fail "override-missing: expected scale override in interface"
 
@@ -1027,7 +1096,7 @@ checkOverrideDependency spirvVal =
     Left err -> fail ("override-dependency: " <> show err)
     Right (SomePreparedShader prep) -> do
       assertSpirv spirvVal "override-dependency" (preparedSpirv prep)
-      let overrides = siOverrides (preparedInterface prep)
+      let overrides = (preparedInterface prep).siOverrides
       case find (\o -> oiName o == "scale") overrides of
         Nothing -> fail "override-dependency: missing scale override"
         Just info ->
@@ -1040,7 +1109,7 @@ checkOverrideParityMode = do
   case prepareWeslWith opts overrideSpecOpShader of
     Left err -> fail ("override-parity: " <> show err)
     Right (SomePreparedShader prep) -> do
-      let overrides = siOverrides (preparedInterface prep)
+      let overrides = (preparedInterface prep).siOverrides
       case find (\o -> oiName o == "scale") overrides of
         Nothing -> fail "override-parity: missing scale override"
         Just info ->

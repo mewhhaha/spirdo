@@ -11,6 +11,8 @@ module Spirdo.Wesl.Types.Uniform
   , M2(..)
   , M3(..)
   , M4(..)
+  , M3x4(..)
+  , M4x3(..)
   , ScalarValue(..)
   , UniformValue(..)
   , ToScalar(..)
@@ -49,27 +51,43 @@ import Spirdo.Wesl.Types.Layout
 
 -- | Typed uniform values for packing.
 
+-- | 16-bit float storage (IEEE 754 half).
 data Half = Half !Word16
   deriving (Eq, Show)
 
+-- | 2D vector.
 data V2 a = V2 !a !a
   deriving (Eq, Show)
 
+-- | 3D vector.
 data V3 a = V3 !a !a !a
   deriving (Eq, Show)
 
+-- | 4D vector.
 data V4 a = V4 !a !a !a !a
   deriving (Eq, Show)
 
+-- | 2x2 matrix (column-major).
 data M2 a = M2 !(V2 a) !(V2 a)
   deriving (Eq, Show)
 
+-- | 3x3 matrix (column-major).
 data M3 a = M3 !(V3 a) !(V3 a) !(V3 a)
   deriving (Eq, Show)
 
+-- | 4x4 matrix (column-major).
 data M4 a = M4 !(V4 a) !(V4 a) !(V4 a) !(V4 a)
   deriving (Eq, Show)
 
+-- | 3x4 matrix (column-major).
+data M3x4 a = M3x4 !(V4 a) !(V4 a) !(V4 a)
+  deriving (Eq, Show)
+
+-- | 4x3 matrix (column-major).
+data M4x3 a = M4x3 !(V3 a) !(V3 a) !(V3 a) !(V3 a)
+  deriving (Eq, Show)
+
+-- | Scalar leaf for manual uniform construction.
 data ScalarValue
   = SVI32 !Int32
   | SVU32 !Word32
@@ -78,6 +96,7 @@ data ScalarValue
   | SVBool !Bool
   deriving (Eq, Show)
 
+-- | Uniform value tree used for layout-aware packing.
 data UniformValue
   = UVScalar !ScalarValue
   | UVVector !Int ![ScalarValue]
@@ -86,6 +105,7 @@ data UniformValue
   | UVStruct ![(String, UniformValue)]
   deriving (Eq, Show)
 
+-- | Convert a scalar host value into a 'ScalarValue'.
 class ToScalar a where
   toScalar :: a -> ScalarValue
 
@@ -104,11 +124,13 @@ instance ToScalar Bool where
 instance ToScalar Half where
   toScalar (Half w) = SVF16 w
 
+-- | Convert host values into uniform trees.
 class ToUniform a where
   toUniform :: a -> UniformValue
   default toUniform :: (Generic a, GUniform (Rep a)) => a -> UniformValue
   toUniform a = UVStruct (gUniform (from a))
 
+-- | Convenience wrapper for 'toUniform'.
 uniform :: ToUniform a => a -> UniformValue
 uniform = toUniform
 
@@ -153,6 +175,23 @@ instance ToScalar a => ToUniform (M4 a) where
       , toScalar m, toScalar n, toScalar o, toScalar p
       ]
 
+instance ToScalar a => ToUniform (M3x4 a) where
+  toUniform (M3x4 (V4 a b c d) (V4 e f g h) (V4 i j k l)) =
+    UVMatrix 3 4
+      [ toScalar a, toScalar b, toScalar c, toScalar d
+      , toScalar e, toScalar f, toScalar g, toScalar h
+      , toScalar i, toScalar j, toScalar k, toScalar l
+      ]
+
+instance ToScalar a => ToUniform (M4x3 a) where
+  toUniform (M4x3 (V3 a b c) (V3 d e f) (V3 g h i) (V3 j k l)) =
+    UVMatrix 4 3
+      [ toScalar a, toScalar b, toScalar c
+      , toScalar d, toScalar e, toScalar f
+      , toScalar g, toScalar h, toScalar i
+      , toScalar j, toScalar k, toScalar l
+      ]
+
 instance ToUniform a => ToUniform [a] where
   toUniform xs = UVArray (map toUniform xs)
 
@@ -173,6 +212,7 @@ instance {-# OVERLAPPING #-} (Selector s, ToUniform a) => GUniform (M1 S s (K1 i
 
 type UniformPath = String
 
+-- | Pack a uniform value against a reflected layout.
 packUniform :: TypeLayout -> UniformValue -> Either String ByteString
 packUniform layout value = do
   let size = fromIntegral (layoutSize layout)
@@ -183,9 +223,11 @@ packUniform layout value = do
       let final = builder <> padBytes (size - pos)
       in pure (BSL.toStrict (toLazyByteString final))
 
+-- | Pack a host value by first converting it via 'ToUniform'.
 packUniformFrom :: ToUniform a => TypeLayout -> a -> Either String ByteString
 packUniformFrom layout value = packUniform layout (uniform value)
 
+-- | Validate that a 'Storable' matches the requested layout.
 validateUniformStorable :: forall a. Storable a => TypeLayout -> Proxy a -> Either String ()
 validateUniformStorable layout _ =
   let wantSize = fromIntegral (layoutSize layout)
@@ -198,6 +240,7 @@ validateUniformStorable layout _ =
         then Left ("storable alignment mismatch: expected >= " <> show wantAlign <> ", got " <> show gotAlign)
         else Right ()
 
+-- | Pack a 'Storable' into a layout-compatible byte blob.
 packUniformStorable :: forall a. Storable a => TypeLayout -> a -> IO (Either String ByteString)
 packUniformStorable layout value =
   case validateUniformStorable layout (Proxy @a) of
@@ -253,7 +296,7 @@ emitValue size ctx off layout value pos =
       in if not (null dupes)
         then Left (formatAt structCtx ("duplicate struct fields: " <> intercalate ", " dupes))
         else
-          let fieldNames = map flName fields
+          let fieldNames = map (.flName) fields
               fieldSet = Set.fromList fieldNames
               extra = filter (`Set.notMember` fieldSet) (map fst vals)
           in if not (null extra)
@@ -261,10 +304,10 @@ emitValue size ctx off layout value pos =
             else
               let valMap = Map.fromList vals
               in foldMBuilder pos fields $ \fld curPos ->
-                  case Map.lookup (flName fld) valMap of
-                    Nothing -> Left (formatAt structCtx ("missing struct field: " <> flName fld))
+                  case Map.lookup fld.flName valMap of
+                    Nothing -> Left (formatAt structCtx ("missing struct field: " <> fld.flName))
                     Just v ->
-                      emitValue size (ctxField structCtx (flName fld)) (off + fromIntegral (flOffset fld)) (flType fld) v curPos
+                      emitValue size (ctxField structCtx fld.flName) (off + fromIntegral fld.flOffset) fld.flType v curPos
     _ ->
       Left (formatAt ctx ("uniform value does not match layout: " <> show layout))
 

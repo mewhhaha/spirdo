@@ -36,17 +36,17 @@ import System.FilePath (dropExtension, makeRelative, splitDirectories, takeDirec
 
 validateEntry :: EntryPoint -> Either CompileError ()
 validateEntry entry =
-  case epStage entry of
+  case entry.epStage of
     StageCompute ->
-      case epWorkgroupSize entry of
+      case entry.epWorkgroupSize of
         Nothing -> Left (CompileError "@workgroup_size is required for @compute" Nothing Nothing)
         Just _ -> pure ()
     StageVertex ->
-      case epWorkgroupSize entry of
+      case entry.epWorkgroupSize of
         Nothing -> pure ()
         Just _ -> Left (CompileError "@workgroup_size is not allowed for @vertex" Nothing Nothing)
     StageFragment ->
-      case epWorkgroupSize entry of
+      case entry.epWorkgroupSize of
         Nothing -> pure ()
         Just _ -> Left (CompileError "@workgroup_size is not allowed for @fragment" Nothing Nothing)
 
@@ -96,7 +96,7 @@ loadModuleGraph opts rootDir rootFile rootAst = go Map.empty [(rootFile, rootAst
                 Right targets -> go acc' (queue <> targets)
 
     loadImportTargets opts' acc' imports = do
-      let moduleFiles = Map.keys (Map.fromList [(irModuleFile imp, ()) | imp <- imports])
+      let moduleFiles = Map.keys (Map.fromList [(imp.irModuleFile, ()) | imp <- imports])
       results <- mapM (loadOne opts' acc') moduleFiles
       pure (fmap concat (sequence results))
 
@@ -121,17 +121,17 @@ validateImportAliases imports =
           else Left (CompileError ("duplicate imports: " <> T.unpack (T.intercalate ", " dupTargets)) Nothing Nothing)
   where
     aliasFor imp =
-      case irItem imp of
+      case imp.irItem of
         Nothing ->
-          let alias = fromMaybe (last (irModulePath imp)) (irAlias imp)
+          let alias = fromMaybe (last imp.irModulePath) imp.irAlias
           in if T.null alias then Nothing else Just alias
         Just item ->
-          let alias = fromMaybe item (irAlias imp)
+          let alias = fromMaybe item imp.irAlias
           in if T.null alias then Nothing else Just alias
 
     importTarget imp =
-      let modName = T.intercalate "::" (irModulePath imp)
-      in case irItem imp of
+      let modName = T.intercalate "::" imp.irModulePath
+      in case imp.irItem of
           Nothing -> modName
           Just item -> modName <> "::" <> item
 
@@ -142,7 +142,7 @@ validateImportAliases imports =
 
 resolveImportItems :: CompileOptions -> FilePath -> FilePath -> ModuleAst -> IO (Either CompileError [ImportResolved])
 resolveImportItems opts rootDir moduleFile ast = do
-  let items = [(decl, item) | decl <- modImports ast, item <- idItems decl]
+  let items = [(decl, item) | decl <- ast.modImports, item <- decl.idItems]
   results <- mapM (resolveOne opts rootDir moduleFile) items
   pure (sequence results)
   where
@@ -163,12 +163,12 @@ loadModuleFromFile opts path = do
   where
     parseModule file = do
       src <- readFile file
-      pure (parseModuleWith (enabledFeatures opts) src)
+      pure (parseModuleWith opts.enabledFeatures src)
 
 resolveImportItem :: CompileOptions -> FilePath -> FilePath -> ImportDecl -> ImportItem -> IO (Either CompileError ImportResolved)
 resolveImportItem opts rootDir moduleFile decl item = do
-  let baseDir = importBaseDir rootDir moduleFile (idRelative decl)
-  let segs = iiPath item
+  let baseDir = importBaseDir rootDir moduleFile decl.idRelative
+  let segs = item.iiPath
   let fullBase = foldl (</>) baseDir (map T.unpack segs)
   fullMod <- findModuleFile fullBase
   case fullMod of
@@ -188,7 +188,7 @@ resolveImportItem opts rootDir moduleFile decl item = do
               pure itemExists
       if ambiguous
         then pure (Left (CompileError ("ambiguous import: " <> T.unpack (T.intercalate "::" segs) <> " refers to both a module and an item") Nothing Nothing))
-        else pure (Right (ImportResolved (modulePathFromFile rootDir moduleBase) moduleBase Nothing (iiAlias item)))
+        else pure (Right (ImportResolved (modulePathFromFile rootDir moduleBase) moduleBase Nothing item.iiAlias))
     Nothing ->
       case segs of
         [] -> pure (Left (CompileError "import path is empty" Nothing Nothing))
@@ -200,7 +200,7 @@ resolveImportItem opts rootDir moduleFile decl item = do
           moduleBase <- findModuleFile moduleBasePath
           case moduleBase of
             Just mb ->
-              pure (Right (ImportResolved (modulePathFromFile rootDir mb) mb (Just itemName) (iiAlias item)))
+              pure (Right (ImportResolved (modulePathFromFile rootDir mb) mb (Just itemName) item.iiAlias))
             Nothing ->
               pure (Left (CompileError ("import module not found: " <> T.unpack (T.intercalate "::" modSegs)) Nothing Nothing))
 
@@ -211,14 +211,14 @@ moduleHasItem opts moduleBase itemName = do
     Left _ -> pure False
     Right ast ->
       pure $
-        itemName `elem` (map sdName (modStructs ast))
-          || itemName `elem` map bdName (modBindings ast)
-          || itemName `elem` map gvName (modGlobals ast)
-          || itemName `elem` map cdName (modConsts ast)
-          || itemName `elem` map odName (modOverrides ast)
-          || itemName `elem` map adName (modAliases ast)
-          || itemName `elem` map fnName (modFunctions ast)
-          || maybe False ((== itemName) . epName) (modEntry ast)
+        itemName `elem` map (.sdName) ast.modStructs
+          || itemName `elem` map (.bdName) ast.modBindings
+          || itemName `elem` map (.gvName) ast.modGlobals
+          || itemName `elem` map (.cdName) ast.modConsts
+          || itemName `elem` map (.odName) ast.modOverrides
+          || itemName `elem` map (.adName) ast.modAliases
+          || itemName `elem` map (.fnName) ast.modFunctions
+          || maybe False ((== itemName) . (.epName)) ast.modEntry
 
 findModuleFile :: FilePath -> IO (Maybe FilePath)
 findModuleFile base = do
@@ -251,11 +251,11 @@ superModuleFile filePath n =
 
 linkModules :: CompileOptions -> FilePath -> FilePath -> [ModuleNode] -> Either CompileError ModuleAst
 linkModules opts rootFile rootDir nodes = do
-  rootNode <- case [n | n <- nodes, mnFile n == rootFile] of
+  rootNode <- case [n | n <- nodes, n.mnFile == rootFile] of
     (n:_) -> Right n
     [] -> Left (CompileError "root module not found during import resolution" Nothing Nothing)
-  let rootPath = mnPath rootNode
-  let otherEntries = [n | n <- nodes, mnFile n /= rootFile, modEntry (mnAst n) /= Nothing]
+  let rootPath = rootNode.mnPath
+  let otherEntries = [n | n <- nodes, n.mnFile /= rootFile, n.mnAst.modEntry /= Nothing]
   when (not (null otherEntries)) $
     Left (CompileError "entry points are only supported in the root module" Nothing Nothing)
   let constIndex = buildConstIndex nodes
@@ -263,28 +263,28 @@ linkModules opts rootFile rootDir nodes = do
   let structIndex = buildStructIndex nodes
   let overrideIndex = buildOverrideIndex nodes
   validateModuleScopes opts True rootPath rootDir constIndex fnIndex structIndex overrideIndex nodes
-  let contexts = Map.fromList [(mnFile n, buildModuleContext rootPath rootDir n) | n <- nodes]
+  let contexts = Map.fromList [(n.mnFile, buildModuleContext rootPath rootDir n) | n <- nodes]
   let qualified = map (\n -> qualifyModule rootPath contexts n) nodes
   let merged = foldl' mergeModule emptyModuleAst qualified
   let rootEntry =
-        case [q | q <- qualified, mnFile q == rootFile] of
-          (q:_) -> modEntry (mnAst q)
+        case [q | q <- qualified, q.mnFile == rootFile] of
+          (q:_) -> q.mnAst.modEntry
           [] -> Nothing
   Right merged { modEntry = rootEntry }
 
 mergeModule :: ModuleAst -> ModuleNode -> ModuleAst
 mergeModule acc node =
-  let ast = mnAst node
+  let ast = node.mnAst
   in acc
-      { modDirectives = modDirectives acc <> modDirectives ast
-      , modAliases = modAliases acc <> modAliases ast
-      , modStructs = modStructs acc <> modStructs ast
-      , modBindings = modBindings acc <> modBindings ast
-      , modGlobals = modGlobals acc <> modGlobals ast
-      , modConsts = modConsts acc <> modConsts ast
-      , modOverrides = modOverrides acc <> modOverrides ast
-      , modConstAsserts = modConstAsserts acc <> modConstAsserts ast
-      , modFunctions = modFunctions acc <> modFunctions ast
+      { modDirectives = acc.modDirectives <> ast.modDirectives
+      , modAliases = acc.modAliases <> ast.modAliases
+      , modStructs = acc.modStructs <> ast.modStructs
+      , modBindings = acc.modBindings <> ast.modBindings
+      , modGlobals = acc.modGlobals <> ast.modGlobals
+      , modConsts = acc.modConsts <> ast.modConsts
+      , modOverrides = acc.modOverrides <> ast.modOverrides
+      , modConstAsserts = acc.modConstAsserts <> ast.modConstAsserts
+      , modFunctions = acc.modFunctions <> ast.modFunctions
       }
 
 data ModuleContext = ModuleContext
@@ -346,21 +346,21 @@ pathKey = T.intercalate "::"
 
 buildModuleContext :: [Text] -> FilePath -> ModuleNode -> ModuleContext
 buildModuleContext rootPath _rootDir node =
-  let ast = mnAst node
+  let ast = node.mnAst
       localNames =
         Set.fromList
-          ( map sdName (modStructs ast)
-            <> map bdName (modBindings ast)
-            <> map gvName (modGlobals ast)
-            <> map cdName (modConsts ast)
-            <> map odName (modOverrides ast)
-            <> map fnName (modFunctions ast)
-            <> maybe [] (\e -> [epName e]) (modEntry ast)
+          ( map (.sdName) ast.modStructs
+            <> map (.bdName) ast.modBindings
+            <> map (.gvName) ast.modGlobals
+            <> map (.cdName) ast.modConsts
+            <> map (.odName) ast.modOverrides
+            <> map (.fnName) ast.modFunctions
+            <> maybe [] (\e -> [e.epName]) ast.modEntry
           )
-      constNames = Set.fromList (map cdName (modConsts ast) <> map odName (modOverrides ast))
-      functionNames = Set.fromList (map fnName (modFunctions ast))
-      (moduleAliases, itemAliases) = buildAliasMaps (mnImports node)
-  in ModuleContext (mnPath node) moduleAliases itemAliases localNames constNames functionNames rootPath
+      constNames = Set.fromList (map (.cdName) ast.modConsts <> map (.odName) ast.modOverrides)
+      functionNames = Set.fromList (map (.fnName) ast.modFunctions)
+      (moduleAliases, itemAliases) = buildAliasMaps node.mnImports
+  in ModuleContext node.mnPath moduleAliases itemAliases localNames constNames functionNames rootPath
 
 data ConstIndex = ConstIndex
   { ciPathTable :: !NameTable
@@ -382,9 +382,9 @@ buildConstIndex nodes =
       let (nid, nt1) = internName name nt0
       in (nt1, IntMap.insert nid expr m)
     constPairs n =
-      let ast = mnAst n
-          consts = [(cdName c, cdExpr c) | c <- modConsts ast]
-          overrides = [(odName o, expr) | o <- modOverrides ast, Just expr <- [odExpr o]]
+      let ast = n.mnAst
+          consts = [(c.cdName, c.cdExpr) | c <- ast.modConsts]
+          overrides = [(o.odName, expr) | o <- ast.modOverrides, Just expr <- [o.odExpr]]
       in consts <> overrides
 
 lookupConstIndex :: ConstIndex -> [Text] -> Text -> Maybe Expr
@@ -398,7 +398,7 @@ type OverrideIndex = Map.Map [Text] (Set.Set Text)
 buildOverrideIndex :: [ModuleNode] -> OverrideIndex
 buildOverrideIndex nodes =
   Map.fromList
-    [ (mnPath n, Set.fromList (map odName (modOverrides (mnAst n))))
+    [ (n.mnPath, Set.fromList (map (.odName) n.mnAst.modOverrides))
     | n <- nodes
     ]
 
@@ -414,8 +414,8 @@ buildStructIndex nodes =
   in StructIndex pt nt entries
   where
     addNode (pt, nt, acc) node =
-      let (pid, pt1) = internName (pathKey (mnPath node)) pt
-          (nt1, entryMap) = foldl' addEntry (nt, IntMap.empty) [(sdName s, s) | s <- modStructs (mnAst node)]
+      let (pid, pt1) = internName (pathKey node.mnPath) pt
+          (nt1, entryMap) = foldl' addEntry (nt, IntMap.empty) [(s.sdName, s) | s <- node.mnAst.modStructs]
           merged = IntMap.union entryMap (IntMap.findWithDefault IntMap.empty pid acc)
       in (pt1, nt1, IntMap.insert pid merged acc)
     addEntry (nt0, m) (name, decl) =
@@ -424,9 +424,9 @@ buildStructIndex nodes =
 
 lookupStructIndex :: StructIndex -> [Text] -> Text -> Maybe StructDecl
 lookupStructIndex idx path name = do
-  pid <- Map.lookup (pathKey path) (ntMap (siPathTable idx))
-  nid <- Map.lookup name (ntMap (siNameTable idx))
-  IntMap.lookup pid (siEntries idx) >>= IntMap.lookup nid
+  pid <- Map.lookup (pathKey path) (ntMap idx.siPathTable)
+  nid <- Map.lookup name (ntMap idx.siNameTable)
+  IntMap.lookup pid idx.siEntries >>= IntMap.lookup nid
 
 data FunctionIndex = FunctionIndex
   { fiPathTable :: !NameTable
@@ -440,8 +440,8 @@ buildFunctionIndex nodes =
   in FunctionIndex pt nt entries
   where
     addNode (pt, nt, acc) node =
-      let (pid, pt1) = internName (pathKey (mnPath node)) pt
-          (nt1, entryMap) = foldl' addEntry (nt, IntMap.empty) [(fnName f, [f]) | f <- modFunctions (mnAst node)]
+      let (pid, pt1) = internName (pathKey node.mnPath) pt
+          (nt1, entryMap) = foldl' addEntry (nt, IntMap.empty) [(f.fnName, [f]) | f <- node.mnAst.modFunctions]
           merged = IntMap.unionWith (<>) entryMap (IntMap.findWithDefault IntMap.empty pid acc)
       in (pt1, nt1, IntMap.insert pid merged acc)
     addEntry (nt0, m) (name, decls) =
@@ -450,35 +450,35 @@ buildFunctionIndex nodes =
 
 lookupFunctionIndex :: FunctionIndex -> [Text] -> Text -> Maybe [FunctionDecl]
 lookupFunctionIndex idx path name = do
-  pid <- Map.lookup (pathKey path) (ntMap (fiPathTable idx))
-  nid <- Map.lookup name (ntMap (fiNameTable idx))
-  IntMap.lookup pid (fiEntries idx) >>= IntMap.lookup nid
+  pid <- Map.lookup (pathKey path) (ntMap idx.fiPathTable)
+  nid <- Map.lookup name (ntMap idx.fiNameTable)
+  IntMap.lookup pid idx.fiEntries >>= IntMap.lookup nid
 
 lowerOverridesWith :: [Text] -> [(Text, OverrideValue)] -> ModuleAst -> Either CompileError ModuleAst
 lowerOverridesWith rootPath overridesMap ast =
-  case modOverrides ast of
+  case ast.modOverrides of
     [] -> Right ast
     overrides -> do
-      let existing = Set.fromList (map cdName (modConsts ast))
-      let (dups, _) = foldl' collect ([], Set.empty) (map odName overrides)
+      let existing = Set.fromList (map (.cdName) ast.modConsts)
+      let (dups, _) = foldl' collect ([], Set.empty) (map (.odName) overrides)
       when (not (null dups)) $
         Left (CompileError ("duplicate override declarations: " <> T.unpack (T.intercalate ", " dups)) Nothing Nothing)
-      when (any (`Set.member` existing) (map odName overrides)) $
+      when (any (`Set.member` existing) (map (.odName) overrides)) $
         Left (CompileError "override names must not conflict with const declarations" Nothing Nothing)
       let overrideLookup = buildOverrideValueMap rootPath overridesMap
-      let structEnv = [(sdName s, s) | s <- modStructs ast]
+      let structEnv = [(s.sdName, s) | s <- ast.modStructs]
       (consts, kept) <- foldM (partitionOverride structEnv overrideLookup) ([], []) overrides
-      Right ast { modConsts = modConsts ast <> reverse consts, modOverrides = reverse kept }
+      Right ast { modConsts = ast.modConsts <> reverse consts, modOverrides = reverse kept }
   where
     collect (acc, seen) name =
       if Set.member name seen
         then (name : acc, seen)
         else (acc, Set.insert name seen)
     partitionOverride structEnv overrideLookup (constAcc, keepAcc) o =
-      case Map.lookup (odName o) overrideLookup of
+      case Map.lookup o.odName overrideLookup of
         Just ov -> do
-          expr <- overrideValueToExpr structEnv (odType o) ov
-          Right (ConstDecl (odName o) expr : constAcc, keepAcc)
+          expr <- overrideValueToExpr structEnv o.odType ov
+          Right (ConstDecl o.odName expr : constAcc, keepAcc)
         Nothing -> Right (constAcc, o : keepAcc)
 
 buildOverrideValueMap :: [Text] -> [(Text, OverrideValue)] -> Map.Map Text OverrideValue
@@ -561,30 +561,30 @@ overrideValueToExpr structEnv ty ov =
         Just decl ->
           case ov of
             OVComposite vals -> do
-              let fields = sdFields decl
+              let fields = decl.sdFields
               when (length vals /= length fields) $
                 Left (CompileError "override struct field count does not match" Nothing Nothing)
-              args <- zipWithM (\f v -> overrideValueToExpr structEnv (fdType f) v) fields vals
+              args <- zipWithM (\f v -> overrideValueToExpr structEnv f.fdType v) fields vals
               Right (ECall name args)
             _ -> Left (CompileError "override value must be a struct composite" Nothing Nothing)
     _ -> Left (CompileError "override values are only supported for scalar, vector, matrix, array, and struct types" Nothing Nothing)
 
 resolveTypeAliases :: ModuleAst -> Either CompileError ModuleAst
 resolveTypeAliases ast = do
-  let (dupAliases, _) = foldl' collect ([], Set.empty) (map adName (modAliases ast))
+  let (dupAliases, _) = foldl' collect ([], Set.empty) (map (.adName) ast.modAliases)
   when (not (null dupAliases)) $
     Left (CompileError ("duplicate type aliases: " <> T.unpack (T.intercalate ", " dupAliases)) Nothing Nothing)
-  let aliasMap = Map.fromList [(adName a, adType a) | a <- modAliases ast]
+  let aliasMap = Map.fromList [(a.adName, a.adType) | a <- ast.modAliases]
   let expand = expandType aliasMap
-  aliases <- mapM (\a -> (\ty -> a { adType = ty }) <$> expand (adType a)) (modAliases ast)
-  structs <- mapM (expandStruct expand) (modStructs ast)
-  bindings <- mapM (expandBinding expand) (modBindings ast)
-  globals <- mapM (expandGlobal expand) (modGlobals ast)
-  consts <- mapM (expandConst expand) (modConsts ast)
-  overrides <- mapM (expandOverride expand) (modOverrides ast)
-  constAsserts <- mapM (expandConstAssert expand) (modConstAsserts ast)
-  functions <- mapM (expandFunction expand) (modFunctions ast)
-  entry <- mapM (expandEntry expand) (modEntry ast)
+  aliases <- mapM (\a -> (\ty -> a { adType = ty }) <$> expand a.adType) ast.modAliases
+  structs <- mapM (expandStruct expand) ast.modStructs
+  bindings <- mapM (expandBinding expand) ast.modBindings
+  globals <- mapM (expandGlobal expand) ast.modGlobals
+  consts <- mapM (expandConst expand) ast.modConsts
+  overrides <- mapM (expandOverride expand) ast.modOverrides
+  constAsserts <- mapM (expandConstAssert expand) ast.modConstAsserts
+  functions <- mapM (expandFunction expand) ast.modFunctions
+  entry <- mapM (expandEntry expand) ast.modEntry
   Right ast
     { modAliases = aliases
     , modStructs = structs
@@ -616,7 +616,7 @@ resolveTypeAliases ast = do
             _ -> Right ty
 
     expandStruct expand decl = do
-      fields <- mapM (\f -> (\ty -> f { fdType = ty }) <$> expand (fdType f)) (sdFields decl)
+      fields <- mapM (\f -> (\ty -> f { fdType = ty }) <$> expand f.fdType) decl.sdFields
       Right decl { sdFields = fields }
 
     expandBinding expand decl = do
@@ -642,15 +642,15 @@ resolveTypeAliases ast = do
       Right decl { odType = ty, odExpr = expr }
 
     expandFunction expand decl = do
-      params <- mapM (\p -> (\ty -> p { paramType = ty }) <$> expand (paramType p)) (fnParams decl)
-      ret <- mapM expand (fnReturnType decl)
-      body <- mapM (expandStmt expand) (fnBody decl)
+      params <- mapM (\p -> (\ty -> p { paramType = ty }) <$> expand p.paramType) decl.fnParams
+      ret <- mapM expand decl.fnReturnType
+      body <- mapM (expandStmt expand) decl.fnBody
       Right decl { fnParams = params, fnReturnType = ret, fnBody = body }
 
     expandEntry expand decl = do
-      params <- mapM (\p -> (\ty -> p { paramType = ty }) <$> expand (paramType p)) (epParams decl)
-      ret <- mapM expand (epReturnType decl)
-      body <- mapM (expandStmt expand) (epBody decl)
+      params <- mapM (\p -> (\ty -> p { paramType = ty }) <$> expand p.paramType) decl.epParams
+      ret <- mapM expand decl.epReturnType
+      body <- mapM (expandStmt expand) decl.epBody
       Right decl { epParams = params, epReturnType = ret, epBody = body }
 
     expandStmt expand stmt =
@@ -701,15 +701,15 @@ buildAliasMaps :: [ImportResolved] -> (Map.Map Text [Text], Map.Map Text [Text])
 buildAliasMaps imports = foldl' add (Map.empty, Map.empty) imports
   where
     add (modAcc, itemAcc) imp =
-      case irItem imp of
+      case imp.irItem of
         Nothing ->
-          let alias = fromMaybe (last (irModulePath imp)) (irAlias imp)
+          let alias = fromMaybe (last imp.irModulePath) imp.irAlias
           in if T.null alias
               then (modAcc, itemAcc)
-              else (Map.insert alias (irModulePath imp) modAcc, itemAcc)
+              else (Map.insert alias imp.irModulePath modAcc, itemAcc)
         Just item ->
-          let alias = fromMaybe item (irAlias imp)
-              target = irModulePath imp <> [item]
+          let alias = fromMaybe item imp.irAlias
+              target = imp.irModulePath <> [item]
           in if T.null alias
               then (modAcc, itemAcc)
               else (modAcc, Map.insert alias target itemAcc)
@@ -730,7 +730,7 @@ validateDirectives opts directives = do
   mapM_ checkEnable directives
   pure (foldl' applyDiag Map.empty directives)
   where
-    enabled = Set.fromList (map T.pack (enabledFeatures opts))
+    enabled = Set.fromList (map T.pack opts.enabledFeatures)
     checkEnable dir =
       case dir of
         DirEnable feat ->
@@ -753,12 +753,12 @@ validateModuleScopes opts skipConstAsserts rootPath rootDir constIndex fnIndex s
 validateModuleScope :: CompileOptions -> Bool -> [Text] -> FilePath -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideIndex -> ModuleNode -> Either CompileError ()
 validateModuleScope opts skipConstAsserts rootPath rootDir constIndex fnIndex structIndex overrideIndex node = do
   let ctx = buildModuleContext rootPath rootDir node
-  diagConfig <- validateDirectives opts (modDirectives (mnAst node))
+  diagConfig <- validateDirectives opts node.mnAst.modDirectives
   let allowShadowing = diagnosticSeverity diagConfig "shadowing" /= DiagError
-  let (nt1, globalsIds) = internNameSet emptyNameTable (Set.toList (mcLocals ctx))
-  let (nt2, moduleAliasIds) = internNameSet nt1 (Map.keys (mcModuleAliases ctx))
-  let (nt3, itemAliasIds) = internNameSet nt2 (Map.keys (mcItemAliases ctx))
-  let (nt4, typeAliasIds) = internNameSet nt3 (map adName (modAliases (mnAst node)))
+  let (nt1, globalsIds) = internNameSet emptyNameTable (Set.toList ctx.mcLocals)
+  let (nt2, moduleAliasIds) = internNameSet nt1 (Map.keys ctx.mcModuleAliases)
+  let (nt3, itemAliasIds) = internNameSet nt2 (Map.keys ctx.mcItemAliases)
+  let (nt4, typeAliasIds) = internNameSet nt3 (map (.adName) node.mnAst.modAliases)
   let scope0 =
         Scope
           { scNameTable = nt4
@@ -770,22 +770,22 @@ validateModuleScope opts skipConstAsserts rootPath rootDir constIndex fnIndex st
           , scAllowShadowing = allowShadowing
           , scAllowFallthrough = False
           }
-  validateModuleAst ctx constIndex fnIndex structIndex overrideIndex scope0 diagConfig skipConstAsserts (mnAst node)
+  validateModuleAst ctx constIndex fnIndex structIndex overrideIndex scope0 diagConfig skipConstAsserts node.mnAst
 
 type DiagnosticConfig = Map.Map String DiagnosticSeverity
 
 validateModuleAst :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideIndex -> Scope -> DiagnosticConfig -> Bool -> ModuleAst -> Either CompileError ()
 validateModuleAst ctx constIndex fnIndex structIndex overrideIndex scope diagConfig skipConstAsserts ast = do
-  mapM_ (validateAlias ctx scope) (modAliases ast)
-  mapM_ (validateStruct ctx scope) (modStructs ast)
-  mapM_ (validateBinding ctx scope) (modBindings ast)
-  mapM_ (validateGlobalVar ctx scope) (modGlobals ast)
-  mapM_ (validateConst ctx scope) (modConsts ast)
-  mapM_ (validateOverride ctx scope overrideIndex) (modOverrides ast)
+  mapM_ (validateAlias ctx scope) ast.modAliases
+  mapM_ (validateStruct ctx scope) ast.modStructs
+  mapM_ (validateBinding ctx scope) ast.modBindings
+  mapM_ (validateGlobalVar ctx scope) ast.modGlobals
+  mapM_ (validateConst ctx scope) ast.modConsts
+  mapM_ (validateOverride ctx scope overrideIndex) ast.modOverrides
   when (not skipConstAsserts) $
-    mapM_ (validateConstAssert ctx constIndex fnIndex structIndex diagConfig) (modConstAsserts ast)
-  mapM_ (validateFunction ctx constIndex fnIndex structIndex skipConstAsserts scope) (modFunctions ast)
-  case modEntry ast of
+    mapM_ (validateConstAssert ctx constIndex fnIndex structIndex diagConfig) ast.modConstAsserts
+  mapM_ (validateFunction ctx constIndex fnIndex structIndex skipConstAsserts scope) ast.modFunctions
+  case ast.modEntry of
     Nothing -> Right ()
     Just entry -> validateEntryPoint ctx constIndex fnIndex structIndex skipConstAsserts scope entry
 
@@ -796,8 +796,8 @@ validateConstAssertsMerged opts rootPath ast = do
   let fnIndex = buildFunctionIndex [node]
   let structIndex = buildStructIndex [node]
   let ctx = buildModuleContext rootPath "" node
-  diagConfig <- validateDirectives opts (modDirectives ast)
-  mapM_ (validateConstAssert ctx constIndex fnIndex structIndex diagConfig) (modConstAsserts ast)
+  diagConfig <- validateDirectives opts ast.modDirectives
+  mapM_ (validateConstAssert ctx constIndex fnIndex structIndex diagConfig) ast.modConstAsserts
   Right ()
 
 collectDiagnosticsMerged :: CompileOptions -> [Text] -> ModuleAst -> Either CompileError [Diagnostic]
@@ -807,8 +807,8 @@ collectDiagnosticsMerged opts rootPath ast = do
   let fnIndex = buildFunctionIndex [node]
   let structIndex = buildStructIndex [node]
   let ctx = buildModuleContext rootPath "" node
-  diagConfig <- validateDirectives opts (modDirectives ast)
-  constDiags <- fmap concat (mapM (collectConstAssertDiagnostic ctx constIndex fnIndex structIndex diagConfig) (modConstAsserts ast))
+  diagConfig <- validateDirectives opts ast.modDirectives
+  constDiags <- fmap concat (mapM (collectConstAssertDiagnostic ctx constIndex fnIndex structIndex diagConfig) ast.modConstAsserts)
   let unreachableDiags = collectUnreachableDiagnostics diagConfig ast
   let unusedExprDiags = collectUnusedExpressionDiagnostics diagConfig ast
   let unusedVarDiags = collectUnusedVariableDiagnostics diagConfig ast
@@ -843,7 +843,7 @@ collectConstAssertDiagnostic ctx constIndex fnIndex structIndex diagConfig (Cons
       ok <- withPos pos (evalConstBoolExpr ctx constIndex fnIndex structIndex expr)
       if ok
         then Right []
-        else Right [Diagnostic sev "const_assert" "const_assert condition failed" (Just (spLine pos)) (Just (spCol pos))]
+        else Right [Diagnostic sev "const_assert" "const_assert condition failed" (Just pos.spLine) (Just pos.spCol)]
 
 collectUnreachableDiagnostics :: DiagnosticConfig -> ModuleAst -> [Diagnostic]
 collectUnreachableDiagnostics diagConfig ast =
@@ -852,7 +852,7 @@ collectUnreachableDiagnostics diagConfig ast =
     Just DiagOff -> []
     Just sev ->
       let diag = Diagnostic sev "unreachable_code" "unreachable code" Nothing Nothing
-          bodies = map fnBody (modFunctions ast) <> maybe [] (pure . epBody) (modEntry ast)
+          bodies = map (.fnBody) ast.modFunctions <> maybe [] (pure . (.epBody)) ast.modEntry
       in concatMap (unreachableInStmts diag) bodies
   where
     unreachableInStmts diag = go False
@@ -871,7 +871,7 @@ collectUnreachableDiagnostics diagConfig ast =
                   SFor _ _ _ body ->
                     unreachableInStmts diag body
                   SSwitch _ cases defBody ->
-                    concatMap (unreachableInStmts diag . scBody) cases <> maybe [] (unreachableInStmts diag) defBody
+                    concatMap (unreachableInStmts diag . (.scBody)) cases <> maybe [] (unreachableInStmts diag) defBody
                   _ -> []
               unreachable' = unreachable || isTerminator stmt
           in here <> nested <> go unreachable' rest
@@ -891,7 +891,7 @@ collectUnusedExpressionDiagnostics diagConfig ast =
     Just DiagOff -> []
     Just sev ->
       let diag = Diagnostic sev "unused_expression" "expression has no effect" Nothing Nothing
-          bodies = map fnBody (modFunctions ast) <> maybe [] (pure . epBody) (modEntry ast)
+          bodies = map (.fnBody) ast.modFunctions <> maybe [] (pure . (.epBody)) ast.modEntry
       in concatMap (unusedExprs diag) bodies
   where
     unusedExprs diag = go
@@ -916,7 +916,7 @@ collectUnusedExpressionDiagnostics diagConfig ast =
                   SFor _ _ _ body ->
                     go body
                   SSwitch _ cases defBody ->
-                    concatMap (go . scBody) cases <> maybe [] go defBody
+                    concatMap (go . (.scBody)) cases <> maybe [] go defBody
                   _ -> []
           in here <> nested <> go rest
 
@@ -927,7 +927,7 @@ collectUnusedVariableDiagnostics diagConfig ast =
     Just DiagOff -> []
     Just sev ->
       let diag name = Diagnostic sev "unused_variable" ("unused variable: " <> T.unpack name) Nothing Nothing
-          bodies = map fnBody (modFunctions ast) <> maybe [] (pure . epBody) (modEntry ast)
+          bodies = map (.fnBody) ast.modFunctions <> maybe [] (pure . (.epBody)) ast.modEntry
       in concatMap (unusedVarsInBody diag) bodies
   where
     unusedVarsInBody mkDiag stmts =
@@ -955,7 +955,7 @@ collectUnusedVariableDiagnostics diagConfig ast =
         SFor initStmt _ contStmt body ->
           maybe [] declsInStmt initStmt <> maybe [] declsInStmt contStmt <> collectDecls body
         SSwitch _ cases defBody ->
-          concatMap (collectDecls . scBody) cases <> maybe [] collectDecls defBody
+          concatMap (collectDecls . (.scBody)) cases <> maybe [] collectDecls defBody
         _ -> []
 
 collectUnusedParameterDiagnostics :: DiagnosticConfig -> ModuleAst -> [Diagnostic]
@@ -965,13 +965,13 @@ collectUnusedParameterDiagnostics diagConfig ast =
     Just DiagOff -> []
     Just sev ->
       let mkDiag name = Diagnostic sev "unused_parameter" ("unused parameter: " <> T.unpack name) Nothing Nothing
-      in concatMap (unusedParamsInFunction mkDiag) (modFunctions ast)
-          <> maybe [] (unusedParamsInEntry mkDiag) (modEntry ast)
+      in concatMap (unusedParamsInFunction mkDiag) (ast.modFunctions)
+          <> maybe [] (unusedParamsInEntry mkDiag) (ast.modEntry)
   where
     unusedParamsInFunction mkDiag fn =
-      let params = map paramName (fnParams fn)
+      let params = map paramName fn.fnParams
           (nt1, paramPairs) = internNamePairs emptyNameTable params
-          (_, usedIds) = internNameSet nt1 (collectUsesInStmts (fnBody fn))
+          (_, usedIds) = internNameSet nt1 (collectUsesInStmts fn.fnBody)
           unused =
             [ name
             | (name, ident) <- uniqueById paramPairs
@@ -980,9 +980,9 @@ collectUnusedParameterDiagnostics diagConfig ast =
             ]
       in map mkDiag unused
     unusedParamsInEntry mkDiag entry =
-      let params = map paramName (epParams entry)
+      let params = map paramName entry.epParams
           (nt1, paramPairs) = internNamePairs emptyNameTable params
-          (_, usedIds) = internNameSet nt1 (collectUsesInStmts (epBody entry))
+          (_, usedIds) = internNameSet nt1 (collectUsesInStmts entry.epBody)
           unused =
             [ name
             | (name, ident) <- uniqueById paramPairs
@@ -999,17 +999,17 @@ collectShadowingDiagnostics diagConfig ast =
     Just DiagOff -> []
     Just sev ->
       let mkDiag name = Diagnostic sev "shadowing" ("name shadows outer scope: " <> T.unpack name) Nothing Nothing
-      in concatMap (shadowingInFunction mkDiag) (modFunctions ast)
-          <> maybe [] (shadowingInEntry mkDiag) (modEntry ast)
+      in concatMap (shadowingInFunction mkDiag) (ast.modFunctions)
+          <> maybe [] (shadowingInEntry mkDiag) (ast.modEntry)
   where
     shadowingInFunction mkDiag fn =
-      let params = map paramName (fnParams fn)
+      let params = map paramName fn.fnParams
           (nt1, paramIds) = internNames emptyNameTable params
-      in shadowingInStmts mkDiag nt1 [IntSet.empty, IntSet.fromList paramIds] (fnBody fn)
+      in shadowingInStmts mkDiag nt1 [IntSet.empty, IntSet.fromList paramIds] fn.fnBody
     shadowingInEntry mkDiag entry =
-      let params = map paramName (epParams entry)
+      let params = map paramName entry.epParams
           (nt1, paramIds) = internNames emptyNameTable params
-      in shadowingInStmts mkDiag nt1 [IntSet.empty, IntSet.fromList paramIds] (epBody entry)
+      in shadowingInStmts mkDiag nt1 [IntSet.empty, IntSet.fromList paramIds] entry.epBody
 
     shadowingInStmts mkDiag table scopes0 stmts = let (diags, _, _) = go table scopes0 stmts in diags
       where
@@ -1070,7 +1070,7 @@ collectShadowingDiagnostics diagConfig ast =
       foldl' step ([], table) cases
       where
         step (diagsAcc, tableAcc) sc =
-          let (diags, table') = shadowingInBlock mkDiag tableAcc scopes (scBody sc)
+          let (diags, table') = shadowingInBlock mkDiag tableAcc scopes sc.scBody
           in (diagsAcc <> diags, table')
 
     diagIfShadow mkDiag scopes ident name
@@ -1095,8 +1095,8 @@ collectConstantConditionDiagnostics diagConfig ctx constIndex fnIndex structInde
     Just DiagOff -> []
     Just sev ->
       let mkDiag msg = Diagnostic sev "constant_condition" msg Nothing Nothing
-      in concatMap (constantCondInStmts mkDiag) (map fnBody (modFunctions ast))
-          <> maybe [] (constantCondInStmts mkDiag . epBody) (modEntry ast)
+      in concatMap (constantCondInStmts mkDiag) (map (.fnBody) ast.modFunctions)
+          <> maybe [] (constantCondInStmts mkDiag . (.epBody)) ast.modEntry
   where
     constantCondInStmts mkDiag stmts = concatMap (constantCondInStmt mkDiag) stmts
 
@@ -1116,7 +1116,7 @@ collectConstantConditionDiagnostics diagConfig ctx constIndex fnIndex structInde
             <> maybe [] (checkCond mkDiag "for" ) condExpr
             <> constantCondInStmts mkDiag body
         SSwitch _ cases defBody ->
-          concatMap (constantCondInStmts mkDiag . scBody) cases <> maybe [] (constantCondInStmts mkDiag) defBody
+          concatMap (constantCondInStmts mkDiag . (.scBody)) cases <> maybe [] (constantCondInStmts mkDiag) defBody
         SBreakIf cond -> checkCond mkDiag "break if" cond
         _ -> []
 
@@ -1132,8 +1132,8 @@ collectDuplicateCaseDiagnostics diagConfig ctx constIndex fnIndex structIndex as
     Just DiagOff -> []
     Just sev ->
       let mkDiag val = Diagnostic sev "duplicate_case" ("duplicate switch case selector: " <> val) Nothing Nothing
-      in concatMap (duplicateInStmts mkDiag) (map fnBody (modFunctions ast))
-          <> maybe [] (duplicateInStmts mkDiag . epBody) (modEntry ast)
+      in concatMap (duplicateInStmts mkDiag) (map (.fnBody) ast.modFunctions)
+          <> maybe [] (duplicateInStmts mkDiag . (.epBody)) ast.modEntry
   where
     duplicateInStmts mkDiag stmts = concatMap (duplicateInStmt mkDiag) stmts
 
@@ -1149,12 +1149,12 @@ collectDuplicateCaseDiagnostics diagConfig ctx constIndex fnIndex structIndex as
             <> maybe [] (duplicateInStmt mkDiag) contStmt
             <> duplicateInStmts mkDiag body
         SSwitch _ cases defBody ->
-          let selectors = concatMap scSelectors cases
+          let selectors = concatMap (.scSelectors) cases
               values = mapMaybe (constSelectorValue ctx constIndex fnIndex structIndex) selectors
               keys = map renderKey values
               dupes = duplicateValues keys
               diags = map mkDiag dupes
-              nested = concatMap (duplicateInStmts mkDiag . scBody) cases <> maybe [] (duplicateInStmts mkDiag) defBody
+              nested = concatMap (duplicateInStmts mkDiag . (.scBody)) cases <> maybe [] (duplicateInStmts mkDiag) defBody
           in diags <> nested
         _ -> []
 
@@ -1209,7 +1209,7 @@ collectUsesInStmt stmt =
 
 collectUsesInCase :: SwitchCase -> [Text]
 collectUsesInCase sc =
-  concatMap collectUsesInExpr (scSelectors sc) <> collectUsesInStmts (scBody sc)
+  concatMap collectUsesInExpr sc.scSelectors <> collectUsesInStmts sc.scBody
 
 collectUsesInExpr :: Expr -> [Text]
 collectUsesInExpr expr =
@@ -1235,7 +1235,7 @@ collectUsesInLValue lv =
 
 validateStruct :: ModuleContext -> Scope -> StructDecl -> Either CompileError ()
 validateStruct ctx scope decl =
-  mapM_ (validateType ctx scope . fdType) (sdFields decl)
+  mapM_ (validateType ctx scope . (.fdType)) decl.sdFields
 
 validateBinding :: ModuleContext -> Scope -> BindingDecl -> Either CompileError ()
 validateBinding ctx scope decl = validateType ctx scope (bdType decl)
@@ -1286,21 +1286,21 @@ validateConstAssert ctx constIndex fnIndex structIndex diagConfig (ConstAssert p
 
 validateFunction :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> FunctionDecl -> Either CompileError ()
 validateFunction ctx constIndex fnIndex structIndex skipConstEval scope fn = do
-  mapM_ (validateType ctx scope . paramType) (fnParams fn)
-  mapM_ (validateType ctx scope) (maybeToList (fnReturnType fn))
-  let paramNames = map paramName (fnParams fn)
+  mapM_ (validateType ctx scope . (.paramType)) fn.fnParams
+  mapM_ (validateType ctx scope) (maybeToList fn.fnReturnType)
+  let paramNames = map paramName fn.fnParams
   ensureNoDuplicates "function parameters" paramNames
   let scope1 = scopeWithParams scope paramNames
-  validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 (fnBody fn)
+  validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 fn.fnBody
 
 validateEntryPoint :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> EntryPoint -> Either CompileError ()
 validateEntryPoint ctx constIndex fnIndex structIndex skipConstEval scope entry = do
-  mapM_ (validateType ctx scope . paramType) (epParams entry)
-  mapM_ (validateType ctx scope) (maybeToList (epReturnType entry))
-  let paramNames = map paramName (epParams entry)
+  mapM_ (validateType ctx scope . (.paramType)) entry.epParams
+  mapM_ (validateType ctx scope) (maybeToList entry.epReturnType)
+  let paramNames = map paramName entry.epParams
   ensureNoDuplicates "entry point parameters" paramNames
   let scope1 = scopeWithParams scope paramNames
-  validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 (epBody entry)
+  validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 entry.epBody
 
 validateStmtList :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> [Stmt] -> Either CompileError ()
 validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope0 = go scope0
@@ -1362,11 +1362,11 @@ validateStmt ctx constIndex fnIndex structIndex skipConstEval scope stmt =
 
 validateSwitchCase :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> SwitchCase -> Either CompileError ()
 validateSwitchCase ctx constIndex fnIndex structIndex skipConstEval scope sc = do
-  _ <- analyzeFallthroughPlacement (scBody sc)
+  _ <- analyzeFallthroughPlacement sc.scBody
   when (not skipConstEval) $
-    mapM_ (evalConstIntExpr ctx constIndex fnIndex structIndex) (scSelectors sc)
+    mapM_ (evalConstIntExpr ctx constIndex fnIndex structIndex) sc.scSelectors
   let scope' = scope { scAllowFallthrough = True }
-  validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope') (scBody sc)
+  validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope') sc.scBody
 
 analyzeFallthroughPlacement :: [Stmt] -> Either CompileError (Bool, [Stmt])
 analyzeFallthroughPlacement body =
@@ -1575,7 +1575,7 @@ coerceConstValueToType ctx structIndex target val =
       val' <- case lookup (fdName field) pairs of
         Just v -> Right v
         Nothing -> Left (CompileError ("missing field: " <> textToString (fdName field)) Nothing Nothing)
-      coerced <- coerceConstValueToType ctx structIndex (fdType field) val'
+      coerced <- coerceConstValueToType ctx structIndex field.fdType val'
       Right (fdName field, coerced)
 
 resolveStructDecl :: ModuleContext -> StructIndex -> Text -> Either CompileError StructDecl
@@ -1583,10 +1583,10 @@ resolveStructDecl ctx structIndex name =
   case splitQName name of
     [] -> Left (CompileError "invalid struct reference" Nothing Nothing)
     [single] ->
-      case lookupStruct (mcPath ctx) single of
+      case lookupStruct ctx.mcPath single of
         Just decl -> Right decl
         Nothing ->
-          case Map.lookup single (mcItemAliases ctx) of
+          case Map.lookup single ctx.mcItemAliases of
             Just target ->
               case splitLast target of
                 Nothing -> Left (CompileError "invalid struct reference" Nothing Nothing)
@@ -1596,7 +1596,7 @@ resolveStructDecl ctx structIndex name =
                     Nothing -> Left (CompileError ("unknown struct: " <> textToString item) Nothing Nothing)
             Nothing -> Left (CompileError ("unknown struct: " <> textToString single) Nothing Nothing)
     seg0 : segRest ->
-      case Map.lookup seg0 (mcModuleAliases ctx) of
+      case Map.lookup seg0 ctx.mcModuleAliases of
         Nothing -> Left (CompileError ("unknown module alias: " <> textToString seg0) Nothing Nothing)
         Just target ->
           case splitLast (target <> segRest) of
@@ -1649,7 +1649,7 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns 
                 then evalConstScalarValue seen fnSeen ex
                 else
                   case resolveStructDecl ctx structIndex name of
-                    Right decl -> evalConstStructCtor (sdName decl) (sdFields decl) seen fnSeen args
+                    Right decl -> evalConstStructCtor decl.sdName decl.sdFields seen fnSeen args
                     Left _ ->
                       evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seen fnSeen name args
         _ -> evalConstScalarValue seen fnSeen ex
@@ -1788,7 +1788,7 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns 
 
 evalConstFunctionValueWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> FunctionDecl -> Either CompileError ConstValue
 evalConstFunctionValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns decl = do
-  (_, ctrl, _) <- evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns constEvalMaxSteps (fnBody decl)
+  (_, ctrl, _) <- evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns constEvalMaxSteps decl.fnBody
   val <- case ctrl of
     CCReturn v -> Right v
     CCNone -> Left (CompileError "const function must return a value" Nothing Nothing)
@@ -1813,7 +1813,7 @@ evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seenConsts seen
         let params = fnParams decl
         when (length params /= length argVals) $
           Left (CompileError "const function overload not found" Nothing Nothing)
-        coercedArgs <- zipWithM (coerceConstValueToType ctx structIndex . paramType) params argVals
+        coercedArgs <- zipWithM (coerceConstValueToType ctx structIndex . (.paramType)) params argVals
         let bindings = [ConstBinding val False | val <- coercedArgs]
         let env' = Map.fromList (zip (map paramName params) bindings)
         evalConstFunctionValueWithEnv ctx constIndex fnIndex structIndex env' seenConsts seenFns' decl
@@ -1922,9 +1922,9 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
         Nothing -> Right (env, CCNone, fuel'')
         Just body -> evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel'' body
     matchCase selector (case0:rest) defBody fuel'' = do
-      matched <- or <$> mapM (matchesSelector selector) (scSelectors case0)
+      matched <- or <$> mapM (matchesSelector selector) case0.scSelectors
       if matched
-        then evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel'' (scBody case0)
+        then evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel'' case0.scBody
         else matchCase selector rest defBody fuel''
 
     matchesSelector selector ex = do
@@ -2624,16 +2624,16 @@ resolveConstRef ctx name =
   case splitQName name of
     [] -> Left (CompileError "invalid constant reference" Nothing Nothing)
     [single] ->
-      if Set.member single (mcConstNames ctx)
-        then Right (mcPath ctx, single)
-        else case Map.lookup single (mcItemAliases ctx) of
+      if Set.member single ctx.mcConstNames
+        then Right (ctx.mcPath, single)
+        else case Map.lookup single ctx.mcItemAliases of
           Just target ->
             case splitLast target of
               Nothing -> Left (CompileError "invalid constant reference" Nothing Nothing)
               Just (path, item) -> Right (path, item)
           Nothing -> Left (CompileError ("unknown constant: " <> textToString single) Nothing Nothing)
     seg0 : segRest ->
-      case Map.lookup seg0 (mcModuleAliases ctx) of
+      case Map.lookup seg0 ctx.mcModuleAliases of
         Nothing -> Left (CompileError ("unknown module alias: " <> textToString seg0) Nothing Nothing)
         Just target ->
           case splitLast (target <> segRest) of
@@ -2645,16 +2645,16 @@ resolveFunctionRef ctx name =
   case splitQName name of
     [] -> Left (CompileError "invalid function reference" Nothing Nothing)
     [single] ->
-      if Set.member single (mcFunctionNames ctx)
-        then Right (mcPath ctx, single)
-        else case Map.lookup single (mcItemAliases ctx) of
+      if Set.member single ctx.mcFunctionNames
+        then Right (ctx.mcPath, single)
+        else case Map.lookup single ctx.mcItemAliases of
           Just target ->
             case splitLast target of
               Nothing -> Left (CompileError "invalid function reference" Nothing Nothing)
               Just (path, item) -> Right (path, item)
           Nothing -> Left (CompileError ("unknown function: " <> textToString single) Nothing Nothing)
     seg0 : segRest ->
-      case Map.lookup seg0 (mcModuleAliases ctx) of
+      case Map.lookup seg0 ctx.mcModuleAliases of
         Nothing -> Left (CompileError ("unknown module alias: " <> textToString seg0) Nothing Nothing)
         Just target ->
           case splitLast (target <> segRest) of
@@ -2919,10 +2919,10 @@ builtinNames =
 
 qualifyModule :: [Text] -> Map.Map FilePath ModuleContext -> ModuleNode -> ModuleNode
 qualifyModule rootPath ctxs node =
-  let ctx = fromMaybe (buildModuleContext rootPath "" node) (Map.lookup (mnFile node) ctxs)
-      ast = mnAst node
-      prefix = mcPath ctx
-      rename = qualNameWithRoot (mcRootPath ctx) prefix
+  let ctx = fromMaybe (buildModuleContext rootPath "" node) (Map.lookup node.mnFile ctxs)
+      ast = node.mnAst
+      prefix = ctx.mcPath
+      rename = qualNameWithRoot ctx.mcRootPath prefix
       renameDecl name = rename name
       rewriteTy = rewriteType ctx
       rewriteParam = rewriteParamType ctx
@@ -2931,68 +2931,68 @@ qualifyModule rootPath ctxs node =
       rewriteExpr = rewriteExprNames ctx
       rewriteFn fn =
         fn
-          { fnName = renameDecl (fnName fn)
-          , fnParams = map rewriteParam (fnParams fn)
-          , fnReturnType = fmap rewriteTy (fnReturnType fn)
-          , fnBody = map rewriteStmt (fnBody fn)
+          { fnName = renameDecl fn.fnName
+          , fnParams = map rewriteParam fn.fnParams
+          , fnReturnType = fmap rewriteTy fn.fnReturnType
+          , fnBody = map rewriteStmt fn.fnBody
           }
       rewriteConst c =
         c
-          { cdName = renameDecl (cdName c)
-          , cdExpr = rewriteExpr (cdExpr c)
+          { cdName = renameDecl c.cdName
+          , cdExpr = rewriteExpr c.cdExpr
           }
       rewriteAlias a =
         a
-          { adName = renameDecl (adName a)
-          , adType = rewriteTy (adType a)
+          { adName = renameDecl a.adName
+          , adType = rewriteTy a.adType
           }
       rewriteOverride o =
         o
-          { odName = renameDecl (odName o)
-          , odType = rewriteTy (odType o)
-          , odExpr = fmap rewriteExpr (odExpr o)
+          { odName = renameDecl o.odName
+          , odType = rewriteTy o.odType
+          , odExpr = fmap rewriteExpr o.odExpr
           }
       rewriteBinding b =
         b
-          { bdName = renameDecl (bdName b)
-          , bdType = rewriteTy (bdType b)
+          { bdName = renameDecl b.bdName
+          , bdType = rewriteTy b.bdType
           }
       rewriteGlobal g =
         g
-          { gvName = renameDecl (gvName g)
-          , gvType = rewriteTy (gvType g)
-          , gvInit = fmap rewriteExpr (gvInit g)
+          { gvName = renameDecl g.gvName
+          , gvType = rewriteTy g.gvType
+          , gvInit = fmap rewriteExpr g.gvInit
           }
       rewriteStruct s =
         s
-          { sdName = renameDecl (sdName s)
-          , sdFields = map rewriteField (sdFields s)
+          { sdName = renameDecl s.sdName
+          , sdFields = map rewriteField s.sdFields
           }
       rewriteConstAssert (ConstAssert pos expr) =
         ConstAssert pos (rewriteExpr expr)
       entry =
-        case modEntry ast of
+        case ast.modEntry of
           Nothing -> Nothing
           Just e ->
             if prefix == rootPath
               then Just
                 e
-                  { epParams = map rewriteParam (epParams e)
-                  , epReturnType = fmap rewriteTy (epReturnType e)
-                  , epBody = map rewriteStmt (epBody e)
+                  { epParams = map rewriteParam e.epParams
+                  , epReturnType = fmap rewriteTy e.epReturnType
+                  , epBody = map rewriteStmt e.epBody
                   }
               else Nothing
       ast' =
         ast
           { modImports = []
-          , modAliases = map rewriteAlias (modAliases ast)
-          , modStructs = map rewriteStruct (modStructs ast)
-          , modBindings = map rewriteBinding (modBindings ast)
-          , modGlobals = map rewriteGlobal (modGlobals ast)
-          , modConsts = map rewriteConst (modConsts ast)
-          , modOverrides = map rewriteOverride (modOverrides ast)
-          , modConstAsserts = map rewriteConstAssert (modConstAsserts ast)
-          , modFunctions = map rewriteFn (modFunctions ast)
+          , modAliases = map rewriteAlias (ast.modAliases)
+          , modStructs = map rewriteStruct (ast.modStructs)
+          , modBindings = map rewriteBinding (ast.modBindings)
+          , modGlobals = map rewriteGlobal (ast.modGlobals)
+          , modConsts = map rewriteConst (ast.modConsts)
+          , modOverrides = map rewriteOverride (ast.modOverrides)
+          , modConstAsserts = map rewriteConstAssert (ast.modConstAsserts)
+          , modFunctions = map rewriteFn (ast.modFunctions)
           , modEntry = entry
           }
   in node { mnAst = ast' }
@@ -3008,28 +3008,28 @@ rewriteIdent ctx name =
   case splitQName name of
     [] -> name
     [single] ->
-      if Set.member single (mcLocals ctx)
+      if Set.member single ctx.mcLocals
         then
-          if mcPath ctx == mcRootPath ctx
+          if ctx.mcPath == ctx.mcRootPath
             then single
-            else qualNameWithRoot (mcRootPath ctx) (mcPath ctx) single
+            else qualNameWithRoot ctx.mcRootPath ctx.mcPath single
         else
-          case Map.lookup single (mcItemAliases ctx) of
+          case Map.lookup single ctx.mcItemAliases of
             Just target ->
               case splitLast target of
                 Nothing -> single
-                Just (path, item) -> qualNameWithRoot (mcRootPath ctx) path item
+                Just (path, item) -> qualNameWithRoot ctx.mcRootPath path item
             Nothing -> single
     seg0 : segRest ->
-      case Map.lookup seg0 (mcModuleAliases ctx) of
+      case Map.lookup seg0 ctx.mcModuleAliases of
         Just target ->
           case splitLast (target <> segRest) of
             Nothing -> name
-            Just (path, item) -> qualNameWithRoot (mcRootPath ctx) path item
+            Just (path, item) -> qualNameWithRoot ctx.mcRootPath path item
         Nothing ->
           case splitLast (seg0 : segRest) of
             Nothing -> name
-            Just (path, item) -> qualNameWithRoot (mcRootPath ctx) path item
+            Just (path, item) -> qualNameWithRoot ctx.mcRootPath path item
 
 rewriteType :: ModuleContext -> Type -> Type
 rewriteType ctx ty =
@@ -3063,11 +3063,11 @@ rewriteType ctx ty =
 
 rewriteParamType :: ModuleContext -> Param -> Param
 rewriteParamType ctx param =
-  param { paramType = rewriteType ctx (paramType param) }
+  param { paramType = rewriteType ctx param.paramType }
 
 rewriteFieldDecl :: ModuleContext -> FieldDecl -> FieldDecl
 rewriteFieldDecl ctx field =
-  field { fdType = rewriteType ctx (fdType field) }
+  field { fdType = rewriteType ctx field.fdType }
 
 rewriteStmtNames :: ModuleContext -> Stmt -> Stmt
 rewriteStmtNames ctx stmt =
@@ -3104,8 +3104,8 @@ rewriteStmtNames ctx stmt =
     SReturn expr -> SReturn (fmap (rewriteExprNames ctx) expr)
   where
     rewriteCase sc =
-      sc { scSelectors = map (rewriteExprNames ctx) (scSelectors sc)
-         , scBody = map (rewriteStmtNames ctx) (scBody sc)
+      sc { scSelectors = map (rewriteExprNames ctx) sc.scSelectors
+         , scBody = map (rewriteStmtNames ctx) sc.scBody
          }
 
 rewriteLValueNames :: ModuleContext -> LValue -> LValue

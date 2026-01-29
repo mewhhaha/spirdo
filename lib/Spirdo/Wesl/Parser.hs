@@ -89,7 +89,7 @@ lexWesl = go (SrcPos 1 1)
               let sym = T.singleton c
               in (Token (TkSymbol sym) pos :) <$> go (advance pos c) cs
           | otherwise ->
-              Left (CompileError ("unexpected character: " <> [c]) (Just (spLine pos)) (Just (spCol pos)))
+              Left (CompileError ("unexpected character: " <> [c]) (Just pos.spLine) (Just pos.spCol))
 
     symbolChars :: String
     symbolChars = "@:{}();,<>=[]+-*/.%!&|^"
@@ -119,7 +119,7 @@ lexWesl = go (SrcPos 1 1)
     consumeBlockComment p cs =
       let goBlock pos' src' =
             case T.uncons src' of
-              Nothing -> Left (CompileError "unterminated block comment" (Just (spLine pos')) (Just (spCol pos')))
+              Nothing -> Left (CompileError "unterminated block comment" (Just pos'.spLine) (Just pos'.spCol))
               Just (x, rest0) ->
                 case T.uncons rest0 of
                   Just (y, rest)
@@ -153,12 +153,12 @@ lexWesl = go (SrcPos 1 1)
     consumeString p cs =
       let goStr acc pos' src' =
             case T.uncons src' of
-              Nothing -> Left (CompileError "unterminated string" (Just (spLine pos')) (Just (spCol pos')))
+              Nothing -> Left (CompileError "unterminated string" (Just pos'.spLine) (Just pos'.spCol))
               Just (x, xs)
                 | x == '"' -> Right (T.pack (reverse acc), xs, advance pos' x)
                 | x == '\\' ->
                     case T.uncons xs of
-                      Nothing -> Left (CompileError "unterminated escape" (Just (spLine pos')) (Just (spCol pos')))
+                      Nothing -> Left (CompileError "unterminated escape" (Just pos'.spLine) (Just pos'.spCol))
                       Just (e, rest) -> goStr (e : acc) (advance (advance pos' x) e) rest
                 | otherwise -> goStr (x : acc) (advance pos' x) xs
       in goStr [] (advance p '"') cs
@@ -512,7 +512,7 @@ parseImportPathOrItem toks = do
       (alias, rest1) <- parseImportAlias rest
       Right ([ImportItem [name] alias], rest1)
   where
-    prefix name items = [item { iiPath = name : iiPath item } | item <- items]
+    prefix name items = [item { iiPath = name : item.iiPath } | item <- items]
 
 parseImportAlias :: [Token] -> Either CompileError (Maybe Text, [Token])
 parseImportAlias toks =

@@ -37,9 +37,13 @@ import Spirdo.Wesl.Inputs
   , SamplerInput(..)
   , TextureInput(..)
   , StorageTextureInput(..)
-  , ShaderInputs(..)
+  , ShaderInputs
   , InputsBuilder
   , inputsFromPrepared
+  , inputsInterface
+  , inputsSamplers
+  , inputsStorageTextures
+  , inputsTextures
   , orderedUniforms
   )
 import qualified Spirdo.Wesl.Inputs as Inputs
@@ -269,13 +273,13 @@ countsFromPrepared prepared =
   let bindingPlan = preparedPlan prepared
       iface = preparedInterface prepared
       samplerBindings =
-        case siSamplerMode iface of
-          SamplerCombined -> bpTextures bindingPlan
-          SamplerSeparate -> bpSamplers bindingPlan
+        case iface.siSamplerMode of
+          SamplerCombined -> bindingPlan.bpTextures
+          SamplerSeparate -> bindingPlan.bpSamplers
       samplerCount = bindingCount samplerBindings
-      storageTextureCount = bindingCount (bpStorageTextures bindingPlan)
-      storageBufferCount = bindingCount (bpStorageBuffers bindingPlan)
-      uniformCount = bindingCount (bpUniforms bindingPlan)
+      storageTextureCount = bindingCount bindingPlan.bpStorageTextures
+      storageBufferCount = bindingCount bindingPlan.bpStorageBuffers
+      uniformCount = bindingCount bindingPlan.bpUniforms
   in ShaderCounts
       samplerCount
       storageTextureCount
@@ -284,28 +288,28 @@ countsFromPrepared prepared =
   where
     bindingCount :: [BindingInfo] -> Word32
     bindingCount [] = 0
-    bindingCount xs = maximum (map biBinding xs) + 1
+    bindingCount xs = maximum (map (.biBinding) xs) + 1
 
 bindingsFromInputs :: ShaderInputs iface -> [Binding]
 bindingsFromInputs inputs =
-  let iface = siInterface inputs
+  let iface = inputsInterface inputs
       uniforms =
-        [ fUniformBytes (uiBinding u) (uiBytes u)
+        [ fUniformBytes u.uiBinding u.uiBytes
         | u <- orderedUniforms inputs
         ]
       samplers =
-        case siSamplerMode iface of
+        case iface.siSamplerMode of
           SamplerCombined ->
             [ fSamplerWith (textureBinding t) (textureFromHandle (textureHandle t)) (samplerFromHandle (resolveSampler t))
-            | t <- siTextures inputs
+            | t <- inputsTextures inputs
             ]
           SamplerSeparate ->
             [ fSamplerWith (samplerBinding s) (textureFromHandle (TextureHandle (samplerTex s))) (samplerFromHandle (samplerHandle s))
-            | s <- siSamplers inputs
+            | s <- inputsSamplers inputs
             ]
       storage =
         [ fStorageTexture (storageTextureBinding t) (storageTextureFromHandle (storageTextureHandle t))
-        | t <- siStorageTextures inputs
+        | t <- inputsStorageTextures inputs
         ]
   in uniforms <> samplers <> storage
   where
@@ -313,11 +317,11 @@ bindingsFromInputs inputs =
       case textureSampler texInput of
         Just handle -> handle
         Nothing ->
-          case findSamplerForTexture (textureName texInput) (siSamplers inputs) of
+          case findSamplerForTexture (textureName texInput) (inputsSamplers inputs) of
             Just handle -> handle
             Nothing -> error ("missing sampler for texture: " <> textureName texInput)
     samplerTex (SamplerInput samplerName _ _ _) =
-      case findSamplerTexture samplerName (siTextures inputs) of
+      case findSamplerTexture samplerName (inputsTextures inputs) of
         Just tex -> unTexture tex
         Nothing -> 0
     unTexture (TextureInput _ _ _ textureHandle _) =

@@ -22,9 +22,11 @@ import Data.Word (Word32)
 
 -- Storage access/format
 
+-- | Access qualifier for storage buffers/textures.
 data StorageAccess = StorageRead | StorageWrite | StorageReadWrite
   deriving (Eq, Show, Read)
 
+-- | Storage texture format (subset of WGSL storage formats).
 data StorageFormat
   = FormatRgba8Unorm
   | FormatRgba8Snorm
@@ -69,9 +71,11 @@ data StorageFormat
 
 -- Runtime interface representation
 
+-- | Runtime scalar type.
 data Scalar = I32 | U32 | F16 | F32 | Bool
   deriving (Eq, Show, Read)
 
+-- | Parsed WGSL type for reflection and layout.
 data Type
   = TyScalar Scalar
   | TyVector Int Scalar
@@ -103,6 +107,7 @@ data Type
 
 -- Layout metadata
 
+-- | Struct field layout information.
 data FieldLayout = FieldLayout
   { flName :: !String
   , flOffset :: !Word32
@@ -111,6 +116,7 @@ data FieldLayout = FieldLayout
   , flSize :: !Word32
   } deriving (Eq, Show, Read)
 
+-- | Layout metadata used for uniform packing and reflection.
 data TypeLayout
   = TLScalar !Scalar !Word32 !Word32
   | TLVector !Int !Scalar !Word32 !Word32
@@ -140,6 +146,7 @@ data TypeLayout
   | TLPointer !Word32 !(Maybe StorageAccess) !TypeLayout
   deriving (Eq, Show, Read)
 
+-- | Alignment (bytes) for a layout. Returns 0 for non-uniform types.
 layoutAlign :: TypeLayout -> Word32
 layoutAlign tl = case tl of
   TLScalar _ a _ -> a
@@ -169,6 +176,7 @@ layoutAlign tl = case tl of
   TLStorageTexture3D _ _ -> 0
   TLAtomic _ -> 4
 
+-- | Size (bytes) for a layout. Returns 0 for non-uniform types.
 layoutSize :: TypeLayout -> Word32
 layoutSize tl = case tl of
   TLScalar _ _ s -> s
@@ -198,12 +206,14 @@ layoutSize tl = case tl of
   TLStorageTexture3D _ _ -> 0
   TLAtomic _ -> 4
 
+-- | Alignment/size for a scalar type.
 scalarLayout :: Scalar -> (Word32, Word32)
 scalarLayout s =
   case s of
     F16 -> (2, 2)
     _ -> (4, 4)
 
+-- | Alignment/size for a vector type.
 vectorLayout :: Scalar -> Int -> (Word32, Word32)
 vectorLayout scalar n =
   let elemAlign = case scalar of
@@ -216,12 +226,14 @@ vectorLayout scalar n =
       4 -> (elemAlign * 4, elemSize * 4)
       _ -> (elemAlign * 4, elemSize * 4)
 
+-- | Round @val@ up to the next multiple of @align@.
 roundUp :: Word32 -> Word32 -> Word32
 roundUp val align =
   if align == 0
     then val
     else ((val + align - 1) `div` align) * align
 
+-- | Layout metadata for a column-major matrix.
 matrixLayout :: Int -> Int -> Scalar -> TypeLayout
 matrixLayout cols rows scalar =
   let (a, sz) = vectorLayout scalar rows

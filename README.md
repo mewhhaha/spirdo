@@ -75,16 +75,7 @@ defaultCompileOptions
 ```
 
 Combined samplers are the default. If your backend expects **separate** sampler
-bindings, either set the option explicitly or add an inline pragma:
-
-```hs
-import Spirdo.Wesl (wesl)
-
-shader = [wesl|
-// spirdo:sampler=separate
-// WESL...
-|]
-```
+bindings, set the option explicitly via `weslWith` / `prepareWeslWith`.
 
 Set `cacheVerbose = True` to print basic timing output (cache read/write).
 Set `timingVerbose = True` to print per‑phase compiler timings (parse/validate/emit).
@@ -147,7 +138,7 @@ distinct at the type level.
 
 `inputsFromPrepared` uses the shader interface to order everything by
 `(group, binding, name)` and pack uniforms for you. The resulting `ShaderInputs`
-lists (`siUniforms`, `siSamplers`, `siTextures`, ...) are ready to hand off to your
+lists (`inputsUniforms`, `inputsSamplers`, `inputsTextures`, ...) are ready to hand off to your
 renderer.
 
 If you need deterministic uniform ordering (by group/binding/name), use
@@ -158,6 +149,39 @@ If you need deterministic uniform ordering (by group/binding/name), use
 `InputsBuilder` is parameterized by sampler mode (`'SamplerCombined` /
 `'SamplerSeparate`), but you almost never write it explicitly—the mode is
 inferred from the `PreparedShader` you pass to `inputsFromPrepared`.
+
+### Algebraic Laws & Invariants
+Spirdo keeps a small, explicit set of algebraic laws and runtime invariants.
+These are enforced either by types or by validation in `inputsFromPrepared` /
+`packUniform`:
+
+Algebraic laws
+- `InputsBuilder mode iface` is a **free monoid** over binding entries:
+  - `(<>)` is associative
+  - `mempty` is the identity
+- Builder order does **not** affect final submission order because inputs are
+  normalized by `(group, binding, name)` before use.
+
+Core invariants (validated)
+- `PreparedShader mode iface` always has a valid entry point (no‑stage shaders
+  fail during `prepareShader`).
+- Binding names are **unique** in a shader interface (duplicates are compile errors).
+- `inputsFromPrepared` fails on:
+  - missing binding names
+  - duplicate binding entries
+  - kind mismatches (e.g. sampler provided for a uniform)
+- Combined sampler mode:
+  - sampler bindings are **omitted** from the interface
+  - `sampledTexture` must provide a sampler for every texture
+- Uniform packing is **exact**:
+  - missing struct fields are errors
+  - extra struct fields are errors
+  - vector/matrix sizes must match layout expectations
+  - padding bytes are zeroed
+
+Refinement via types
+- `PreparedShader mode iface` ties the sampler mode to the shader at the type
+  level, preventing mixed‑mode input builders.
 
 Notes:
 - Record field names must match the WESL struct field names (extra or missing
@@ -220,14 +244,14 @@ let inputs =
 ### Sampler Modes
 Spirdo defaults to **combined samplers** (texture + sampler are bound together
 on the host). If your backend wants separate sampler slots, opt into
-`SamplerSeparate` via `CompileOptions` or the inline pragma shown earlier.
+`SamplerSeparate` via `CompileOptions`.
 
 ```hs
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 
-import Spirdo.Wesl (PreparedShader, SamplerBindingMode(..), wesl)
+import Spirdo.Wesl (PreparedShader, SamplerBindingMode(..), defaultCompileOptions, weslWith)
 import Spirdo.Wesl.Inputs
   ( InputsBuilder
   , SamplerHandle(..)
@@ -237,9 +261,10 @@ import Spirdo.Wesl.Inputs
   , uniform
   )
 
+let opts = defaultCompileOptions { samplerBindingMode = SamplerSeparate }
+
 shader :: PreparedShader 'SamplerSeparate iface
-shader = [wesl|
-// spirdo:sampler=separate
+shader = [weslWith opts|
 struct Params { time_res: vec4<f32>; };
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(0) var tex0: texture_2d<f32>;
@@ -266,8 +291,8 @@ In combined mode, **sampler bindings are not part of the interface type**, so
 you provide samplers via `sampledTexture`. If your backend expects sampler
 slots starting at 0, keep *texture* bindings contiguous for predictability.
 
-To opt into **separate** samplers for a shader, use:
-`samplerBindingMode = SamplerSeparate` or `// spirdo:sampler=separate`.
+To opt into **separate** samplers for a shader, set:
+`samplerBindingMode = SamplerSeparate`.
 
 ### Storage Buffers & Storage Textures (Builder)
 ```hs
@@ -343,12 +368,12 @@ submitInputs
   -> IO ()
 submitInputs inputs = do
   -- upload uniforms (each has name/group/binding + bytes)
-  mapM_ uploadUniform (siUniforms inputs)
+  mapM_ uploadUniform (inputsUniforms inputs)
   -- bind resources using your own handle types
-  mapM_ bindSampler (siSamplers inputs)
-  mapM_ bindTexture (siTextures inputs)
-  mapM_ bindStorageBuffer (siStorageBuffers inputs)
-  mapM_ bindStorageTexture (siStorageTextures inputs)
+  mapM_ bindSampler (inputsSamplers inputs)
+  mapM_ bindTexture (inputsTextures inputs)
+  mapM_ bindStorageBuffer (inputsStorageBuffers inputs)
+  mapM_ bindStorageTexture (inputsStorageTextures inputs)
 ```
 
 ### Runtime Compilation (Optional)
@@ -438,8 +463,8 @@ case uniformSlots si of
 ```
 
 Notes:
-- `inputsFromPrepared` already normalizes ordering; you can bind `siSamplers`,
-  `siTextures`, etc. directly in `(group, binding)` order.
+- `inputsFromPrepared` already normalizes ordering; you can bind `inputsSamplers`,
+  `inputsTextures`, etc. directly in `(group, binding)` order.
 - `SamplerHandle`/`TextureHandle` are *your* runtime IDs, not shader bindings.
 - If you’re using **Slop’s** Sprite/Shader2D override path, its ABI expects
   fragment uniforms in `@group(3)` and textures/samplers in `@group(2)`.
@@ -550,7 +575,8 @@ Everything else is internal.
 
 ### `Spirdo.Wesl` functions
 Compilation / preparation
-- `wesl` — Quasiquoter that compiles inline WESL at build time to `PreparedShader mode` (mode inferred from options/pragma).
+- `wesl` — Quasiquoter that compiles inline WESL at build time to `PreparedShader mode` (mode inferred from options).
+- `wesl` — Quasiquoter that compiles inline WESL at build time to `PreparedShader mode` (mode inferred from options).
 - `weslWith` — Same as `wesl`, but with explicit `CompileOptions` (features, cache, sampler mode).
 - `prepareWesl` — Compile inline WESL at runtime to `SomePreparedShader`.
 - `prepareWeslWith` — Runtime compile with explicit `CompileOptions`.
@@ -592,6 +618,9 @@ Input builder (host‑agnostic)
 - `emptyInputs` — Start from an empty `ShaderInputs` (rarely needed directly).
 - `orderedUniforms` — Uniforms sorted by `(group, binding, name)`.
 - `uniformSlots` — Compact `(group, binding, bytes)` view of uniforms.
+- `inputsInterface` — Access the reflected `ShaderInterface`.
+- `inputsUniforms`, `inputsSamplers`, `inputsTextures` — Access sorted inputs.
+- `inputsStorageBuffers`, `inputsStorageTextures` — Access storage inputs.
 
 InputsBuilder constructors
 - `uniform` — Add a uniform binding (uses `ToUniform`).

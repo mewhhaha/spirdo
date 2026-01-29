@@ -36,9 +36,7 @@ module Spirdo.Wesl
   , preparedStage
   , preparedPlan
   , preparedVertexAttributes
-  , UniformValue(..)
-  , ScalarValue(..)
-  , ToScalar(..)
+  , UniformValue
   , ToUniform(..)
   , uniform
   , packUniform
@@ -51,6 +49,8 @@ module Spirdo.Wesl
   , M2(..)
   , M3(..)
   , M4(..)
+  , M3x4(..)
+  , M4x3(..)
   , Half(..)
   , stageIO
   , stageInputs

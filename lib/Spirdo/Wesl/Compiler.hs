@@ -24,10 +24,10 @@ import Control.Monad.Trans.Except (ExceptT(..), runExceptT)
 import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Char (isSpace, ord, toLower)
-import Data.List (intercalate, isPrefixOf, tails)
+import Data.Char (isSpace, ord)
+import Data.List (intercalate, isPrefixOf)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word64)
@@ -69,22 +69,14 @@ withSamplerMode mode k =
 
 compileToCompiled :: CompileOptions -> CompileResult -> SomeCompiledShader
 compileToCompiled opts result =
-  withSamplerMode (samplerBindingMode opts) $ \(_ :: SamplerModeProxy mode) ->
+  withSamplerMode opts.samplerBindingMode $ \(_ :: SamplerModeProxy mode) ->
     SomeCompiledShader (CompiledShader @mode (crSpirv result) (crInterface result))
 
--- Public API
-
-compileWeslToSpirv :: String -> Either CompileError SomeCompiledShader
-compileWeslToSpirv = compileWeslToSpirvWith defaultCompileOptions
-
-compileWeslToSpirvWith :: CompileOptions -> String -> Either CompileError SomeCompiledShader
-compileWeslToSpirvWith opts src = do
-  result <- compileInlineResult opts False src
-  pure (compileToCompiled opts result)
-
+-- | Compile inline WESL to a prepared shader (runtime).
 prepareWesl :: String -> Either CompileError SomePreparedShader
 prepareWesl = prepareWeslWith defaultCompileOptions
 
+-- | Compile inline WESL with explicit options (runtime).
 prepareWeslWith :: CompileOptions -> String -> Either CompileError SomePreparedShader
 prepareWeslWith opts src = do
   result <- compileInlineResult opts False src
@@ -93,11 +85,7 @@ prepareWeslWith opts src = do
       prep <- toCompileError (prepareShader shader)
       pure (SomePreparedShader prep)
 
-compileWeslToSpirvWithDiagnostics :: CompileOptions -> String -> Either CompileError (SomeCompiledShader, [Diagnostic])
-compileWeslToSpirvWithDiagnostics opts src = do
-  result <- compileInlineResult opts True src
-  pure (compileToCompiled opts result, crDiagnostics result)
-
+-- | Compile inline WESL with diagnostics (runtime).
 prepareWeslWithDiagnostics :: CompileOptions -> String -> Either CompileError (SomePreparedShader, [Diagnostic])
 prepareWeslWithDiagnostics opts src = do
   result <- compileInlineResult opts True src
@@ -106,31 +94,11 @@ prepareWeslWithDiagnostics opts src = do
       prep <- toCompileError (prepareShader shader)
       pure (SomePreparedShader prep, crDiagnostics result)
 
-compileWeslToSpirvWithTimings :: CompileOptions -> String -> IO (Either CompileError SomeCompiledShader)
-compileWeslToSpirvWithTimings opts src = do
-  result <- compileInlineResultIO (opts { timingVerbose = True }) False src
-  pure (fmap (compileToCompiled opts) result)
-
-compileWeslToSpirvFile :: FilePath -> IO (Either CompileError SomeCompiledShader)
-compileWeslToSpirvFile = compileWeslToSpirvFileWith defaultCompileOptions
-
-compileWeslToSpirvFileWith :: CompileOptions -> FilePath -> IO (Either CompileError SomeCompiledShader)
-compileWeslToSpirvFileWith opts path = do
-  result <- compileFileResult opts False path
-  pure $ do
-    cr <- result
-    pure (compileToCompiled opts cr)
-
-compileWeslToSpirvFileWithDiagnostics :: CompileOptions -> FilePath -> IO (Either CompileError (SomeCompiledShader, [Diagnostic]))
-compileWeslToSpirvFileWithDiagnostics opts path = do
-  result <- compileFileResult opts True path
-  pure $ do
-    cr <- result
-    pure (compileToCompiled opts cr, crDiagnostics cr)
-
+-- | Compile a WESL file (imports supported).
 prepareWeslFile :: FilePath -> IO (Either CompileError SomePreparedShader)
 prepareWeslFile = prepareWeslFileWith defaultCompileOptions
 
+-- | Compile a WESL file with explicit options.
 prepareWeslFileWith :: CompileOptions -> FilePath -> IO (Either CompileError SomePreparedShader)
 prepareWeslFileWith opts path = do
   result <- compileFileResult opts False path
@@ -141,6 +109,7 @@ prepareWeslFileWith opts path = do
         prep <- toCompileError (prepareShader shader)
         pure (SomePreparedShader prep)
 
+-- | Compile a WESL file and return diagnostics.
 prepareWeslFileWithDiagnostics :: CompileOptions -> FilePath -> IO (Either CompileError (SomePreparedShader, [Diagnostic]))
 prepareWeslFileWithDiagnostics opts path = do
   result <- compileFileResult opts True path
@@ -151,30 +120,12 @@ prepareWeslFileWithDiagnostics opts path = do
         prep <- toCompileError (prepareShader shader)
         pure (SomePreparedShader prep, crDiagnostics cr)
 
-compileWeslToSpirvBytes :: String -> Either CompileError ByteString
-compileWeslToSpirvBytes src = compileWeslToSpirvBytesWith defaultCompileOptions src
-
-compileWeslToSpirvBytesWith :: CompileOptions -> String -> Either CompileError ByteString
-compileWeslToSpirvBytesWith opts src = do
-  result <- compileInlineResult opts False src
-  pure (crSpirv result)
-
-compileWeslToSpirvBytesWithDiagnostics :: CompileOptions -> String -> Either CompileError (ByteString, [Diagnostic])
-compileWeslToSpirvBytesWithDiagnostics opts src = do
-  result <- compileInlineResult opts True src
-  pure (crSpirv result, crDiagnostics result)
-
-compileWeslToSpirvBytesWithTimings :: CompileOptions -> String -> IO (Either CompileError ByteString)
-compileWeslToSpirvBytesWithTimings opts src = do
-  result <- compileInlineResultIO (opts { timingVerbose = True }) False src
-  pure (fmap crSpirv result)
-
 compileInlineResult :: CompileOptions -> Bool -> String -> Either CompileError CompileResult
 compileInlineResult opts wantDiagnostics src = do
-  moduleAst0 <- parseModuleWith (enabledFeatures opts) src
+  moduleAst0 <- parseModuleWith opts.enabledFeatures src
   moduleAst1 <- resolveTypeAliases moduleAst0
-  moduleAst <- lowerOverridesWith [] (overrideValuesText (overrideValues opts)) moduleAst1
-  when (not (null (modImports moduleAst))) $
+  moduleAst <- lowerOverridesWith [] (overrideValuesText opts.overrideValues) moduleAst1
+  when (not (null moduleAst.modImports)) $
     Left (CompileError "imports require file-based compilation" Nothing Nothing)
   let node = ModuleNode "<inline>" [] moduleAst []
   let constIndex = buildConstIndex [node]
@@ -197,7 +148,7 @@ compileInlineResult opts wantDiagnostics src = do
 
 compileInlineResultIO :: CompileOptions -> Bool -> String -> IO (Either CompileError CompileResult)
 compileInlineResultIO opts wantDiagnostics src = do
-  moduleAst0 <- timedPhase opts "parse" (evaluate (parseModuleWith (enabledFeatures opts) src))
+  moduleAst0 <- timedPhase opts "parse" (evaluate (parseModuleWith opts.enabledFeatures src))
   case moduleAst0 of
     Left err -> pure (Left err)
     Right ast0 -> do
@@ -205,11 +156,11 @@ compileInlineResultIO opts wantDiagnostics src = do
       case moduleAst1 of
         Left err -> pure (Left err)
         Right ast1 -> do
-          moduleAst2 <- timedPhase opts "overrides" (evaluate (lowerOverridesWith [] (overrideValuesText (overrideValues opts)) ast1))
+          moduleAst2 <- timedPhase opts "overrides" (evaluate (lowerOverridesWith [] (overrideValuesText opts.overrideValues) ast1))
           case moduleAst2 of
             Left err -> pure (Left err)
             Right moduleAst -> do
-              if not (null (modImports moduleAst))
+              if not (null moduleAst.modImports)
                 then pure (Left (CompileError "imports require file-based compilation" Nothing Nothing))
                 else do
                   let node = ModuleNode "<inline>" [] moduleAst []
@@ -251,13 +202,13 @@ compileFileResult opts wantDiagnostics path =
   runExceptT $ do
     filePath <- ExceptT (resolveInputPath path)
     src <- liftIO (timedPhase opts "read-file" (readFile filePath))
-    moduleAst0 <- ExceptT (timedPhase opts "parse" (evaluate (parseModuleWith (enabledFeatures opts) src)))
+    moduleAst0 <- ExceptT (timedPhase opts "parse" (evaluate (parseModuleWith opts.enabledFeatures src)))
     -- resolveImports performs module linking and validateModuleScopes for file-based builds.
     linked <- ExceptT (timedPhase opts "imports" (resolveImports opts (dropExtension filePath) moduleAst0))
     linked' <- ExceptT (timedPhase opts "type-aliases" (evaluate (resolveTypeAliases linked)))
     let rootDir = takeDirectory filePath
         rootPath = modulePathFromFile rootDir filePath
-    lowered <- ExceptT (timedPhase opts "overrides" (evaluate (lowerOverridesWith rootPath (overrideValuesText (overrideValues opts)) linked')))
+    lowered <- ExceptT (timedPhase opts "overrides" (evaluate (lowerOverridesWith rootPath (overrideValuesText opts.overrideValues) linked')))
     diags <-
       if wantDiagnostics
         then ExceptT (timedPhase opts "diagnostics" (evaluate (collectDiagnosticsMerged opts rootPath lowered)))
@@ -287,9 +238,9 @@ weslCacheKey opts src =
           [ weslCacheVersion
           , "v=" <> show (spirvVersion opts)
           , "features=" <> show (enabledFeatures opts)
-          , "overrides=" <> show (overrideValues opts)
-          , "spec=" <> show (overrideSpecMode opts)
-          , "samplerMode=" <> show (samplerBindingMode opts)
+          , "overrides=" <> show opts.overrideValues
+          , "spec=" <> show opts.overrideSpecMode
+          , "samplerMode=" <> show opts.samplerBindingMode
           , src
           ]
       bytes = BS.pack (map (fromIntegral . ord) keySrc)
@@ -343,9 +294,11 @@ writeWeslCache opts src bytes iface =
 
 -- Quasiquoter
 
+-- | Quasiquoter for inline WESL (compile-time).
 wesl :: QuasiQuoter
 wesl = weslWith defaultCompileOptions
 
+-- | Quasiquoter with explicit compile options.
 weslWith :: CompileOptions -> QuasiQuoter
 weslWith opts =
   QuasiQuoter
@@ -357,16 +310,17 @@ weslWith opts =
 
 weslExpWith :: CompileOptions -> String -> Q Exp
 weslExpWith opts src = do
-  let opts' = applyInlinePragmas opts src
-  cached <- TH.runIO (timed opts' "cache-read" (loadWeslCache opts' src))
+  cached <- TH.runIO (timed opts "cache-read" (loadWeslCache opts src))
   case cached of
-    Just (bytes, iface) -> emitPreparedExp opts' bytes iface
+    Just (bytes, iface) -> emitPreparedExp opts bytes iface
     Nothing ->
-      case compileWeslToSpirvWith opts' src of
+      case compileInlineResult opts False src of
         Left err -> fail (renderError err)
-        Right (SomeCompiledShader (CompiledShader bytes iface)) -> do
-          TH.runIO (timed opts' "cache-write" (writeWeslCache opts' src bytes iface))
-          emitPreparedExp opts' bytes iface
+        Right result -> do
+          let bytes = crSpirv result
+              iface = crInterface result
+          TH.runIO (timed opts "cache-write" (writeWeslCache opts src bytes iface))
+          emitPreparedExp opts bytes iface
   where
     emitPreparedExp opts'' bytes iface = do
       bytesExp <- bytesToExp bytes
@@ -375,7 +329,7 @@ weslExpWith opts src = do
         Left err -> fail ("wesl: " <> err)
         Right ty -> pure ty
       let modeTy =
-            case samplerBindingMode opts'' of
+            case opts''.samplerBindingMode of
               SamplerCombined -> TH.PromotedT 'SamplerCombined
               SamplerSeparate -> TH.PromotedT 'SamplerSeparate
       let compiledTy =
@@ -426,34 +380,10 @@ unsafePrepareInline shader =
     Left err -> error ("prepareShader: " <> err)
     Right prep -> prep
 
-applyInlinePragmas :: CompileOptions -> String -> CompileOptions
-applyInlinePragmas opts src =
-  case samplerDirective src of
-    Just "combined" -> opts { samplerBindingMode = SamplerCombined }
-    Just "separate" -> opts { samplerBindingMode = SamplerSeparate }
-    _ -> opts
-  where
-    samplerDirective text =
-      let ls = lines text
-          hit = listToMaybe [l | l <- ls, hasDirective l]
-      in hit >>= parseValue
-    key = "spirdo:sampler="
-    hasDirective line =
-      case extractDirective line of
-        Just _ -> True
-        Nothing -> False
-    extractDirective line =
-      listToMaybe [drop (length key) t | t <- tails line, key `isPrefixOf` t]
-    parseValue line =
-      case extractDirective line of
-        Nothing -> Nothing
-        Just rest ->
-          let trimmed = dropWhile isSpace rest
-              val = takeWhile (\c -> c /= ';' && not (isSpace c)) trimmed
-          in if null val then Nothing else Just (map toLower val)
 
 -- Package metadata
 
+-- | Minimal package metadata parsed from @wesl.toml@.
 data PackageInfo = PackageInfo
   { pkgName :: String
   , pkgVersion :: Maybe String
@@ -462,6 +392,7 @@ data PackageInfo = PackageInfo
   , pkgDependencies :: [PackageDependency]
   } deriving (Eq, Show)
 
+-- | Dependency entry from @wesl.toml@.
 data PackageDependency = PackageDependency
   { depName :: String
   , depVersion :: Maybe String
@@ -475,6 +406,7 @@ data TomlSection
   | TomlSectionDependency String
   deriving (Eq, Show)
 
+-- | Find and parse the nearest @wesl.toml@ above a file path.
 discoverPackageInfo :: FilePath -> IO (Maybe PackageInfo)
 discoverPackageInfo filePath = do
   let start = takeDirectory filePath

@@ -69,18 +69,18 @@ withPos pos result =
   case result of
     Left err ->
       let err' =
-            case (ceLine err, ceColumn err) of
-              (Nothing, Nothing) -> err { ceLine = Just (spLine pos), ceColumn = Just (spCol pos) }
+            case (err.ceLine, err.ceColumn) of
+              (Nothing, Nothing) -> err { ceLine = Just pos.spLine, ceColumn = Just pos.spCol }
               _ -> err
       in Left err'
     Right val -> Right val
 
 renderError :: CompileError -> String
 renderError err =
-  let loc = case (ceLine err, ceColumn err) of
+  let loc = case (err.ceLine, err.ceColumn) of
         (Just l, Just c) -> " at " <> show l <> ":" <> show c
         _ -> ""
-  in ceMessage err <> loc
+  in err.ceMessage <> loc
 
 textToString :: Text -> String
 textToString = T.unpack
