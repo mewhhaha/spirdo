@@ -307,11 +307,11 @@ emptyNameTable = NameTable 0 Map.empty
 
 internName :: Text -> NameTable -> (Int, NameTable)
 internName name table =
-  case Map.lookup name (ntMap table) of
+  case Map.lookup name table.ntMap of
     Just i -> (i, table)
     Nothing ->
-      let i = ntNext table
-          table' = table { ntNext = i + 1, ntMap = Map.insert name i (ntMap table) }
+      let i = table.ntNext
+          table' = table { ntNext = i + 1, ntMap = Map.insert name i table.ntMap }
       in (i, table')
 
 internNames :: NameTable -> [Text] -> (NameTable, [Int])
@@ -374,7 +374,7 @@ buildConstIndex nodes =
   in ConstIndex pt nt entries
   where
     addNode (pt, nt, acc) node =
-      let (pid, pt1) = internName (pathKey (mnPath node)) pt
+      let (pid, pt1) = internName (pathKey node.mnPath) pt
           (nt1, entryMap) = foldl' addEntry (nt, IntMap.empty) (constPairs node)
           merged = IntMap.union entryMap (IntMap.findWithDefault IntMap.empty pid acc)
       in (pt1, nt1, IntMap.insert pid merged acc)
@@ -389,9 +389,9 @@ buildConstIndex nodes =
 
 lookupConstIndex :: ConstIndex -> [Text] -> Text -> Maybe Expr
 lookupConstIndex idx path name = do
-  pid <- Map.lookup (pathKey path) (ntMap (ciPathTable idx))
-  nid <- Map.lookup name (ntMap (ciNameTable idx))
-  IntMap.lookup pid (ciEntries idx) >>= IntMap.lookup nid
+  pid <- Map.lookup (pathKey path) idx.ciPathTable.ntMap
+  nid <- Map.lookup name idx.ciNameTable.ntMap
+  IntMap.lookup pid idx.ciEntries >>= IntMap.lookup nid
 
 type OverrideIndex = Map.Map [Text] (Set.Set Text)
 
@@ -424,8 +424,8 @@ buildStructIndex nodes =
 
 lookupStructIndex :: StructIndex -> [Text] -> Text -> Maybe StructDecl
 lookupStructIndex idx path name = do
-  pid <- Map.lookup (pathKey path) (ntMap idx.siPathTable)
-  nid <- Map.lookup name (ntMap idx.siNameTable)
+  pid <- Map.lookup (pathKey path) idx.siPathTable.ntMap
+  nid <- Map.lookup name idx.siNameTable.ntMap
   IntMap.lookup pid idx.siEntries >>= IntMap.lookup nid
 
 data FunctionIndex = FunctionIndex
@@ -450,8 +450,8 @@ buildFunctionIndex nodes =
 
 lookupFunctionIndex :: FunctionIndex -> [Text] -> Text -> Maybe [FunctionDecl]
 lookupFunctionIndex idx path name = do
-  pid <- Map.lookup (pathKey path) (ntMap idx.fiPathTable)
-  nid <- Map.lookup name (ntMap idx.fiNameTable)
+  pid <- Map.lookup (pathKey path) idx.fiPathTable.ntMap
+  nid <- Map.lookup name idx.fiNameTable.ntMap
   IntMap.lookup pid idx.fiEntries >>= IntMap.lookup nid
 
 lowerOverridesWith :: [Text] -> [(Text, OverrideValue)] -> ModuleAst -> Either CompileError ModuleAst
@@ -620,12 +620,12 @@ resolveTypeAliases ast = do
       Right decl { sdFields = fields }
 
     expandBinding expand decl = do
-      ty <- expand (bdType decl)
+      ty <- expand decl.bdType
       Right decl { bdType = ty }
 
     expandGlobal expand decl = do
-      ty <- expand (gvType decl)
-      init' <- mapM (expandExpr expand) (gvInit decl)
+      ty <- expand decl.gvType
+      init' <- mapM (expandExpr expand) decl.gvInit
       Right decl { gvType = ty, gvInit = init' }
 
     expandConstAssert expand (ConstAssert pos expr) = do
@@ -633,12 +633,12 @@ resolveTypeAliases ast = do
       Right (ConstAssert pos expr')
 
     expandConst expand decl = do
-      expr <- expandExpr expand (cdExpr decl)
+      expr <- expandExpr expand decl.cdExpr
       Right decl { cdExpr = expr }
 
     expandOverride expand decl = do
-      ty <- expand (odType decl)
-      expr <- mapM (expandExpr expand) (odExpr decl)
+      ty <- expand decl.odType
+      expr <- mapM (expandExpr expand) decl.odExpr
       Right decl { odType = ty, odExpr = expr }
 
     expandFunction expand decl = do
@@ -969,7 +969,7 @@ collectUnusedParameterDiagnostics diagConfig ast =
           <> maybe [] (unusedParamsInEntry mkDiag) (ast.modEntry)
   where
     unusedParamsInFunction mkDiag fn =
-      let params = map paramName fn.fnParams
+      let params = map (.paramName) fn.fnParams
           (nt1, paramPairs) = internNamePairs emptyNameTable params
           (_, usedIds) = internNameSet nt1 (collectUsesInStmts fn.fnBody)
           unused =
@@ -980,7 +980,7 @@ collectUnusedParameterDiagnostics diagConfig ast =
             ]
       in map mkDiag unused
     unusedParamsInEntry mkDiag entry =
-      let params = map paramName entry.epParams
+      let params = map (.paramName) entry.epParams
           (nt1, paramPairs) = internNamePairs emptyNameTable params
           (_, usedIds) = internNameSet nt1 (collectUsesInStmts entry.epBody)
           unused =
@@ -1003,11 +1003,11 @@ collectShadowingDiagnostics diagConfig ast =
           <> maybe [] (shadowingInEntry mkDiag) (ast.modEntry)
   where
     shadowingInFunction mkDiag fn =
-      let params = map paramName fn.fnParams
+      let params = map (.paramName) fn.fnParams
           (nt1, paramIds) = internNames emptyNameTable params
       in shadowingInStmts mkDiag nt1 [IntSet.empty, IntSet.fromList paramIds] fn.fnBody
     shadowingInEntry mkDiag entry =
-      let params = map paramName entry.epParams
+      let params = map (.paramName) entry.epParams
           (nt1, paramIds) = internNames emptyNameTable params
       in shadowingInStmts mkDiag nt1 [IntSet.empty, IntSet.fromList paramIds] entry.epBody
 
@@ -1238,33 +1238,33 @@ validateStruct ctx scope decl =
   mapM_ (validateType ctx scope . (.fdType)) decl.sdFields
 
 validateBinding :: ModuleContext -> Scope -> BindingDecl -> Either CompileError ()
-validateBinding ctx scope decl = validateType ctx scope (bdType decl)
+validateBinding ctx scope decl = validateType ctx scope decl.bdType
 
 validateGlobalVar :: ModuleContext -> Scope -> GlobalVarDecl -> Either CompileError ()
 validateGlobalVar ctx scope decl = do
-  validateType ctx scope (gvType decl)
-  mapM_ (validateExpr ctx scope) (gvInit decl)
-  case gvType decl of
+  validateType ctx scope decl.gvType
+  mapM_ (validateExpr ctx scope) decl.gvInit
+  case decl.gvType of
     TyPtr {} -> Left (CompileError "global pointer types are not supported" Nothing Nothing)
     _ -> Right ()
-  case gvSpace decl of
+  case decl.gvSpace of
     "private" -> Right ()
     "workgroup" ->
-      case gvInit decl of
+      case decl.gvInit of
         Nothing -> Right ()
         Just _ -> Left (CompileError "workgroup variables cannot have initializers" Nothing Nothing)
-    _ -> Left (CompileError ("unsupported global address space: " <> textToString (gvSpace decl)) Nothing Nothing)
+    _ -> Left (CompileError ("unsupported global address space: " <> textToString decl.gvSpace) Nothing Nothing)
 
 validateConst :: ModuleContext -> Scope -> ConstDecl -> Either CompileError ()
-validateConst ctx scope decl = validateExpr ctx scope (cdExpr decl) >> Right ()
+validateConst ctx scope decl = validateExpr ctx scope decl.cdExpr >> Right ()
 
 validateAlias :: ModuleContext -> Scope -> AliasDecl -> Either CompileError ()
-validateAlias ctx scope decl = validateType ctx scope (adType decl)
+validateAlias ctx scope decl = validateType ctx scope decl.adType
 
 validateOverride :: ModuleContext -> Scope -> OverrideIndex -> OverrideDecl -> Either CompileError ()
 validateOverride ctx scope _overrideIndex decl = do
-  validateType ctx scope (odType decl)
-  case odExpr decl of
+  validateType ctx scope decl.odType
+  case decl.odExpr of
     Nothing -> Right ()
     Just expr -> do
       validateExpr ctx scope expr
@@ -1288,7 +1288,7 @@ validateFunction :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex 
 validateFunction ctx constIndex fnIndex structIndex skipConstEval scope fn = do
   mapM_ (validateType ctx scope . (.paramType)) fn.fnParams
   mapM_ (validateType ctx scope) (maybeToList fn.fnReturnType)
-  let paramNames = map paramName fn.fnParams
+  let paramNames = map (.paramName) fn.fnParams
   ensureNoDuplicates "function parameters" paramNames
   let scope1 = scopeWithParams scope paramNames
   validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 fn.fnBody
@@ -1297,7 +1297,7 @@ validateEntryPoint :: ModuleContext -> ConstIndex -> FunctionIndex -> StructInde
 validateEntryPoint ctx constIndex fnIndex structIndex skipConstEval scope entry = do
   mapM_ (validateType ctx scope . (.paramType)) entry.epParams
   mapM_ (validateType ctx scope) (maybeToList entry.epReturnType)
-  let paramNames = map paramName entry.epParams
+  let paramNames = map (.paramName) entry.epParams
   ensureNoDuplicates "entry point parameters" paramNames
   let scope1 = scopeWithParams scope paramNames
   validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 entry.epBody
@@ -1355,7 +1355,7 @@ validateStmt ctx constIndex fnIndex structIndex skipConstEval scope stmt =
     SContinue -> Right scope
     SDiscard -> Right scope
     SFallthrough ->
-      if scAllowFallthrough scope
+      if scope.scAllowFallthrough
         then Right scope
         else Left (CompileError "fallthrough is only allowed in switch cases" Nothing Nothing)
     SReturn mexpr -> mapM_ (validateExpr ctx scope) mexpr >> Right scope
@@ -1556,7 +1556,7 @@ coerceConstValueToType ctx structIndex target val =
       case val of
         CVStruct structName pairs | structName == name -> do
           decl <- resolveStructDecl ctx structIndex name
-          fields' <- mapM (coerceField pairs) (sdFields decl)
+          fields' <- mapM (coerceField pairs) decl.sdFields
           Right (CVStruct name fields')
         _ -> Left (CompileError "struct constant does not match type" Nothing Nothing)
     TyPtr space access elemTy ->
@@ -1572,11 +1572,11 @@ coerceConstValueToType ctx structIndex target val =
     _ -> Left (CompileError "unsupported const type" Nothing Nothing)
   where
     coerceField pairs field = do
-      val' <- case lookup (fdName field) pairs of
+      val' <- case lookup field.fdName pairs of
         Just v -> Right v
-        Nothing -> Left (CompileError ("missing field: " <> textToString (fdName field)) Nothing Nothing)
+        Nothing -> Left (CompileError ("missing field: " <> textToString field.fdName) Nothing Nothing)
       coerced <- coerceConstValueToType ctx structIndex field.fdType val'
-      Right (fdName field, coerced)
+      Right (field.fdName, coerced)
 
 resolveStructDecl :: ModuleContext -> StructIndex -> Text -> Either CompileError StructDecl
 resolveStructDecl ctx structIndex name =
@@ -1619,7 +1619,7 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns 
           derefConstPointer seen fnSeen ptr
         EVar name ->
           case Map.lookup name env of
-            Just envBinding -> Right (cbValue envBinding)
+            Just envBinding -> Right envBinding.cbValue
             Nothing -> do
               (path, ident) <- resolveConstRef ctx name
               let key = T.intercalate "::" (path <> [ident])
@@ -1751,7 +1751,7 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns 
       when (length args /= length fields) $
         Left (CompileError ("struct constructor arity mismatch for " <> textToString name) Nothing Nothing)
       vals <- mapM (go seen fnSeen) args
-      let pairs = zip (map fdName fields) vals
+      let pairs = zip (map (.fdName) fields) vals
       Right (CVStruct name pairs)
 
     evalConstAddressOf seen fnSeen inner =
@@ -1794,7 +1794,7 @@ evalConstFunctionValueWithEnv ctx constIndex fnIndex structIndex env seenConsts 
     CCNone -> Left (CompileError "const function must return a value" Nothing Nothing)
     CCBreak -> Left (CompileError "break used outside of a loop" Nothing Nothing)
     CCContinue -> Left (CompileError "continue used outside of a loop" Nothing Nothing)
-  case fnReturnType decl of
+  case decl.fnReturnType of
     Just ty -> coerceConstValueToType ctx structIndex ty val
     Nothing -> Left (CompileError "const function must declare a return type" Nothing Nothing)
 
@@ -1810,12 +1810,12 @@ evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seenConsts seen
   argVals <- mapM (evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns) args
   let seenFns' = Set.insert key seenFns
   let attempt decl = do
-        let params = fnParams decl
+        let params = decl.fnParams
         when (length params /= length argVals) $
           Left (CompileError "const function overload not found" Nothing Nothing)
         coercedArgs <- zipWithM (coerceConstValueToType ctx structIndex . (.paramType)) params argVals
         let bindings = [ConstBinding val False | val <- coercedArgs]
-        let env' = Map.fromList (zip (map paramName params) bindings)
+        let env' = Map.fromList (zip (map (.paramName) params) bindings)
         evalConstFunctionValueWithEnv ctx constIndex fnIndex structIndex env' seenConsts seenFns' decl
   let (errs, results) = partitionEithers (map attempt decls)
   case results of
@@ -2006,7 +2006,7 @@ evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv 
   case lv of
     LVVar name ->
       case Map.lookup name env of
-        Just envBinding -> Right (cbValue envBinding)
+        Just envBinding -> Right envBinding.cbValue
         Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
     LVField base field -> do
       baseVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns base
@@ -2028,7 +2028,7 @@ evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv 
         case Map.lookup name env of
           Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
           Just envBinding ->
-            if cbMutable envBinding
+            if envBinding.cbMutable
               then Right (Map.insert name envBinding { cbValue = newVal } env)
               else Left (CompileError "cannot assign to immutable let binding" Nothing Nothing)
     LVField base field -> do
@@ -2284,7 +2284,7 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFn
         EVar name ->
           case Map.lookup name env of
             Just envBinding ->
-              case cbValue envBinding of
+              case envBinding.cbValue of
                 CVInt v -> Right v
                 CVBool _ -> Left (CompileError "const int expression references a bool value" Nothing Nothing)
                 CVFloat _ -> Left (CompileError "const int expression references a float value" Nothing Nothing)
@@ -2392,7 +2392,7 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seen
           Right (ConstFloat F32 (fromIntegral val))
         EUnary OpNeg inner -> do
           cf <- go seen fnSeen inner
-          Right (applyFloatOp (cfScalar cf) negate (cfValue cf))
+          Right (applyFloatOp cf.cfScalar negate cf.cfValue)
         EUnary OpDeref inner -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen (EUnary OpDeref inner)
           constValueToFloat val
@@ -2404,7 +2404,7 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seen
           Right (convertConstFloatTo F16 cf)
         ECall "abs" [arg] -> do
           cf <- evalFloatArg seen fnSeen arg
-          Right (applyFloatOp (cfScalar cf) abs (cfValue cf))
+          Right (applyFloatOp cf.cfScalar abs cf.cfValue)
         ECall "min" [a, b] -> do
           cfA <- evalFloatArg seen fnSeen a
           cfB <- evalFloatArg seen fnSeen b
@@ -2420,14 +2420,14 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seen
           cfLo <- evalFloatArg seen fnSeen loExpr
           cfHi <- evalFloatArg seen fnSeen hiExpr
           let (scalar1, x, lo) = coerceFloatPair cfX cfLo
-          let hi = cfValue (convertConstFloatTo scalar1 cfHi)
+          let hi = (convertConstFloatTo scalar1 cfHi).cfValue
           Right (applyFloatOp scalar1 (\v -> v) (min (max x lo) hi))
         ECall "mix" [aExpr, bExpr, tExpr] -> do
           cfA <- evalFloatArg seen fnSeen aExpr
           cfB <- evalFloatArg seen fnSeen bExpr
           cfT <- evalFloatArg seen fnSeen tExpr
           let (scalar1, a, b) = coerceFloatPair cfA cfB
-          let t = cfValue (convertConstFloatTo scalar1 cfT)
+          let t = (convertConstFloatTo scalar1 cfT).cfValue
           Right (applyFloatOp scalar1 (\v -> v) (a * (1.0 - t) + b * t))
         ECall "select" [aExpr, bExpr, condExpr] -> do
           cond <- evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen condExpr
@@ -2454,7 +2454,7 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seen
         EVar name ->
           case Map.lookup name env of
             Just envBinding ->
-              case cbValue envBinding of
+              case envBinding.cbValue of
                 CVFloat v -> Right v
                 CVInt (ConstInt _ v) -> Right (ConstFloat F32 (fromIntegral v))
                 CVBool _ -> Left (CompileError "const float expression references a bool value" Nothing Nothing)
@@ -2481,10 +2481,10 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seen
       Right cf
 
     coerceFloatPair a b =
-      let scalar = if cfScalar a == F32 || cfScalar b == F32 then F32 else F16
+      let scalar = if a.cfScalar == F32 || b.cfScalar == F32 then F32 else F16
           a' = convertConstFloatTo scalar a
           b' = convertConstFloatTo scalar b
-      in (scalar, cfValue a', cfValue b')
+      in (scalar, a'.cfValue, b'.cfValue)
 
     applyFloatOp scalar f v =
       let v' = f v
@@ -2524,7 +2524,7 @@ evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenF
         EVar name ->
           case Map.lookup name env of
             Just envBinding ->
-              case cbValue envBinding of
+              case envBinding.cbValue of
                 CVBool b -> Right b
                 CVInt _ -> Left (CompileError "const bool expression references an int value" Nothing Nothing)
                 CVFloat _ -> Left (CompileError "const bool expression references a float value" Nothing Nothing)
@@ -2693,7 +2693,7 @@ validateType ctx scope ty =
   case ty of
     TyStructRef name ->
       case lookupNameId scope name of
-        Just sid | IntSet.member sid (scTypeAliases scope) -> Right ()
+        Just sid | IntSet.member sid scope.scTypeAliases -> Right ()
         _ -> validateName ctx scope name
     TyArray elemTy _ -> validateType ctx scope elemTy
     TyVector _ _ -> Right ()
@@ -2732,39 +2732,39 @@ validateName _ scope name =
           case lookupNameId scope single of
             Just sid
               | IntSet.member sid (scopeLocals scope)
-                  || IntSet.member sid (scGlobals scope)
-                  || IntSet.member sid (scItemAliases scope) -> Right ()
+                  || IntSet.member sid scope.scGlobals
+                  || IntSet.member sid scope.scItemAliases -> Right ()
             _ -> Left (CompileError ("unknown identifier: " <> textToString single) Nothing Nothing)
     seg0 : _ ->
       case lookupNameId scope seg0 of
-        Just sid | IntSet.member sid (scModuleAliases scope) -> Right ()
+        Just sid | IntSet.member sid scope.scModuleAliases -> Right ()
         _ -> Left (CompileError ("unknown module alias: " <> textToString seg0) Nothing Nothing)
 
 lookupNameId :: Scope -> Text -> Maybe Int
-lookupNameId scope name = Map.lookup name (ntMap (scNameTable scope))
+lookupNameId scope name = Map.lookup name scope.scNameTable.ntMap
 
 scopeLocals :: Scope -> IntSet.IntSet
-scopeLocals scope = foldl' IntSet.union IntSet.empty (scScopes scope)
+scopeLocals scope = foldl' IntSet.union IntSet.empty scope.scScopes
 
 currentScope :: Scope -> IntSet.IntSet
 currentScope scope =
-  case scScopes scope of
+  case scope.scScopes of
     [] -> IntSet.empty
     s : _ -> s
 
 scopeAdd :: Scope -> Text -> Either CompileError Scope
 scopeAdd scope name =
-  let (nameId, table') = internName name (scNameTable scope)
+  let (nameId, table') = internName name scope.scNameTable
       scope' = scope { scNameTable = table' }
   in if IntSet.member nameId (currentScope scope')
       then Left (CompileError ("duplicate local declaration: " <> textToString name) Nothing Nothing)
       else
-        if not (scAllowShadowing scope')
+        if not scope'.scAllowShadowing
           && not (T.isPrefixOf "_" name)
           && IntSet.member nameId (scopeOuterLocals scope')
           then Left (CompileError ("shadowing is not allowed: " <> textToString name) Nothing Nothing)
           else
-            case scScopes scope' of
+            case scope'.scScopes of
               [] ->
                 Right scope' { scScopes = [IntSet.singleton nameId] }
               current : rest ->
@@ -2772,16 +2772,16 @@ scopeAdd scope name =
 
 scopeOuterLocals :: Scope -> IntSet.IntSet
 scopeOuterLocals scope =
-  case scScopes scope of
+  case scope.scScopes of
     [] -> IntSet.empty
     _ : rest -> foldl' IntSet.union IntSet.empty rest
 
 enterBlock :: Scope -> Scope
-enterBlock scope = scope { scScopes = IntSet.empty : scScopes scope }
+enterBlock scope = scope { scScopes = IntSet.empty : scope.scScopes }
 
 scopeWithParams :: Scope -> [Text] -> Scope
 scopeWithParams scope names =
-  let (table', ids) = internNames (scNameTable scope) names
+  let (table', ids) = internNames scope.scNameTable names
   in scope { scNameTable = table', scScopes = [IntSet.fromList ids] }
 
 ensureNoDuplicates :: Text -> [Text] -> Either CompileError ()

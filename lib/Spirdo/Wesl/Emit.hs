@@ -20,6 +20,8 @@ import Control.Monad (foldM, zipWithM_, when)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSC
+import qualified Data.ByteString.Internal as BSI
 import Data.Foldable (foldrM)
 import Data.Int (Int32)
 import Data.List (intercalate, mapAccumL)
@@ -36,22 +38,24 @@ import Spirdo.Wesl.Syntax
 import Spirdo.Wesl.Typecheck
 import Spirdo.Wesl.Types
 import Spirdo.Wesl.Util
+import Text.Read (readMaybe)
+import System.IO.Unsafe (unsafeDupablePerformIO)
 
 -- Interface and layout
 
 buildInterface :: CompileOptions -> ModuleAst -> Either CompileError ShaderInterface
 buildInterface opts modAst = do
-  let structEnv = [(sdName s, s) | s <- modAst.modStructs]
+  let structEnv = [(s.sdName, s) | s <- modAst.modStructs]
   structLayouts <- resolveStructLayouts structEnv
   bindings0 <- mapM (layoutBinding structLayouts) (modAst.modBindings)
   let bindings =
-        case samplerBindingMode opts of
+        case opts.samplerBindingMode of
           SamplerCombined -> filter (not . isSamplerKind . (.biKind)) bindings0
           SamplerSeparate -> bindings0
   checkBindingInvariants bindings
-  overrides <- buildOverrideInfo (overrideSpecMode opts) structLayouts (modAst.modOverrides)
+  overrides <- buildOverrideInfo opts.overrideSpecMode structLayouts (modAst.modOverrides)
   stageInfo <- buildStageIO structLayouts structEnv (modAst.modEntry)
-  pure (ShaderInterface bindings overrides stageInfo Nothing (samplerBindingMode opts))
+  pure (ShaderInterface bindings overrides stageInfo Nothing opts.samplerBindingMode)
 
 checkBindingInvariants :: [BindingInfo] -> Either CompileError ()
 checkBindingInvariants bindings = do
@@ -75,7 +79,7 @@ buildStageIO layoutCache structEnv (Just entry) = do
   inputs <- collectStageInputs layoutCache structEnv entry
   outputs <- collectStageOutputs layoutCache structEnv entry
   let stage = toShaderStage (entry.epStage)
-  let wgSize = epWorkgroupSize entry
+  let wgSize = entry.epWorkgroupSize
   pure (Just (StageIO stage wgSize inputs outputs))
 
 toShaderStage :: Stage -> ShaderStage
@@ -91,18 +95,18 @@ collectStageInputs layoutCache structEnv entry =
 
 paramInputs :: StructLayoutCache -> [(Text, StructDecl)] -> Param -> Either CompileError [IOParam]
 paramInputs layoutCache structEnv param =
-  case paramType param of
+  case param.paramType of
     TyStructRef structName -> do
       structDecl <- lookupStruct structEnv structName
-      mapM (fieldInput (paramName param) structName) (structDecl.sdFields)
+      mapM (fieldInput param.paramName structName) structDecl.sdFields
     ty -> do
       layout <- resolveTypeLayoutWithCache layoutCache ty
-      fmap pure (mkIOParam (textToString (paramName param)) (paramAttrs param) layout)
+      fmap pure (mkIOParam (textToString param.paramName) param.paramAttrs layout)
   where
     fieldInput parentName structName field = do
-      layout <- resolveTypeLayoutWithCache layoutCache (fdType field)
-      let label = qualifyField parentName structName (fdName field)
-      mkIOParam label (fdAttrs field) layout
+      layout <- resolveTypeLayoutWithCache layoutCache field.fdType
+      let label = qualifyField parentName structName field.fdName
+      mkIOParam label field.fdAttrs layout
 
 collectStageOutputs :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> Either CompileError [IOParam]
 collectStageOutputs layoutCache structEnv entry =
@@ -118,17 +122,17 @@ collectStageOutputs layoutCache structEnv entry =
               mapM (fieldOutput structName) (structDecl.sdFields)
             _ -> do
               layout <- resolveTypeLayoutWithCache layoutCache ty
-              let builtin = epReturnBuiltin entry
+              let builtin = entry.epReturnBuiltin
               let loc =
-                    if isNothing builtin && isNothing (epReturnLocation entry) && entry.epStage == StageFragment
+                    if isNothing builtin && isNothing entry.epReturnLocation && entry.epStage == StageFragment
                       then Just 0
-                      else epReturnLocation entry
+                      else entry.epReturnLocation
               fmap pure (mkReturnIOParam layout loc builtin)
   where
     fieldOutput structName field = do
-      layout <- resolveTypeLayoutWithCache layoutCache (fdType field)
-      let label = qualifyField structName structName (fdName field)
-      mkIOParam label (fdAttrs field) layout
+      layout <- resolveTypeLayoutWithCache layoutCache field.fdType
+      let label = qualifyField structName structName field.fdName
+      mkIOParam label field.fdAttrs layout
 
 lookupStruct :: [(Text, StructDecl)] -> Text -> Either CompileError StructDecl
 lookupStruct structEnv structName =
@@ -274,7 +278,7 @@ topoSortOverrides order depsMap = go Set.empty Set.empty [] order
 
 layoutBinding :: StructLayoutCache -> BindingDecl -> Either CompileError BindingInfo
 layoutBinding layoutCache decl = do
-  case bdKind decl of
+  case decl.bdKind of
     BUniform -> ensureStructBinding
     BStorageRead -> ensureStructBinding
     BStorageReadWrite -> ensureStructBinding
@@ -357,7 +361,7 @@ layoutBinding layoutCache decl = do
   tyLayout <- resolveTypeLayoutWithCache layoutCache (decl.bdType)
   when (containsPointer tyLayout) $
     Left (CompileError "bindings cannot contain pointer types" Nothing Nothing)
-  case bdKind decl of
+  case decl.bdKind of
     BUniform ->
       if containsAtomic tyLayout
         then Left (CompileError "uniform bindings cannot contain atomic types" Nothing Nothing)
@@ -365,7 +369,7 @@ layoutBinding layoutCache decl = do
           then Left (CompileError "uniform bindings cannot contain runtime arrays" Nothing Nothing)
           else pure ()
     _ -> pure ()
-  pure (BindingInfo (textToString (bdName decl)) (bdKind decl) (bdGroup decl) (bdBinding decl) tyLayout)
+  pure (BindingInfo (textToString decl.bdName) decl.bdKind decl.bdGroup decl.bdBinding tyLayout)
   where
     ensureStructBinding =
       case decl.bdType of
@@ -683,7 +687,7 @@ emitSpirv opts modAst iface = do
     Nothing -> Left (CompileError "missing entry point" Nothing Nothing)
     Just e -> Right e
   validateEntry entry
-  let structEnv = [(sdName s, s) | s <- modAst.modStructs]
+  let structEnv = [(s.sdName, s) | s <- modAst.modStructs]
   structLayoutsMap <- resolveStructLayouts structEnv
   let structLayouts = Map.toList structLayoutsMap
   samplerLayouts <- collectSamplerLayouts structLayoutsMap (modAst.modBindings)
@@ -694,14 +698,14 @@ emitSpirv opts modAst iface = do
     (StageVertex, Nothing) -> Left (CompileError "vertex entry point missing return type" Nothing Nothing)
     _ -> Right Nothing
   let blockStructs = [T.pack name | BindingInfo _ _ _ _ (TLStruct name _ _ _) <- iface.siBindings]
-  let state0 = emptyGenState (samplerBindingMode opts) (entry.epStage) structLayouts blockStructs samplerLayouts
+  let state0 = emptyGenState opts.samplerBindingMode entry.epStage structLayouts blockStructs samplerLayouts
   let ((), state1) = emitStructs state0
   let node = ModuleNode "<merged>" [] modAst []
   let constIndex = buildConstIndex [node]
   let fnIndex = buildFunctionIndex [node]
   let structIndex = buildStructIndex [node]
   let ctx = buildModuleContext [] "" node
-  state2 <- emitModuleOverrides ctx constIndex fnIndex structIndex (overrideSpecMode opts) structLayoutsMap structEnv (modAst.modOverrides) state1
+  state2 <- emitModuleOverrides ctx constIndex fnIndex structIndex opts.overrideSpecMode structLayoutsMap structEnv (modAst.modOverrides) state1
   state3 <- emitModuleConstants (modAst.modConsts) state2
   (envGlobals, entryInits, _ifaceIds, outTargets, state4) <- emitGlobals structLayoutsMap structEnv iface entry retLayout (modAst.modGlobals) state3
   state5 <- registerFunctions structLayoutsMap (modAst.modFunctions) state4
@@ -716,25 +720,25 @@ emitModuleOverrides ctx constIndex fnIndex structIndex specMode layoutCache stru
     [] -> Right st0
     _ -> do
       specIds <- assignOverrideSpecIds decls
-      let declMap = Map.fromList [(odName d, d) | d <- decls]
+      let declMap = Map.fromList [(d.odName, d) | d <- decls]
       let depsMap = overrideDependencies decls
-      order <- topoSortOverrides (map odName decls) depsMap
+      order <- topoSortOverrides (map (.odName) decls) depsMap
       foldM (emitOne specIds depsMap) st0 (map (\n -> declMap Map.! n) order)
   where
     emitOne specIds depsMap st decl = do
-      layout <- resolveTypeLayoutWithCache layoutCache (odType decl)
-      let deps = Map.findWithDefault Set.empty (odName decl) depsMap
+      layout <- resolveTypeLayoutWithCache layoutCache decl.odType
+      let deps = Map.findWithDefault Set.empty decl.odName depsMap
       (st2, val) <- case decl.odExpr of
         Just expr ->
           case emitSpecConstExpr ctx constIndex fnIndex structIndex st expr of
               Right (st1, val0) -> do
                 (st2', val1) <-
-                  if valType val0 == layout
+                  if val0.valType == layout
                     then Right (st1, val0)
                     else coerceSpecConstValueToLayout layout val0 st1
                 if Set.null deps
                   then
-                    if isSpecConstantLiteral (valId val1) st2'
+                    if isSpecConstantLiteral val1.valId st2'
                       then Right (st2', val1)
                       else fallbackLiteral layout expr st
                   else Right (st2', val1)
@@ -749,18 +753,18 @@ emitModuleOverrides ctx constIndex fnIndex structIndex specMode layoutCache stru
                           err.ceColumn
                       )
         Nothing -> do
-          defaultVal <- defaultConstValueForType structEnv (odType decl)
+          defaultVal <- defaultConstValueForType structEnv decl.odType
           emitSpecConstValueToLayout layout defaultVal st
       st3 <-
         if specMode == SpecParity || Set.null deps
           then do
-            specId <- case Map.lookup (odName decl) specIds of
+            specId <- case Map.lookup decl.odName specIds of
               Nothing -> Left (CompileError "missing specialization id for override" Nothing Nothing)
               Just i -> Right i
-            Right (addDecoration (Instr opDecorate [valId val, decorationSpecId, specId]) st2)
+            Right (addDecoration (Instr opDecorate [val.valId, decorationSpecId, specId]) st2)
           else Right st2
-      let st4 = addName (Instr opName (valId val : encodeString (textToString (odName decl)))) st3
-      let st5 = st4 { gsConstValues = (odName decl, val) : gsConstValues st4 }
+      let st4 = addName (Instr opName (val.valId : encodeString (textToString decl.odName))) st3
+      let st5 = st4 { gsConstValues = (decl.odName, val) : st4.gsConstValues }
       Right st5
 
     fallbackLiteral layout expr st = do
@@ -796,18 +800,18 @@ defaultConstValueForType structEnv ty =
     _ -> Left (CompileError "override defaults are only supported for scalar, vector, matrix, array, and struct types" Nothing Nothing)
   where
     fieldDefault fld = do
-      val <- defaultConstValueForType structEnv (fdType fld)
-      Right (fdName fld, val)
+      val <- defaultConstValueForType structEnv fld.fdType
+      Right (fld.fdName, val)
 
 emitModuleConstants :: [ConstDecl] -> GenState -> Either CompileError GenState
 emitModuleConstants decls st0 = foldM emitOne st0 decls
   where
     emitOne st decl =
-      case lookup (cdName decl) (gsConstValues st) of
-        Just _ -> Left (CompileError ("duplicate constant: " <> textToString (cdName decl)) Nothing Nothing)
+      case lookup decl.cdName st.gsConstValues of
+        Just _ -> Left (CompileError ("duplicate constant: " <> textToString decl.cdName) Nothing Nothing)
         Nothing -> do
-          (st1, val) <- emitConstExpr st (decl.cdExpr)
-          let st2 = st1 { gsConstValues = (cdName decl, val) : gsConstValues st1 }
+          (st1, val) <- emitConstExpr st decl.cdExpr
+          let st2 = st1 { gsConstValues = (decl.cdName, val) : st1.gsConstValues }
           pure st2
 
 emitConstExpr :: GenState -> Expr -> Either CompileError (GenState, Value)
@@ -839,9 +843,9 @@ emitConstExpr st expr =
       Right (st1, Value layout cid)
     EUnary OpNeg inner -> do
       (st1, val) <- emitConstExpr st inner
-      case valType val of
+      case val.valType of
         TLScalar I32 _ _ -> do
-          key <- maybe (Left (CompileError "constant integer literal required" Nothing Nothing)) Right (lookupConstKeyById st1 (valId val))
+          key <- maybe (Left (CompileError "constant integer literal required" Nothing Nothing)) Right (lookupConstKeyById st1 (val.valId))
           v <- constKeyToI32 key
           let out = negate (fromIntegral v :: Integer)
           (cid, st2) <- emitConstIntScalar I32 out st1
@@ -850,14 +854,14 @@ emitConstExpr st expr =
           Right (st2, Value layout cid)
         TLScalar U32 _ _ -> Left (CompileError "unary minus is not supported for u32 constants" Nothing Nothing)
         TLScalar F32 _ _ -> do
-          key <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st1 (valId val))
+          key <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st1 (val.valId))
           v <- constKeyToFloat key
           let (cid, st2) = emitConstF32 st1 (negate v)
           let (a, sz) = scalarLayout F32
           let layout = TLScalar F32 a sz
           Right (st2, Value layout cid)
         TLScalar F16 _ _ -> do
-          key <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st1 (valId val))
+          key <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st1 (val.valId))
           v <- constKeyToFloat key
           let (cid, st2) = emitConstF16 st1 (negate v)
           let (a, sz) = scalarLayout F16
@@ -867,7 +871,7 @@ emitConstExpr st expr =
     EBinary op a b -> do
       (st1, v1) <- emitConstExpr st a
       (st2, v2) <- emitConstExpr st1 b
-      case (valType v1, valType v2) of
+      case (v1.valType, v2.valType) of
         (TLScalar s1 _ _, TLScalar s2 _ _) ->
           case (s1, s2) of
             (F32, F32) -> emitFloatBin op F32 st2 v1 v2
@@ -877,7 +881,7 @@ emitConstExpr st expr =
             _ -> emitIntBin op s1 s2 st2 v1 v2
         _ -> Left (CompileError "constant operation expects scalar values" Nothing Nothing)
     EVar name ->
-      case lookup name (gsConstValues st) of
+      case lookup name (st.gsConstValues) of
         Just val -> Right (st, val)
         Nothing -> Left (CompileError ("unknown constant: " <> textToString name) Nothing Nothing)
     ECall name args ->
@@ -894,14 +898,14 @@ emitConstExpr st expr =
           case parseMatrixName name of
             Just (cols, rows) -> emitConstMatrixCtor cols rows args st
             Nothing ->
-              case lookup name (gsStructLayouts st) of
+              case lookup name (st.gsStructLayouts) of
                 Just layout -> emitConstStructCtor name layout args st
                 Nothing -> Left (CompileError ("unsupported constant constructor: " <> textToString name) Nothing Nothing)
     _ -> Left (CompileError "unsupported constant expression" Nothing Nothing)
   where
     emitFloatBin op' target st' v1 v2 = do
-      key1 <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st' (valId v1))
-      key2 <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st' (valId v2))
+      key1 <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st' (v1.valId))
+      key2 <- maybe (Left (CompileError "constant float literal required" Nothing Nothing)) Right (lookupConstKeyById st' (v2.valId))
       x <- constKeyToFloat key1
       y <- constKeyToFloat key2
       out <- case op' of
@@ -922,8 +926,8 @@ emitConstExpr st expr =
           Right (st3, Value (TLScalar F16 a sz) cid)
         _ -> Left (CompileError "unsupported constant float operation" Nothing Nothing)
     emitIntBin op' s1 s2 st' v1 v2 = do
-      key1 <- maybe (Left (CompileError "constant integer literal required" Nothing Nothing)) Right (lookupConstKeyById st' (valId v1))
-      key2 <- maybe (Left (CompileError "constant integer literal required" Nothing Nothing)) Right (lookupConstKeyById st' (valId v2))
+      key1 <- maybe (Left (CompileError "constant integer literal required" Nothing Nothing)) Right (lookupConstKeyById st' (v1.valId))
+      key2 <- maybe (Left (CompileError "constant integer literal required" Nothing Nothing)) Right (lookupConstKeyById st' (v2.valId))
       i1 <- constKeyToInt key1
       i2 <- constKeyToInt key2
       let (scalar, x, y) = coerceConstPair s1 i1 s2 i2
@@ -1000,7 +1004,7 @@ emitConstValueToLayout layout val st =
           comps' <- mapM (coerceConstScalarValue scalar) comps
           let (a, sz) = scalarLayout scalar
           (st1, vals) <- emitConstValues (TLScalar scalar a sz) comps' st
-          let (cid, st2) = emitConstComposite layout (map valId vals) st1
+          let (cid, st2) = emitConstComposite layout (map (.valId) vals) st1
           Right (st2, Value layout cid)
         _ -> Left (CompileError "vector constant does not match type" Nothing Nothing)
     TLMatrix cols rows scalar _ _ _ ->
@@ -1009,14 +1013,14 @@ emitConstValueToLayout layout val st =
           let (a, sz) = vectorLayout scalar rows
           let colLayout = TLVector rows scalar a sz
           (st1, colsEmitted) <- emitConstValues colLayout colsVals st
-          let (cid, st2) = emitConstComposite layout (map valId colsEmitted) st1
+          let (cid, st2) = emitConstComposite layout (map (.valId) colsEmitted) st1
           Right (st2, Value layout cid)
         _ -> Left (CompileError "matrix constant does not match type" Nothing Nothing)
     TLArray mlen _ elemLayout _ _ ->
       case (mlen, val) of
         (Just n, CVArray _ elems) | length elems == n -> do
           (st1, vals) <- emitConstValues elemLayout elems st
-          let (cid, st2) = emitConstComposite layout (map valId vals) st1
+          let (cid, st2) = emitConstComposite layout (map (.valId) vals) st1
           Right (st2, Value layout cid)
         (Nothing, _) -> Left (CompileError "runtime array constants are not supported" Nothing Nothing)
         _ -> Left (CompileError "array constant does not match type" Nothing Nothing)
@@ -1026,7 +1030,7 @@ emitConstValueToLayout layout val st =
         CVStruct structName pairs | structName == nameT -> do
           fieldVals <- mapM (lookupField pairs) fields
           (st1, emitted) <- emitConstValuesFromFields fields fieldVals st
-          let (cid, st2) = emitConstComposite layout (map valId emitted) st1
+          let (cid, st2) = emitConstComposite layout (map (.valId) emitted) st1
           Right (st2, Value layout cid)
         _ -> Left (CompileError "struct constant does not match type" Nothing Nothing)
     _ -> Left (CompileError "unsupported constant layout" Nothing Nothing)
@@ -1070,7 +1074,7 @@ emitSpecConstValueToLayout layout val st =
           comps' <- mapM (coerceConstScalarValue scalar) comps
           let (a, sz) = scalarLayout scalar
           (st1, vals) <- emitConstValues (TLScalar scalar a sz) comps' st
-          let (cid, st2) = emitSpecConstComposite layout (map valId vals) st1
+          let (cid, st2) = emitSpecConstComposite layout (map (.valId) vals) st1
           Right (st2, Value layout cid)
         _ -> Left (CompileError "vector constant does not match type" Nothing Nothing)
     TLMatrix cols rows scalar _ _ _ ->
@@ -1079,14 +1083,14 @@ emitSpecConstValueToLayout layout val st =
           let (a, sz) = vectorLayout scalar rows
           let colLayout = TLVector rows scalar a sz
           (st1, colsEmitted) <- emitConstValues colLayout colsVals st
-          let (cid, st2) = emitSpecConstComposite layout (map valId colsEmitted) st1
+          let (cid, st2) = emitSpecConstComposite layout (map (.valId) colsEmitted) st1
           Right (st2, Value layout cid)
         _ -> Left (CompileError "matrix constant does not match type" Nothing Nothing)
     TLArray mlen _ elemLayout _ _ ->
       case (mlen, val) of
         (Just n, CVArray _ elems) | length elems == n -> do
           (st1, vals) <- emitConstValues elemLayout elems st
-          let (cid, st2) = emitSpecConstComposite layout (map valId vals) st1
+          let (cid, st2) = emitSpecConstComposite layout (map (.valId) vals) st1
           Right (st2, Value layout cid)
         (Nothing, _) -> Left (CompileError "runtime array constants are not supported" Nothing Nothing)
         _ -> Left (CompileError "array constant does not match type" Nothing Nothing)
@@ -1096,7 +1100,7 @@ emitSpecConstValueToLayout layout val st =
         CVStruct structName pairs | structName == nameT -> do
           fieldVals <- mapM (lookupField pairs) fields
           (st1, emitted) <- emitConstValuesFromFields fields fieldVals st
-          let (cid, st2) = emitSpecConstComposite layout (map valId emitted) st1
+          let (cid, st2) = emitSpecConstComposite layout (map (.valId) emitted) st1
           Right (st2, Value layout cid)
         _ -> Left (CompileError "struct constant does not match type" Nothing Nothing)
     _ -> Left (CompileError "unsupported constant layout" Nothing Nothing)
@@ -1144,7 +1148,7 @@ constValueLayout st val =
       let total = stride * fromIntegral (length elems)
       Right (TLArray (Just (length elems)) stride elemLayout elemAlign total)
     CVStruct name _ ->
-      case lookup name (gsStructLayouts st) of
+      case lookup name (st.gsStructLayouts) of
         Just layout -> Right layout
         Nothing -> Left (CompileError ("unknown struct layout for constant: " <> textToString name) Nothing Nothing)
     CVPointer _ _ ->
@@ -1170,7 +1174,7 @@ constValueLayout st val =
         TyArray _ Nothing ->
           Left (CompileError "runtime array constants are not supported" Nothing Nothing)
         TyStructRef name ->
-          case lookup name (gsStructLayouts st) of
+          case lookup name (st.gsStructLayouts) of
             Just layout -> Right layout
             Nothing -> Left (CompileError ("unknown struct layout for constant: " <> textToString name) Nothing Nothing)
         _ -> Left (CompileError "unsupported constant type layout" Nothing Nothing)
@@ -1184,7 +1188,7 @@ emitSpecConstOp layout opcode operands st = do
   Right (st3, Value layout resId)
 
 isSpecConstantLiteral :: Word32 -> GenState -> Bool
-isSpecConstantLiteral cid st = any matches (gsConstants st)
+isSpecConstantLiteral cid st = any matches (st.gsConstants)
   where
     matches (Instr op ops)
       | op == opSpecConstantTrue || op == opSpecConstantFalse =
@@ -1215,13 +1219,13 @@ emitSpecConstScalarConvert fromScalar toScalarTy val st = do
     _ -> Left (CompileError "unsupported scalar conversion for spec constant" Nothing Nothing)
   let (a, sz) = scalarLayout toScalarTy
   let layout = TLScalar toScalarTy a sz
-  emitSpecConstOp layout opcode [valId val] st
+  emitSpecConstOp layout opcode [val.valId] st
 
 coerceSpecConstValueToLayout :: TypeLayout -> Value -> GenState -> Either CompileError (GenState, Value)
 coerceSpecConstValueToLayout target val st
-  | valType val == target = Right (st, val)
+  | val.valType == target = Right (st, val)
   | otherwise =
-      case (target, valType val) of
+      case (target, val.valType) of
         (TLScalar targetScalar _ _, TLScalar srcScalar _ _) -> do
           case targetScalar of
             Bool ->
@@ -1271,24 +1275,24 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
           Right (st1, Value (TLScalar Bool a sz) cid)
         EUnary OpNeg inner -> do
           (st1, v) <- tryEmit st0 inner
-          case valType v of
-            TLScalar I32 _ _ -> emitSpecConstOp (valType v) opSNegate [valId v] st1
+          case v.valType of
+            TLScalar I32 _ _ -> emitSpecConstOp (v.valType) opSNegate [v.valId] st1
             TLScalar U32 _ _ -> Left (CompileError "unary minus is not supported for u32 spec constants" Nothing Nothing)
-            TLScalar F32 _ _ -> emitSpecConstOp (valType v) opFNegate [valId v] st1
-            TLScalar F16 _ _ -> emitSpecConstOp (valType v) opFNegate [valId v] st1
+            TLScalar F32 _ _ -> emitSpecConstOp (v.valType) opFNegate [v.valId] st1
+            TLScalar F16 _ _ -> emitSpecConstOp (v.valType) opFNegate [v.valId] st1
             _ -> Left (CompileError "unary minus expects a scalar" Nothing Nothing)
         EUnary OpNot inner -> do
           (st1, v) <- tryEmit st0 inner
-          case valType v of
-            TLScalar Bool _ _ -> emitSpecConstOp (valType v) opLogicalNot [valId v] st1
+          case v.valType of
+            TLScalar Bool _ _ -> emitSpecConstOp (v.valType) opLogicalNot [v.valId] st1
             _ -> Left (CompileError "logical not expects bool" Nothing Nothing)
         EBinary op a b -> do
           (st1, v1) <- tryEmit st0 a
           (st2, v2) <- tryEmit st1 b
-          case (valType v1, valType v2) of
+          case (v1.valType, v2.valType) of
             (TLScalar s1 _ _, TLScalar s2 _ _) | s1 == s2 -> do
-              let layout = valType v1
-              let opIds = [valId v1, valId v2]
+              let layout = v1.valType
+              let opIds = [v1.valId, v2.valId]
               case s1 of
                 I32 ->
                   emitSpecConstIntOp layout op opIds st2
@@ -1305,9 +1309,9 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
           (st1, vA) <- tryEmit st0 aExpr
           (st2, vB) <- tryEmit st1 bExpr
           (st3, vCond) <- tryEmit st2 condExpr
-          case (valType vA, valType vB, valType vCond) of
+          case (vA.valType, vB.valType, vCond.valType) of
             (layoutA, layoutB, TLScalar Bool _ _) | layoutA == layoutB ->
-              emitSpecConstOp layoutA opSelect [valId vCond, valId vA, valId vB] st3
+              emitSpecConstOp layoutA opSelect [vCond.valId, vA.valId, vB.valId] st3
             _ -> Left (CompileError "select requires matching value types and a bool condition" Nothing Nothing)
         ECall name args ->
           case name of
@@ -1323,11 +1327,11 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
               case parseMatrixName name of
                 Just (cols, rows) -> emitSpecConstMatrixCtor ctx constIndex fnIndex structIndex cols rows args st0
                 Nothing ->
-                  case lookup name (gsStructLayouts st) of
+                  case lookup name (st.gsStructLayouts) of
                     Just layout -> emitSpecConstStructCtor ctx constIndex fnIndex structIndex name layout args st0
                     Nothing -> Left (CompileError ("unsupported spec constant constructor: " <> textToString name) Nothing Nothing)
         EVar name ->
-          case lookup name (gsConstValues st0) of
+          case lookup name (st0.gsConstValues) of
             Just val -> Right (st0, val)
             Nothing -> Left (CompileError "const reference requires fallback" Nothing Nothing)
         _ -> Left (CompileError "unsupported spec constant expression" Nothing Nothing)
@@ -1423,7 +1427,7 @@ emitSpecConstVectorCtor ctx constIndex fnIndex structIndex n args st =
             _ -> Left (CompileError "vector constructor arguments must be scalars" Nothing Nothing)
           let (align, size) = vectorLayout scalar n
           let layout = TLVector n scalar align size
-          let (cid, st3) = emitSpecConstComposite layout (map valId vals') st2
+          let (cid, st3) = emitSpecConstComposite layout (map (.valId) vals') st2
           Right (st3, Value layout cid)
 
 emitSpecConstMatrixCtor :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Int -> Int -> [Expr] -> GenState -> Either CompileError (GenState, Value)
@@ -1444,24 +1448,24 @@ emitSpecConstMatrixCtor ctx constIndex fnIndex structIndex cols rows args st =
               let vecLayout = TLVector rows scalar a sz
               (st2, colsVals) <- buildColumns vecLayout vals' st1'
               let layout = matrixLayout cols rows scalar
-              let (cid, st3) = emitSpecConstComposite layout (map valId colsVals) st2
+              let (cid, st3) = emitSpecConstComposite layout (map (.valId) colsVals) st2
               Right (st3, Value layout cid)
             TLVector n scalar _ _ | n == rows && length vals == cols -> do
               mapM_ (ensureColumn scalar) vals
               let layout = matrixLayout cols rows scalar
-              let (cid, st2) = emitSpecConstComposite layout (map valId vals) st1
+              let (cid, st2) = emitSpecConstComposite layout (map (.valId) vals) st1
               Right (st2, Value layout cid)
             _ -> Left (CompileError "matrix constructor expects column vectors or a full scalar list" Nothing Nothing)
   where
     ensureColumn scalar val =
-      case valType val of
+      case val.valType of
         TLVector n s _ _ | n == rows && s == scalar -> Right ()
         _ -> Left (CompileError "matrix constructor expects column vectors" Nothing Nothing)
     buildColumns vecLayout vals st' =
       case splitAt rows vals of
         ([], _) -> Right (st', [])
         (col, rest) -> do
-          let (cid, st1) = emitSpecConstComposite vecLayout (map valId col) st'
+          let (cid, st1) = emitSpecConstComposite vecLayout (map (.valId) col) st'
           (st2, colsVals) <- buildColumns vecLayout rest st1
           Right (st2, Value vecLayout cid : colsVals)
 
@@ -1473,7 +1477,7 @@ emitSpecConstStructCtor ctx constIndex fnIndex structIndex name layout args st =
         Left (CompileError ("struct constructor arity mismatch for " <> textToString name) Nothing Nothing)
       (st1, vals) <- emitSpecConstExprList ctx constIndex fnIndex structIndex st args
       (st2, vals') <- coerceSpecConstArgsToLayouts vals (map (.flType) fields) st1
-      let (cid, st3) = emitSpecConstComposite layout (map valId vals') st2
+      let (cid, st3) = emitSpecConstComposite layout (map (.valId) vals') st2
       Right (st3, Value layout cid)
     _ -> Left (CompileError ("unsupported constructor: " <> textToString name) Nothing Nothing)
 
@@ -1497,7 +1501,7 @@ emitSpecConstArrayCtor ctx constIndex fnIndex structIndex args st =
           let stride = roundUp elemSize elemAlign
           let total = stride * fromIntegral (length vals')
           let layout = TLArray (Just (length vals)) stride firstLayout elemAlign total
-          let (cid, st3) = emitSpecConstComposite layout (map valId vals') st2
+          let (cid, st3) = emitSpecConstComposite layout (map (.valId) vals') st2
           Right (st3, Value layout cid)
 
 emitSpecConstScalarCtor :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Scalar -> [Expr] -> GenState -> Either CompileError (GenState, Value)
@@ -1505,7 +1509,7 @@ emitSpecConstScalarCtor ctx constIndex fnIndex structIndex scalar args st =
   case args of
     [arg] -> do
       (st1, val) <- emitSpecConstExpr ctx constIndex fnIndex structIndex st arg
-      case valType val of
+      case val.valType of
         TLScalar s _ _ | s == scalar -> Right (st1, val)
         TLScalar s _ _ -> do
           (st2, val') <- emitSpecConstScalarConvert s scalar val st1
@@ -1546,7 +1550,7 @@ emitConstVectorCtor n args st =
             _ -> Left (CompileError "vector constructor arguments must be scalars" Nothing Nothing)
           let (align, size) = vectorLayout scalar n
           let layout = TLVector n scalar align size
-          let (cid, st3) = emitConstComposite layout (map valId vals') st2
+          let (cid, st3) = emitConstComposite layout (map (.valId) vals') st2
           Right (st3, Value layout cid)
 
 emitConstMatrixCtor :: Int -> Int -> [Expr] -> GenState -> Either CompileError (GenState, Value)
@@ -1567,11 +1571,11 @@ emitConstMatrixCtor cols rows args st =
               let vecLayout = TLVector rows scalar a sz
               (st3, colsVals) <- buildColumns vecLayout vals' st2
               let layout = matrixLayout cols rows scalar
-              let (cid, st4) = emitConstComposite layout (map valId colsVals) st3
+              let (cid, st4) = emitConstComposite layout (map (.valId) colsVals) st3
               Right (st4, Value layout cid)
             TLVector n scalar _ _ | n == rows && length vals' == cols -> do
               let layout = matrixLayout cols rows scalar
-              let (cid, st3) = emitConstComposite layout (map valId vals') st2
+              let (cid, st3) = emitConstComposite layout (map (.valId) vals') st2
               Right (st3, Value layout cid)
             _ -> Left (CompileError "matrix constructor expects column vectors or a full scalar list" Nothing Nothing)
   where
@@ -1579,7 +1583,7 @@ emitConstMatrixCtor cols rows args st =
       case splitAt rows vals of
         ([], _) -> Right (st', [])
         (col, rest) -> do
-          let (cid, st1) = emitConstComposite vecLayout (map valId col) st'
+          let (cid, st1) = emitConstComposite vecLayout (map (.valId) col) st'
           (st2, colsVals) <- buildColumns vecLayout rest st1
           Right (st2, Value vecLayout cid : colsVals)
 
@@ -1591,7 +1595,7 @@ emitConstStructCtor name layout args st =
         Left (CompileError ("struct constructor arity mismatch for " <> textToString name) Nothing Nothing)
       (st1, vals) <- emitConstExprList st args
       (st2, vals') <- coerceConstArgsToLayouts vals (map (.flType) fields) st1
-      let (cid, st3) = emitConstComposite layout (map valId vals') st2
+      let (cid, st3) = emitConstComposite layout (map (.valId) vals') st2
       Right (st3, Value layout cid)
     _ -> Left (CompileError ("unsupported constructor: " <> textToString name) Nothing Nothing)
 
@@ -1615,7 +1619,7 @@ emitConstArrayCtor args st =
           let stride = roundUp elemSize elemAlign
           let total = stride * fromIntegral (length vals')
           let layout = TLArray (Just (length vals)) stride firstLayout elemAlign total
-          let (cid, st3) = emitConstComposite layout (map valId vals') st2
+          let (cid, st3) = emitConstComposite layout (map (.valId) vals') st2
           Right (st3, Value layout cid)
 
 emitConstScalarCtor :: Scalar -> [Expr] -> GenState -> Either CompileError (GenState, Value)
@@ -1623,10 +1627,10 @@ emitConstScalarCtor scalar args st =
   case args of
     [arg] -> do
       (st1, val) <- emitConstExpr st arg
-      case valType val of
+      case val.valType of
         TLScalar s _ _ | s == scalar -> Right (st1, val)
         TLScalar _ _ _ ->
-          case lookupConstKeyById st1 (valId val) of
+          case lookupConstKeyById st1 (val.valId) of
             Nothing -> Left (CompileError "scalar constant cast requires a literal value" Nothing Nothing)
             Just key -> do
               key' <- convertConstKey key scalar
@@ -1639,7 +1643,7 @@ emitConstScalarCtor scalar args st =
 
 lookupConstKeyById :: GenState -> Word32 -> Maybe ConstKey
 lookupConstKeyById st cid =
-  case [key | (key, cid') <- gsConstCache st, cid' == cid] of
+  case [key | (key, cid') <- st.gsConstCache, cid' == cid] of
     (k:_) -> Just k
     [] -> Nothing
 
@@ -2504,7 +2508,7 @@ assignStructIds start layouts =
   in go start [] layouts
 
 freshId :: GenState -> (Word32, GenState)
-freshId st = (gsNextId st, st { gsNextId = gsNextId st + 1 })
+freshId st = (st.gsNextId, st { gsNextId = st.gsNextId + 1 })
 
 addInstr :: (GenState -> [Instr]) -> (GenState -> [Instr] -> GenState) -> Instr -> GenState -> GenState
 addInstr getter setter instr st =
@@ -2513,45 +2517,45 @@ addInstr getter setter instr st =
 
 addCapability :: Word32 -> GenState -> GenState
 addCapability cap st =
-  if cap `elem` gsCapabilities st
+  if cap `elem` st.gsCapabilities
     then st
-    else st { gsCapabilities = gsCapabilities st <> [cap] }
+    else st { gsCapabilities = st.gsCapabilities <> [cap] }
 
 addName :: Instr -> GenState -> GenState
-addName = addInstr gsNames (\st v -> st { gsNames = v })
+addName = addInstr (.gsNames) (\st v -> st { gsNames = v })
 
 addDecoration :: Instr -> GenState -> GenState
-addDecoration = addInstr gsDecorations (\st v -> st { gsDecorations = v })
+addDecoration = addInstr (.gsDecorations) (\st v -> st { gsDecorations = v })
 
 addType :: Instr -> GenState -> GenState
-addType = addInstr gsTypes (\st v -> st { gsTypes = v })
+addType = addInstr (.gsTypes) (\st v -> st { gsTypes = v })
 
 addConst :: Instr -> GenState -> GenState
-addConst = addInstr gsConstants (\st v -> st { gsConstants = v })
+addConst = addInstr (.gsConstants) (\st v -> st { gsConstants = v })
 
 addGlobal :: Instr -> GenState -> GenState
-addGlobal = addInstr gsGlobals (\st v -> st { gsGlobals = v })
+addGlobal = addInstr (.gsGlobals) (\st v -> st { gsGlobals = v })
 
 -- Emit struct types with member decorations
 emitStructs :: GenState -> ((), GenState)
 emitStructs st0 =
-  let st1 = foldl' emitStruct st0 (gsStructLayouts st0)
+  let st1 = foldl' emitStruct st0 st0.gsStructLayouts
   in ((), st1)
   where
     emitStruct st (name, layout) =
       case layout of
         TLStruct _ fields _ _ ->
           let (structId, st1) =
-                case lookup name (gsStructIds st) of
+                case lookup name (st.gsStructIds) of
                   Just sid -> (sid, st)
                   Nothing ->
                     let (sid, st') = freshId st
-                    in (sid, st' { gsStructIds = (name, sid) : gsStructIds st' })
+                    in (sid, st' { gsStructIds = (name, sid) : st'.gsStructIds })
               (st2, fieldTypeIds) = mapAccumL emitFieldType st1 fields
               st3 = addType (Instr opTypeStruct (structId : fieldTypeIds)) st2
               st4 = addName (Instr opName (structId : encodeString (textToString name))) st3
               st5 = foldl' (emitMemberDecorate structId) st4 (zip [0 :: Int ..] fields)
-              st6 = if name `elem` gsBlockStructs st5
+              st6 = if name `elem` st5.gsBlockStructs
                 then addDecoration (Instr opDecorate [structId, decorationBlock]) st5
                 else st5
               st7 = foldl' (emitMemberName structId) st6 (zip [0 :: Int ..] fields)
@@ -2636,7 +2640,7 @@ emitGlobals layoutCache structEnv iface entry retLayout globals st0 = do
   (envInputs, entryInits, idsInputs, st3) <- emitEntryInputs layoutCache structEnv entry st2
   (outTargets, idsOut, st4) <- emitStageOutput layoutCache structEnv entry retLayout st3
   let envAll = envBindings <> envGlobals <> envInputs
-  let idsGlobals = map (viPtrId . snd) envGlobals
+  let idsGlobals = map ((.viPtrId) . snd) envGlobals
   let ifaceIds = idsBindings <> idsInputs <> idsOut <> idsGlobals
   let st5 = st4 { gsInterfaceIds = ifaceIds, gsGlobalVars = envBindings <> envGlobals }
   pure (envAll, entryInits, ifaceIds, outTargets, st5)
@@ -2688,18 +2692,18 @@ emitModuleGlobals layoutCache decls st0 = foldM emitOne ([], st0) decls
         Left (CompileError "atomic types are only supported in storage buffers for now" Nothing Nothing)
       when (containsRuntimeArray layout) $
         Left (CompileError "runtime arrays are only supported in storage buffers" Nothing Nothing)
-      storageClass <- case gvSpace decl of
+      storageClass <- case decl.gvSpace of
         "private" -> Right storageClassPrivate
         "workgroup" -> Right storageClassWorkgroup
         other -> Left (CompileError ("unsupported global address space: " <> textToString other) Nothing Nothing)
-      (initId, st1) <- case gvInit decl of
+      (initId, st1) <- case decl.gvInit of
         Nothing -> Right (Nothing, st)
         Just expr -> do
           when (storageClass == storageClassWorkgroup) $
             Left (CompileError "workgroup variables cannot have initializers" Nothing Nothing)
           (st2, val) <- emitConstExpr st expr
           (st3, val') <- coerceConstValueToLayout layout val st2
-          Right (Just (valId val'), st3)
+          Right (Just (val'.valId), st3)
       let (baseTy, st2) = emitTypeFromLayout st1 layout
       let (ptrTy, st3) = emitPointerType st2 storageClass baseTy
       let (varId, st4) = freshId st3
@@ -2708,9 +2712,9 @@ emitModuleGlobals layoutCache decls st0 = foldM emitOne ([], st0) decls
               Nothing -> [ptrTy, varId, storageClass]
               Just cid -> [ptrTy, varId, storageClass, cid]
       let st5 = addGlobal (Instr opVariable operands) st4
-      let st6 = addName (Instr opName (varId : encodeString (textToString (gvName decl)))) st5
+      let st6 = addName (Instr opName (varId : encodeString (textToString (decl.gvName)))) st5
       let info = VarInfo layout varId storageClass ReadWrite
-      Right (envAcc <> [(gvName decl, info)], st6)
+      Right (envAcc <> [(decl.gvName, info)], st6)
 
 emitEntryInputs :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
 emitEntryInputs layoutCache structEnv entry st0 =
@@ -2800,10 +2804,10 @@ emitStageInputs layoutCache stage structEnv entry st0 = do
     emitStructFields stg paramName fields usedLocs usedBuiltins idAcc st = do
       let go accVars accIds accLocs accBuiltins st' [] = Right (reverse accVars, accLocs, accBuiltins, accIds, st')
           go accVars accIds accLocs accBuiltins st' (field:rest) = do
-            let fieldName = fdName field
+            let fieldName = field.fdName
                 fullName = paramName <> "_" <> fieldName
-                attrs = fdAttrs field
-                fty = fdType field
+                attrs = field.fdAttrs
+                fty = field.fdType
             layout <- resolveTypeLayoutWithCache layoutCache fty
             when (containsResource layout) $
               Left (CompileError "resource types are not allowed as stage inputs" Nothing Nothing)
@@ -2876,7 +2880,7 @@ emitFragmentOutput structEnv entry retLayout st0 =
     (Just layout, Just ty) ->
       case ty of
         TyStructRef structName -> do
-          when (epReturnBuiltin entry /= Nothing || epReturnLocation entry /= Nothing) $
+          when (entry.epReturnBuiltin /= Nothing || entry.epReturnLocation /= Nothing) $
             Left (CompileError "struct return values cannot use @location or @builtin on the function" Nothing Nothing)
           structDecl <- case lookup structName structEnv of
             Nothing -> Left (CompileError ("unknown struct: " <> textToString structName) Nothing Nothing)
@@ -2887,9 +2891,9 @@ emitFragmentOutput structEnv entry retLayout st0 =
             Left (CompileError "resource types are not allowed as fragment outputs" Nothing Nothing)
           when (containsAtomic layout) $
             Left (CompileError "atomic types are not allowed as fragment outputs" Nothing Nothing)
-          when (epReturnBuiltin entry /= Nothing && epReturnLocation entry /= Nothing) $
+          when (entry.epReturnBuiltin /= Nothing && entry.epReturnLocation /= Nothing) $
             Left (CompileError "fragment returns cannot use both @location and @builtin" Nothing Nothing)
-          case epReturnBuiltin entry of
+          case entry.epReturnBuiltin of
             Just builtin -> do
               expected <- case builtinOutputType StageFragment builtin of
                 Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for fragment output") Nothing Nothing)
@@ -2903,7 +2907,7 @@ emitFragmentOutput structEnv entry retLayout st0 =
               let target = OutputTarget info layout []
               pure ([target], [varId], st1)
             Nothing -> do
-              let loc = fromMaybe 0 (epReturnLocation entry)
+              let loc = fromMaybe 0 entry.epReturnLocation
               (info, varId, st1) <- emitOutputVar "frag_output" layout (InputLocation loc) st0
               let target = OutputTarget info layout []
               pure ([target], [varId], st1)
@@ -2916,18 +2920,18 @@ emitVertexOutput structEnv entry retLayout st0 =
     (Just layout, Just ty) ->
       case ty of
         TyStructRef structName -> do
-          when (epReturnBuiltin entry /= Nothing || epReturnLocation entry /= Nothing) $
+          when (entry.epReturnBuiltin /= Nothing || entry.epReturnLocation /= Nothing) $
             Left (CompileError "struct return values cannot use @location or @builtin on the function" Nothing Nothing)
           structDecl <- case lookup structName structEnv of
             Nothing -> Left (CompileError ("unknown struct: " <> textToString structName) Nothing Nothing)
             Just decl -> Right decl
           emitStructOutputs StageVertex structName layout structDecl st0
         _ -> do
-          when (epReturnLocation entry /= Nothing) $
+          when (entry.epReturnLocation /= Nothing) $
             Left (CompileError "vertex entry points do not support @location returns" Nothing Nothing)
-          when (epReturnBuiltin entry == Nothing) $
+          when (entry.epReturnBuiltin == Nothing) $
             Left (CompileError "vertex entry point must return @builtin(position)" Nothing Nothing)
-          case epReturnBuiltin entry of
+          case entry.epReturnBuiltin of
             Just "position" -> do
               when (TyVector 4 F32 /= ty) $
                 Left (CompileError "@builtin(position) must be vec4<f32>" Nothing Nothing)
@@ -2946,9 +2950,9 @@ emitStructOutputs stage structName layout structDecl st0 =
         Left (CompileError ("struct layout mismatch for " <> textToString structName) Nothing Nothing)
       let go _idx accTargets accIds usedLocs usedBuiltins st [] = Right (reverse accTargets, reverse accIds, st, usedLocs, usedBuiltins)
           go idx accTargets accIds usedLocs usedBuiltins st (field:rest) = do
-            let fieldName = fdName field
-                attrs = fdAttrs field
-                fty = fdType field
+            let fieldName = field.fdName
+                attrs = field.fdAttrs
+                fty = field.fdType
                 layoutField = fieldLayouts !! idx
                 fieldLayout = layoutField.flType
             when (containsResource fieldLayout) $
@@ -2986,7 +2990,7 @@ emitStructOutputs stage structName layout structDecl st0 =
       (targets, ids, st1, _usedLocs, _usedBuiltins) <- go 0 [] [] [] [] st0 fields
       case stage of
         StageVertex ->
-          if any (\f -> attrBuiltin (fdAttrs f) == Just "position") fields
+          if any (\f -> attrBuiltin (f.fdAttrs) == Just "position") fields
             then pure ()
             else Left (CompileError "vertex output struct must include @builtin(position)" Nothing Nothing)
         _ -> pure ()
@@ -3012,18 +3016,18 @@ emitMainFunction entry env entryInits outTargets st0 = do
   let (fnTy, st2) = emitFunctionType st1 voidTy []
   let (fnId, st3) = freshId st2
   let (labelId, st4) = freshId st3
-  let st5 = addName (Instr opName (fnId : encodeString (textToString (epName entry)))) st4
+  let st5 = addName (Instr opName (fnId : encodeString (textToString entry.epName))) st4
   let fs0 = FuncState [] [] env [] False [] []
   (st6, fs1) <- emitEntryParamInits entryInits st5 fs0
   (st7, fs2) <- emitStatements entry outTargets st6 fs1
   let tailInstrs =
-        if fsTerminated fs2
+        if fs2.fsTerminated
           then [Instr opFunctionEnd []]
           else [Instr opReturn [], Instr opFunctionEnd []]
   let funcInstrs =
         [ Instr opFunction [voidTy, fnId, functionControlNone, fnTy]
         , Instr opLabel [labelId]
-        ] <> fsLocals fs2 <> fsInstrs fs2 <> tailInstrs
+        ] <> fs2.fsLocals <> fs2.fsInstrs <> tailInstrs
   let st8 = addFunctions funcInstrs st7
   let st9 = st8 { gsEntryPoint = Just fnId }
   pure st9
@@ -3032,16 +3036,16 @@ emitEntryParamInits :: [EntryParamInit] -> GenState -> FuncState -> Either Compi
 emitEntryParamInits inits st fs = foldM emitOne (st, fs) inits
   where
     emitOne (st', fs') initParam = do
-      (st1, fs1, fieldVals) <- emitEntryFieldValues st' fs' (epiFields initParam)
-      let (tyId, st2) = emitTypeFromLayout st1 (epiLayout initParam)
+      (st1, fs1, fieldVals) <- emitEntryFieldValues st' fs' (initParam.epiFields)
+      let (tyId, st2) = emitTypeFromLayout st1 (initParam.epiLayout)
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map valId fieldVals)) fs1
+      let fs2 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map (.valId) fieldVals)) fs1
       let (ptrTy, st4) = emitPointerType st3 storageClassFunction tyId
       let (varId, st5) = freshId st4
       let fs3 = addFuncLocal (Instr opVariable [ptrTy, varId, storageClassFunction]) fs2
       let fs4 = addFuncInstr (Instr opStore [varId, resId]) fs3
-      let info = VarInfo (epiLayout initParam) varId storageClassFunction ReadOnly
-      let fs5 = fs4 { fsVars = (epiName initParam, info) : fsVars fs4 }
+      let info = VarInfo (initParam.epiLayout) varId storageClassFunction ReadOnly
+      let fs5 = fs4 { fsVars = (initParam.epiName, info) : fs4.fsVars }
       pure (st5, fs5)
 
 emitEntryFieldValues :: GenState -> FuncState -> [EntryFieldInit] -> Either CompileError (GenState, FuncState, [Value])
@@ -3054,27 +3058,27 @@ emitEntryFieldValues st fs fields = go st fs fields []
 
 emitLoadVar :: GenState -> FuncState -> VarInfo -> Either CompileError (GenState, FuncState, Value)
 emitLoadVar st fs info = do
-  let (tyId, st1) = emitTypeFromLayout st (viType info)
+  let (tyId, st1) = emitTypeFromLayout st info.viType
   let (resId, st2) = freshId st1
-  let fs1 = addFuncInstr (Instr opLoad [tyId, resId, viPtrId info]) fs
-  pure (st2, fs1, Value (viType info) resId)
+  let fs1 = addFuncInstr (Instr opLoad [tyId, resId, info.viPtrId]) fs
+  pure (st2, fs1, Value info.viType resId)
 
 registerFunctions :: StructLayoutCache -> [FunctionDecl] -> GenState -> Either CompileError GenState
 registerFunctions layoutCache decls st0 = foldM registerOne st0 decls
   where
     registerOne st decl =
       do
-        paramLayouts <- mapM (resolveTypeLayoutWithCache layoutCache) (map paramType (decl.fnParams))
+        paramLayouts <- mapM (resolveTypeLayoutWithCache layoutCache) (map (.paramType) decl.fnParams)
         mapM_ (ensureNoResources "function parameter") paramLayouts
-        retLayout <- case fnReturnType decl of
+        retLayout <- case decl.fnReturnType of
           Nothing -> Right Nothing
           Just ty -> do
             layout <- resolveTypeLayoutWithCache layoutCache ty
             ensureNoResources "function return type" layout
             Right (Just layout)
-        let existing = [fi | fi <- gsFunctionTable st, fiName fi == fnName decl]
-        when (any (\fi -> fiParams fi == paramLayouts) existing) $
-          Left (CompileError ("duplicate function overload: " <> textToString (fnName decl)) Nothing Nothing)
+        let existing = [fi | fi <- st.gsFunctionTable, fi.fiName == decl.fnName]
+        when (any (\fi -> fi.fiParams == paramLayouts) existing) $
+          Left (CompileError ("duplicate function overload: " <> textToString decl.fnName) Nothing Nothing)
         let (retTyId, st1) = case retLayout of
               Nothing -> emitVoidType st
               Just layout -> emitTypeFromLayout st layout
@@ -3082,42 +3086,42 @@ registerFunctions layoutCache decls st0 = foldM registerOne st0 decls
               mapAccumL (\acc layout -> let (tid, acc') = emitTypeFromLayout acc layout in (acc', tid)) st1 paramLayouts
         let (fnTypeId, st3) = emitFunctionType st2 retTyId paramTypeIds
         let (fnId, st4) = freshId st3
-        let info = FunctionInfo (fnName decl) paramLayouts retLayout fnId fnTypeId
-        let st5 = st4 { gsFunctionTable = info : gsFunctionTable st4 }
+        let info = FunctionInfo decl.fnName paramLayouts retLayout fnId fnTypeId
+        let st5 = st4 { gsFunctionTable = info : st4.gsFunctionTable }
         pure st5
 
 emitFunctionBodies :: StructLayoutCache -> [FunctionDecl] -> GenState -> Either CompileError GenState
 emitFunctionBodies layoutCache decls st0 = foldM emitOne st0 decls
   where
     emitOne st decl = do
-      paramLayouts <- mapM (resolveTypeLayoutWithCache layoutCache) (map paramType (decl.fnParams))
-      case findFunctionInfo (fnName decl) paramLayouts (gsFunctionTable st) of
-        Nothing -> Left (CompileError ("missing function info for " <> textToString (fnName decl)) Nothing Nothing)
+      paramLayouts <- mapM (resolveTypeLayoutWithCache layoutCache) (map (.paramType) decl.fnParams)
+      case findFunctionInfo decl.fnName paramLayouts st.gsFunctionTable of
+        Nothing -> Left (CompileError ("missing function info for " <> textToString decl.fnName) Nothing Nothing)
         Just info -> emitFunctionBody info decl st
 
 findFunctionInfo :: Text -> [TypeLayout] -> [FunctionInfo] -> Maybe FunctionInfo
 findFunctionInfo name paramLayouts infos =
-  case filter (\fi -> fiName fi == name && fiParams fi == paramLayouts) infos of
+  case filter (\fi -> fi.fiName == name && fi.fiParams == paramLayouts) infos of
     (x:_) -> Just x
     [] -> Nothing
 
 emitFunctionBody :: FunctionInfo -> FunctionDecl -> GenState -> Either CompileError GenState
 emitFunctionBody info decl st0 = do
-  let (retTyId, st1) = case fiReturn info of
+  let (retTyId, st1) = case info.fiReturn of
         Nothing -> emitVoidType st0
         Just layout -> emitTypeFromLayout st0 layout
   let (fnLabel, st2) = freshId st1
-  let st3 = addName (Instr opName (fiId info : encodeString (textToString (fnName decl)))) st2
-  let (paramInstrs, paramLocals, paramStores, env, st4) = emitFunctionParams (decl.fnParams) (fiParams info) st3
-  let envWithGlobals = gsGlobalVars st4 <> env
+  let st3 = addName (Instr opName (info.fiId : encodeString (textToString decl.fnName))) st2
+  let (paramInstrs, paramLocals, paramStores, env, st4) = emitFunctionParams decl.fnParams info.fiParams st3
+  let envWithGlobals = st4.gsGlobalVars <> env
   let fs0 = FuncState paramLocals paramStores envWithGlobals [] False [] []
-  (st5, fs1) <- emitStmtListFn (fiReturn info) st4 fs0 (decl.fnBody)
-  fs2 <- finalizeFunctionReturn (fiReturn info) fs1
+  (st5, fs1) <- emitStmtListFn info.fiReturn st4 fs0 decl.fnBody
+  fs2 <- finalizeFunctionReturn info.fiReturn fs1
   let funcInstrs =
-        [ Instr opFunction [retTyId, fiId info, functionControlNone, fiTypeId info]
+        [ Instr opFunction [retTyId, info.fiId, functionControlNone, info.fiTypeId]
         ] <> paramInstrs <>
         [ Instr opLabel [fnLabel]
-        ] <> fsLocals fs2 <> fsInstrs fs2 <> [Instr opFunctionEnd []]
+        ] <> fs2.fsLocals <> fs2.fsInstrs <> [Instr opFunctionEnd []]
   let st6 = addFunctions funcInstrs st5
   pure st6
 
@@ -3133,7 +3137,7 @@ emitFunctionParams params layouts st0 =
             localInstr = Instr opVariable [ptrTy, varId, storageClassFunction]
             storeInstr = Instr opStore [varId, paramId]
             info = VarInfo l varId storageClassFunction ReadOnly
-        in go st4 (paramInstr:accInstrs) (localInstr:accLocals) (storeInstr:accStores) ((paramName p, info):accEnv) ps ls
+        in go st4 (paramInstr:accInstrs) (localInstr:accLocals) (storeInstr:accStores) ((p.paramName, info):accEnv) ps ls
       go st accInstrs accLocals accStores accEnv _ _ = (reverse accInstrs, reverse accLocals, reverse accStores, reverse accEnv, st)
   in go st0 [] [] [] [] params layouts
 
@@ -3147,54 +3151,54 @@ emitStmtListFn retLayout st fs = go st fs
 
 emitStmtFn :: Maybe TypeLayout -> GenState -> FuncState -> Stmt -> Either CompileError (GenState, FuncState)
 emitStmtFn retLayout st fs stmt
-  | fsTerminated fs = Right (st, fs)
+  | fs.fsTerminated = Right (st, fs)
   | otherwise =
       case stmt of
         SLet name expr -> emitLet name expr st fs
         SVar name expr -> emitVar name expr st fs
         SAssign lv expr -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case viType ptrInfo of
+          case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
             _ -> pure ()
           (st2, fs2, val) <- emitExpr st1 fs1 expr
-          (st3, fs3, val') <- coerceValueToLayout (viType ptrInfo) val st2 fs2
+          (st3, fs3, val') <- coerceValueToLayout (ptrInfo.viType) val st2 fs2
           ensureWritable ptrInfo
-          let fs4 = addFuncInstr (Instr opStore [viPtrId ptrInfo, valId val']) fs3
+          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, val'.valId]) fs3
           Right (st3, fs4)
         SAssignOp lv op expr -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case viType ptrInfo of
+          case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
             _ -> pure ()
           ensureWritable ptrInfo
           (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
           (st3, fs3, rhsVal) <- emitExpr st2 fs2 expr
-          (st4, fs4, rhsVal') <- coerceValueToLayout (viType ptrInfo) rhsVal st3 fs3
-          (st5, fs5, resVal) <- emitBinary op (viType ptrInfo) (valId lhsVal) (valId rhsVal') st4 fs4
-          let fs6 = addFuncInstr (Instr opStore [viPtrId ptrInfo, valId resVal]) fs5
+          (st4, fs4, rhsVal') <- coerceValueToLayout (ptrInfo.viType) rhsVal st3 fs3
+          (st5, fs5, resVal) <- emitBinary op (ptrInfo.viType) (lhsVal.valId) (rhsVal'.valId) st4 fs4
+          let fs6 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs5
           Right (st5, fs6)
         SInc lv -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case viType ptrInfo of
+          case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
             _ -> pure ()
           ensureWritable ptrInfo
           (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
-          (oneId, st3) <- emitConstOne (viType ptrInfo) st2
-          (st4, fs3, resVal) <- emitBinary OpAdd (viType ptrInfo) (valId lhsVal) oneId st3 fs2
-          let fs4 = addFuncInstr (Instr opStore [viPtrId ptrInfo, valId resVal]) fs3
+          (oneId, st3) <- emitConstOne (ptrInfo.viType) st2
+          (st4, fs3, resVal) <- emitBinary OpAdd (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
+          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
           Right (st4, fs4)
         SDec lv -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case viType ptrInfo of
+          case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
             _ -> pure ()
           ensureWritable ptrInfo
           (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
-          (oneId, st3) <- emitConstOne (viType ptrInfo) st2
-          (st4, fs3, resVal) <- emitBinary OpSub (viType ptrInfo) (valId lhsVal) oneId st3 fs2
-          let fs4 = addFuncInstr (Instr opStore [viPtrId ptrInfo, valId resVal]) fs3
+          (oneId, st3) <- emitConstOne (ptrInfo.viType) st2
+          (st4, fs3, resVal) <- emitBinary OpSub (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
+          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
           Right (st4, fs4)
         SExpr expr -> emitExprStmt st fs expr
         SIf cond thenBody elseBody ->
@@ -3214,7 +3218,7 @@ emitStmtFn retLayout st fs stmt
         SContinue ->
           emitContinue st fs
         SDiscard ->
-          if gsEntryStage st == StageFragment
+          if st.gsEntryStage == StageFragment
             then
               let fs1 = addTerminator (Instr opKill []) fs
               in Right (st, fs1)
@@ -3225,7 +3229,7 @@ emitStmtFn retLayout st fs stmt
           case retLayout of
             Nothing ->
               case mexpr of
-                Nothing -> Right (st, fs { fsTerminated = True, fsInstrs = fsInstrs fs <> [Instr opReturn []] })
+                Nothing -> Right (st, fs { fsTerminated = True, fsInstrs = fs.fsInstrs <> [Instr opReturn []] })
                 Just _ -> Left (CompileError "void function cannot return a value" Nothing Nothing)
             Just layout -> do
               expr <- case mexpr of
@@ -3233,37 +3237,37 @@ emitStmtFn retLayout st fs stmt
                 Just e -> Right e
               (st1, fs1, val) <- emitExpr st fs expr
               (st2, fs2, val') <- coerceValueToLayout layout val st1 fs1
-              let fs3 = addFuncInstr (Instr opReturnValue [valId val']) fs2
+              let fs3 = addFuncInstr (Instr opReturnValue [val'.valId]) fs2
               Right (st2, fs3 { fsTerminated = True })
 
 finalizeFunctionReturn :: Maybe TypeLayout -> FuncState -> Either CompileError FuncState
 finalizeFunctionReturn retLayout fs =
-  if fsTerminated fs
+  if fs.fsTerminated
     then Right fs
     else case retLayout of
-      Nothing -> Right (fs { fsInstrs = fsInstrs fs <> [Instr opReturn []], fsTerminated = True })
+      Nothing -> Right (fs { fsInstrs = fs.fsInstrs <> [Instr opReturn []], fsTerminated = True })
       Just _ -> Left (CompileError "non-void function must return a value" Nothing Nothing)
 
 emitIfFn :: Maybe TypeLayout -> Expr -> [Stmt] -> Maybe [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitIfFn retLayout cond thenBody elseBody st fs = do
   (st1, fs1, condVal) <- emitExpr st fs cond
-  ensureBoolScalar (valType condVal)
+  ensureBoolScalar (condVal.valType)
   let (thenLabel, st2) = freshId st1
   let (elseLabel, st3) = freshId st2
   let (mergeLabel, st4) = freshId st3
   let fs2 = addFuncInstr (Instr opSelectionMerge [mergeLabel, selectionControlNone]) fs1
-  let fs3 = addTerminator (Instr opBranchConditional [valId condVal, thenLabel, elseLabel]) fs2
+  let fs3 = addTerminator (Instr opBranchConditional [condVal.valId, thenLabel, elseLabel]) fs2
 
   let fsThen0 = addLabel thenLabel fs3
   (st5, fsThen1) <- emitStmtListFn retLayout st4 fsThen0 thenBody
-  let thenTerm = fsTerminated fsThen1
+  let thenTerm = fsThen1.fsTerminated
   let fsThen2 = if thenTerm then fsThen1 else addTerminator (Instr opBranch [mergeLabel]) fsThen1
 
   let fsElse0 = addLabel elseLabel fsThen2
   (st6, fsElse1) <- case elseBody of
     Nothing -> Right (st5, fsElse0)
     Just body -> emitStmtListFn retLayout st5 fsElse0 body
-  let elseTerm = fsTerminated fsElse1
+  let elseTerm = fsElse1.fsTerminated
   let fsElse2 = if elseTerm then fsElse1 else addTerminator (Instr opBranch [mergeLabel]) fsElse1
 
   let fsMerge = addLabel mergeLabel fsElse2
@@ -3275,8 +3279,8 @@ emitIfFn retLayout cond thenBody elseBody st fs = do
 
 emitWhileFn :: Maybe TypeLayout -> Expr -> [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitWhileFn retLayout cond body st fs = do
-  let loopStack = fsLoopStack fs
-  let breakStack = fsBreakStack fs
+  let loopStack = fs.fsLoopStack
+  let breakStack = fs.fsBreakStack
   let (headerLabel, st1) = freshId st
   let (bodyLabel, st2) = freshId st1
   let (continueLabel, st3) = freshId st2
@@ -3285,14 +3289,14 @@ emitWhileFn retLayout cond body st fs = do
   let fs1 = addTerminator (Instr opBranch [headerLabel]) fs
   let fsHeader0 = addLabel headerLabel fs1
   (st5, fsHeader1, condVal) <- emitExpr st4 fsHeader0 cond
-  ensureBoolScalar (valType condVal)
+  ensureBoolScalar (condVal.valType)
   let fsHeader2 = addFuncInstr (Instr opLoopMerge [mergeLabel, continueLabel, loopControlNone]) fsHeader1
-  let fsHeader3 = addTerminator (Instr opBranchConditional [valId condVal, bodyLabel, mergeLabel]) fsHeader2
+  let fsHeader3 = addTerminator (Instr opBranchConditional [condVal.valId, bodyLabel, mergeLabel]) fsHeader2
 
   let fsBody0 = addLabel bodyLabel fsHeader3
   let fsBody1 = fsBody0 { fsLoopStack = (mergeLabel, continueLabel) : loopStack, fsBreakStack = mergeLabel : breakStack }
   (st6, fsBody2) <- emitStmtListFn retLayout st5 fsBody1 body
-  let fsBody3 = if fsTerminated fsBody2 then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
+  let fsBody3 = if fsBody2.fsTerminated then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
 
   let fsContinue0 = addLabel continueLabel fsBody3
   let fsContinue1 = addTerminator (Instr opBranch [headerLabel]) (fsContinue0 { fsBreakStack = mergeLabel : breakStack })
@@ -3303,8 +3307,8 @@ emitWhileFn retLayout cond body st fs = do
 
 emitLoopFn :: Maybe TypeLayout -> [Stmt] -> Maybe [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitLoopFn retLayout body continuing st fs = do
-  let loopStack = fsLoopStack fs
-  let breakStack = fsBreakStack fs
+  let loopStack = fs.fsLoopStack
+  let breakStack = fs.fsBreakStack
   let (headerLabel, st1) = freshId st
   let (bodyLabel, st2) = freshId st1
   let (continueLabel, st3) = freshId st2
@@ -3318,7 +3322,7 @@ emitLoopFn retLayout body continuing st fs = do
   let fsBody0 = addLabel bodyLabel fsHeader2
   let fsBody1 = fsBody0 { fsLoopStack = (mergeLabel, continueLabel) : loopStack, fsBreakStack = mergeLabel : breakStack }
   (st5, fsBody2) <- emitStmtListFn retLayout st4 fsBody1 body
-  let fsBody3 = if fsTerminated fsBody2 then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
+  let fsBody3 = if fsBody2.fsTerminated then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
 
   let fsContinue0 = addLabel continueLabel fsBody3
   let fsContinue1 = fsContinue0 { fsLoopStack = (mergeLabel, continueLabel) : loopStack, fsBreakStack = mergeLabel : breakStack }
@@ -3326,7 +3330,7 @@ emitLoopFn retLayout body continuing st fs = do
     Nothing -> Right (st5, fsContinue1)
     Just contBody -> emitStmtListFn retLayout st5 fsContinue1 contBody
   let fsContinue3 =
-        if fsTerminated fsContinue2
+        if fsContinue2.fsTerminated
           then fsContinue2
           else addTerminator (Instr opBranch [headerLabel]) fsContinue2
 
@@ -3339,11 +3343,11 @@ emitForFn retLayout initStmt condExpr contStmt body st fs = do
   (st1, fs1) <- case initStmt of
     Nothing -> Right (st, fs)
     Just s -> emitStmtFn retLayout st fs s
-  if fsTerminated fs1
+  if fs1.fsTerminated
     then Right (st1, fs1)
     else do
-      let loopStack = fsLoopStack fs1
-      let breakStack = fsBreakStack fs1
+      let loopStack = fs1.fsLoopStack
+      let breakStack = fs1.fsBreakStack
       let (headerLabel, st2) = freshId st1
       let (bodyLabel, st3) = freshId st2
       let (continueLabel, st4) = freshId st3
@@ -3358,14 +3362,14 @@ emitForFn retLayout initStmt condExpr contStmt body st fs = do
           let layout = TLScalar Bool a sz
           Right (st', fsHeader0, Value layout cid)
         Just expr -> emitExpr st5 fsHeader0 expr
-      ensureBoolScalar (valType condVal)
+      ensureBoolScalar (condVal.valType)
       let fsHeader2 = addFuncInstr (Instr opLoopMerge [mergeLabel, continueLabel, loopControlNone]) fsHeader1
-      let fsHeader3 = addTerminator (Instr opBranchConditional [valId condVal, bodyLabel, mergeLabel]) fsHeader2
+      let fsHeader3 = addTerminator (Instr opBranchConditional [condVal.valId, bodyLabel, mergeLabel]) fsHeader2
 
       let fsBody0 = addLabel bodyLabel fsHeader3
       let fsBody1 = fsBody0 { fsLoopStack = (mergeLabel, continueLabel) : loopStack, fsBreakStack = mergeLabel : breakStack }
       (st7, fsBody2) <- emitStmtListFn retLayout st6 fsBody1 body
-      let fsBody3 = if fsTerminated fsBody2 then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
+      let fsBody3 = if fsBody2.fsTerminated then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
 
       let fsContinue0 = addLabel continueLabel fsBody3
       let fsContinue1 = fsContinue0 { fsLoopStack = (mergeLabel, continueLabel) : loopStack, fsBreakStack = mergeLabel : breakStack }
@@ -3373,7 +3377,7 @@ emitForFn retLayout initStmt condExpr contStmt body st fs = do
         Nothing -> Right (st7, fsContinue1)
         Just s -> emitStmtFn retLayout st7 fsContinue1 s
       let fsContinue3 =
-            if fsTerminated fsContinue2
+            if fsContinue2.fsTerminated
               then fsContinue2
               else addTerminator (Instr opBranch [headerLabel]) fsContinue2
 
@@ -3384,13 +3388,13 @@ emitForFn retLayout initStmt condExpr contStmt body st fs = do
 emitSwitchFn :: Maybe TypeLayout -> Expr -> [SwitchCase] -> Maybe [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitSwitchFn retLayout expr cases defBody st fs = do
   (st1, fs1, selVal) <- emitExpr st fs expr
-  ensureSwitchType (valType selVal)
+  ensureSwitchType (selVal.valType)
   cases' <- expandSwitchCases cases defBody
-  let breakStack = fsBreakStack fs1
+  let breakStack = fs1.fsBreakStack
   let (mergeLabel, st2) = freshId st1
   let fs2 = fs1 { fsBreakStack = mergeLabel : breakStack }
   (st3, fs3) <- emitSwitchChainFn retLayout selVal cases' defBody st2 fs2
-  let fs4 = if fsTerminated fs3 then fs3 else addTerminator (Instr opBranch [mergeLabel]) fs3
+  let fs4 = if fs3.fsTerminated then fs3 else addTerminator (Instr opBranch [mergeLabel]) fs3
   let fs5 = addLabel mergeLabel fs4
   let fs6 = fs5 { fsBreakStack = breakStack }
   Right (st3, fs6)
@@ -3404,24 +3408,24 @@ emitSwitchChainFn retLayout selVal cases defBody st fs =
         Just body -> emitStmtListFn retLayout st fs body
     (SwitchCase selectors body : rest) -> do
       (st1, fs1, condVal) <- emitSwitchCond selVal selectors st fs
-      ensureBoolScalar (valType condVal)
+      ensureBoolScalar (condVal.valType)
       let (thenLabel, st2) = freshId st1
       let (elseLabel, st3) = freshId st2
       let (mergeLabel, st4) = freshId st3
       let fs2 = addFuncInstr (Instr opSelectionMerge [mergeLabel, selectionControlNone]) fs1
-      let fs3 = addTerminator (Instr opBranchConditional [valId condVal, thenLabel, elseLabel]) fs2
+      let fs3 = addTerminator (Instr opBranchConditional [condVal.valId, thenLabel, elseLabel]) fs2
 
       let fsThen0 = addLabel thenLabel fs3
       (st5, fsThen1) <- emitStmtListFn retLayout st4 fsThen0 body
-      let fsThen2 = if fsTerminated fsThen1 then fsThen1 else addTerminator (Instr opBranch [mergeLabel]) fsThen1
+      let fsThen2 = if fsThen1.fsTerminated then fsThen1 else addTerminator (Instr opBranch [mergeLabel]) fsThen1
 
       let fsElse0 = addLabel elseLabel fsThen2
       (st6, fsElse1) <- emitSwitchChainFn retLayout selVal rest defBody st5 fsElse0
-      let fsElse2 = if fsTerminated fsElse1 then fsElse1 else addTerminator (Instr opBranch [mergeLabel]) fsElse1
+      let fsElse2 = if fsElse1.fsTerminated then fsElse1 else addTerminator (Instr opBranch [mergeLabel]) fsElse1
 
       let fsMerge = addLabel mergeLabel fsElse2
       let fsMerge1 =
-            if fsTerminated fsThen1 && fsTerminated fsElse1
+            if fsThen1.fsTerminated && fsElse1.fsTerminated
               then addTerminator (Instr opUnreachable []) fsMerge
               else fsMerge
       Right (st6, fsMerge1)
@@ -3436,11 +3440,11 @@ emitSwitchCond selVal selectors st fs =
   where
     emitSelector base expr st' fs' = do
       (st1, sel) <- emitConstExpr st' expr
-      (st2, sel') <- coerceConstValueToLayout (valType base) sel st1
-      emitBinary OpEq (valType base) (valId base) (valId sel') st2 fs'
+      (st2, sel') <- coerceConstValueToLayout (base.valType) sel st1
+      emitBinary OpEq (base.valType) (base.valId) (sel'.valId) st2 fs'
     combine (st1, fs1, acc) expr = do
       (st2, fs2, nextCond) <- emitSelector selVal expr st1 fs1
-      emitBinary OpOr (valType acc) (valId acc) (valId nextCond) st2 fs2
+      emitBinary OpOr (acc.valType) (acc.valId) (nextCond.valId) st2 fs2
 
 ensureNoResources :: String -> TypeLayout -> Either CompileError ()
 ensureNoResources label layout =
@@ -3449,71 +3453,71 @@ ensureNoResources label layout =
     else Right ()
 
 addFunctions :: [Instr] -> GenState -> GenState
-addFunctions instrs st = st { gsFunctions = gsFunctions st <> instrs }
+addFunctions instrs st = st { gsFunctions = st.gsFunctions <> instrs }
 
 getExtInstSet :: GenState -> String -> (Word32, GenState)
 getExtInstSet st name =
-  case lookup name (gsExtInstIds st) of
+  case lookup name (st.gsExtInstIds) of
     Just sid -> (sid, st)
     Nothing ->
       let (sid, st1) = freshId st
           instr = Instr opExtInstImport (sid : encodeString name)
           st2 = st1
-            { gsExtInstIds = (name, sid) : gsExtInstIds st1
-            , gsExtInstImports = gsExtInstImports st1 <> [instr]
+            { gsExtInstIds = (name, sid) : st1.gsExtInstIds
+            , gsExtInstImports = st1.gsExtInstImports <> [instr]
             }
       in (sid, st2)
 
 addFuncInstr :: Instr -> FuncState -> FuncState
-addFuncInstr instr fs = fs { fsInstrs = fsInstrs fs <> [instr] }
+addFuncInstr instr fs = fs { fsInstrs = fs.fsInstrs <> [instr] }
 
 addFuncLocal :: Instr -> FuncState -> FuncState
-addFuncLocal instr fs = fs { fsLocals = fsLocals fs <> [instr] }
+addFuncLocal instr fs = fs { fsLocals = fs.fsLocals <> [instr] }
 
 addTerminator :: Instr -> FuncState -> FuncState
-addTerminator instr fs = fs { fsInstrs = fsInstrs fs <> [instr], fsTerminated = True }
+addTerminator instr fs = fs { fsInstrs = fs.fsInstrs <> [instr], fsTerminated = True }
 
 addLabel :: Word32 -> FuncState -> FuncState
-addLabel lbl fs = fs { fsInstrs = fsInstrs fs <> [Instr opLabel [lbl]], fsTerminated = False }
+addLabel lbl fs = fs { fsInstrs = fs.fsInstrs <> [Instr opLabel [lbl]], fsTerminated = False }
 
 emitStatements :: EntryPoint -> [OutputTarget] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitStatements entry outTargets st fs = do
   (st1, fs1) <- emitStmtList entry outTargets st fs (entry.epBody)
   case entry.epStage of
     StageFragment ->
-      if fsTerminated fs1
+      if fs1.fsTerminated
         then Right (st1, fs1)
         else Left (CompileError "fragment entry point must return a value" Nothing Nothing)
     StageVertex ->
-      if fsTerminated fs1
+      if fs1.fsTerminated
         then Right (st1, fs1)
         else Left (CompileError "vertex entry point must return a value" Nothing Nothing)
     StageCompute -> Right (st1, fs1)
 
 storeReturnValue :: [OutputTarget] -> TypeLayout -> Word32 -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
-storeReturnValue targets valLayout valId st fs = do
+storeReturnValue targets valLayout valueId st fs = do
   when (null targets) $
     Left (CompileError "missing output targets for return value" Nothing Nothing)
   case targets of
     [OutputTarget out layout []] -> do
       ensureTypeMatch layout valLayout
-      let fs1 = addFuncInstr (Instr opStore [viPtrId out, valId]) fs
+      let fs1 = addFuncInstr (Instr opStore [out.viPtrId, valueId]) fs
       Right (st, fs1)
     _ -> foldM storeOne (st, fs) targets
   where
     storeOne (st', fs') target = do
-      let outInfo = otVar target
-      let outLayout = otLayout target
-      case otPath target of
+      let outInfo = target.otVar
+      let outLayout = target.otLayout
+      case target.otPath of
         [] -> do
           ensureTypeMatch outLayout valLayout
-          let fs1 = addFuncInstr (Instr opStore [viPtrId outInfo, valId]) fs'
+          let fs1 = addFuncInstr (Instr opStore [outInfo.viPtrId, valueId]) fs'
           Right (st', fs1)
         path -> do
           let (tyId, st1) = emitTypeFromLayout st' outLayout
           let (resId, st2) = freshId st1
-          let fs1 = addFuncInstr (Instr opCompositeExtract (tyId : resId : valId : path)) fs'
-          let fs2 = addFuncInstr (Instr opStore [viPtrId outInfo, resId]) fs1
+          let fs1 = addFuncInstr (Instr opCompositeExtract (tyId : resId : valueId : path)) fs'
+          let fs2 = addFuncInstr (Instr opStore [outInfo.viPtrId, resId]) fs1
           Right (st2, fs2)
 
 emitStmtList :: EntryPoint -> [OutputTarget] -> GenState -> FuncState -> [Stmt] -> Either CompileError (GenState, FuncState)
@@ -3526,54 +3530,54 @@ emitStmtList entry outTargets st fs = go st fs
 
 emitStmt :: EntryPoint -> [OutputTarget] -> GenState -> FuncState -> Stmt -> Either CompileError (GenState, FuncState)
 emitStmt entry outTargets st fs stmt
-  | fsTerminated fs = Right (st, fs)
+  | fs.fsTerminated = Right (st, fs)
   | otherwise =
       case stmt of
         SLet name expr -> emitLet name expr st fs
         SVar name expr -> emitVar name expr st fs
         SAssign lv expr -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case viType ptrInfo of
+          case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
             _ -> pure ()
           (st2, fs2, val) <- emitExpr st1 fs1 expr
-          (st3, fs3, val') <- coerceValueToLayout (viType ptrInfo) val st2 fs2
+          (st3, fs3, val') <- coerceValueToLayout (ptrInfo.viType) val st2 fs2
           ensureWritable ptrInfo
-          let fs4 = addFuncInstr (Instr opStore [viPtrId ptrInfo, valId val']) fs3
+          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, val'.valId]) fs3
           Right (st3, fs4)
         SAssignOp lv op expr -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case viType ptrInfo of
+          case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
             _ -> pure ()
           ensureWritable ptrInfo
           (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
           (st3, fs3, rhsVal) <- emitExpr st2 fs2 expr
-          (st4, fs4, rhsVal') <- coerceValueToLayout (viType ptrInfo) rhsVal st3 fs3
-          (st5, fs5, resVal) <- emitBinary op (viType ptrInfo) (valId lhsVal) (valId rhsVal') st4 fs4
-          let fs6 = addFuncInstr (Instr opStore [viPtrId ptrInfo, valId resVal]) fs5
+          (st4, fs4, rhsVal') <- coerceValueToLayout (ptrInfo.viType) rhsVal st3 fs3
+          (st5, fs5, resVal) <- emitBinary op (ptrInfo.viType) (lhsVal.valId) (rhsVal'.valId) st4 fs4
+          let fs6 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs5
           Right (st5, fs6)
         SInc lv -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case viType ptrInfo of
+          case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
             _ -> pure ()
           ensureWritable ptrInfo
           (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
-          (oneId, st3) <- emitConstOne (viType ptrInfo) st2
-          (st4, fs3, resVal) <- emitBinary OpAdd (viType ptrInfo) (valId lhsVal) oneId st3 fs2
-          let fs4 = addFuncInstr (Instr opStore [viPtrId ptrInfo, valId resVal]) fs3
+          (oneId, st3) <- emitConstOne (ptrInfo.viType) st2
+          (st4, fs3, resVal) <- emitBinary OpAdd (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
+          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
           Right (st4, fs4)
         SDec lv -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case viType ptrInfo of
+          case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
             _ -> pure ()
           ensureWritable ptrInfo
           (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
-          (oneId, st3) <- emitConstOne (viType ptrInfo) st2
-          (st4, fs3, resVal) <- emitBinary OpSub (viType ptrInfo) (valId lhsVal) oneId st3 fs2
-          let fs4 = addFuncInstr (Instr opStore [viPtrId ptrInfo, valId resVal]) fs3
+          (oneId, st3) <- emitConstOne (ptrInfo.viType) st2
+          (st4, fs3, resVal) <- emitBinary OpSub (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
+          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
           Right (st4, fs4)
         SExpr expr -> emitExprStmt st fs expr
         SIf cond thenBody elseBody ->
@@ -3613,7 +3617,7 @@ emitStmt entry outTargets st fs stmt
                 Nothing -> Left (CompileError "fragment entry points must return a value" Nothing Nothing)
                 Just e -> Right e
               (st1, fs1, val) <- emitExpr st fs expr
-              (st2, fs2) <- storeReturnValue outTargets (valType val) (valId val) st1 fs1
+              (st2, fs2) <- storeReturnValue outTargets (val.valType) (val.valId) st1 fs1
               let fs3 = addTerminator (Instr opReturn []) fs2
               Right (st2, fs3)
             StageVertex -> do
@@ -3621,7 +3625,7 @@ emitStmt entry outTargets st fs stmt
                 Nothing -> Left (CompileError "vertex entry points must return a value" Nothing Nothing)
                 Just e -> Right e
               (st1, fs1, val) <- emitExpr st fs expr
-              (st2, fs2) <- storeReturnValue outTargets (valType val) (valId val) st1 fs1
+              (st2, fs2) <- storeReturnValue outTargets (val.valType) (val.valId) st1 fs1
               let fs3 = addTerminator (Instr opReturn []) fs2
               Right (st2, fs3)
 
@@ -3633,7 +3637,7 @@ emitExprStmt st fs expr =
         "textureStore" -> emitTextureStore args st fs
         "atomicStore" -> emitAtomicStore args st fs
         _ ->
-          if any (\fi -> fiName fi == name) (gsFunctionTable st)
+          if any (\fi -> fi.fiName == name) (st.gsFunctionTable)
             then do
               (st1, fs1, _) <- emitFunctionCallByName name args st fs
               Right (st1, fs1)
@@ -3646,10 +3650,10 @@ emitExprStmt st fs expr =
 
 emitLoadFromPtr :: GenState -> FuncState -> VarInfo -> Either CompileError (GenState, FuncState, Value)
 emitLoadFromPtr st fs info = do
-  let (tyId, st1) = emitTypeFromLayout st (viType info)
+  let (tyId, st1) = emitTypeFromLayout st (info.viType)
   let (resId, st2) = freshId st1
-  let fs1 = addFuncInstr (Instr opLoad [tyId, resId, viPtrId info]) fs
-  Right (st2, fs1, Value (viType info) resId)
+  let fs1 = addFuncInstr (Instr opLoad [tyId, resId, info.viPtrId]) fs
+  Right (st2, fs1, Value (info.viType) resId)
 
 emitConstOne :: TypeLayout -> GenState -> Either CompileError (Word32, GenState)
 emitConstOne layout st =
@@ -3663,50 +3667,50 @@ emitConstOne layout st =
 emitLet :: Text -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitLet name expr st fs = do
   (st1, fs1, val) <- emitExpr st fs expr
-  case valType val of
+  case val.valType of
     TLPointer {} ->
-      let fs2 = fs1 { fsValues = (name, val) : fsValues fs1 }
+      let fs2 = fs1 { fsValues = (name, val) : fs1.fsValues }
       in Right (st1, fs2)
     _ -> emitLocalValue name val st1 fs1
 
 emitVar :: Text -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitVar name expr st fs = do
   (st1, fs1, val) <- emitExpr st fs expr
-  case valType val of
+  case val.valType of
     TLPointer {} -> Left (CompileError "var cannot have pointer type" Nothing Nothing)
     _ -> emitLocalValue name val st1 fs1
 
 emitLocalValue :: Text -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitLocalValue name val st fs = do
-  let (baseTy, st1) = emitTypeFromLayout st (valType val)
+  let (baseTy, st1) = emitTypeFromLayout st (val.valType)
   let (ptrTy, st2) = emitPointerType st1 storageClassFunction baseTy
   let (varId, st3) = freshId st2
   let fs1 = addFuncLocal (Instr opVariable [ptrTy, varId, storageClassFunction]) fs
-  let fs2 = addFuncInstr (Instr opStore [varId, valId val]) fs1
-  let info = VarInfo (valType val) varId storageClassFunction ReadWrite
-  let fs3 = fs2 { fsVars = (name, info) : fsVars fs2 }
+  let fs2 = addFuncInstr (Instr opStore [varId, val.valId]) fs1
+  let info = VarInfo (val.valType) varId storageClassFunction ReadWrite
+  let fs3 = fs2 { fsVars = (name, info) : fs2.fsVars }
   Right (st3, fs3)
 
 emitIf :: EntryPoint -> [OutputTarget] -> Expr -> [Stmt] -> Maybe [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitIf entry outTargets cond thenBody elseBody st fs = do
   (st1, fs1, condVal) <- emitExpr st fs cond
-  ensureBoolScalar (valType condVal)
+  ensureBoolScalar (condVal.valType)
   let (thenLabel, st2) = freshId st1
   let (elseLabel, st3) = freshId st2
   let (mergeLabel, st4) = freshId st3
   let fs2 = addFuncInstr (Instr opSelectionMerge [mergeLabel, selectionControlNone]) fs1
-  let fs3 = addTerminator (Instr opBranchConditional [valId condVal, thenLabel, elseLabel]) fs2
+  let fs3 = addTerminator (Instr opBranchConditional [condVal.valId, thenLabel, elseLabel]) fs2
 
   let fsThen0 = addLabel thenLabel fs3
   (st5, fsThen1) <- emitStmtList entry outTargets st4 fsThen0 thenBody
-  let thenTerm = fsTerminated fsThen1
+  let thenTerm = fsThen1.fsTerminated
   let fsThen2 = if thenTerm then fsThen1 else addTerminator (Instr opBranch [mergeLabel]) fsThen1
 
   let fsElse0 = addLabel elseLabel fsThen2
   (st6, fsElse1) <- case elseBody of
     Nothing -> Right (st5, fsElse0)
     Just body -> emitStmtList entry outTargets st5 fsElse0 body
-  let elseTerm = fsTerminated fsElse1
+  let elseTerm = fsElse1.fsTerminated
   let fsElse2 = if elseTerm then fsElse1 else addTerminator (Instr opBranch [mergeLabel]) fsElse1
 
   let fsMerge = addLabel mergeLabel fsElse2
@@ -3718,8 +3722,8 @@ emitIf entry outTargets cond thenBody elseBody st fs = do
 
 emitWhile :: EntryPoint -> [OutputTarget] -> Expr -> [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitWhile entry outTargets cond body st fs = do
-  let loopStack = fsLoopStack fs
-  let breakStack = fsBreakStack fs
+  let loopStack = fs.fsLoopStack
+  let breakStack = fs.fsBreakStack
   let (headerLabel, st1) = freshId st
   let (bodyLabel, st2) = freshId st1
   let (continueLabel, st3) = freshId st2
@@ -3728,14 +3732,14 @@ emitWhile entry outTargets cond body st fs = do
   let fs1 = addTerminator (Instr opBranch [headerLabel]) fs
   let fsHeader0 = addLabel headerLabel fs1
   (st5, fsHeader1, condVal) <- emitExpr st4 fsHeader0 cond
-  ensureBoolScalar (valType condVal)
+  ensureBoolScalar (condVal.valType)
   let fsHeader2 = addFuncInstr (Instr opLoopMerge [mergeLabel, continueLabel, loopControlNone]) fsHeader1
-  let fsHeader3 = addTerminator (Instr opBranchConditional [valId condVal, bodyLabel, mergeLabel]) fsHeader2
+  let fsHeader3 = addTerminator (Instr opBranchConditional [condVal.valId, bodyLabel, mergeLabel]) fsHeader2
 
   let fsBody0 = addLabel bodyLabel fsHeader3
   let fsBody1 = fsBody0 { fsLoopStack = (mergeLabel, continueLabel) : loopStack, fsBreakStack = mergeLabel : breakStack }
   (st6, fsBody2) <- emitStmtList entry outTargets st5 fsBody1 body
-  let fsBody3 = if fsTerminated fsBody2 then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
+  let fsBody3 = if fsBody2.fsTerminated then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
 
   let fsContinue0 = addLabel continueLabel fsBody3
   let fsContinue1 = addTerminator (Instr opBranch [headerLabel]) (fsContinue0 { fsBreakStack = mergeLabel : breakStack })
@@ -3746,8 +3750,8 @@ emitWhile entry outTargets cond body st fs = do
 
 emitLoop :: EntryPoint -> [OutputTarget] -> [Stmt] -> Maybe [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitLoop entry outTargets body continuing st fs = do
-  let loopStack = fsLoopStack fs
-  let breakStack = fsBreakStack fs
+  let loopStack = fs.fsLoopStack
+  let breakStack = fs.fsBreakStack
   let (headerLabel, st1) = freshId st
   let (bodyLabel, st2) = freshId st1
   let (continueLabel, st3) = freshId st2
@@ -3761,7 +3765,7 @@ emitLoop entry outTargets body continuing st fs = do
   let fsBody0 = addLabel bodyLabel fsHeader2
   let fsBody1 = fsBody0 { fsLoopStack = (mergeLabel, continueLabel) : loopStack, fsBreakStack = mergeLabel : breakStack }
   (st5, fsBody2) <- emitStmtList entry outTargets st4 fsBody1 body
-  let fsBody3 = if fsTerminated fsBody2 then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
+  let fsBody3 = if fsBody2.fsTerminated then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
 
   let fsContinue0 = addLabel continueLabel fsBody3
   let fsContinue1 = fsContinue0 { fsLoopStack = (mergeLabel, continueLabel) : loopStack, fsBreakStack = mergeLabel : breakStack }
@@ -3769,7 +3773,7 @@ emitLoop entry outTargets body continuing st fs = do
     Nothing -> Right (st5, fsContinue1)
     Just contBody -> emitStmtList entry outTargets st5 fsContinue1 contBody
   let fsContinue3 =
-        if fsTerminated fsContinue2
+        if fsContinue2.fsTerminated
           then fsContinue2
           else addTerminator (Instr opBranch [headerLabel]) fsContinue2
 
@@ -3782,11 +3786,11 @@ emitFor entry outTargets initStmt condExpr contStmt body st fs = do
   (st1, fs1) <- case initStmt of
     Nothing -> Right (st, fs)
     Just s -> emitStmt entry outTargets st fs s
-  if fsTerminated fs1
+  if fs1.fsTerminated
     then Right (st1, fs1)
     else do
-      let loopStack = fsLoopStack fs1
-      let breakStack = fsBreakStack fs1
+      let loopStack = fs1.fsLoopStack
+      let breakStack = fs1.fsBreakStack
       let (headerLabel, st2) = freshId st1
       let (bodyLabel, st3) = freshId st2
       let (continueLabel, st4) = freshId st3
@@ -3801,14 +3805,14 @@ emitFor entry outTargets initStmt condExpr contStmt body st fs = do
           let layout = TLScalar Bool a sz
           Right (st', fsHeader0, Value layout cid)
         Just expr -> emitExpr st5 fsHeader0 expr
-      ensureBoolScalar (valType condVal)
+      ensureBoolScalar (condVal.valType)
       let fsHeader2 = addFuncInstr (Instr opLoopMerge [mergeLabel, continueLabel, loopControlNone]) fsHeader1
-      let fsHeader3 = addTerminator (Instr opBranchConditional [valId condVal, bodyLabel, mergeLabel]) fsHeader2
+      let fsHeader3 = addTerminator (Instr opBranchConditional [condVal.valId, bodyLabel, mergeLabel]) fsHeader2
 
       let fsBody0 = addLabel bodyLabel fsHeader3
       let fsBody1 = fsBody0 { fsLoopStack = (mergeLabel, continueLabel) : loopStack, fsBreakStack = mergeLabel : breakStack }
       (st7, fsBody2) <- emitStmtList entry outTargets st6 fsBody1 body
-      let fsBody3 = if fsTerminated fsBody2 then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
+      let fsBody3 = if fsBody2.fsTerminated then fsBody2 else addTerminator (Instr opBranch [continueLabel]) fsBody2
 
       let fsContinue0 = addLabel continueLabel fsBody3
       let fsContinue1 = fsContinue0 { fsLoopStack = (mergeLabel, continueLabel) : loopStack, fsBreakStack = mergeLabel : breakStack }
@@ -3816,7 +3820,7 @@ emitFor entry outTargets initStmt condExpr contStmt body st fs = do
         Nothing -> Right (st7, fsContinue1)
         Just s -> emitStmt entry outTargets st7 fsContinue1 s
       let fsContinue3 =
-            if fsTerminated fsContinue2
+            if fsContinue2.fsTerminated
               then fsContinue2
               else addTerminator (Instr opBranch [headerLabel]) fsContinue2
 
@@ -3827,13 +3831,13 @@ emitFor entry outTargets initStmt condExpr contStmt body st fs = do
 emitSwitch :: EntryPoint -> [OutputTarget] -> Expr -> [SwitchCase] -> Maybe [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitSwitch entry outTargets expr cases defBody st fs = do
   (st1, fs1, selVal) <- emitExpr st fs expr
-  ensureSwitchType (valType selVal)
+  ensureSwitchType (selVal.valType)
   cases' <- expandSwitchCases cases defBody
-  let breakStack = fsBreakStack fs1
+  let breakStack = fs1.fsBreakStack
   let (mergeLabel, st2) = freshId st1
   let fs2 = fs1 { fsBreakStack = mergeLabel : breakStack }
   (st3, fs3) <- emitSwitchChain entry outTargets selVal cases' defBody st2 fs2
-  let fs4 = if fsTerminated fs3 then fs3 else addTerminator (Instr opBranch [mergeLabel]) fs3
+  let fs4 = if fs3.fsTerminated then fs3 else addTerminator (Instr opBranch [mergeLabel]) fs3
   let fs5 = addLabel mergeLabel fs4
   let fs6 = fs5 { fsBreakStack = breakStack }
   Right (st3, fs6)
@@ -3847,31 +3851,31 @@ emitSwitchChain entry outTargets selVal cases defBody st fs =
         Just body -> emitStmtList entry outTargets st fs body
     (SwitchCase selectors body : rest) -> do
       (st1, fs1, condVal) <- emitSwitchCond selVal selectors st fs
-      ensureBoolScalar (valType condVal)
+      ensureBoolScalar (condVal.valType)
       let (thenLabel, st2) = freshId st1
       let (elseLabel, st3) = freshId st2
       let (mergeLabel, st4) = freshId st3
       let fs2 = addFuncInstr (Instr opSelectionMerge [mergeLabel, selectionControlNone]) fs1
-      let fs3 = addTerminator (Instr opBranchConditional [valId condVal, thenLabel, elseLabel]) fs2
+      let fs3 = addTerminator (Instr opBranchConditional [condVal.valId, thenLabel, elseLabel]) fs2
 
       let fsThen0 = addLabel thenLabel fs3
       (st5, fsThen1) <- emitStmtList entry outTargets st4 fsThen0 body
-      let fsThen2 = if fsTerminated fsThen1 then fsThen1 else addTerminator (Instr opBranch [mergeLabel]) fsThen1
+      let fsThen2 = if fsThen1.fsTerminated then fsThen1 else addTerminator (Instr opBranch [mergeLabel]) fsThen1
 
       let fsElse0 = addLabel elseLabel fsThen2
       (st6, fsElse1) <- emitSwitchChain entry outTargets selVal rest defBody st5 fsElse0
-      let fsElse2 = if fsTerminated fsElse1 then fsElse1 else addTerminator (Instr opBranch [mergeLabel]) fsElse1
+      let fsElse2 = if fsElse1.fsTerminated then fsElse1 else addTerminator (Instr opBranch [mergeLabel]) fsElse1
 
       let fsMerge = addLabel mergeLabel fsElse2
       let fsMerge1 =
-            if fsTerminated fsThen1 && fsTerminated fsElse1
+            if fsThen1.fsTerminated && fsElse1.fsTerminated
               then addTerminator (Instr opUnreachable []) fsMerge
               else fsMerge
       Right (st6, fsMerge1)
 
 emitBreak :: GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitBreak st fs =
-  case fsBreakStack fs of
+  case fs.fsBreakStack of
     [] -> Left (CompileError "break used outside of a loop or switch" Nothing Nothing)
     (mergeLabel:_) ->
       let fs1 = addTerminator (Instr opBranch [mergeLabel]) fs
@@ -3879,7 +3883,7 @@ emitBreak st fs =
 
 emitContinue :: GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitContinue st fs =
-  case fsLoopStack fs of
+  case fs.fsLoopStack of
     [] -> Left (CompileError "continue used outside of a loop" Nothing Nothing)
     ((_, continueLabel):_) ->
       let fs1 = addTerminator (Instr opBranch [continueLabel]) fs
@@ -3913,23 +3917,23 @@ emitExpr st fs expr =
       let layout = TLScalar Bool a sz
       Right (st1, fs, Value layout cid)
     EVar name ->
-      case lookup name (fsValues fs) of
+      case lookup name (fs.fsValues) of
         Just val -> Right (st, fs, val)
         Nothing ->
-          case lookup name (gsConstValues st) of
+          case lookup name (st.gsConstValues) of
             Just val -> Right (st, fs, val)
             Nothing ->
-              case Map.lookup name (gsSamplerLayouts st) of
-                Just _ | gsSamplerMode st == SamplerCombined ->
+              case Map.lookup name (st.gsSamplerLayouts) of
+                Just _ | st.gsSamplerMode == SamplerCombined ->
                   Left (CompileError "sampler values are unavailable in combined mode; pass the sampler directly to textureSample" Nothing Nothing)
                 _ -> emitLoadFromExpr st fs expr
     EField base field -> emitFieldExpr st fs base field
     EIndex _ _ -> emitLoadFromExpr st fs expr
     EUnary OpNeg inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
-      case valType val of
+      case val.valType of
         TLScalar U32 _ _ ->
-          case lookupConstKeyById st1 (valId val) of
+          case lookupConstKeyById st1 (val.valId) of
             Just key -> do
               key' <- convertConstKey key I32
               let (cid, st2) = emitConstFromKey st1 key'
@@ -3941,7 +3945,7 @@ emitExpr st fs expr =
               Right (st4, fs2, Value layout resId)
             Nothing -> Left (CompileError "unary minus is not supported for u32" Nothing Nothing)
         _ -> do
-          opcode <- case classifyNumeric (valType val) of
+          opcode <- case classifyNumeric (val.valType) of
             Nothing -> Left (CompileError "unary minus only supports scalar or vector numeric types" Nothing Nothing)
             Just (_, scalar) -> case scalar of
               F32 -> Right opFNegate
@@ -3949,31 +3953,31 @@ emitExpr st fs expr =
               I32 -> Right opSNegate
               U32 -> Left (CompileError "unary minus is not supported for u32" Nothing Nothing)
               Bool -> Left (CompileError "unary minus is not supported for bool" Nothing Nothing)
-          let (tyId, st2) = emitTypeFromLayout st1 (valType val)
+          let (tyId, st2) = emitTypeFromLayout st1 (val.valType)
           let (resId, st3) = freshId st2
-          let fs2 = addFuncInstr (Instr opcode [tyId, resId, valId val]) fs1
-          Right (st3, fs2, Value (valType val) resId)
+          let fs2 = addFuncInstr (Instr opcode [tyId, resId, val.valId]) fs1
+          Right (st3, fs2, Value (val.valType) resId)
     EUnary OpNot inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
-      ensureBoolScalar (valType val)
-      let (tyId, st2) = emitTypeFromLayout st1 (valType val)
+      ensureBoolScalar (val.valType)
+      let (tyId, st2) = emitTypeFromLayout st1 (val.valType)
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opLogicalNot [tyId, resId, valId val]) fs1
-      Right (st3, fs2, Value (valType val) resId)
+      let fs2 = addFuncInstr (Instr opLogicalNot [tyId, resId, val.valId]) fs1
+      Right (st3, fs2, Value (val.valType) resId)
     EUnary OpAddr inner ->
       case exprToLValue inner of
         Nothing -> Left (CompileError "address-of requires an addressable expression" Nothing Nothing)
         Just lv -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          let layout = TLPointer (viStorage ptrInfo) (varAccessToPtrAccess (viAccess ptrInfo)) (viType ptrInfo)
-          Right (st1, fs1, Value layout (viPtrId ptrInfo))
+          let layout = TLPointer (ptrInfo.viStorage) (varAccessToPtrAccess (ptrInfo.viAccess)) (ptrInfo.viType)
+          Right (st1, fs1, Value layout (ptrInfo.viPtrId))
     EUnary OpDeref inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
-      case valType val of
+      case val.valType of
         TLPointer _ _ elemLayout -> do
           let (tyId, st2) = emitTypeFromLayout st1 elemLayout
           let (resId, st3) = freshId st2
-          let fs2 = addFuncInstr (Instr opLoad [tyId, resId, valId val]) fs1
+          let fs2 = addFuncInstr (Instr opLoad [tyId, resId, val.valId]) fs1
           Right (st3, fs2, Value elemLayout resId)
         _ -> Left (CompileError "deref requires a pointer value" Nothing Nothing)
     EBinary op lhs rhs -> do
@@ -3981,7 +3985,7 @@ emitExpr st fs expr =
       (st2, fs2, rval) <- emitExpr st1 fs1 rhs
       case op of
         OpMul ->
-          case (valType lval, valType rval) of
+          case (lval.valType, rval.valType) of
             (TLMatrix cols rows scalar _ _ _, TLVector n s _ _) -> do
               if n /= cols || s /= scalar
                 then Left (CompileError "matrix times vector dimension mismatch" Nothing Nothing)
@@ -3990,7 +3994,7 @@ emitExpr st fs expr =
                   let layout = TLVector rows scalar a sz
                   let (tyId, st3) = emitTypeFromLayout st2 layout
                   let (resId, st4) = freshId st3
-                  let fs3 = addFuncInstr (Instr opMatrixTimesVector [tyId, resId, valId lval, valId rval]) fs2
+                  let fs3 = addFuncInstr (Instr opMatrixTimesVector [tyId, resId, lval.valId, rval.valId]) fs2
                   Right (st4, fs3, Value layout resId)
             (TLVector n s _ _, TLMatrix cols rows scalar _ _ _) -> do
               if n /= rows || s /= scalar
@@ -4000,7 +4004,7 @@ emitExpr st fs expr =
                   let layout = TLVector cols scalar a sz
                   let (tyId, st3) = emitTypeFromLayout st2 layout
                   let (resId, st4) = freshId st3
-                  let fs3 = addFuncInstr (Instr opVectorTimesMatrix [tyId, resId, valId lval, valId rval]) fs2
+                  let fs3 = addFuncInstr (Instr opVectorTimesMatrix [tyId, resId, lval.valId, rval.valId]) fs2
                   Right (st4, fs3, Value layout resId)
             (TLMatrix colsA rowsA scalarA _ _ _, TLMatrix colsB rowsB scalarB _ _ _) -> do
               if colsA /= rowsB || scalarA /= scalarB
@@ -4009,23 +4013,23 @@ emitExpr st fs expr =
                   let layout = matrixLayout colsB rowsA scalarA
                   let (tyId, st3) = emitTypeFromLayout st2 layout
                   let (resId, st4) = freshId st3
-                  let fs3 = addFuncInstr (Instr opMatrixTimesMatrix [tyId, resId, valId lval, valId rval]) fs2
+                  let fs3 = addFuncInstr (Instr opMatrixTimesMatrix [tyId, resId, lval.valId, rval.valId]) fs2
                   Right (st4, fs3, Value layout resId)
             _ -> do
               (st3, fs3, lval', rval', layout) <- coerceBinaryOperands lval rval st2 fs2
-              emitBinary op layout (valId lval') (valId rval') st3 fs3
+              emitBinary op layout (lval'.valId) (rval'.valId) st3 fs3
         _ -> do
           (st3, fs3, lval', rval', layout) <- coerceBinaryOperands lval rval st2 fs2
-          emitBinary op layout (valId lval') (valId rval') st3 fs3
+          emitBinary op layout (lval'.valId) (rval'.valId) st3 fs3
     ECall name args -> emitCall name args st fs
     EBitcast targetTy inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
       targetLayout <- resolveBitcastLayout targetTy
-      (srcN, srcSz, _) <- bitcastLayoutInfo (valType val)
+      (srcN, srcSz, _) <- bitcastLayoutInfo (val.valType)
       (dstN, dstSz, _) <- bitcastLayoutInfo targetLayout
       when (srcN /= dstN || srcSz /= dstSz) $
         Left (CompileError "bitcast source and target types must have the same size" Nothing Nothing)
-      if valType val == targetLayout
+      if val.valType == targetLayout
         then Right (st1, fs1, val)
         else emitBitcastValue targetLayout val st1 fs1
 
@@ -4035,18 +4039,18 @@ emitLoadFromExpr st fs expr =
     Nothing -> Left (CompileError "expected addressable expression" Nothing Nothing)
     Just lv -> do
       (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-      case viType ptrInfo of
+      case ptrInfo.viType of
         TLAtomic _ -> Left (CompileError "use atomicLoad for atomic values" Nothing Nothing)
         _ -> pure ()
-      let (tyId, st2) = emitTypeFromLayout st1 (viType ptrInfo)
+      let (tyId, st2) = emitTypeFromLayout st1 (ptrInfo.viType)
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opLoad [tyId, resId, viPtrId ptrInfo]) fs1
-      Right (st3, fs2, Value (viType ptrInfo) resId)
+      let fs2 = addFuncInstr (Instr opLoad [tyId, resId, ptrInfo.viPtrId]) fs1
+      Right (st3, fs2, Value (ptrInfo.viType) resId)
 
 emitFieldExpr :: GenState -> FuncState -> Expr -> Text -> Either CompileError (GenState, FuncState, Value)
 emitFieldExpr st fs base field = do
   (st1, fs1, baseVal) <- emitExpr st fs base
-  case valType baseVal of
+  case baseVal.valType of
     TLVector n scalar _ _ -> do
       idxs <- vectorFieldIndices field n
       case idxs of
@@ -4055,7 +4059,7 @@ emitFieldExpr st fs base field = do
           let layout = TLScalar scalar a sz
           let (tyId, st2) = emitTypeFromLayout st1 layout
           let (resId, st3) = freshId st2
-          let fs2 = addFuncInstr (Instr opCompositeExtract [tyId, resId, valId baseVal, ix]) fs1
+          let fs2 = addFuncInstr (Instr opCompositeExtract [tyId, resId, baseVal.valId, ix]) fs1
           Right (st3, fs2, Value layout resId)
         _ -> do
           let len = length idxs
@@ -4063,14 +4067,14 @@ emitFieldExpr st fs base field = do
           let layout = TLVector len scalar a sz
           let (tyId, st2) = emitTypeFromLayout st1 layout
           let (resId, st3) = freshId st2
-          let shuffleOps = [tyId, resId, valId baseVal, valId baseVal] <> idxs
+          let shuffleOps = [tyId, resId, baseVal.valId, baseVal.valId] <> idxs
           let fs2 = addFuncInstr (Instr opVectorShuffle shuffleOps) fs1
           Right (st3, fs2, Value layout resId)
     TLStruct _ fields _ _ -> do
       (ix, fieldLayout) <- findField (textToString field) fields
       let (tyId, st2) = emitTypeFromLayout st1 fieldLayout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opCompositeExtract [tyId, resId, valId baseVal, fromIntegral ix]) fs1
+      let fs2 = addFuncInstr (Instr opCompositeExtract [tyId, resId, baseVal.valId, fromIntegral ix]) fs1
       Right (st3, fs2, Value fieldLayout resId)
     _ -> Left (CompileError "field access requires struct or vector type" Nothing Nothing)
 
@@ -4348,7 +4352,7 @@ emitCall name args st fs =
       case parseMatrixName name of
         Just (cols, rows) -> emitMatrixCtor cols rows args st fs
         Nothing ->
-          case lookup name (gsStructLayouts st) of
+          case lookup name (st.gsStructLayouts) of
             Just layout ->
               emitStructCtor name layout args st fs
             Nothing -> do
@@ -4362,7 +4366,7 @@ emitGLSLUnary inst args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      (st2, fs2, val') <- case valType val of
+      (st2, fs2, val') <- case val.valType of
         TLScalar F32 _ _ -> Right (st1, fs1, val)
         TLScalar F16 _ _ -> Right (st1, fs1, val)
         TLScalar _ _ _ -> do
@@ -4370,8 +4374,8 @@ emitGLSLUnary inst args st fs =
           let layout = TLScalar F32 a sz
           coerceValueToLayout layout val st1 fs1
         _ -> Right (st1, fs1, val)
-      ensureFloatNumeric (valType val')
-      emitExtInst (valType val') inst [valId val'] st2 fs2
+      ensureFloatNumeric (val'.valType)
+      emitExtInst (val'.valType) inst [val'.valId] st2 fs2
     _ -> Left (CompileError "builtin expects one argument" Nothing Nothing)
 
 emitGLSLBinary :: Word32 -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4381,11 +4385,11 @@ emitGLSLBinary inst args st fs =
       (st1, fs1, v1) <- emitExpr st fs a
       (st2, fs2, v2) <- emitExpr st1 fs1 b
       (st3, fs3, v1', v2', layout) <-
-        if valType v1 == valType v2
-          then Right (st2, fs2, v1, v2, valType v1)
+        if v1.valType == v2.valType
+          then Right (st2, fs2, v1, v2, v1.valType)
           else coerceBinaryOperands v1 v2 st2 fs2
       ensureFloatNumeric layout
-      emitExtInst layout inst [valId v1', valId v2'] st3 fs3
+      emitExtInst layout inst [v1'.valId, v2'.valId] st3 fs3
     _ -> Left (CompileError "builtin expects two arguments" Nothing Nothing)
 
 emitGLSLTrinary :: Word32 -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4400,7 +4404,7 @@ emitGLSLTrinary inst args st fs =
       (st5, fs5, v2') <- coerceValueToLayout targetLayout v2 st4 fs4
       (st6, fs6, v3') <- coerceValueToLayout targetLayout v3 st5 fs5
       ensureFloatNumeric targetLayout
-      emitExtInst targetLayout inst [valId v1', valId v2', valId v3'] st6 fs6
+      emitExtInst targetLayout inst [v1'.valId, v2'.valId, v3'.valId] st6 fs6
     _ -> Left (CompileError "builtin expects three arguments" Nothing Nothing)
 
 emitGLSLLength :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4408,13 +4412,13 @@ emitGLSLLength args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      ensureFloatVector (valType val)
-      scalar <- case valType val of
+      ensureFloatVector (val.valType)
+      scalar <- case val.valType of
         TLVector _ s _ _ -> Right s
         _ -> Left (CompileError "length expects a float vector" Nothing Nothing)
       let (align, size) = scalarLayout scalar
       let layout = TLScalar scalar align size
-      emitExtInst layout glslStd450Length [valId val] st1 fs1
+      emitExtInst layout glslStd450Length [val.valId] st1 fs1
     _ -> Left (CompileError "length expects one argument" Nothing Nothing)
 
 emitDot :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4423,16 +4427,16 @@ emitDot args st fs =
     [a, b] -> do
       (st1, fs1, v1) <- emitExpr st fs a
       (st2, fs2, v2) <- emitExpr st1 fs1 b
-      ensureTypeMatch (valType v1) (valType v2)
-      ensureFloatVector (valType v1)
-      scalar <- case valType v1 of
+      ensureTypeMatch (v1.valType) (v2.valType)
+      ensureFloatVector (v1.valType)
+      scalar <- case v1.valType of
         TLVector _ s _ _ -> Right s
         _ -> Left (CompileError "dot expects float vectors" Nothing Nothing)
       let (align, size) = scalarLayout scalar
       let layout = TLScalar scalar align size
       let (tyId, st3) = emitTypeFromLayout st2 layout
       let (resId, st4) = freshId st3
-      let fs3 = addFuncInstr (Instr opDot [tyId, resId, valId v1, valId v2]) fs2
+      let fs3 = addFuncInstr (Instr opDot [tyId, resId, v1.valId, v2.valId]) fs2
       Right (st4, fs3, Value layout resId)
     _ -> Left (CompileError "dot expects two arguments" Nothing Nothing)
 
@@ -4443,19 +4447,19 @@ emitDistance args st fs =
       (st1, fs1, v1) <- emitExpr st fs a
       (st2, fs2, v2) <- emitExpr st1 fs1 b
       (st3, fs3, v1', v2', layout) <-
-        if valType v1 == valType v2
-          then Right (st2, fs2, v1, v2, valType v1)
+        if v1.valType == v2.valType
+          then Right (st2, fs2, v1, v2, v1.valType)
           else coerceBinaryOperands v1 v2 st2 fs2
       ensureFloatNumeric layout
       case layout of
         TLScalar _ _ _ -> do
-          (st4, fs4, diff) <- emitBinary OpSub layout (valId v1') (valId v2') st3 fs3
-          emitExtInst (valType diff) glslStd450FAbs [valId diff] st4 fs4
+          (st4, fs4, diff) <- emitBinary OpSub layout (v1'.valId) (v2'.valId) st3 fs3
+          emitExtInst (diff.valType) glslStd450FAbs [diff.valId] st4 fs4
         TLVector _ scalar _ _ -> do
-          (st4, fs4, diff) <- emitBinary OpSub layout (valId v1') (valId v2') st3 fs3
+          (st4, fs4, diff) <- emitBinary OpSub layout (v1'.valId) (v2'.valId) st3 fs3
           let (a', sz') = scalarLayout scalar
           let distLayout = TLScalar scalar a' sz'
-          emitExtInst distLayout glslStd450Length [valId diff] st4 fs4
+          emitExtInst distLayout glslStd450Length [diff.valId] st4 fs4
         _ -> Left (CompileError "distance expects float scalar or vector arguments" Nothing Nothing)
     _ -> Left (CompileError "distance expects two arguments" Nothing Nothing)
 
@@ -4465,28 +4469,28 @@ emitReflect args st fs =
     [iExpr, nExpr] -> do
       (st1, fs1, iVal) <- emitExpr st fs iExpr
       (st2, fs2, nVal) <- emitExpr st1 fs1 nExpr
-      ensureTypeMatch (valType iVal) (valType nVal)
-      ensureFloatVector (valType iVal)
-      scalar <- case valType iVal of
+      ensureTypeMatch (iVal.valType) (nVal.valType)
+      ensureFloatVector (iVal.valType)
+      scalar <- case iVal.valType of
         TLVector _ s _ _ -> Right s
         _ -> Left (CompileError "reflect expects float vector arguments" Nothing Nothing)
       let (a', sz') = scalarLayout scalar
       let dotLayout = TLScalar scalar a' sz'
       let (dotTy, st3) = emitTypeFromLayout st2 dotLayout
       let (dotId, st4) = freshId st3
-      let fs3 = addFuncInstr (Instr opDot [dotTy, dotId, valId nVal, valId iVal]) fs2
+      let fs3 = addFuncInstr (Instr opDot [dotTy, dotId, nVal.valId, iVal.valId]) fs2
       (twoId, st5) <- emitConstFloatScalar scalar 2.0 st4
       (st6, fs4, scaleVal) <- emitBinary OpMul dotLayout dotId twoId st5 fs3
-      (st7, fs5, scaleVec) <- emitSplatVector (valType iVal) (valId scaleVal) st6 fs4
-      (st8, fs6, scaledN) <- emitBinary OpMul (valType nVal) (valId nVal) (valId scaleVec) st7 fs5
-      emitBinary OpSub (valType iVal) (valId iVal) (valId scaledN) st8 fs6
+      (st7, fs5, scaleVec) <- emitSplatVector (iVal.valType) (scaleVal.valId) st6 fs4
+      (st8, fs6, scaledN) <- emitBinary OpMul (nVal.valType) (nVal.valId) (scaleVec.valId) st7 fs5
+      emitBinary OpSub (iVal.valType) (iVal.valId) (scaledN.valId) st8 fs6
     _ -> Left (CompileError "reflect expects two arguments" Nothing Nothing)
 
 emitSelectValue :: TypeLayout -> Value -> Value -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitSelectValue layout trueVal falseVal condVal st fs = do
   let (tyId, st1) = emitTypeFromLayout st layout
   let (resId, st2) = freshId st1
-  let fs1 = addFuncInstr (Instr opSelect [tyId, resId, valId condVal, valId trueVal, valId falseVal]) fs
+  let fs1 = addFuncInstr (Instr opSelect [tyId, resId, condVal.valId, trueVal.valId, falseVal.valId]) fs
   Right (st2, fs1, Value layout resId)
 
 emitSelectBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4498,8 +4502,8 @@ emitSelectBuiltin args st fs =
       (st3, fs3, condVal) <- emitExpr st2 fs2 condExpr
       (st4, fs4, aVal', bVal', layout) <- coerceBinaryOperands aVal bVal st3 fs3
       case layout of
-        TLScalar _ _ _ -> ensureBoolScalar (valType condVal)
-        TLVector n _ _ _ -> ensureBoolVectorSize n (valType condVal)
+        TLScalar _ _ _ -> ensureBoolScalar (condVal.valType)
+        TLVector n _ _ _ -> ensureBoolVectorSize n (condVal.valType)
         _ -> Left (CompileError "select expects scalar or vector types" Nothing Nothing)
       emitSelectValue layout bVal' aVal' condVal st4 fs4
     _ -> Left (CompileError "select expects (a, b, cond)" Nothing Nothing)
@@ -4509,14 +4513,14 @@ emitAnyAll opcode args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      case valType val of
+      case val.valType of
         TLScalar Bool _ _ -> Right (st1, fs1, val)
         TLVector _ Bool _ _ -> do
           let (a, sz) = scalarLayout Bool
           let layout = TLScalar Bool a sz
           let (tyId, st2) = emitTypeFromLayout st1 layout
           let (resId, st3) = freshId st2
-          let fs2 = addFuncInstr (Instr opcode [tyId, resId, valId val]) fs1
+          let fs2 = addFuncInstr (Instr opcode [tyId, resId, val.valId]) fs1
           Right (st3, fs2, Value layout resId)
         _ -> Left (CompileError "any/all expect a bool vector" Nothing Nothing)
     _ -> Left (CompileError "any/all expect one argument" Nothing Nothing)
@@ -4573,14 +4577,14 @@ frexpStructLayout baseLayout = do
 
 emitFloatConvert :: Scalar -> Scalar -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitFloatConvert fromScalar toScalarTy val st fs =
-  case valType val of
+  case val.valType of
     TLScalar s _ _ | s == fromScalar -> emitScalarConvert fromScalar toScalarTy val st fs
     TLVector n s _ _ | s == fromScalar -> do
       let (a, sz) = vectorLayout toScalarTy n
       let layout = TLVector n toScalarTy a sz
       let (tyId, st1) = emitTypeFromLayout st layout
       let (resId, st2) = freshId st1
-      let fs1 = addFuncInstr (Instr opFConvert [tyId, resId, valId val]) fs
+      let fs1 = addFuncInstr (Instr opFConvert [tyId, resId, val.valId]) fs
       Right (st2, fs1, Value layout resId)
     _ -> Left (CompileError "expected float scalar or vector for conversion" Nothing Nothing)
 
@@ -4589,7 +4593,7 @@ emitQuantizeToF16 args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      case valType val of
+      case val.valType of
         TLScalar F32 _ _ -> do
           (st2, fs2, halfVal) <- emitFloatConvert F32 F16 val st1 fs1
           emitFloatConvert F16 F32 halfVal st2 fs2
@@ -4604,9 +4608,9 @@ emitModfBuiltin args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      ensureFloatNumeric (valType val)
-      layout <- modfStructLayout (valType val)
-      emitExtInst layout glslStd450ModfStruct [valId val] st1 fs1
+      ensureFloatNumeric (val.valType)
+      layout <- modfStructLayout (val.valType)
+      emitExtInst layout glslStd450ModfStruct [val.valId] st1 fs1
     _ -> Left (CompileError "modf expects one argument" Nothing Nothing)
 
 emitFrexpBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4614,9 +4618,9 @@ emitFrexpBuiltin args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      ensureFloatNumeric (valType val)
-      layout <- frexpStructLayout (valType val)
-      emitExtInst layout glslStd450FrexpStruct [valId val] st1 fs1
+      ensureFloatNumeric (val.valType)
+      layout <- frexpStructLayout (val.valType)
+      emitExtInst layout glslStd450FrexpStruct [val.valId] st1 fs1
     _ -> Left (CompileError "frexp expects one argument" Nothing Nothing)
 
 emitLdexpBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4624,10 +4628,10 @@ emitLdexpBuiltin args st fs =
   case args of
     [xExpr, expExpr] -> do
       (st1, fs1, xVal) <- emitExpr st fs xExpr
-      ensureFloatNumeric (valType xVal)
+      ensureFloatNumeric (xVal.valType)
       (st2, fs2, expVal) <- emitExpr st1 fs1 expExpr
-      (st3, fs3, expVal') <- coerceExpToI32 (valType xVal) expVal st2 fs2
-      emitExtInst (valType xVal) glslStd450Ldexp [valId xVal, valId expVal'] st3 fs3
+      (st3, fs3, expVal') <- coerceExpToI32 (xVal.valType) expVal st2 fs2
+      emitExtInst (xVal.valType) glslStd450Ldexp [xVal.valId, expVal'.valId] st3 fs3
     _ -> Left (CompileError "ldexp expects (x, exp)" Nothing Nothing)
 
 emitPackBuiltin :: Word32 -> Int -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4635,10 +4639,10 @@ emitPackBuiltin inst n args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      ensureFloatVecN n (valType val)
+      ensureFloatVecN n (val.valType)
       let (a, sz) = scalarLayout U32
       let layout = TLScalar U32 a sz
-      emitExtInst layout inst [valId val] st1 fs1
+      emitExtInst layout inst [val.valId] st1 fs1
     _ -> Left (CompileError "pack builtin expects one argument" Nothing Nothing)
 
 emitUnpackBuiltin :: Word32 -> Int -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4651,7 +4655,7 @@ emitUnpackBuiltin inst n args st fs =
       (st2, fs2, val') <- coerceValueToLayout layoutU32 val st1 fs1
       let (va, vsz) = vectorLayout F32 n
       let layout = TLVector n F32 va vsz
-      emitExtInst layout inst [valId val'] st2 fs2
+      emitExtInst layout inst [val'.valId] st2 fs2
     _ -> Left (CompileError "unpack builtin expects one argument" Nothing Nothing)
 
 emitTransposeBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4659,11 +4663,11 @@ emitTransposeBuiltin args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      (cols, rows, scalar) <- ensureFloatMatrix (valType val)
+      (cols, rows, scalar) <- ensureFloatMatrix (val.valType)
       let layout = matrixLayout rows cols scalar
       let (tyId, st2) = emitTypeFromLayout st1 layout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opTranspose [tyId, resId, valId val]) fs1
+      let fs2 = addFuncInstr (Instr opTranspose [tyId, resId, val.valId]) fs1
       Right (st3, fs2, Value layout resId)
     _ -> Left (CompileError "transpose expects one argument" Nothing Nothing)
 
@@ -4672,12 +4676,12 @@ emitDeterminantBuiltin args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      (cols, rows, scalar) <- ensureFloatMatrix (valType val)
+      (cols, rows, scalar) <- ensureFloatMatrix (val.valType)
       when (cols /= rows) $
         Left (CompileError "determinant expects a square matrix" Nothing Nothing)
       let (a, sz) = scalarLayout scalar
       let layout = TLScalar scalar a sz
-      emitExtInst layout glslStd450Determinant [valId val] st1 fs1
+      emitExtInst layout glslStd450Determinant [val.valId] st1 fs1
     _ -> Left (CompileError "determinant expects one argument" Nothing Nothing)
 
 emitMatrixInverseBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4685,10 +4689,10 @@ emitMatrixInverseBuiltin args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      (cols, rows, _) <- ensureFloatMatrix (valType val)
+      (cols, rows, _) <- ensureFloatMatrix (val.valType)
       when (cols /= rows) $
         Left (CompileError "inverse expects a square matrix" Nothing Nothing)
-      emitExtInst (valType val) glslStd450MatrixInverse [valId val] st1 fs1
+      emitExtInst (val.valType) glslStd450MatrixInverse [val.valId] st1 fs1
     _ -> Left (CompileError "inverse expects one argument" Nothing Nothing)
 
 emitCrossBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4698,11 +4702,11 @@ emitCrossBuiltin args st fs =
       (st1, fs1, v1) <- emitExpr st fs aExpr
       (st2, fs2, v2) <- emitExpr st1 fs1 bExpr
       (st3, fs3, v1', v2', layout) <-
-        if valType v1 == valType v2
-          then Right (st2, fs2, v1, v2, valType v1)
+        if v1.valType == v2.valType
+          then Right (st2, fs2, v1, v2, v1.valType)
           else coerceBinaryOperands v1 v2 st2 fs2
       ensureFloatVec3 layout
-      emitExtInst layout glslStd450Cross [valId v1', valId v2'] st3 fs3
+      emitExtInst layout glslStd450Cross [v1'.valId, v2'.valId] st3 fs3
     _ -> Left (CompileError "cross expects two arguments" Nothing Nothing)
 
 emitFaceForwardBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4713,12 +4717,12 @@ emitFaceForwardBuiltin args st fs =
       (st2, fs2, iVal) <- emitExpr st1 fs1 iExpr
       (st3, fs3, nrefVal) <- emitExpr st2 fs2 nrefExpr
       (st4, fs4, nVal', iVal', layout) <-
-        if valType nVal == valType iVal
-          then Right (st3, fs3, nVal, iVal, valType nVal)
+        if nVal.valType == iVal.valType
+          then Right (st3, fs3, nVal, iVal, nVal.valType)
           else coerceBinaryOperands nVal iVal st3 fs3
       (st5, fs5, nrefVal') <- coerceValueToLayout layout nrefVal st4 fs4
       ensureFloatVector layout
-      emitExtInst layout glslStd450FaceForward [valId nVal', valId iVal', valId nrefVal'] st5 fs5
+      emitExtInst layout glslStd450FaceForward [nVal'.valId, iVal'.valId, nrefVal'.valId] st5 fs5
     _ -> Left (CompileError "faceForward expects three arguments" Nothing Nothing)
 
 emitRefractBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4729,11 +4733,11 @@ emitRefractBuiltin args st fs =
       (st2, fs2, nVal) <- emitExpr st1 fs1 nExpr
       (st3, fs3, etaVal) <- emitExpr st2 fs2 etaExpr
       (st4, fs4, iVal', nVal', layout) <-
-        if valType iVal == valType nVal
-          then Right (st3, fs3, iVal, nVal, valType iVal)
+        if iVal.valType == nVal.valType
+          then Right (st3, fs3, iVal, nVal, iVal.valType)
           else coerceBinaryOperands iVal nVal st3 fs3
       ensureFloatVector layout
-      (st5, fs5, etaScalar) <- case valType etaVal of
+      (st5, fs5, etaScalar) <- case etaVal.valType of
         TLScalar s _ _ ->
           if s == scalarFromLayout layout
             then Right (st4, fs4, etaVal)
@@ -4741,7 +4745,7 @@ emitRefractBuiltin args st fs =
               (st5, fs5, etaConverted) <- emitScalarConvert s (scalarFromLayout layout) etaVal st4 fs4
               Right (st5, fs5, etaConverted)
         _ -> Left (CompileError "refract expects a float scalar for eta" Nothing Nothing)
-      emitExtInst layout glslStd450Refract [valId iVal', valId nVal', valId etaScalar] st5 fs5
+      emitExtInst layout glslStd450Refract [iVal'.valId, nVal'.valId, etaScalar.valId] st5 fs5
     _ -> Left (CompileError "refract expects three arguments" Nothing Nothing)
   where
     scalarFromLayout layout =
@@ -4754,8 +4758,8 @@ emitFirstTrailingBitBuiltin args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      ensureIntNumeric (valType val)
-      emitExtInst (valType val) glslStd450FindILsb [valId val] st1 fs1
+      ensureIntNumeric (val.valType)
+      emitExtInst (val.valType) glslStd450FindILsb [val.valId] st1 fs1
     _ -> Left (CompileError "firstTrailingBit expects one argument" Nothing Nothing)
 
 emitFirstLeadingBitBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4763,12 +4767,12 @@ emitFirstLeadingBitBuiltin args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      ensureIntNumeric (valType val)
-      let inst = case classifyNumeric (valType val) of
+      ensureIntNumeric (val.valType)
+      let inst = case classifyNumeric (val.valType) of
             Just (_, I32) -> glslStd450FindSMsb
             Just (_, U32) -> glslStd450FindUMsb
             _ -> glslStd450FindSMsb
-      emitExtInst (valType val) inst [valId val] st1 fs1
+      emitExtInst (val.valType) inst [val.valId] st1 fs1
     _ -> Left (CompileError "firstLeadingBit expects one argument" Nothing Nothing)
 
 emitSaturateBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4776,25 +4780,25 @@ emitSaturateBuiltin args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      ensureFloatNumeric (valType val)
-      (st2, zeroVal) <- emitConstFloatSplat (valType val) 0.0 st1
-      (st3, oneVal) <- emitConstFloatSplat (valType val) 1.0 st2
-      emitExtInst (valType val) glslStd450FClamp [valId val, valId zeroVal, valId oneVal] st3 fs1
+      ensureFloatNumeric (val.valType)
+      (st2, zeroVal) <- emitConstFloatSplat (val.valType) 0.0 st1
+      (st3, oneVal) <- emitConstFloatSplat (val.valType) 1.0 st2
+      emitExtInst (val.valType) glslStd450FClamp [val.valId, zeroVal.valId, oneVal.valId] st3 fs1
     _ -> Left (CompileError "saturate expects one argument" Nothing Nothing)
 
 emitIntNegate :: Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitIntNegate val st fs =
-  case valType val of
+  case val.valType of
     TLScalar I32 _ _ -> do
-      let (tyId, st1) = emitTypeFromLayout st (valType val)
+      let (tyId, st1) = emitTypeFromLayout st (val.valType)
       let (resId, st2) = freshId st1
-      let fs1 = addFuncInstr (Instr opSNegate [tyId, resId, valId val]) fs
-      Right (st2, fs1, Value (valType val) resId)
+      let fs1 = addFuncInstr (Instr opSNegate [tyId, resId, val.valId]) fs
+      Right (st2, fs1, Value (val.valType) resId)
     TLVector _ I32 _ _ -> do
-      let (tyId, st1) = emitTypeFromLayout st (valType val)
+      let (tyId, st1) = emitTypeFromLayout st (val.valType)
       let (resId, st2) = freshId st1
-      let fs1 = addFuncInstr (Instr opSNegate [tyId, resId, valId val]) fs
-      Right (st2, fs1, Value (valType val) resId)
+      let fs1 = addFuncInstr (Instr opSNegate [tyId, resId, val.valId]) fs
+      Right (st2, fs1, Value (val.valType) resId)
     _ -> Left (CompileError "expected i32 scalar or vector" Nothing Nothing)
 
 emitAbsBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4802,21 +4806,21 @@ emitAbsBuiltin args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      case classifyNumeric (valType val) of
-        Just (_, F32) -> emitExtInst (valType val) glslStd450FAbs [valId val] st1 fs1
-        Just (_, F16) -> emitExtInst (valType val) glslStd450FAbs [valId val] st1 fs1
+      case classifyNumeric (val.valType) of
+        Just (_, F32) -> emitExtInst (val.valType) glslStd450FAbs [val.valId] st1 fs1
+        Just (_, F16) -> emitExtInst (val.valType) glslStd450FAbs [val.valId] st1 fs1
         Just (_, I32) -> do
-          (st2, zeroVal) <- emitConstIntSplat (valType val) 0 st1
-          (st3, fs3, condVal) <- emitBinary OpLt (valType val) (valId val) (valId zeroVal) st2 fs1
+          (st2, zeroVal) <- emitConstIntSplat (val.valType) 0 st1
+          (st3, fs3, condVal) <- emitBinary OpLt (val.valType) (val.valId) (zeroVal.valId) st2 fs1
           (st4, fs4, negVal) <- emitIntNegate val st3 fs3
-          emitSelectValue (valType val) negVal val condVal st4 fs4
+          emitSelectValue (val.valType) negVal val condVal st4 fs4
         Just (_, U32) -> Right (st1, fs1, val)
         _ -> Left (CompileError "abs expects numeric scalar or vector types" Nothing Nothing)
     _ -> Left (CompileError "abs expects one argument" Nothing Nothing)
 
 emitMinMaxInt :: BinOp -> TypeLayout -> Value -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitMinMaxInt cmpOp layout v1 v2 st fs = do
-  (st1, fs1, condVal) <- emitBinary cmpOp layout (valId v1) (valId v2) st fs
+  (st1, fs1, condVal) <- emitBinary cmpOp layout (v1.valId) (v2.valId) st fs
   emitSelectValue layout v1 v2 condVal st1 fs1
 
 emitMinMaxBuiltin :: Bool -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4826,16 +4830,16 @@ emitMinMaxBuiltin isMin args st fs =
       (st1, fs1, v1) <- emitExpr st fs aExpr
       (st2, fs2, v2) <- emitExpr st1 fs1 bExpr
       (st3, fs3, v1', v2', layout) <-
-        if valType v1 == valType v2
-          then Right (st2, fs2, v1, v2, valType v1)
+        if v1.valType == v2.valType
+          then Right (st2, fs2, v1, v2, v1.valType)
           else coerceBinaryOperands v1 v2 st2 fs2
       case classifyNumeric layout of
         Just (_, F32) ->
           let inst = if isMin then glslStd450FMin else glslStd450FMax
-          in emitExtInst layout inst [valId v1', valId v2'] st3 fs3
+          in emitExtInst layout inst [v1'.valId, v2'.valId] st3 fs3
         Just (_, F16) ->
           let inst = if isMin then glslStd450FMin else glslStd450FMax
-          in emitExtInst layout inst [valId v1', valId v2'] st3 fs3
+          in emitExtInst layout inst [v1'.valId, v2'.valId] st3 fs3
         Just (_, I32) -> do
           let cmpOp = if isMin then OpLt else OpGt
           emitMinMaxInt cmpOp layout v1' v2' st3 fs3
@@ -4858,12 +4862,12 @@ emitClampBuiltin args st fs =
           (st4, fs4, vx') <- coerceValueToLayout baseLayout vx st3 fs3
           (st5, fs5, vlo') <- coerceValueToLayout baseLayout vlo st4 fs4
           (st6, fs6, vhi') <- coerceValueToLayout baseLayout vhi st5 fs5
-          emitExtInst baseLayout glslStd450FClamp [valId vx', valId vlo', valId vhi'] st6 fs6
+          emitExtInst baseLayout glslStd450FClamp [vx'.valId, vlo'.valId, vhi'.valId] st6 fs6
         Just (_, F16) -> do
           (st4, fs4, vx') <- coerceValueToLayout baseLayout vx st3 fs3
           (st5, fs5, vlo') <- coerceValueToLayout baseLayout vlo st4 fs4
           (st6, fs6, vhi') <- coerceValueToLayout baseLayout vhi st5 fs5
-          emitExtInst baseLayout glslStd450FClamp [valId vx', valId vlo', valId vhi'] st6 fs6
+          emitExtInst baseLayout glslStd450FClamp [vx'.valId, vlo'.valId, vhi'.valId] st6 fs6
         Just (_, I32) -> do
           (st4, fs4, vx') <- coerceValueToLayout baseLayout vx st3 fs3
           (st5, fs5, vlo') <- coerceValueToLayout baseLayout vlo st4 fs4
@@ -4884,10 +4888,10 @@ emitSignBuiltin args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      case classifyNumeric (valType val) of
-        Just (_, F32) -> emitSignFloat (valType val) val st1 fs1
-        Just (_, F16) -> emitSignFloat (valType val) val st1 fs1
-        Just (_, I32) -> emitSignInt (valType val) val st1 fs1
+      case classifyNumeric (val.valType) of
+        Just (_, F32) -> emitSignFloat (val.valType) val st1 fs1
+        Just (_, F16) -> emitSignFloat (val.valType) val st1 fs1
+        Just (_, I32) -> emitSignInt (val.valType) val st1 fs1
         _ -> Left (CompileError "sign expects i32 or float scalar/vector types" Nothing Nothing)
     _ -> Left (CompileError "sign expects one argument" Nothing Nothing)
   where
@@ -4895,16 +4899,16 @@ emitSignBuiltin args st fs =
       (st2, zeroVal) <- emitConstFloatSplat layout 0.0 st1
       (st3, oneVal) <- emitConstFloatSplat layout 1.0 st2
       (st4, negOneVal) <- emitConstFloatSplat layout (-1.0) st3
-      (st5, fs2, condPos) <- emitBinary OpGt layout (valId val) (valId zeroVal) st4 fs1
-      (st6, fs3, condNeg) <- emitBinary OpLt layout (valId val) (valId zeroVal) st5 fs2
+      (st5, fs2, condPos) <- emitBinary OpGt layout (val.valId) (zeroVal.valId) st4 fs1
+      (st6, fs3, condNeg) <- emitBinary OpLt layout (val.valId) (zeroVal.valId) st5 fs2
       (st7, fs4, posVal) <- emitSelectValue layout oneVal zeroVal condPos st6 fs3
       emitSelectValue layout negOneVal posVal condNeg st7 fs4
     emitSignInt layout val st1 fs1 = do
       (st2, zeroVal) <- emitConstIntSplat layout 0 st1
       (st3, oneVal) <- emitConstIntSplat layout 1 st2
       (st4, negOneVal) <- emitConstIntSplat layout (-1) st3
-      (st5, fs2, condPos) <- emitBinary OpGt layout (valId val) (valId zeroVal) st4 fs1
-      (st6, fs3, condNeg) <- emitBinary OpLt layout (valId val) (valId zeroVal) st5 fs2
+      (st5, fs2, condPos) <- emitBinary OpGt layout (val.valId) (zeroVal.valId) st4 fs1
+      (st6, fs3, condNeg) <- emitBinary OpLt layout (val.valId) (zeroVal.valId) st5 fs2
       (st7, fs4, posVal) <- emitSelectValue layout oneVal zeroVal condPos st6 fs3
       emitSelectValue layout negOneVal posVal condNeg st7 fs4
 
@@ -4913,11 +4917,11 @@ emitBitUnary opcode args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      ensureIntNumeric (valType val)
-      let (tyId, st2) = emitTypeFromLayout st1 (valType val)
+      ensureIntNumeric (val.valType)
+      let (tyId, st2) = emitTypeFromLayout st1 (val.valType)
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opcode [tyId, resId, valId val]) fs1
-      Right (st3, fs2, Value (valType val) resId)
+      let fs2 = addFuncInstr (Instr opcode [tyId, resId, val.valId]) fs1
+      Right (st3, fs2, Value (val.valType) resId)
     _ -> Left (CompileError "bitwise builtin expects one argument" Nothing Nothing)
 
 emitCountLeadingZeros :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -4928,11 +4932,11 @@ emitCountLeadingZeros args st fs =
       (st2, fs2, valU, layoutU, origLayout) <- toUnsignedValue val st1 fs1
       let bitWidth = intBitWidth layoutU
       (st3, zeroVal) <- emitConstIntSplat layoutU 0 st2
-      (st4, fs3, condZero) <- emitBinary OpEq layoutU (valId valU) (valId zeroVal) st3 fs2
+      (st4, fs3, condZero) <- emitBinary OpEq layoutU (valU.valId) (zeroVal.valId) st3 fs2
       (st5, bitWidthVal) <- emitConstIntSplat layoutU bitWidth st4
       (st6, oneLessVal) <- emitConstIntSplat layoutU (bitWidth - 1) st5
-      (st7, fs4, msbVal) <- emitExtInst layoutU glslStd450FindUMsb [valId valU] st6 fs3
-      (st8, fs5, clzVal) <- emitBinary OpSub layoutU (valId oneLessVal) (valId msbVal) st7 fs4
+      (st7, fs4, msbVal) <- emitExtInst layoutU glslStd450FindUMsb [valU.valId] st6 fs3
+      (st8, fs5, clzVal) <- emitBinary OpSub layoutU (oneLessVal.valId) (msbVal.valId) st7 fs4
       (st9, fs6, resU) <- emitSelectValue layoutU bitWidthVal clzVal condZero st8 fs5
       fromUnsignedValue origLayout resU st9 fs6
     _ -> Left (CompileError "countLeadingZeros expects one argument" Nothing Nothing)
@@ -4945,9 +4949,9 @@ emitCountTrailingZeros args st fs =
       (st2, fs2, valU, layoutU, origLayout) <- toUnsignedValue val st1 fs1
       let bitWidth = intBitWidth layoutU
       (st3, zeroVal) <- emitConstIntSplat layoutU 0 st2
-      (st4, fs3, condZero) <- emitBinary OpEq layoutU (valId valU) (valId zeroVal) st3 fs2
+      (st4, fs3, condZero) <- emitBinary OpEq layoutU (valU.valId) (zeroVal.valId) st3 fs2
       (st5, bitWidthVal) <- emitConstIntSplat layoutU bitWidth st4
-      (st6, fs4, lsbVal) <- emitExtInst layoutU glslStd450FindILsb [valId valU] st5 fs3
+      (st6, fs4, lsbVal) <- emitExtInst layoutU glslStd450FindILsb [valU.valId] st5 fs3
       (st7, fs5, resU) <- emitSelectValue layoutU bitWidthVal lsbVal condZero st6 fs4
       fromUnsignedValue origLayout resU st7 fs5
     _ -> Left (CompileError "countTrailingZeros expects one argument" Nothing Nothing)
@@ -4970,21 +4974,21 @@ emitDot4Packed signed args st fs =
           go st' fs' acc (off:rest) = do
             (stA, fsA, aLane) <- emitBitFieldExtractConst opcode layout aPacked off 8 st' fs'
             (stB, fsB, bLane) <- emitBitFieldExtractConst opcode layout bPacked off 8 stA fsA
-            (stC, fsC, prod) <- emitBinary OpMul layout (valId aLane) (valId bLane) stB fsB
-            (stD, fsD, sum') <- emitBinary OpAdd layout (valId acc) (valId prod) stC fsC
+            (stC, fsC, prod) <- emitBinary OpMul layout (aLane.valId) (bLane.valId) stB fsB
+            (stD, fsD, sum') <- emitBinary OpAdd layout (acc.valId) (prod.valId) stC fsC
             go stD fsD sum' rest
       (st6, fs6, sumVal) <- go st5 fs4 sum0 offsets
       Right (st6, fs6, sumVal)
     _ -> Left (CompileError "dot4 packed expects two arguments" Nothing Nothing)
   where
     coercePackedScalar label layout val st1 fs1 =
-      case valType val of
+      case val.valType of
         TLScalar I32 _ _ ->
-          if layout == valType val
+          if layout == val.valType
             then Right (st1, fs1, val)
             else emitBitcastValue layout val st1 fs1
         TLScalar U32 _ _ ->
-          if layout == valType val
+          if layout == val.valType
             then Right (st1, fs1, val)
             else emitBitcastValue layout val st1 fs1
         _ -> Left (CompileError (label <> " must be i32 or u32 scalar") Nothing Nothing)
@@ -4995,24 +4999,24 @@ emitBitFieldExtractConst opcode layout baseVal offset count st fs = do
   (st2, countVal) <- emitConstIntSplat layout count st1
   let (tyId, st3) = emitTypeFromLayout st2 layout
   let (resId, st4) = freshId st3
-  let fs1 = addFuncInstr (Instr opcode [tyId, resId, valId baseVal, valId offsetVal, valId countVal]) fs
+  let fs1 = addFuncInstr (Instr opcode [tyId, resId, baseVal.valId, offsetVal.valId, countVal.valId]) fs
   Right (st4, fs1, Value layout resId)
 
 toUnsignedValue :: Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value, TypeLayout, TypeLayout)
 toUnsignedValue val st fs =
-  case valType val of
-    TLScalar U32 _ _ -> Right (st, fs, val, valType val, valType val)
+  case val.valType of
+    TLScalar U32 _ _ -> Right (st, fs, val, val.valType, val.valType)
     TLScalar I32 _ _ -> do
       let (a, sz) = scalarLayout U32
           layoutU = TLScalar U32 a sz
       (st1, fs1, valU) <- emitBitcastValue layoutU val st fs
-      Right (st1, fs1, valU, layoutU, valType val)
-    TLVector _ U32 _ _ -> Right (st, fs, val, valType val, valType val)
+      Right (st1, fs1, valU, layoutU, val.valType)
+    TLVector _ U32 _ _ -> Right (st, fs, val, val.valType, val.valType)
     TLVector n I32 _ _ -> do
       let (a, sz) = vectorLayout U32 n
           layoutU = TLVector n U32 a sz
       (st1, fs1, valU) <- emitBitcastValue layoutU val st fs
-      Right (st1, fs1, valU, layoutU, valType val)
+      Right (st1, fs1, valU, layoutU, val.valType)
     _ -> Left (CompileError "countLeadingZeros/countTrailingZeros expect i32 or u32 scalar or vector types" Nothing Nothing)
 
 fromUnsignedValue :: TypeLayout -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -5067,22 +5071,22 @@ normalizeBitFieldIndex :: TypeLayout -> Value -> GenState -> FuncState -> Either
 normalizeBitFieldIndex baseLayout idxVal st fs =
   case baseLayout of
     TLScalar baseScalar _ _ -> do
-      ensureIndexType (valType idxVal)
-      case valType idxVal of
+      ensureIndexType (idxVal.valType)
+      case idxVal.valType of
         TLScalar s _ _ | s == baseScalar -> Right (st, fs, idxVal)
         TLScalar s _ _ -> emitScalarConvert s baseScalar idxVal st fs
         _ -> Left (CompileError "bitfield indices must be scalar" Nothing Nothing)
     TLVector n baseScalar _ _ ->
-      case valType idxVal of
+      case idxVal.valType of
         TLScalar s _ _ -> do
-          ensureIndexType (valType idxVal)
+          ensureIndexType (idxVal.valType)
           (st1, fs1, scalarVal) <-
             if s == baseScalar
               then Right (st, fs, idxVal)
               else emitScalarConvert s baseScalar idxVal st fs
           let (a, sz) = vectorLayout baseScalar n
           let layout = TLVector n baseScalar a sz
-          emitSplatVector layout (valId scalarVal) st1 fs1
+          emitSplatVector layout (scalarVal.valId) st1 fs1
         TLVector m s _ _ | m == n && s == baseScalar -> Right (st, fs, idxVal)
         TLVector _ _ _ _ -> Left (CompileError "bitfield indices must match vector size and scalar type" Nothing Nothing)
         _ -> Left (CompileError "bitfield indices must be scalar or matching vector" Nothing Nothing)
@@ -5092,19 +5096,19 @@ emitBitcastValue :: TypeLayout -> Value -> GenState -> FuncState -> Either Compi
 emitBitcastValue target val st fs = do
   let (tyId, st1) = emitTypeFromLayout st target
   let (resId, st2) = freshId st1
-  let fs1 = addFuncInstr (Instr opBitcast [tyId, resId, valId val]) fs
+  let fs1 = addFuncInstr (Instr opBitcast [tyId, resId, val.valId]) fs
   Right (st2, fs1, Value target resId)
 
 coerceExpToI32 :: TypeLayout -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 coerceExpToI32 baseLayout expVal st fs =
   case baseLayout of
     TLScalar _ _ _ ->
-      case valType expVal of
+      case expVal.valType of
         TLScalar I32 _ _ -> Right (st, fs, expVal)
         TLScalar U32 _ _ -> emitScalarConvert U32 I32 expVal st fs
         _ -> Left (CompileError "ldexp exponent must be i32 or u32 scalar" Nothing Nothing)
     TLVector n _ _ _ ->
-      case valType expVal of
+      case expVal.valType of
         TLScalar s _ _ -> do
           (st1, fs1, scalarVal) <- case s of
             I32 -> Right (st, fs, expVal)
@@ -5112,7 +5116,7 @@ coerceExpToI32 baseLayout expVal st fs =
             _ -> Left (CompileError "ldexp exponent must be i32 or u32" Nothing Nothing)
           let (a, sz) = vectorLayout I32 n
           let layout = TLVector n I32 a sz
-          emitSplatVector layout (valId scalarVal) st1 fs1
+          emitSplatVector layout (scalarVal.valId) st1 fs1
         TLVector m s _ _ | m == n ->
           case s of
             I32 -> Right (st, fs, expVal)
@@ -5129,22 +5133,22 @@ emitExtractBitsBuiltin args st fs =
   case args of
     [baseExpr, offsetExpr, countExpr] -> do
       (st1, fs1, baseVal) <- emitExpr st fs baseExpr
-      ensureIntNumeric (valType baseVal)
+      ensureIntNumeric (baseVal.valType)
       (st2, fs2, offsetVal) <- emitExpr st1 fs1 offsetExpr
       (st3, fs3, countVal) <- emitExpr st2 fs2 countExpr
-      (st4, fs4, offsetVal') <- normalizeBitFieldIndex (valType baseVal) offsetVal st3 fs3
-      (st5, fs5, countVal') <- normalizeBitFieldIndex (valType baseVal) countVal st4 fs4
-      scalar <- case classifyNumeric (valType baseVal) of
+      (st4, fs4, offsetVal') <- normalizeBitFieldIndex (baseVal.valType) offsetVal st3 fs3
+      (st5, fs5, countVal') <- normalizeBitFieldIndex (baseVal.valType) countVal st4 fs4
+      scalar <- case classifyNumeric (baseVal.valType) of
         Just (_, s) -> Right s
         Nothing -> Left (CompileError "extractBits expects integer types" Nothing Nothing)
       opcode <- case scalar of
         I32 -> Right opBitFieldSExtract
         U32 -> Right opBitFieldUExtract
         _ -> Left (CompileError "extractBits expects i32 or u32 types" Nothing Nothing)
-      let (tyId, st6) = emitTypeFromLayout st5 (valType baseVal)
+      let (tyId, st6) = emitTypeFromLayout st5 (baseVal.valType)
       let (resId, st7) = freshId st6
-      let fs6 = addFuncInstr (Instr opcode [tyId, resId, valId baseVal, valId offsetVal', valId countVal']) fs5
-      Right (st7, fs6, Value (valType baseVal) resId)
+      let fs6 = addFuncInstr (Instr opcode [tyId, resId, baseVal.valId, offsetVal'.valId, countVal'.valId]) fs5
+      Right (st7, fs6, Value (baseVal.valType) resId)
     _ -> Left (CompileError "extractBits expects (e, offset, count)" Nothing Nothing)
 
 emitInsertBitsBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -5156,15 +5160,15 @@ emitInsertBitsBuiltin args st fs =
       (st3, fs3, offsetVal) <- emitExpr st2 fs2 offsetExpr
       (st4, fs4, countVal) <- emitExpr st3 fs3 countExpr
       (st5, fs5, baseVal', insertVal', layout) <-
-        if valType baseVal == valType insertVal
-          then Right (st4, fs4, baseVal, insertVal, valType baseVal)
+        if baseVal.valType == insertVal.valType
+          then Right (st4, fs4, baseVal, insertVal, baseVal.valType)
           else coerceBinaryOperands baseVal insertVal st4 fs4
       ensureIntNumeric layout
       (st6, fs6, offsetVal') <- normalizeBitFieldIndex layout offsetVal st5 fs5
       (st7, fs7, countVal') <- normalizeBitFieldIndex layout countVal st6 fs6
       let (tyId, st8) = emitTypeFromLayout st7 layout
       let (resId, st9) = freshId st8
-      let fs8 = addFuncInstr (Instr opBitFieldInsert [tyId, resId, valId baseVal', valId insertVal', valId offsetVal', valId countVal']) fs7
+      let fs8 = addFuncInstr (Instr opBitFieldInsert [tyId, resId, baseVal'.valId, insertVal'.valId, offsetVal'.valId, countVal'.valId]) fs7
       Right (st9, fs8, Value layout resId)
     _ -> Left (CompileError "insertBits expects (base, insert, offset, count)" Nothing Nothing)
 
@@ -5182,9 +5186,9 @@ emitArrayLengthLValue lv st fs =
   case lv of
     LVField base field -> do
       (st1, fs1, baseInfo) <- emitLValuePtr st fs base
-      when (viStorage baseInfo /= storageClassStorageBuffer) $
+      when (baseInfo.viStorage /= storageClassStorageBuffer) $
         Left (CompileError "arrayLength requires a storage buffer struct" Nothing Nothing)
-      case viType baseInfo of
+      case baseInfo.viType of
         TLStruct _ fields _ _ -> do
           (ix, fieldLayout) <- findField (textToString field) fields
           when (ix /= length fields - 1) $
@@ -5195,7 +5199,7 @@ emitArrayLengthLValue lv st fs =
               let layout = TLScalar U32 a sz
               let (tyId, st2) = emitTypeFromLayout st1 layout
               let (resId, st3) = freshId st2
-              let fs2 = addFuncInstr (Instr opArrayLength [tyId, resId, viPtrId baseInfo, fromIntegral ix]) fs1
+              let fs2 = addFuncInstr (Instr opArrayLength [tyId, resId, baseInfo.viPtrId, fromIntegral ix]) fs1
               Right (st3, fs2, Value layout resId)
             _ -> Left (CompileError "arrayLength expects a runtime array field" Nothing Nothing)
         _ -> Left (CompileError "arrayLength expects a struct field" Nothing Nothing)
@@ -5204,18 +5208,18 @@ emitArrayLengthLValue lv st fs =
 emitFunctionCallByName :: Text -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Maybe Value)
 emitFunctionCallByName name args st fs = do
   (st1, fs1, vals) <- emitExprList st fs args
-  let candidates = [fi | fi <- gsFunctionTable st, fiName fi == name, length (fiParams fi) == length vals]
-  let exactMatches = filter (\fi -> and (zipWith (==) (fiParams fi) (map valType vals))) candidates
+  let candidates = [fi | fi <- st.gsFunctionTable, fi.fiName == name, length (fi.fiParams) == length vals]
+  let exactMatches = filter (\fi -> and (zipWith (==) (fi.fiParams) (map (.valType) vals))) candidates
   let coercibleMatches =
         filter
-          (\fi -> and (zipWith (argCoercible st1) vals (fiParams fi)))
+          (\fi -> and (zipWith (argCoercible st1) vals (fi.fiParams)))
           candidates
   case exactMatches of
     [fi] -> emitFunctionCall fi vals st1 fs1
     [] ->
       case coercibleMatches of
         [fi] -> do
-          (st2, fs2, vals') <- coerceArgsToLayouts vals (fiParams fi) st1 fs1
+          (st2, fs2, vals') <- coerceArgsToLayouts vals (fi.fiParams) st1 fs1
           emitFunctionCall fi vals' st2 fs2
         [] -> Left (CompileError ("unsupported call: " <> textToString name) Nothing Nothing)
         _ -> Left (CompileError ("ambiguous overload for " <> textToString name) Nothing Nothing)
@@ -5223,28 +5227,28 @@ emitFunctionCallByName name args st fs = do
 
 argCoercible :: GenState -> Value -> TypeLayout -> Bool
 argCoercible st actual expected =
-  case ensureTypeMatch expected (valType actual) of
+  case ensureTypeMatch expected (actual.valType) of
     Right _ -> True
     Left _ ->
-      case (valType actual, expected) of
+      case (actual.valType, expected) of
         (TLScalar _ _ _, TLScalar _ _ _) -> isConstLiteral st actual
         _ -> False
 
 emitFunctionCall :: FunctionInfo -> [Value] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Maybe Value)
 emitFunctionCall fnInfo vals st fs = do
-  let expected = length (fiParams fnInfo)
+  let expected = length (fnInfo.fiParams)
   if length vals /= expected
     then Left (CompileError "function arity mismatch" Nothing Nothing)
     else pure ()
-  zipWithM_ (\val ty -> ensureTypeMatch (valType val) ty) vals (fiParams fnInfo)
-  let (retTyId, st1) = case fiReturn fnInfo of
+  zipWithM_ (\val ty -> ensureTypeMatch (val.valType) ty) vals (fnInfo.fiParams)
+  let (retTyId, st1) = case fnInfo.fiReturn of
         Nothing -> emitVoidType st
         Just layout -> emitTypeFromLayout st layout
   let (resId, st2) = freshId st1
-  let argIds = map valId vals
-  let instr = Instr opFunctionCall (retTyId : resId : fiId fnInfo : argIds)
+  let argIds = map (.valId) vals
+  let instr = Instr opFunctionCall (retTyId : resId : fnInfo.fiId : argIds)
   let fs1 = addFuncInstr instr fs
-  case fiReturn fnInfo of
+  case fnInfo.fiReturn of
     Nothing -> Right (st2, fs1, Nothing)
     Just layout -> Right (st2, fs1, Just (Value layout resId))
 
@@ -5266,7 +5270,7 @@ emitVectorCtor n args st fs =
           let layout = TLVector n scalar align size
           let (tyId, st3) = emitTypeFromLayout st2 layout
           let (resId, st4) = freshId st3
-          let fs3 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map valId vals')) fs2
+          let fs3 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map (.valId) vals')) fs2
           Right (st4, fs3, Value layout resId)
 
 emitMatrixCtor :: Int -> Int -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -5289,13 +5293,13 @@ emitMatrixCtor cols rows args st fs =
               let layout = matrixLayout cols rows scalar
               let (tyId, st4) = emitTypeFromLayout st3 layout
               let (resId, st5) = freshId st4
-              let fs4 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map valId colsVals)) fs3
+              let fs4 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map (.valId) colsVals)) fs3
               Right (st5, fs4, Value layout resId)
             TLVector n scalar _ _ | n == rows && length vals' == cols -> do
               let layout = matrixLayout cols rows scalar
               let (tyId, st3) = emitTypeFromLayout st2 layout
               let (resId, st4) = freshId st3
-              let fs3 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map valId vals')) fs2
+              let fs3 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map (.valId) vals')) fs2
               Right (st4, fs3, Value layout resId)
             _ -> Left (CompileError "matrix constructor expects column vectors or a full scalar list" Nothing Nothing)
   where
@@ -5305,7 +5309,7 @@ emitMatrixCtor cols rows args st fs =
         (col, rest) -> do
           let (tyId, st1) = emitTypeFromLayout st' vecLayout
           let (resId, st2) = freshId st1
-          let fs1 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map valId col)) fs'
+          let fs1 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map (.valId) col)) fs'
           (st3, fs2, colsVals) <- buildColumns vecLayout rest st2 fs1
           Right (st3, fs2, Value vecLayout resId : colsVals)
 
@@ -5319,7 +5323,7 @@ emitStructCtor name layout args st fs =
       (st2, fs2, vals') <- coerceArgsToLayouts vals (map (.flType) fields) st1 fs1
       let (tyId, st3) = emitTypeFromLayout st2 layout
       let (resId, st4) = freshId st3
-      let fs3 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map valId vals')) fs2
+      let fs3 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map (.valId) vals')) fs2
       Right (st4, fs3, Value layout resId)
     _ -> Left (CompileError ("unsupported constructor: " <> textToString name) Nothing Nothing)
 
@@ -5345,7 +5349,7 @@ emitArrayCtor args st fs =
           let layout = TLArray (Just (length vals)) stride firstLayout elemAlign total
           let (tyId, st3) = emitTypeFromLayout st2 layout
           let (resId, st4) = freshId st3
-          let fs3 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map valId vals')) fs2
+          let fs3 = addFuncInstr (Instr opCompositeConstruct (tyId : resId : map (.valId) vals')) fs2
           Right (st4, fs3, Value layout resId)
 
 emitScalarCtor :: Scalar -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -5353,7 +5357,7 @@ emitScalarCtor scalar args st fs =
   case args of
     [arg] -> do
       (st1, fs1, val) <- emitExpr st fs arg
-      case valType val of
+      case val.valType of
         TLScalar s _ _ | s == scalar -> Right (st1, fs1, val)
         TLScalar s _ _ -> emitScalarConvert s scalar val st1 fs1
         _ -> Left (CompileError "scalar cast requires a scalar argument" Nothing Nothing)
@@ -5379,19 +5383,19 @@ emitScalarConvert fromScalar toScalarTy val st fs = do
   let layout = TLScalar toScalarTy a sz
   let (tyId, st1) = emitTypeFromLayout st layout
   let (resId, st2) = freshId st1
-  let fs1 = addFuncInstr (Instr opcode [tyId, resId, valId val]) fs
+  let fs1 = addFuncInstr (Instr opcode [tyId, resId, val.valId]) fs
   Right (st2, fs1, Value layout resId)
 
 isConstLiteral :: GenState -> Value -> Bool
-isConstLiteral st val = isJust (lookupConstKeyById st (valId val))
+isConstLiteral st val = isJust (lookupConstKeyById st (val.valId))
 
 pickBaseLayout :: GenState -> [Value] -> TypeLayout
 pickBaseLayout st vals =
   case dropWhile (isConstLiteral st) vals of
-    (v:_) -> valType v
+    (v:_) -> v.valType
     [] ->
       case vals of
-        (v:_) -> valType v
+        (v:_) -> v.valType
         [] ->
           let (a, sz) = scalarLayout F32
           in TLScalar F32 a sz
@@ -5415,15 +5419,15 @@ coerceArgsToLayouts vals tys st fs = go st fs [] vals tys
 
 coerceValueToLayout :: TypeLayout -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 coerceValueToLayout target val st fs
-  | valType val == target = Right (st, fs, val)
+  | val.valType == target = Right (st, fs, val)
   | otherwise =
-      case (target, valType val) of
+      case (target, val.valType) of
         (TLPointer _ _ _, TLPointer _ _ _) ->
-          case ensureTypeMatch target (valType val) of
+          case ensureTypeMatch target (val.valType) of
             Right _ -> Right (st, fs, val)
             Left _ -> Left (CompileError "type mismatch" Nothing Nothing)
         (TLScalar targetScalar _ _, TLScalar _ _ _) ->
-          case lookupConstKeyById st (valId val) of
+          case lookupConstKeyById st (val.valId) of
             Nothing -> Left (CompileError "implicit conversion requires a constant literal" Nothing Nothing)
             Just key -> do
               key' <- convertConstKey key targetScalar
@@ -5435,19 +5439,19 @@ coerceValueToLayout target val st fs
 
 coerceBinaryOperands :: Value -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value, Value, TypeLayout)
 coerceBinaryOperands lval rval st fs
-  | valType lval == valType rval = Right (st, fs, lval, rval, valType lval)
+  | lval.valType == rval.valType = Right (st, fs, lval, rval, lval.valType)
   | otherwise =
-      case (valType lval, valType rval) of
+      case (lval.valType, rval.valType) of
         (TLScalar _ _ _, TLScalar _ _ _) ->
-          let lConst = lookupConstKeyById st (valId lval)
-              rConst = lookupConstKeyById st (valId rval)
+          let lConst = lookupConstKeyById st (lval.valId)
+              rConst = lookupConstKeyById st (rval.valId)
           in case (lConst, rConst) of
             (_, Just _) -> do
-              (st1, fs1, rval') <- coerceValueToLayout (valType lval) rval st fs
-              Right (st1, fs1, lval, rval', valType lval)
+              (st1, fs1, rval') <- coerceValueToLayout (lval.valType) rval st fs
+              Right (st1, fs1, lval, rval', lval.valType)
             (Just _, _) -> do
-              (st1, fs1, lval') <- coerceValueToLayout (valType rval) lval st fs
-              Right (st1, fs1, lval', rval, valType rval)
+              (st1, fs1, lval') <- coerceValueToLayout (rval.valType) lval st fs
+              Right (st1, fs1, lval', rval, rval.valType)
             _ -> Left (CompileError "type mismatch" Nothing Nothing)
         (TLVector n scalar _ _, TLScalar s _ _) -> do
           (st1, fs1, scalarVal) <-
@@ -5456,7 +5460,7 @@ coerceBinaryOperands lval rval st fs
               else emitScalarConvert s scalar rval st fs
           let (a, sz) = vectorLayout scalar n
           let layout = TLVector n scalar a sz
-          (st2, fs2, rvalVec) <- emitSplatVector layout (valId scalarVal) st1 fs1
+          (st2, fs2, rvalVec) <- emitSplatVector layout (scalarVal.valId) st1 fs1
           Right (st2, fs2, lval, rvalVec, layout)
         (TLScalar s _ _, TLVector n scalar _ _) -> do
           (st1, fs1, scalarVal) <-
@@ -5465,17 +5469,17 @@ coerceBinaryOperands lval rval st fs
               else emitScalarConvert s scalar lval st fs
           let (a, sz) = vectorLayout scalar n
           let layout = TLVector n scalar a sz
-          (st2, fs2, lvalVec) <- emitSplatVector layout (valId scalarVal) st1 fs1
+          (st2, fs2, lvalVec) <- emitSplatVector layout (scalarVal.valId) st1 fs1
           Right (st2, fs2, lvalVec, rval, layout)
         _ -> Left (CompileError "type mismatch" Nothing Nothing)
 
 coerceConstValueToLayout :: TypeLayout -> Value -> GenState -> Either CompileError (GenState, Value)
 coerceConstValueToLayout target val st
-  | valType val == target = Right (st, val)
+  | val.valType == target = Right (st, val)
   | otherwise =
-      case (target, valType val) of
+      case (target, val.valType) of
         (TLScalar targetScalar _ _, TLScalar _ _ _) ->
-          case lookupConstKeyById st (valId val) of
+          case lookupConstKeyById st (val.valId) of
             Nothing -> Left (CompileError "implicit conversion requires a constant literal" Nothing Nothing)
             Just key -> do
               key' <- convertConstKey key targetScalar
@@ -5504,7 +5508,7 @@ coerceConstArgsToLayouts vals tys st = go st [] vals tys
 
 emitVectorComponent :: Value -> Word32 -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitVectorComponent vecVal idx st fs =
-  case valType vecVal of
+  case vecVal.valType of
     TLVector n scalar _ _ -> do
       when (idx >= fromIntegral n) $
         Left (CompileError "vector component out of range" Nothing Nothing)
@@ -5512,17 +5516,17 @@ emitVectorComponent vecVal idx st fs =
       let layout = TLScalar scalar a sz
       let (tyId, st1) = emitTypeFromLayout st layout
       let (resId, st2) = freshId st1
-      let fs1 = addFuncInstr (Instr opCompositeExtract [tyId, resId, valId vecVal, idx]) fs
+      let fs1 = addFuncInstr (Instr opCompositeExtract [tyId, resId, vecVal.valId, idx]) fs
       Right (st2, fs1, Value layout resId)
     _ -> Left (CompileError "expected vector value" Nothing Nothing)
 
 emitVec3FromVec2Scalar :: Value -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitVec3FromVec2Scalar vecVal scalarVal st fs =
-  case valType vecVal of
+  case vecVal.valType of
     TLVector 2 scalar _ _ -> do
       (st1, fs1, xVal) <- emitVectorComponent vecVal 0 st fs
       (st2, fs2, yVal) <- emitVectorComponent vecVal 1 st1 fs1
-      (st3, fs3, scalarVal') <- case valType scalarVal of
+      (st3, fs3, scalarVal') <- case scalarVal.valType of
         TLScalar s _ _ | s == scalar -> Right (st2, fs2, scalarVal)
         TLScalar s _ _ -> emitScalarConvert s scalar scalarVal st2 fs2
         _ -> Left (CompileError "expected scalar value" Nothing Nothing)
@@ -5530,15 +5534,15 @@ emitVec3FromVec2Scalar vecVal scalarVal st fs =
       let layout = TLVector 3 scalar a sz
       let (tyId, st4) = emitTypeFromLayout st3 layout
       let (resId, st5) = freshId st4
-      let fs4 = addFuncInstr (Instr opCompositeConstruct [tyId, resId, valId xVal, valId yVal, valId scalarVal']) fs3
+      let fs4 = addFuncInstr (Instr opCompositeConstruct [tyId, resId, xVal.valId, yVal.valId, scalarVal'.valId]) fs3
       Right (st5, fs4, Value layout resId)
     _ -> Left (CompileError "expected vec2 value" Nothing Nothing)
 
 emitVec2FromScalarScalar :: Value -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitVec2FromScalarScalar scalarVal arrayVal st fs =
-  case valType scalarVal of
+  case scalarVal.valType of
     TLScalar scalar _ _ -> do
-      (st1, fs1, arrayVal') <- case valType arrayVal of
+      (st1, fs1, arrayVal') <- case arrayVal.valType of
         TLScalar s _ _ | s == scalar -> Right (st, fs, arrayVal)
         TLScalar s _ _ -> emitScalarConvert s scalar arrayVal st fs
         _ -> Left (CompileError "expected scalar value" Nothing Nothing)
@@ -5546,18 +5550,18 @@ emitVec2FromScalarScalar scalarVal arrayVal st fs =
       let layout = TLVector 2 scalar a sz
       let (tyId, st2) = emitTypeFromLayout st1 layout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opCompositeConstruct [tyId, resId, valId scalarVal, valId arrayVal']) fs1
+      let fs2 = addFuncInstr (Instr opCompositeConstruct [tyId, resId, scalarVal.valId, arrayVal'.valId]) fs1
       Right (st3, fs2, Value layout resId)
     _ -> Left (CompileError "expected scalar value" Nothing Nothing)
 
 emitVec4FromVec3Scalar :: Value -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitVec4FromVec3Scalar vecVal scalarVal st fs =
-  case valType vecVal of
+  case vecVal.valType of
     TLVector 3 scalar _ _ -> do
       (st1, fs1, xVal) <- emitVectorComponent vecVal 0 st fs
       (st2, fs2, yVal) <- emitVectorComponent vecVal 1 st1 fs1
       (st3, fs3, zVal) <- emitVectorComponent vecVal 2 st2 fs2
-      (st4, fs4, scalarVal') <- case valType scalarVal of
+      (st4, fs4, scalarVal') <- case scalarVal.valType of
         TLScalar s _ _ | s == scalar -> Right (st3, fs3, scalarVal)
         TLScalar s _ _ -> emitScalarConvert s scalar scalarVal st3 fs3
         _ -> Left (CompileError "expected scalar value" Nothing Nothing)
@@ -5565,13 +5569,13 @@ emitVec4FromVec3Scalar vecVal scalarVal st fs =
       let layout = TLVector 4 scalar a sz
       let (tyId, st5) = emitTypeFromLayout st4 layout
       let (resId, st6) = freshId st5
-      let fs5 = addFuncInstr (Instr opCompositeConstruct [tyId, resId, valId xVal, valId yVal, valId zVal, valId scalarVal']) fs4
+      let fs5 = addFuncInstr (Instr opCompositeConstruct [tyId, resId, xVal.valId, yVal.valId, zVal.valId, scalarVal'.valId]) fs4
       Right (st6, fs5, Value layout resId)
     _ -> Left (CompileError "expected vec3 value" Nothing Nothing)
 
 emitSamplerExpr :: TypeLayout -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitSamplerExpr expected expr st fs =
-  if gsSamplerMode st == SamplerCombined
+  if st.gsSamplerMode == SamplerCombined
     then Right (st, fs, Value expected 0)
     else emitExpr st fs expr
 
@@ -5588,12 +5592,12 @@ emitTextureSample args st fs =
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
       (st2, fs2, sampVal) <- emitSamplerExpr TLSampler samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
-      case valType sampVal of
+      case sampVal.valType of
         TLSampler -> Right ()
         _ -> Left (CompileError "textureSample expects a sampler binding" Nothing Nothing)
-      case (valType texVal, mArray) of
+      case (texVal.valType, mArray) of
         (TLTexture1D s, Nothing) -> do
-          ensureFloatScalar (valType coordVal)
+          ensureFloatScalar (coordVal.valType)
           sampleColorCoord s coordVal texVal sampVal st3 fs3
         (TLTexture1DArray s, Just arrayExpr) ->
           sampleColor1DArray s coordVal arrayExpr texVal sampVal st3 fs3
@@ -5624,13 +5628,13 @@ emitTextureSample args st fs =
         _ -> Left (CompileError "textureSample expects a sampled texture binding" Nothing Nothing)
 
     buildSampledImage texVal sampVal st0 fs0 =
-      if gsSamplerMode st0 == SamplerCombined
-        then Right (st0, fs0, valId texVal)
+      if st0.gsSamplerMode == SamplerCombined
+        then Right (st0, fs0, texVal.valId)
         else do
-          let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
+          let (imageTy, st1) = emitTypeFromLayout st0 (texVal.valType)
           let (sampledTy, st2) = emitSampledImageType imageTy st1
           let (sampledId, st3) = freshId st2
-          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
+          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, texVal.valId, sampVal.valId]) fs0
           Right (st3, fs1, sampledId)
 
     sampleColorCoord scalar coordVal texVal sampVal st0 fs0 = do
@@ -5639,35 +5643,35 @@ emitTextureSample args st fs =
       let outLayout = TLVector 4 scalar align size
       let (outTy, st2) = emitTypeFromLayout st1 outLayout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opImageSampleImplicitLod [outTy, resId, sampledId, valId coordVal]) fs1
+      let fs2 = addFuncInstr (Instr opImageSampleImplicitLod [outTy, resId, sampledId, coordVal.valId]) fs1
       Right (st3, fs2, Value outLayout resId)
 
     sampleColor3D scalar coordVal texVal sampVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       sampleColorCoord scalar coordVal texVal sampVal st0 fs0
 
     sampleColor scalar coordVal texVal sampVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       sampleColorCoord scalar coordVal texVal sampVal st0 fs0
 
     sampleColor1DArray scalar coordVal arrayExpr texVal sampVal st0 fs0 = do
-      ensureFloatScalar (valType coordVal)
+      ensureFloatScalar (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec2FromScalarScalar coordVal arrayVal st1 fs1
       sampleColorCoord scalar coordVal' texVal sampVal st2 fs2
 
     sampleColorCubeArray scalar coordVal arrayExpr texVal sampVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal st1 fs1
       sampleColorCoord scalar coordVal' texVal sampVal st2 fs2
 
     sampleColorArray scalar coordVal arrayExpr texVal sampVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal st1 fs1
       sampleColorCoord scalar coordVal' texVal sampVal st2 fs2
 
@@ -5677,28 +5681,28 @@ emitTextureSample args st fs =
       let outLayout = TLScalar F32 a sz
       let (outTy, st2) = emitTypeFromLayout st1 outLayout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opImageSampleImplicitLod [outTy, resId, sampledId, valId coordVal]) fs1
+      let fs2 = addFuncInstr (Instr opImageSampleImplicitLod [outTy, resId, sampledId, coordVal.valId]) fs1
       Right (st3, fs2, Value outLayout resId)
 
     sampleDepth2D coordVal texVal sampVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       sampleDepthCoord coordVal texVal sampVal st0 fs0
 
     sampleDepthCube coordVal texVal sampVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       sampleDepthCoord coordVal texVal sampVal st0 fs0
 
     sampleDepthArray2D coordVal arrayExpr texVal sampVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal st1 fs1
       sampleDepthCoord coordVal' texVal sampVal st2 fs2
 
     sampleDepthCubeArray coordVal arrayExpr texVal sampVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal st1 fs1
       sampleDepthCoord coordVal' texVal sampVal st2 fs2
 
@@ -5716,28 +5720,28 @@ emitTextureSampleCompare args st fs =
       (st2, fs2, sampVal) <- emitSamplerExpr TLSamplerComparison samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, depthVal) <- emitExpr st3 fs3 depthExpr
-      case valType sampVal of
+      case sampVal.valType of
         TLSamplerComparison -> Right ()
         _ -> Left (CompileError "textureSampleCompare expects a sampler_comparison binding" Nothing Nothing)
-      ensureFloatScalar (valType depthVal)
+      ensureFloatScalar (depthVal.valType)
       (st5, fs5, coordVal') <-
-        case (valType texVal, mArray) of
+        case (texVal.valType, mArray) of
           (TLTextureDepth2D, Nothing) -> do
-            ensureFloatVec2 (valType coordVal)
+            ensureFloatVec2 (coordVal.valType)
             Right (st4, fs4, coordVal)
           (TLTextureDepth2DArray, Just arrayExpr) -> do
-            ensureFloatVec2 (valType coordVal)
+            ensureFloatVec2 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st4 fs4 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTextureDepthCube, Nothing) -> do
-            ensureFloatVec3 (valType coordVal)
+            ensureFloatVec3 (coordVal.valType)
             Right (st4, fs4, coordVal)
           (TLTextureDepthCubeArray, Just arrayExpr) -> do
-            ensureFloatVec3 (valType coordVal)
+            ensureFloatVec3 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st4 fs4 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTextureDepth2DArray, Nothing) ->
@@ -5746,24 +5750,24 @@ emitTextureSampleCompare args st fs =
             Left (CompileError "textureSampleCompare for texture_depth_cube_array requires an array index" Nothing Nothing)
           _ -> Left (CompileError "textureSampleCompare expects a depth texture binding" Nothing Nothing)
       (st6, fs6, depthVal') <-
-        case valType depthVal of
+        case depthVal.valType of
           TLScalar F32 _ _ -> Right (st5, fs5, depthVal)
           TLScalar F16 _ _ -> emitScalarConvert F16 F32 depthVal st5 fs5
           _ -> Left (CompileError "depth reference must be f32 or f16" Nothing Nothing)
       (st7, fs7, sampledId) <-
-        if gsSamplerMode st6 == SamplerCombined
-          then Right (st6, fs6, valId texVal)
+        if st6.gsSamplerMode == SamplerCombined
+          then Right (st6, fs6, texVal.valId)
           else do
-            let (imageTy, st7') = emitTypeFromLayout st6 (valType texVal)
+            let (imageTy, st7') = emitTypeFromLayout st6 (texVal.valType)
             let (sampledTy, st8) = emitSampledImageType imageTy st7'
             let (sampledId, st9) = freshId st8
-            let fs7' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs6
+            let fs7' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, texVal.valId, sampVal.valId]) fs6
             Right (st9, fs7', sampledId)
       let (a, sz) = scalarLayout F32
       let outLayout = TLScalar F32 a sz
       let (outTy, st10) = emitTypeFromLayout st7 outLayout
       let (resId, st11) = freshId st10
-      let fs8 = addFuncInstr (Instr opImageSampleDrefImplicitLod [outTy, resId, sampledId, valId coordVal', valId depthVal']) fs7
+      let fs8 = addFuncInstr (Instr opImageSampleDrefImplicitLod [outTy, resId, sampledId, coordVal'.valId, depthVal'.valId]) fs7
       Right (st11, fs8, Value outLayout resId)
 
 emitTextureSampleLevel :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -5780,16 +5784,16 @@ emitTextureSampleLevel args st fs =
       (st2, fs2, sampVal) <- emitSamplerExpr TLSampler samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, levelVal) <- emitExpr st3 fs3 levelExpr
-      case valType sampVal of
+      case sampVal.valType of
         TLSampler -> Right ()
         _ -> Left (CompileError "textureSampleLevel expects a sampler binding" Nothing Nothing)
-      (st5, fs5, lodVal) <- case valType levelVal of
+      (st5, fs5, lodVal) <- case levelVal.valType of
         TLScalar F32 _ _ -> Right (st4, fs4, levelVal)
         TLScalar F16 _ _ -> emitScalarConvert F16 F32 levelVal st4 fs4
         _ -> Left (CompileError "textureSampleLevel requires a float level" Nothing Nothing)
-      case (valType texVal, mArray) of
+      case (texVal.valType, mArray) of
         (TLTexture1D s, Nothing) -> do
-          ensureFloatScalar (valType coordVal)
+          ensureFloatScalar (coordVal.valType)
           sampleColorCoordLod s coordVal texVal sampVal lodVal st5 fs5
         (TLTexture1DArray s, Just arrayExpr) ->
           sampleColor1DArray s coordVal arrayExpr texVal sampVal lodVal st5 fs5
@@ -5820,13 +5824,13 @@ emitTextureSampleLevel args st fs =
         _ -> Left (CompileError "textureSampleLevel expects a sampled texture binding" Nothing Nothing)
 
     buildSampledImage texVal sampVal st0 fs0 =
-      if gsSamplerMode st0 == SamplerCombined
-        then Right (st0, fs0, valId texVal)
+      if st0.gsSamplerMode == SamplerCombined
+        then Right (st0, fs0, texVal.valId)
         else do
-          let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
+          let (imageTy, st1) = emitTypeFromLayout st0 (texVal.valType)
           let (sampledTy, st2) = emitSampledImageType imageTy st1
           let (sampledId, st3) = freshId st2
-          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
+          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, texVal.valId, sampVal.valId]) fs0
           Right (st3, fs1, sampledId)
 
     sampleColorCoordLod scalar coordVal texVal sampVal lodVal st0 fs0 = do
@@ -5835,35 +5839,35 @@ emitTextureSampleLevel args st fs =
       let outLayout = TLVector 4 scalar align size
       let (outTy, st2) = emitTypeFromLayout st1 outLayout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opImageSampleExplicitLod [outTy, resId, sampledId, valId coordVal, imageOperandsLod, valId lodVal]) fs1
+      let fs2 = addFuncInstr (Instr opImageSampleExplicitLod [outTy, resId, sampledId, coordVal.valId, imageOperandsLod, lodVal.valId]) fs1
       Right (st3, fs2, Value outLayout resId)
 
     sampleColor2D scalar coordVal texVal sampVal lodVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       sampleColorCoordLod scalar coordVal texVal sampVal lodVal st0 fs0
 
     sampleColor3D scalar coordVal texVal sampVal lodVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       sampleColorCoordLod scalar coordVal texVal sampVal lodVal st0 fs0
 
     sampleColor1DArray scalar coordVal arrayExpr texVal sampVal lodVal st0 fs0 = do
-      ensureFloatScalar (valType coordVal)
+      ensureFloatScalar (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec2FromScalarScalar coordVal arrayVal st1 fs1
       sampleColorCoordLod scalar coordVal' texVal sampVal lodVal st2 fs2
 
     sampleColorCubeArray scalar coordVal arrayExpr texVal sampVal lodVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal st1 fs1
       sampleColorCoordLod scalar coordVal' texVal sampVal lodVal st2 fs2
 
     sampleColorArray scalar coordVal arrayExpr texVal sampVal lodVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal st1 fs1
       sampleColorCoordLod scalar coordVal' texVal sampVal lodVal st2 fs2
 
@@ -5873,28 +5877,28 @@ emitTextureSampleLevel args st fs =
       let outLayout = TLScalar F32 a sz
       let (outTy, st2) = emitTypeFromLayout st1 outLayout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opImageSampleExplicitLod [outTy, resId, sampledId, valId coordVal, imageOperandsLod, valId lodVal]) fs1
+      let fs2 = addFuncInstr (Instr opImageSampleExplicitLod [outTy, resId, sampledId, coordVal.valId, imageOperandsLod, lodVal.valId]) fs1
       Right (st3, fs2, Value outLayout resId)
 
     sampleDepth2D coordVal texVal sampVal lodVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       sampleDepthCoordLod coordVal texVal sampVal lodVal st0 fs0
 
     sampleDepthCube coordVal texVal sampVal lodVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       sampleDepthCoordLod coordVal texVal sampVal lodVal st0 fs0
 
     sampleDepthArray2D coordVal arrayExpr texVal sampVal lodVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal st1 fs1
       sampleDepthCoordLod coordVal' texVal sampVal lodVal st2 fs2
 
     sampleDepthCubeArray coordVal arrayExpr texVal sampVal lodVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal st1 fs1
       sampleDepthCoordLod coordVal' texVal sampVal lodVal st2 fs2
 
@@ -5912,16 +5916,16 @@ emitTextureSampleBias args st fs =
       (st2, fs2, sampVal) <- emitSamplerExpr TLSampler samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, biasVal) <- emitExpr st3 fs3 biasExpr
-      case valType sampVal of
+      case sampVal.valType of
         TLSampler -> Right ()
         _ -> Left (CompileError "textureSampleBias expects a sampler binding" Nothing Nothing)
-      (st5, fs5, biasVal') <- case valType biasVal of
+      (st5, fs5, biasVal') <- case biasVal.valType of
         TLScalar F32 _ _ -> Right (st4, fs4, biasVal)
         TLScalar F16 _ _ -> emitScalarConvert F16 F32 biasVal st4 fs4
         _ -> Left (CompileError "textureSampleBias requires a float bias" Nothing Nothing)
-      case (valType texVal, mArray) of
+      case (texVal.valType, mArray) of
         (TLTexture1D s, Nothing) -> do
-          ensureFloatScalar (valType coordVal)
+          ensureFloatScalar (coordVal.valType)
           sampleColorCoordBias s coordVal texVal sampVal biasVal' st5 fs5
         (TLTexture1DArray s, Just arrayExpr) ->
           sampleColor1DArray s coordVal arrayExpr texVal sampVal biasVal' st5 fs5
@@ -5952,13 +5956,13 @@ emitTextureSampleBias args st fs =
         _ -> Left (CompileError "textureSampleBias expects a sampled texture binding" Nothing Nothing)
 
     buildSampledImage texVal sampVal st0 fs0 =
-      if gsSamplerMode st0 == SamplerCombined
-        then Right (st0, fs0, valId texVal)
+      if st0.gsSamplerMode == SamplerCombined
+        then Right (st0, fs0, texVal.valId)
         else do
-          let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
+          let (imageTy, st1) = emitTypeFromLayout st0 (texVal.valType)
           let (sampledTy, st2) = emitSampledImageType imageTy st1
           let (sampledId, st3) = freshId st2
-          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
+          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, texVal.valId, sampVal.valId]) fs0
           Right (st3, fs1, sampledId)
 
     sampleColorCoordBias scalar coordVal texVal sampVal biasVal st0 fs0 = do
@@ -5967,35 +5971,35 @@ emitTextureSampleBias args st fs =
       let outLayout = TLVector 4 scalar align size
       let (outTy, st2) = emitTypeFromLayout st1 outLayout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opImageSampleImplicitLod [outTy, resId, sampledId, valId coordVal, imageOperandsBias, valId biasVal]) fs1
+      let fs2 = addFuncInstr (Instr opImageSampleImplicitLod [outTy, resId, sampledId, coordVal.valId, imageOperandsBias, biasVal.valId]) fs1
       Right (st3, fs2, Value outLayout resId)
 
     sampleColor2D scalar coordVal texVal sampVal biasVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       sampleColorCoordBias scalar coordVal texVal sampVal biasVal st0 fs0
 
     sampleColor3D scalar coordVal texVal sampVal biasVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       sampleColorCoordBias scalar coordVal texVal sampVal biasVal st0 fs0
 
     sampleColor1DArray scalar coordVal arrayExpr texVal sampVal biasVal st0 fs0 = do
-      ensureFloatScalar (valType coordVal)
+      ensureFloatScalar (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec2FromScalarScalar coordVal arrayVal st1 fs1
       sampleColorCoordBias scalar coordVal' texVal sampVal biasVal st2 fs2
 
     sampleColorCubeArray scalar coordVal arrayExpr texVal sampVal biasVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal st1 fs1
       sampleColorCoordBias scalar coordVal' texVal sampVal biasVal st2 fs2
 
     sampleColorArray scalar coordVal arrayExpr texVal sampVal biasVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal st1 fs1
       sampleColorCoordBias scalar coordVal' texVal sampVal biasVal st2 fs2
 
@@ -6005,28 +6009,28 @@ emitTextureSampleBias args st fs =
       let outLayout = TLScalar F32 a sz
       let (outTy, st2) = emitTypeFromLayout st1 outLayout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opImageSampleImplicitLod [outTy, resId, sampledId, valId coordVal, imageOperandsBias, valId biasVal]) fs1
+      let fs2 = addFuncInstr (Instr opImageSampleImplicitLod [outTy, resId, sampledId, coordVal.valId, imageOperandsBias, biasVal.valId]) fs1
       Right (st3, fs2, Value outLayout resId)
 
     sampleDepth2D coordVal texVal sampVal biasVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       sampleDepthCoordBias coordVal texVal sampVal biasVal st0 fs0
 
     sampleDepthCube coordVal texVal sampVal biasVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       sampleDepthCoordBias coordVal texVal sampVal biasVal st0 fs0
 
     sampleDepthArray2D coordVal arrayExpr texVal sampVal biasVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal st1 fs1
       sampleDepthCoordBias coordVal' texVal sampVal biasVal st2 fs2
 
     sampleDepthCubeArray coordVal arrayExpr texVal sampVal biasVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal st1 fs1
       sampleDepthCoordBias coordVal' texVal sampVal biasVal st2 fs2
 
@@ -6045,13 +6049,13 @@ emitTextureSampleGrad args st fs =
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, ddxVal) <- emitExpr st3 fs3 ddxExpr
       (st5, fs5, ddyVal) <- emitExpr st4 fs4 ddyExpr
-      case valType sampVal of
+      case sampVal.valType of
         TLSampler -> Right ()
         _ -> Left (CompileError "textureSampleGrad expects a sampler binding" Nothing Nothing)
-      ensureFloatNumeric (valType coordVal)
-      ensureTypeMatch (valType coordVal) (valType ddxVal)
-      ensureTypeMatch (valType coordVal) (valType ddyVal)
-      case (valType texVal, mArray) of
+      ensureFloatNumeric (coordVal.valType)
+      ensureTypeMatch (coordVal.valType) (ddxVal.valType)
+      ensureTypeMatch (coordVal.valType) (ddyVal.valType)
+      case (texVal.valType, mArray) of
         (TLTexture1D s, Nothing) ->
           sampleColorCoordGrad s coordVal texVal sampVal ddxVal ddyVal st5 fs5
         (TLTexture1DArray s, Just arrayExpr) ->
@@ -6083,13 +6087,13 @@ emitTextureSampleGrad args st fs =
         _ -> Left (CompileError "textureSampleGrad expects a sampled texture binding" Nothing Nothing)
 
     buildSampledImage texVal sampVal st0 fs0 =
-      if gsSamplerMode st0 == SamplerCombined
-        then Right (st0, fs0, valId texVal)
+      if st0.gsSamplerMode == SamplerCombined
+        then Right (st0, fs0, texVal.valId)
         else do
-          let (imageTy, st1) = emitTypeFromLayout st0 (valType texVal)
+          let (imageTy, st1) = emitTypeFromLayout st0 (texVal.valType)
           let (sampledTy, st2) = emitSampledImageType imageTy st1
           let (sampledId, st3) = freshId st2
-          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs0
+          let fs1 = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, texVal.valId, sampVal.valId]) fs0
           Right (st3, fs1, sampledId)
 
     sampleColorCoordGrad scalar coordVal texVal sampVal ddxVal ddyVal st0 fs0 = do
@@ -6098,35 +6102,35 @@ emitTextureSampleGrad args st fs =
       let outLayout = TLVector 4 scalar align size
       let (outTy, st2) = emitTypeFromLayout st1 outLayout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opImageSampleExplicitLod [outTy, resId, sampledId, valId coordVal, imageOperandsGrad, valId ddxVal, valId ddyVal]) fs1
+      let fs2 = addFuncInstr (Instr opImageSampleExplicitLod [outTy, resId, sampledId, coordVal.valId, imageOperandsGrad, ddxVal.valId, ddyVal.valId]) fs1
       Right (st3, fs2, Value outLayout resId)
 
     sampleColor2D scalar coordVal texVal sampVal ddxVal ddyVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       sampleColorCoordGrad scalar coordVal texVal sampVal ddxVal ddyVal st0 fs0
 
     sampleColor3D scalar coordVal texVal sampVal ddxVal ddyVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       sampleColorCoordGrad scalar coordVal texVal sampVal ddxVal ddyVal st0 fs0
 
     sampleColor1DArray scalar coordVal arrayExpr texVal sampVal ddxVal ddyVal st0 fs0 = do
-      ensureFloatScalar (valType coordVal)
+      ensureFloatScalar (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec2FromScalarScalar coordVal arrayVal st1 fs1
       sampleColorCoordGrad scalar coordVal' texVal sampVal ddxVal ddyVal st2 fs2
 
     sampleColorCubeArray scalar coordVal arrayExpr texVal sampVal ddxVal ddyVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal st1 fs1
       sampleColorCoordGrad scalar coordVal' texVal sampVal ddxVal ddyVal st2 fs2
 
     sampleColorArray scalar coordVal arrayExpr texVal sampVal ddxVal ddyVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal st1 fs1
       sampleColorCoordGrad scalar coordVal' texVal sampVal ddxVal ddyVal st2 fs2
 
@@ -6136,28 +6140,28 @@ emitTextureSampleGrad args st fs =
       let outLayout = TLScalar F32 a sz
       let (outTy, st2) = emitTypeFromLayout st1 outLayout
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opImageSampleExplicitLod [outTy, resId, sampledId, valId coordVal, imageOperandsGrad, valId ddxVal, valId ddyVal]) fs1
+      let fs2 = addFuncInstr (Instr opImageSampleExplicitLod [outTy, resId, sampledId, coordVal.valId, imageOperandsGrad, ddxVal.valId, ddyVal.valId]) fs1
       Right (st3, fs2, Value outLayout resId)
 
     sampleDepth2D coordVal texVal sampVal ddxVal ddyVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       sampleDepthCoordGrad coordVal texVal sampVal ddxVal ddyVal st0 fs0
 
     sampleDepthCube coordVal texVal sampVal ddxVal ddyVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       sampleDepthCoordGrad coordVal texVal sampVal ddxVal ddyVal st0 fs0
 
     sampleDepthArray2D coordVal arrayExpr texVal sampVal ddxVal ddyVal st0 fs0 = do
-      ensureFloatVec2 (valType coordVal)
+      ensureFloatVec2 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal st1 fs1
       sampleDepthCoordGrad coordVal' texVal sampVal ddxVal ddyVal st2 fs2
 
     sampleDepthCubeArray coordVal arrayExpr texVal sampVal ddxVal ddyVal st0 fs0 = do
-      ensureFloatVec3 (valType coordVal)
+      ensureFloatVec3 (coordVal.valType)
       (st1, fs1, arrayVal) <- emitExpr st0 fs0 arrayExpr
-      ensureIndexType (valType arrayVal)
+      ensureIndexType (arrayVal.valType)
       (st2, fs2, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal st1 fs1
       sampleDepthCoordGrad coordVal' texVal sampVal ddxVal ddyVal st2 fs2
 
@@ -6176,32 +6180,32 @@ emitTextureSampleCompareLevel args st fs =
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, depthVal) <- emitExpr st3 fs3 depthExpr
       (st5, fs5, levelVal) <- emitExpr st4 fs4 levelExpr
-      case valType sampVal of
+      case sampVal.valType of
         TLSamplerComparison -> Right ()
         _ -> Left (CompileError "textureSampleCompareLevel expects a sampler_comparison binding" Nothing Nothing)
-      ensureFloatScalar (valType depthVal)
-      (st6, fs6, lodVal) <- case valType levelVal of
+      ensureFloatScalar (depthVal.valType)
+      (st6, fs6, lodVal) <- case levelVal.valType of
         TLScalar F32 _ _ -> Right (st5, fs5, levelVal)
         TLScalar F16 _ _ -> emitScalarConvert F16 F32 levelVal st5 fs5
         _ -> Left (CompileError "textureSampleCompareLevel requires a float level" Nothing Nothing)
       (st7, fs7, coordVal') <-
-        case (valType texVal, mArray) of
+        case (texVal.valType, mArray) of
           (TLTextureDepth2D, Nothing) -> do
-            ensureFloatVec2 (valType coordVal)
+            ensureFloatVec2 (coordVal.valType)
             Right (st6, fs6, coordVal)
           (TLTextureDepth2DArray, Just arrayExpr) -> do
-            ensureFloatVec2 (valType coordVal)
+            ensureFloatVec2 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st6 fs6 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTextureDepthCube, Nothing) -> do
-            ensureFloatVec3 (valType coordVal)
+            ensureFloatVec3 (coordVal.valType)
             Right (st6, fs6, coordVal)
           (TLTextureDepthCubeArray, Just arrayExpr) -> do
-            ensureFloatVec3 (valType coordVal)
+            ensureFloatVec3 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st6 fs6 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTextureDepth2DArray, Nothing) ->
@@ -6210,24 +6214,24 @@ emitTextureSampleCompareLevel args st fs =
             Left (CompileError "textureSampleCompareLevel for texture_depth_cube_array requires an array index" Nothing Nothing)
           _ -> Left (CompileError "textureSampleCompareLevel expects a depth texture binding" Nothing Nothing)
       (st8, fs8, depthVal') <-
-        case valType depthVal of
+        case depthVal.valType of
           TLScalar F32 _ _ -> Right (st7, fs7, depthVal)
           TLScalar F16 _ _ -> emitScalarConvert F16 F32 depthVal st7 fs7
           _ -> Left (CompileError "depth reference must be f32 or f16" Nothing Nothing)
       (st9, fs9, sampledId) <-
-        if gsSamplerMode st8 == SamplerCombined
-          then Right (st8, fs8, valId texVal)
+        if st8.gsSamplerMode == SamplerCombined
+          then Right (st8, fs8, texVal.valId)
           else do
-            let (imageTy, st9') = emitTypeFromLayout st8 (valType texVal)
+            let (imageTy, st9') = emitTypeFromLayout st8 (texVal.valType)
             let (sampledTy, st10) = emitSampledImageType imageTy st9'
             let (sampledId, st11) = freshId st10
-            let fs9' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs8
+            let fs9' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, texVal.valId, sampVal.valId]) fs8
             Right (st11, fs9', sampledId)
       let (a, sz) = scalarLayout F32
       let outLayout = TLScalar F32 a sz
       let (outTy, st12) = emitTypeFromLayout st9 outLayout
       let (resId, st13) = freshId st12
-      let fs10 = addFuncInstr (Instr opImageSampleDrefExplicitLod [outTy, resId, sampledId, valId coordVal', valId depthVal', imageOperandsLod, valId lodVal]) fs9
+      let fs10 = addFuncInstr (Instr opImageSampleDrefExplicitLod [outTy, resId, sampledId, coordVal'.valId, depthVal'.valId, imageOperandsLod, lodVal.valId]) fs9
       Right (st13, fs10, Value outLayout resId)
 
 emitTextureGather :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -6245,10 +6249,10 @@ emitTextureGather args st fs =
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
       (st2, fs2, sampVal) <- emitSamplerExpr TLSampler samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
-      case valType sampVal of
+      case sampVal.valType of
         TLSampler -> Right ()
         _ -> Left (CompileError "textureGather expects a sampler binding" Nothing Nothing)
-      let isArray = case valType texVal of
+      let isArray = case texVal.valType of
             TLTexture2DArray _ -> True
             TLTextureCubeArray _ -> True
             _ -> False
@@ -6265,23 +6269,23 @@ emitTextureGather args st fs =
           (True, Nothing, _) ->
             Left (CompileError "textureGather for array textures requires an array index" Nothing Nothing)
       (st4, fs4, coordValFinal, scalar) <-
-        case (valType texVal, arrayExpr') of
+        case (texVal.valType, arrayExpr') of
           (TLTexture2D s, Nothing) -> do
-            ensureFloatVec2 (valType coordVal)
+            ensureFloatVec2 (coordVal.valType)
             Right (st3, fs3, coordVal, s)
           (TLTexture2DArray s, Just arrayExpr) -> do
-            ensureFloatVec2 (valType coordVal)
+            ensureFloatVec2 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st3 fs3 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal', s)
           (TLTextureCube s, Nothing) -> do
-            ensureFloatVec3 (valType coordVal)
+            ensureFloatVec3 (coordVal.valType)
             Right (st3, fs3, coordVal, s)
           (TLTextureCubeArray s, Just arrayExpr) -> do
-            ensureFloatVec3 (valType coordVal)
+            ensureFloatVec3 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st3 fs3 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal', s)
           _ -> Left (CompileError "textureGather expects a 2d or cube sampled texture" Nothing Nothing)
@@ -6292,25 +6296,25 @@ emitTextureGather args st fs =
           in Right (st', fs4, Value layout cid)
         Just compExpr -> do
           (stA, fsA, compVal0) <- emitExpr st4 fs4 compExpr
-          ensureIndexType (valType compVal0)
-          case valType compVal0 of
+          ensureIndexType (compVal0.valType)
+          case compVal0.valType of
             TLScalar U32 _ _ -> Right (stA, fsA, compVal0)
             TLScalar I32 _ _ -> emitScalarConvert I32 U32 compVal0 stA fsA
             _ -> Left (CompileError "textureGather component must be i32 or u32" Nothing Nothing)
       (st7, fs7, sampledId) <-
-        if gsSamplerMode st6 == SamplerCombined
-          then Right (st6, fs6, valId texVal)
+        if st6.gsSamplerMode == SamplerCombined
+          then Right (st6, fs6, texVal.valId)
           else do
-            let (imageTy, st7') = emitTypeFromLayout st6 (valType texVal)
+            let (imageTy, st7') = emitTypeFromLayout st6 (texVal.valType)
             let (sampledTy, st8) = emitSampledImageType imageTy st7'
             let (sampledId, st9) = freshId st8
-            let fs7' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs6
+            let fs7' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, texVal.valId, sampVal.valId]) fs6
             Right (st9, fs7', sampledId)
       let (align, size) = vectorLayout scalar 4
       let outLayout = TLVector 4 scalar align size
       let (outTy, st10) = emitTypeFromLayout st7 outLayout
       let (resId, st11) = freshId st10
-      let fs8 = addFuncInstr (Instr opImageGather [outTy, resId, sampledId, valId coordValFinal, valId compVal]) fs7
+      let fs8 = addFuncInstr (Instr opImageGather [outTy, resId, sampledId, coordValFinal.valId, compVal.valId]) fs7
       Right (st11, fs8, Value outLayout resId)
 
 emitTextureGatherCompare :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -6327,28 +6331,28 @@ emitTextureGatherCompare args st fs =
       (st2, fs2, sampVal) <- emitSamplerExpr TLSamplerComparison samplerExpr st1 fs1
       (st3, fs3, coordVal) <- emitExpr st2 fs2 coordExpr
       (st4, fs4, depthVal) <- emitExpr st3 fs3 depthExpr
-      case valType sampVal of
+      case sampVal.valType of
         TLSamplerComparison -> Right ()
         _ -> Left (CompileError "textureGatherCompare expects a sampler_comparison binding" Nothing Nothing)
-      ensureFloatScalar (valType depthVal)
+      ensureFloatScalar (depthVal.valType)
       (st5, fs5, coordVal') <-
-        case (valType texVal, mArray) of
+        case (texVal.valType, mArray) of
           (TLTextureDepth2D, Nothing) -> do
-            ensureFloatVec2 (valType coordVal)
+            ensureFloatVec2 (coordVal.valType)
             Right (st4, fs4, coordVal)
           (TLTextureDepth2DArray, Just arrayExpr) -> do
-            ensureFloatVec2 (valType coordVal)
+            ensureFloatVec2 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st4 fs4 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTextureDepthCube, Nothing) -> do
-            ensureFloatVec3 (valType coordVal)
+            ensureFloatVec3 (coordVal.valType)
             Right (st4, fs4, coordVal)
           (TLTextureDepthCubeArray, Just arrayExpr) -> do
-            ensureFloatVec3 (valType coordVal)
+            ensureFloatVec3 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st4 fs4 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTextureDepth2DArray, Nothing) ->
@@ -6357,24 +6361,24 @@ emitTextureGatherCompare args st fs =
             Left (CompileError "textureGatherCompare for texture_depth_cube_array requires an array index" Nothing Nothing)
           _ -> Left (CompileError "textureGatherCompare expects a depth texture binding" Nothing Nothing)
       (st6, fs6, depthVal') <-
-        case valType depthVal of
+        case depthVal.valType of
           TLScalar F32 _ _ -> Right (st5, fs5, depthVal)
           TLScalar F16 _ _ -> emitScalarConvert F16 F32 depthVal st5 fs5
           _ -> Left (CompileError "depth reference must be f32 or f16" Nothing Nothing)
       (st7, fs7, sampledId) <-
-        if gsSamplerMode st6 == SamplerCombined
-          then Right (st6, fs6, valId texVal)
+        if st6.gsSamplerMode == SamplerCombined
+          then Right (st6, fs6, texVal.valId)
           else do
-            let (imageTy, st7') = emitTypeFromLayout st6 (valType texVal)
+            let (imageTy, st7') = emitTypeFromLayout st6 (texVal.valType)
             let (sampledTy, st8) = emitSampledImageType imageTy st7'
             let (sampledId, st9) = freshId st8
-            let fs7' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, valId texVal, valId sampVal]) fs6
+            let fs7' = addFuncInstr (Instr opSampledImage [sampledTy, sampledId, texVal.valId, sampVal.valId]) fs6
             Right (st9, fs7', sampledId)
       let (align, size) = vectorLayout F32 4
       let outLayout = TLVector 4 F32 align size
       let (outTy, st10) = emitTypeFromLayout st7 outLayout
       let (resId, st11) = freshId st10
-      let fs8 = addFuncInstr (Instr opImageDrefGather [outTy, resId, sampledId, valId coordVal', valId depthVal']) fs7
+      let fs8 = addFuncInstr (Instr opImageDrefGather [outTy, resId, sampledId, coordVal'.valId, depthVal'.valId]) fs7
       Right (st11, fs8, Value outLayout resId)
 
 emitTextureDimensions :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -6391,9 +6395,9 @@ emitTextureDimensions args st fs =
         Nothing -> Right (stImage, fsImage, Nothing)
         Just levelExpr -> do
           (stA, fsA, levelVal) <- emitExpr stImage fsImage levelExpr
-          ensureIndexType (valType levelVal)
+          ensureIndexType (levelVal.valType)
           Right (stA, fsA, Just levelVal)
-      let texLayout = valType texVal
+      let texLayout = texVal.valType
       let isStorage = case texLayout of
             TLStorageTexture1D _ _ -> True
             TLStorageTexture2D _ _ -> True
@@ -6424,7 +6428,7 @@ emitTextureDimensions args st fs =
       let fs6 = case lodVal of
             Nothing -> addFuncInstr (Instr opImageQuerySize [queryTy, resId, texId]) fs5
             Just lod ->
-              addFuncInstr (Instr opImageQuerySizeLod [queryTy, resId, texId, valId lod]) fs5
+              addFuncInstr (Instr opImageQuerySizeLod [queryTy, resId, texId, lod.valId]) fs5
       let queryVal = Value queryLayout resId
       adjustQueryValue texLayout queryVal st5 fs6
 
@@ -6473,7 +6477,7 @@ emitTextureNumLevels args st fs =
     [texExpr] -> do
       (st1, fs1, texVal) <- emitExpr st fs texExpr
       (stImage, fsImage, texId) <- emitImageFromTextureValue st1 fs1 texVal
-      case valType texVal of
+      case texVal.valType of
         TLTextureMultisampled2D _ -> Left (CompileError "textureNumLevels is not valid for multisampled textures" Nothing Nothing)
         TLTextureDepthMultisampled2D -> Left (CompileError "textureNumLevels is not valid for multisampled textures" Nothing Nothing)
         TLStorageTexture1D _ _ -> Left (CompileError "textureNumLevels is not valid for storage textures" Nothing Nothing)
@@ -6496,7 +6500,7 @@ emitTextureNumLayers args st fs =
     [texExpr] -> do
       (st1, fs1, texVal) <- emitExpr st fs texExpr
       (stImage, fsImage, texId) <- emitImageFromTextureValue st1 fs1 texVal
-      let texLayout = valType texVal
+      let texLayout = texVal.valType
       let isArray = case texLayout of
             TLTexture1DArray _ -> True
             TLTexture2DArray _ -> True
@@ -6523,7 +6527,7 @@ emitTextureNumLayers args st fs =
             let (cid, st') = emitConstU32 st3' 0
                 (a, sz) = scalarLayout U32
                 lodVal = Value (TLScalar U32 a sz) cid
-            Right (st', addFuncInstr (Instr opImageQuerySizeLod [outTy, resId, texId, valId lodVal]) fsImage)
+            Right (st', addFuncInstr (Instr opImageQuerySizeLod [outTy, resId, texId, lodVal.valId]) fsImage)
       let queryVal = Value queryLayout resId
       let layerIx = case texLayout of
             TLTexture1DArray _ -> 1
@@ -6536,7 +6540,7 @@ emitTextureNumSamples args st fs =
   case args of
     [texExpr] -> do
       (st1, fs1, texVal) <- emitExpr st fs texExpr
-      case valType texVal of
+      case texVal.valType of
         TLTextureMultisampled2D _ -> querySamples texVal st1 fs1
         TLTextureDepthMultisampled2D -> querySamples texVal st1 fs1
         _ -> Left (CompileError "textureNumSamples expects a multisampled texture" Nothing Nothing)
@@ -6559,7 +6563,7 @@ emitTextureLoad args st fs =
       emitStorageLoad texExpr coordExpr st fs
     [texExpr, coordExpr, thirdExpr] -> do
       (st1, fs1, texVal) <- emitExpr st fs texExpr
-      case valType texVal of
+      case texVal.valType of
         TLTextureMultisampled2D _ ->
           emitMultisampledLoad texVal coordExpr thirdExpr st1 fs1
         TLTextureDepthMultisampled2D ->
@@ -6574,7 +6578,7 @@ emitTextureLoad args st fs =
     emitStorageLoad texExpr coordExpr st0 fs0 = do
       (st1, fs1, texVal) <- emitExpr st0 fs0 texExpr
       (st2, fs2, coordVal) <- emitExpr st1 fs1 coordExpr
-      (scalar, access) <- case valType texVal of
+      (scalar, access) <- case texVal.valType of
         TLStorageTexture1D fmt acc -> Right (storageFormatScalar fmt, acc)
         TLStorageTexture2D fmt acc -> Right (storageFormatScalar fmt, acc)
         TLStorageTexture2DArray fmt acc -> Right (storageFormatScalar fmt, acc)
@@ -6582,72 +6586,72 @@ emitTextureLoad args st fs =
         _ -> Left (CompileError "textureLoad expects a storage texture" Nothing Nothing)
       when (access == StorageWrite) $
         Left (CompileError "textureLoad is not allowed on write-only storage textures" Nothing Nothing)
-      case valType texVal of
-        TLStorageTexture1D _ _ -> ensureIndexType (valType coordVal)
-        TLStorageTexture2D _ _ -> ensureIntVec2 (valType coordVal)
-        TLStorageTexture2DArray _ _ -> ensureIntVec3 (valType coordVal)
-        TLStorageTexture3D _ _ -> ensureIntVec3 (valType coordVal)
+      case texVal.valType of
+        TLStorageTexture1D _ _ -> ensureIndexType (coordVal.valType)
+        TLStorageTexture2D _ _ -> ensureIntVec2 (coordVal.valType)
+        TLStorageTexture2DArray _ _ -> ensureIntVec3 (coordVal.valType)
+        TLStorageTexture3D _ _ -> ensureIntVec3 (coordVal.valType)
         _ -> Left (CompileError "invalid storage texture coordinates" Nothing Nothing)
       let (align, size) = vectorLayout scalar 4
       let outLayout = TLVector 4 scalar align size
       let (outTy, st3) = emitTypeFromLayout st2 outLayout
       let (resId, st4) = freshId st3
-      let fs3 = addFuncInstr (Instr opImageRead [outTy, resId, valId texVal, valId coordVal]) fs2
+      let fs3 = addFuncInstr (Instr opImageRead [outTy, resId, texVal.valId, coordVal.valId]) fs2
       Right (st4, fs3, Value outLayout resId)
 
     emitSampledLoad texVal coordExpr mArray levelExpr st0 fs0 = do
       (stImage, fsImage, texId) <- emitImageFromTextureValue st0 fs0 texVal
       (st1, fs1, coordVal) <- emitExpr stImage fsImage coordExpr
       (st2, fs2, levelVal) <- emitExpr st1 fs1 levelExpr
-      ensureIndexType (valType levelVal)
+      ensureIndexType (levelVal.valType)
       (st3, fs3, coordVal') <-
-        case (valType texVal, mArray) of
+        case (texVal.valType, mArray) of
           (TLTexture1D _, Nothing) -> do
-            ensureIndexType (valType coordVal)
+            ensureIndexType (coordVal.valType)
             Right (st2, fs2, coordVal)
           (TLTexture1DArray _, Just arrayExpr) -> do
-            ensureIndexType (valType coordVal)
+            ensureIndexType (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st2 fs2 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec2FromScalarScalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTexture2D _, Nothing) -> do
-            ensureIntVec2 (valType coordVal)
+            ensureIntVec2 (coordVal.valType)
             Right (st2, fs2, coordVal)
           (TLTexture3D _, Nothing) -> do
-            ensureIntVec3 (valType coordVal)
+            ensureIntVec3 (coordVal.valType)
             Right (st2, fs2, coordVal)
           (TLTextureCube _, Nothing) -> do
-            ensureIntVec3 (valType coordVal)
+            ensureIntVec3 (coordVal.valType)
             Right (st2, fs2, coordVal)
           (TLTextureDepth2D, Nothing) -> do
-            ensureIntVec2 (valType coordVal)
+            ensureIntVec2 (coordVal.valType)
             Right (st2, fs2, coordVal)
           (TLTextureDepthCube, Nothing) -> do
-            ensureIntVec3 (valType coordVal)
+            ensureIntVec3 (coordVal.valType)
             Right (st2, fs2, coordVal)
           (TLTexture2DArray _, Just arrayExpr) -> do
-            ensureIntVec2 (valType coordVal)
+            ensureIntVec2 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st2 fs2 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTextureDepth2DArray, Just arrayExpr) -> do
-            ensureIntVec2 (valType coordVal)
+            ensureIntVec2 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st2 fs2 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec3FromVec2Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTextureCubeArray _, Just arrayExpr) -> do
-            ensureIntVec3 (valType coordVal)
+            ensureIntVec3 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st2 fs2 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTextureDepthCubeArray, Just arrayExpr) -> do
-            ensureIntVec3 (valType coordVal)
+            ensureIntVec3 (coordVal.valType)
             (stA, fsA, arrayVal) <- emitExpr st2 fs2 arrayExpr
-            ensureIndexType (valType arrayVal)
+            ensureIndexType (arrayVal.valType)
             (stB, fsB, coordVal') <- emitVec4FromVec3Scalar coordVal arrayVal stA fsA
             Right (stB, fsB, coordVal')
           (TLTexture1DArray _, Nothing) ->
@@ -6662,7 +6666,7 @@ emitTextureLoad args st fs =
             Left (CompileError "textureLoad for texture_depth_cube_array requires an array index" Nothing Nothing)
           _ -> Left (CompileError "textureLoad expects a sampled texture binding" Nothing Nothing)
       let (fetchLayout, resultLayout) =
-            case valType texVal of
+            case texVal.valType of
               TLTextureDepth2D ->
                 let (a, sz) = vectorLayout F32 4
                 in (TLVector 4 F32 a sz, TLScalar F32 (fst (scalarLayout F32)) (snd (scalarLayout F32)))
@@ -6685,7 +6689,7 @@ emitTextureLoad args st fs =
               _ -> let (a, sz) = vectorLayout F32 4 in (TLVector 4 F32 a sz, TLVector 4 F32 a sz)
       let (outTy, st4) = emitTypeFromLayout st3 fetchLayout
       let (resId, st5) = freshId st4
-      let fs4 = addFuncInstr (Instr opImageFetch [outTy, resId, texId, valId coordVal', imageOperandsLod, valId levelVal]) fs3
+      let fs4 = addFuncInstr (Instr opImageFetch [outTy, resId, texId, coordVal'.valId, imageOperandsLod, levelVal.valId]) fs3
       let fetchVal = Value fetchLayout resId
       if fetchLayout == resultLayout
         then Right (st5, fs4, fetchVal)
@@ -6695,13 +6699,13 @@ emitTextureLoad args st fs =
       (stImage, fsImage, texId) <- emitImageFromTextureValue st0 fs0 texVal
       (st1, fs1, coordVal) <- emitExpr stImage fsImage coordExpr
       (st2, fs2, sampleVal) <- emitExpr st1 fs1 sampleExpr
-      ensureIndexType (valType sampleVal)
-      case valType texVal of
-        TLTextureMultisampled2D _ -> ensureIntVec2 (valType coordVal)
-        TLTextureDepthMultisampled2D -> ensureIntVec2 (valType coordVal)
+      ensureIndexType (sampleVal.valType)
+      case texVal.valType of
+        TLTextureMultisampled2D _ -> ensureIntVec2 (coordVal.valType)
+        TLTextureDepthMultisampled2D -> ensureIntVec2 (coordVal.valType)
         _ -> Left (CompileError "textureLoad expects a multisampled texture" Nothing Nothing)
       let (fetchLayout, resultLayout) =
-            case valType texVal of
+            case texVal.valType of
               TLTextureDepthMultisampled2D ->
                 let (a, sz) = vectorLayout F32 4
                 in (TLVector 4 F32 a sz, TLScalar F32 (fst (scalarLayout F32)) (snd (scalarLayout F32)))
@@ -6709,7 +6713,7 @@ emitTextureLoad args st fs =
               _ -> let (a, sz) = vectorLayout F32 4 in (TLVector 4 F32 a sz, TLVector 4 F32 a sz)
       let (outTy, st3) = emitTypeFromLayout st2 fetchLayout
       let (resId, st4) = freshId st3
-      let fs3 = addFuncInstr (Instr opImageFetch [outTy, resId, texId, valId coordVal, imageOperandsSample, valId sampleVal]) fs2
+      let fs3 = addFuncInstr (Instr opImageFetch [outTy, resId, texId, coordVal.valId, imageOperandsSample, sampleVal.valId]) fs2
       let fetchVal = Value fetchLayout resId
       if fetchLayout == resultLayout
         then Right (st4, fs3, fetchVal)
@@ -6722,7 +6726,7 @@ emitTextureStore args st fs =
       (st1, fs1, texVal) <- emitExpr st fs texExpr
       (st2, fs2, coordVal) <- emitExpr st1 fs1 coordExpr
       (st3, fs3, valueVal) <- emitExpr st2 fs2 valueExpr
-      (scalar, access) <- case valType texVal of
+      (scalar, access) <- case texVal.valType of
         TLStorageTexture1D fmt acc -> Right (storageFormatScalar fmt, acc)
         TLStorageTexture2D fmt acc -> Right (storageFormatScalar fmt, acc)
         TLStorageTexture2DArray fmt acc -> Right (storageFormatScalar fmt, acc)
@@ -6730,16 +6734,16 @@ emitTextureStore args st fs =
         _ -> Left (CompileError "textureStore expects a storage texture" Nothing Nothing)
       when (access == StorageRead) $
         Left (CompileError "textureStore is not allowed on read-only storage textures" Nothing Nothing)
-      case valType texVal of
-        TLStorageTexture1D _ _ -> ensureIndexType (valType coordVal)
-        TLStorageTexture2D _ _ -> ensureIntVec2 (valType coordVal)
-        TLStorageTexture2DArray _ _ -> ensureIntVec3 (valType coordVal)
-        TLStorageTexture3D _ _ -> ensureIntVec3 (valType coordVal)
+      case texVal.valType of
+        TLStorageTexture1D _ _ -> ensureIndexType (coordVal.valType)
+        TLStorageTexture2D _ _ -> ensureIntVec2 (coordVal.valType)
+        TLStorageTexture2DArray _ _ -> ensureIntVec3 (coordVal.valType)
+        TLStorageTexture3D _ _ -> ensureIntVec3 (coordVal.valType)
         _ -> Left (CompileError "textureStore expects a storage texture" Nothing Nothing)
       let (align, size) = vectorLayout scalar 4
       let expectedLayout = TLVector 4 scalar align size
-      ensureTypeMatch expectedLayout (valType valueVal)
-      let fs4 = addFuncInstr (Instr opImageWrite [valId texVal, valId coordVal, valId valueVal]) fs3
+      ensureTypeMatch expectedLayout (valueVal.valType)
+      let fs4 = addFuncInstr (Instr opImageWrite [texVal.valId, coordVal.valId, valueVal.valId]) fs3
       Right (st3, fs4)
     _ -> Left (CompileError "textureStore expects (texture, coords, value)" Nothing Nothing)
 
@@ -6747,14 +6751,14 @@ emitDerivative :: Word16 -> [Expr] -> GenState -> FuncState -> Either CompileErr
 emitDerivative opcode args st fs =
   case args of
     [arg] -> do
-      when (gsEntryStage st /= StageFragment) $
+      when (st.gsEntryStage /= StageFragment) $
         Left (CompileError "derivatives are only available in fragment shaders" Nothing Nothing)
       (st1, fs1, val) <- emitExpr st fs arg
-      ensureFloatNumeric (valType val)
-      let (tyId, st2) = emitTypeFromLayout st1 (valType val)
+      ensureFloatNumeric (val.valType)
+      let (tyId, st2) = emitTypeFromLayout st1 (val.valType)
       let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opcode [tyId, resId, valId val]) fs1
-      Right (st3, fs2, Value (valType val) resId)
+      let fs2 = addFuncInstr (Instr opcode [tyId, resId, val.valId]) fs1
+      Right (st3, fs2, Value (val.valType) resId)
     _ -> Left (CompileError "derivative builtins expect one argument" Nothing Nothing)
 
 emitAtomicPtr :: Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState, VarInfo)
@@ -6763,12 +6767,12 @@ emitAtomicPtr expr st fs =
     Nothing -> Left (CompileError "atomic operations require an addressable expression" Nothing Nothing)
     Just lv -> do
       (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-      case viType ptrInfo of
+      case ptrInfo.viType of
         TLAtomic _ -> pure ()
         _ -> Left (CompileError "atomic operations require atomic types" Nothing Nothing)
-      when (viStorage ptrInfo /= storageClassStorageBuffer) $
+      when (ptrInfo.viStorage /= storageClassStorageBuffer) $
         Left (CompileError "atomic operations are only supported on storage buffers" Nothing Nothing)
-      when (viAccess ptrInfo == ReadOnly) $
+      when (ptrInfo.viAccess == ReadOnly) $
         Left (CompileError "atomic operations require read_write storage buffers" Nothing Nothing)
       Right (st1, fs1, ptrInfo)
 
@@ -6777,7 +6781,7 @@ emitAtomicLoad args st fs =
   case args of
     [ptrExpr] -> do
       (st1, fs1, ptrInfo) <- emitAtomicPtr ptrExpr st fs
-      scalar <- case viType ptrInfo of
+      scalar <- case ptrInfo.viType of
         TLAtomic s -> Right s
         _ -> Left (CompileError "atomicLoad expects an atomic value" Nothing Nothing)
       let (a, sz) = scalarLayout scalar
@@ -6786,7 +6790,7 @@ emitAtomicLoad args st fs =
       let (resId, st3) = freshId st2
       let (scopeId, st4) = emitConstU32 st3 memoryScopeDevice
       let (semId, st5) = emitConstU32 st4 memorySemanticsRelaxed
-      let fs2 = addFuncInstr (Instr opAtomicLoad [tyId, resId, viPtrId ptrInfo, scopeId, semId]) fs1
+      let fs2 = addFuncInstr (Instr opAtomicLoad [tyId, resId, ptrInfo.viPtrId, scopeId, semId]) fs1
       Right (st5, fs2, Value layout resId)
     _ -> Left (CompileError "atomicLoad expects (ptr)" Nothing Nothing)
 
@@ -6795,7 +6799,7 @@ emitAtomicStore args st fs =
   case args of
     [ptrExpr, valueExpr] -> do
       (st1, fs1, ptrInfo) <- emitAtomicPtr ptrExpr st fs
-      scalar <- case viType ptrInfo of
+      scalar <- case ptrInfo.viType of
         TLAtomic s -> Right s
         _ -> Left (CompileError "atomicStore expects an atomic value" Nothing Nothing)
       (st2, fs2, val) <- emitExpr st1 fs1 valueExpr
@@ -6803,7 +6807,7 @@ emitAtomicStore args st fs =
       (st3, fs3, val') <- coerceValueToLayout (TLScalar scalar a sz) val st2 fs2
       let (scopeId, st4) = emitConstU32 st3 memoryScopeDevice
       let (semId, st5) = emitConstU32 st4 memorySemanticsRelaxed
-      let fs4 = addFuncInstr (Instr opAtomicStore [viPtrId ptrInfo, scopeId, semId, valId val']) fs3
+      let fs4 = addFuncInstr (Instr opAtomicStore [ptrInfo.viPtrId, scopeId, semId, val'.valId]) fs3
       Right (st5, fs4)
     _ -> Left (CompileError "atomicStore expects (ptr, value)" Nothing Nothing)
 
@@ -6812,7 +6816,7 @@ emitAtomicBinary opcodeFor args st fs =
   case args of
     [ptrExpr, valueExpr] -> do
       (st1, fs1, ptrInfo) <- emitAtomicPtr ptrExpr st fs
-      scalar <- case viType ptrInfo of
+      scalar <- case ptrInfo.viType of
         TLAtomic s -> Right s
         _ -> Left (CompileError "atomic operation expects an atomic value" Nothing Nothing)
       opcode <- opcodeFor scalar
@@ -6824,7 +6828,7 @@ emitAtomicBinary opcodeFor args st fs =
       let (resId, st5) = freshId st4
       let (scopeId, st6) = emitConstU32 st5 memoryScopeDevice
       let (semId, st7) = emitConstU32 st6 memorySemanticsRelaxed
-      let fs4 = addFuncInstr (Instr opcode [tyId, resId, viPtrId ptrInfo, scopeId, semId, valId val']) fs3
+      let fs4 = addFuncInstr (Instr opcode [tyId, resId, ptrInfo.viPtrId, scopeId, semId, val'.valId]) fs3
       Right (st7, fs4, Value layout resId)
     _ -> Left (CompileError "atomic operation expects (ptr, value)" Nothing Nothing)
 
@@ -6839,15 +6843,15 @@ emitLValuePtr :: GenState -> FuncState -> LValue -> Either CompileError (GenStat
 emitLValuePtr st fs lv =
   case lv of
     LVVar name ->
-      case lookup name (fsVars fs) of
+      case lookup name (fs.fsVars) of
         Just v -> Right (st, fs, v)
         Nothing ->
-          case lookup name (fsValues fs) of
+          case lookup name (fs.fsValues) of
             Just _ -> Left (CompileError "cannot take the address of an immutable let binding" Nothing Nothing)
             Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
     LVField base field -> do
       (st1, fs1, baseInfo) <- emitLValuePtr st fs base
-      case viType baseInfo of
+      case baseInfo.viType of
         TLStruct _ fields _ _ -> do
           (ix, fieldLayout) <- findField (textToString field) fields
           let (ixId, st2) = emitConstU32 st1 (fromIntegral ix)
@@ -6865,33 +6869,33 @@ emitLValuePtr st fs lv =
     LVIndex base idxExpr -> do
       (st1, fs1, baseInfo) <- emitLValuePtr st fs base
       (st2, fs2, idxVal) <- emitExpr st1 fs1 idxExpr
-      ensureIndexType (valType idxVal)
-      case viType baseInfo of
-        TLArray _ _ elemLayout _ _ -> emitAccessChain st2 fs2 baseInfo [valId idxVal] elemLayout
+      ensureIndexType (idxVal.valType)
+      case baseInfo.viType of
+        TLArray _ _ elemLayout _ _ -> emitAccessChain st2 fs2 baseInfo [idxVal.valId] elemLayout
         TLVector _ scalar _ _ ->
           let (a, sz) = scalarLayout scalar
               elemLayout = TLScalar scalar a sz
-          in emitAccessChain st2 fs2 baseInfo [valId idxVal] elemLayout
+          in emitAccessChain st2 fs2 baseInfo [idxVal.valId] elemLayout
         TLMatrix _ rows scalar _ _ _ ->
           let elemLayout = TLVector rows scalar (fst (vectorLayout scalar rows)) (snd (vectorLayout scalar rows))
-          in emitAccessChain st2 fs2 baseInfo [valId idxVal] elemLayout
+          in emitAccessChain st2 fs2 baseInfo [idxVal.valId] elemLayout
         _ -> Left (CompileError "indexing requires array or vector type" Nothing Nothing)
     LVDeref expr -> do
       (st1, fs1, val) <- emitExpr st fs expr
-      case valType val of
+      case val.valType of
         TLPointer storageClass access elemLayout ->
-          Right (st1, fs1, VarInfo elemLayout (valId val) storageClass (ptrAccessToVarAccess access))
+          Right (st1, fs1, VarInfo elemLayout (val.valId) storageClass (ptrAccessToVarAccess access))
         _ -> Left (CompileError "deref requires a pointer value" Nothing Nothing)
 
 emitAccessChain :: GenState -> FuncState -> VarInfo -> [Word32] -> TypeLayout -> Either CompileError (GenState, FuncState, VarInfo)
 emitAccessChain st fs baseInfo indices elemLayout = do
-  let storageClass = viStorage baseInfo
+  let storageClass = baseInfo.viStorage
   let (elemTy, st1) = emitTypeFromLayout st elemLayout
   let (ptrTy, st2) = emitPointerType st1 storageClass elemTy
   let (resId, st3) = freshId st2
-  let instr = Instr opAccessChain (ptrTy : resId : viPtrId baseInfo : indices)
+  let instr = Instr opAccessChain (ptrTy : resId : baseInfo.viPtrId : indices)
   let fs1 = addFuncInstr instr fs
-  Right (st3, fs1, VarInfo elemLayout resId storageClass (viAccess baseInfo))
+  Right (st3, fs1, VarInfo elemLayout resId storageClass (baseInfo.viAccess))
 
 ensureTypeMatch :: TypeLayout -> TypeLayout -> Either CompileError ()
 ensureTypeMatch a b =
@@ -6907,7 +6911,7 @@ ensureTypeMatch a b =
 
 ensureWritable :: VarInfo -> Either CompileError ()
 ensureWritable info =
-  case viAccess info of
+  case info.viAccess of
     ReadWrite -> Right ()
     ReadOnly -> Left (CompileError "assignment target is read-only" Nothing Nothing)
 
@@ -7044,27 +7048,27 @@ buildSpirvWords :: CompileOptions -> EntryPoint -> GenState -> [Word32]
 buildSpirvWords opts entry st =
   let header =
         [ 0x07230203
-        , spirvVersion opts
+        , opts.spirvVersion
         , 0
-        , gsNextId st
+        , st.gsNextId
         , 0
         ]
-      entryPointInstr = case gsEntryPoint st of
+      entryPointInstr = case st.gsEntryPoint of
         Nothing -> []
         Just epId ->
-          let nameWords = encodeString (textToString (epName entry))
+          let nameWords = encodeString (textToString entry.epName)
               model = case entry.epStage of
                 StageCompute -> executionModelGLCompute
                 StageFragment -> executionModelFragment
                 StageVertex -> executionModelVertex
-              operands = model : epId : nameWords <> gsInterfaceIds st
+              operands = model : epId : nameWords <> st.gsInterfaceIds
           in encodeInstr (Instr opEntryPoint operands)
-      execModeInstr = case gsEntryPoint st of
+      execModeInstr = case st.gsEntryPoint of
         Nothing -> []
         Just epId ->
           case entry.epStage of
             StageCompute ->
-              case epWorkgroupSize entry of
+              case entry.epWorkgroupSize of
                 Nothing -> []
                 Just (x, y, z) ->
                   let ops = [epId, executionModeLocalSize, x, y, z]
@@ -7073,20 +7077,20 @@ buildSpirvWords opts entry st =
               encodeInstr (Instr opExecutionMode [epId, executionModeOriginUpperLeft])
             StageVertex -> []
       capInstrs =
-        concatMap (\cap -> encodeInstr (Instr opCapability [cap])) (capabilityShader : gsCapabilities st)
+        concatMap (\cap -> encodeInstr (Instr opCapability [cap])) (capabilityShader : st.gsCapabilities)
       body =
         concat
           [ capInstrs
-          , concatMap encodeInstr (gsExtInstImports st)
+          , concatMap encodeInstr (st.gsExtInstImports)
           , encodeInstr (Instr opMemoryModel [addressingLogical, memoryModelGLSL450])
           , entryPointInstr
           , execModeInstr
-          , concatMap encodeInstr (gsNames st)
-          , concatMap encodeInstr (gsDecorations st)
-          , concatMap encodeInstr (gsTypes st)
-          , concatMap encodeInstr (gsConstants st)
-          , concatMap encodeInstr (gsGlobals st)
-          , concatMap encodeInstr (gsFunctions st)
+          , concatMap encodeInstr (st.gsNames)
+          , concatMap encodeInstr (st.gsDecorations)
+          , concatMap encodeInstr (st.gsTypes)
+          , concatMap encodeInstr (st.gsConstants)
+          , concatMap encodeInstr (st.gsGlobals)
+          , concatMap encodeInstr (st.gsFunctions)
           ]
   in header <> body
 
@@ -7211,7 +7215,7 @@ emitSampledImageType imageId st =
 emitArrayType :: Word32 -> Word32 -> Word32 -> GenState -> (Word32, GenState)
 emitArrayType elemId lenVal stride st =
   let key = TKArray elemId (Just lenVal) stride
-  in case lookup key (gsTypeCache st) of
+  in case lookup key (st.gsTypeCache) of
        Just tid -> (tid, st)
        Nothing ->
          let (lenId, st1) = emitTypeConstU32 st lenVal
@@ -7224,7 +7228,7 @@ emitRuntimeArrayType :: Word32 -> Word32 -> GenState -> (Word32, GenState)
 emitRuntimeArrayType elemId stride st =
   let key = TKArray elemId Nothing stride
       instr = Instr opTypeRuntimeArray [elemId]
-  in case lookup key (gsTypeCache st) of
+  in case lookup key (st.gsTypeCache) of
        Just tid -> (tid, st)
        Nothing ->
          let (tyId, st1) = emitTypeCached st key instr
@@ -7321,16 +7325,16 @@ emitTypeFromLayout st layout =
           emitArrayType elemId (fromIntegral n) stride st1
     TLStruct name fields _ _ ->
       let nameT = T.pack name
-      in case lookup nameT (gsStructIds st) of
+      in case lookup nameT (st.gsStructIds) of
         Just sid -> (sid, st)
         Nothing ->
           let (sid, st1) = freshId st
-              st2 = st1 { gsStructIds = (nameT, sid) : gsStructIds st1 }
+              st2 = st1 { gsStructIds = (nameT, sid) : st1.gsStructIds }
               (st3, fieldTypeIds) = mapAccumL emitFieldType st2 fields
               st4 = addType (Instr opTypeStruct (sid : fieldTypeIds)) st3
               st5 = addName (Instr opName (sid : encodeString name)) st4
               st6 = foldl' (emitMemberDecorate sid) st5 (zip [0 :: Int ..] fields)
-              st7 = if nameT `elem` gsBlockStructs st6
+              st7 = if nameT `elem` st6.gsBlockStructs
                 then addDecoration (Instr opDecorate [sid, decorationBlock]) st6
                 else st6
               st8 = foldl' (emitMemberName sid) st7 (zip [0 :: Int ..] fields)
@@ -7340,7 +7344,7 @@ emitTypeFromLayout st layout =
       let (tyId, st'') = emitTypeFromLayout st' field.flType
       in (st'', tyId)
     emitSampledImageIfNeeded imageId st' =
-      if gsSamplerMode st' == SamplerCombined
+      if st'.gsSamplerMode == SamplerCombined
         then emitSampledImageType imageId st'
         else (imageId, st')
     emitMemberDecorate structId st' (ix, field) =
@@ -7391,13 +7395,13 @@ emitImageTypeFromTextureLayout st layout =
 
 emitImageFromTextureValue :: GenState -> FuncState -> Value -> Either CompileError (GenState, FuncState, Word32)
 emitImageFromTextureValue st fs texVal
-  | gsSamplerMode st == SamplerCombined && isSampledTextureLayout (valType texVal) = do
-      (imageTy, st1) <- emitImageTypeFromTextureLayout st (valType texVal)
+  | st.gsSamplerMode == SamplerCombined && isSampledTextureLayout (texVal.valType) = do
+      (imageTy, st1) <- emitImageTypeFromTextureLayout st (texVal.valType)
       let (resId, st2) = freshId st1
-      let fs1 = addFuncInstr (Instr opImage [imageTy, resId, valId texVal]) fs
+      let fs1 = addFuncInstr (Instr opImage [imageTy, resId, texVal.valId]) fs
       Right (st2, fs1, resId)
   | otherwise =
-      Right (st, fs, valId texVal)
+      Right (st, fs, texVal.valId)
 
 emitPointerForBinding :: GenState -> BindingKind -> TypeLayout -> (Word32, GenState)
 emitPointerForBinding st kind layout =
@@ -7613,23 +7617,23 @@ emitConst = emitConstWith addConst
 
 emitConstWith :: (Instr -> GenState -> GenState) -> GenState -> ConstKey -> (Word32 -> GenState -> (Instr, GenState)) -> (Word32, GenState)
 emitConstWith addInstrFn st key build =
-  case lookup key (gsConstCache st) of
+  case lookup key (st.gsConstCache) of
     Just cid -> (cid, st)
     Nothing ->
       let (id', st1) = freshId st
           (instr, st2) = build id' st1
           st3 = addInstrFn instr st2
-          st4 = st3 { gsConstCache = (key, id') : gsConstCache st3 }
+          st4 = st3 { gsConstCache = (key, id') : st3.gsConstCache }
       in (id', st4)
 
 emitTypeCached :: GenState -> TypeKey -> Instr -> (Word32, GenState)
 emitTypeCached st key instr =
-  case lookup key (gsTypeCache st) of
+  case lookup key (st.gsTypeCache) of
     Just tid -> (tid, st)
     Nothing ->
       let (tid, st1) = freshId st
           st2 = addType (addResultId tid instr) st1
-          st3 = st2 { gsTypeCache = (key, tid) : gsTypeCache st2 }
+          st3 = st2 { gsTypeCache = (key, tid) : st2.gsTypeCache }
       in (tid, st3)
 
 addResultId :: Word32 -> Instr -> Instr
@@ -7704,137 +7708,25 @@ packWord _ = 0
 
 bytesToExp :: ByteString -> Q Exp
 bytesToExp bytes = do
-  let ints = map (fromIntegral :: Word8 -> Integer) (BS.unpack bytes)
-  listExp <- TH.listE (map (TH.litE . TH.integerL) ints)
-  let listSig = TH.SigE listExp (TH.AppT TH.ListT (TH.ConT ''Word8))
-  pure (TH.AppE (TH.VarE 'BS.pack) listSig)
-
-interfaceToExp :: ShaderInterface -> Q Exp
-interfaceToExp (ShaderInterface bindings overrides stageInfo pushConst samplerMode) = do
-  bindingsExp <- TH.listE (map bindingToExp bindings)
-  overridesExp <- TH.listE (map overrideToExp overrides)
-  stageExp <- maybeStageIOToExp stageInfo
-  pushExp <- maybeLayoutToExp pushConst
-  samplerModeExp <- samplerModeToExp samplerMode
+  let len = BS.length bytes
+      lit = TH.LitE (TH.StringPrimL (BS.unpack bytes))
   pure
     (TH.AppE
+      (TH.VarE 'unsafeDupablePerformIO)
       (TH.AppE
-        (TH.AppE
-          (TH.AppE
-            (TH.AppE (TH.ConE 'ShaderInterface) bindingsExp)
-            overridesExp)
-          stageExp)
-        pushExp)
-      samplerModeExp)
+        (TH.AppE (TH.VarE 'BSI.unsafePackLenAddress) (TH.LitE (TH.IntegerL (fromIntegral len))))
+        lit))
 
-samplerModeToExp :: SamplerBindingMode -> Q Exp
-samplerModeToExp mode =
-  case mode of
-    SamplerSeparate -> TH.conE 'SamplerSeparate
-    SamplerCombined -> TH.conE 'SamplerCombined
+interfaceToExp :: ShaderInterface -> Q Exp
+interfaceToExp iface = do
+  bytesExp <- bytesToExp (BSC.pack (show iface))
+  pure (TH.AppE (TH.VarE 'decodeInterface) bytesExp)
 
-bindingToExp :: BindingInfo -> Q Exp
-bindingToExp info =
-  TH.recConE 'BindingInfo
-    [ TH.fieldExp 'biName (TH.litE (TH.stringL info.biName))
-    , TH.fieldExp 'biKind (TH.conE (bindingKindCon info.biKind))
-    , TH.fieldExp 'biGroup (TH.litE (TH.integerL (fromIntegral info.biGroup)))
-    , TH.fieldExp 'biBinding (TH.litE (TH.integerL (fromIntegral info.biBinding)))
-    , TH.fieldExp 'biType (typeLayoutToExp info.biType)
-    ]
-
-overrideToExp :: OverrideInfo -> Q Exp
-overrideToExp info =
-  TH.recConE 'OverrideInfo
-    [ TH.fieldExp 'oiName (TH.litE (TH.stringL (oiName info)))
-    , TH.fieldExp 'oiId (maybeToExp (oiId info))
-    , TH.fieldExp 'oiSpecId (maybeToExp (oiSpecId info))
-    , TH.fieldExp 'oiType (typeLayoutToExp (oiType info))
-    ]
-
-maybeToExp :: Maybe Word32 -> Q Exp
-maybeToExp val =
-  case val of
-    Nothing -> TH.conE 'Nothing
-    Just v -> TH.appE (TH.conE 'Just) (TH.litE (TH.integerL (fromIntegral v)))
-
-maybeLayoutToExp :: Maybe TypeLayout -> Q Exp
-maybeLayoutToExp val =
-  case val of
-    Nothing -> TH.conE 'Nothing
-    Just layout -> TH.appE (TH.conE 'Just) (typeLayoutToExp layout)
-
-maybeStageIOToExp :: Maybe StageIO -> Q Exp
-maybeStageIOToExp val =
-  case val of
-    Nothing -> TH.conE 'Nothing
-    Just sio -> TH.appE (TH.conE 'Just) (stageIOToExp sio)
-
-stageIOToExp :: StageIO -> Q Exp
-stageIOToExp sio =
-  TH.recConE 'StageIO
-    [ TH.fieldExp 'sioStage (shaderStageToExp (sioStage sio))
-    , TH.fieldExp 'sioWorkgroupSize (maybeWorkgroupToExp (sioWorkgroupSize sio))
-    , TH.fieldExp 'sioInputs (TH.listE (map ioParamToExp (sioInputs sio)))
-    , TH.fieldExp 'sioOutputs (TH.listE (map ioParamToExp (sioOutputs sio)))
-    ]
-
-shaderStageToExp :: ShaderStage -> Q Exp
-shaderStageToExp st =
-  TH.conE $
-    case st of
-      ShaderStageCompute -> 'ShaderStageCompute
-      ShaderStageFragment -> 'ShaderStageFragment
-      ShaderStageVertex -> 'ShaderStageVertex
-
-maybeWorkgroupToExp :: Maybe (Word32, Word32, Word32) -> Q Exp
-maybeWorkgroupToExp val =
-  case val of
-    Nothing -> TH.conE 'Nothing
-    Just (x, y, z) -> do
-      let lit n = TH.litE (TH.integerL (fromIntegral n))
-      tup <- TH.tupE [lit x, lit y, lit z]
-      TH.appE (TH.conE 'Just) (pure tup)
-
-ioParamToExp :: IOParam -> Q Exp
-ioParamToExp param =
-  TH.recConE 'IOParam
-    [ TH.fieldExp 'ioName (TH.litE (TH.stringL (ioName param)))
-    , TH.fieldExp 'ioLocation (maybeToExp (ioLocation param))
-    , TH.fieldExp 'ioBuiltin (maybeStringToExp (ioBuiltin param))
-    , TH.fieldExp 'ioType (typeLayoutToExp (ioType param))
-    ]
-
-maybeStringToExp :: Maybe String -> Q Exp
-maybeStringToExp val =
-  case val of
-    Nothing -> TH.conE 'Nothing
-    Just s -> TH.appE (TH.conE 'Just) (TH.litE (TH.stringL s))
-
-bindingKindCon :: BindingKind -> TH.Name
-bindingKindCon kind = case kind of
-  BUniform -> 'BUniform
-  BStorageRead -> 'BStorageRead
-  BStorageReadWrite -> 'BStorageReadWrite
-  BSampler -> 'BSampler
-  BSamplerComparison -> 'BSamplerComparison
-  BTexture1D -> 'BTexture1D
-  BTexture1DArray -> 'BTexture1DArray
-  BTexture2D -> 'BTexture2D
-  BTexture2DArray -> 'BTexture2DArray
-  BTexture3D -> 'BTexture3D
-  BTextureCube -> 'BTextureCube
-  BTextureCubeArray -> 'BTextureCubeArray
-  BTextureMultisampled2D -> 'BTextureMultisampled2D
-  BTextureDepth2D -> 'BTextureDepth2D
-  BTextureDepth2DArray -> 'BTextureDepth2DArray
-  BTextureDepthCube -> 'BTextureDepthCube
-  BTextureDepthCubeArray -> 'BTextureDepthCubeArray
-  BTextureDepthMultisampled2D -> 'BTextureDepthMultisampled2D
-  BStorageTexture1D -> 'BStorageTexture1D
-  BStorageTexture2D -> 'BStorageTexture2D
-  BStorageTexture2DArray -> 'BStorageTexture2DArray
-  BStorageTexture3D -> 'BStorageTexture3D
+decodeInterface :: ByteString -> ShaderInterface
+decodeInterface bytes =
+  case readMaybe (BSC.unpack bytes) of
+    Just iface -> iface
+    Nothing -> error "wesl: failed to decode ShaderInterface"
 
 storageFormatCon :: StorageFormat -> TH.Name
 storageFormatCon fmt = case fmt of
@@ -7883,97 +7775,6 @@ storageAccessCon access = case access of
   StorageRead -> 'StorageRead
   StorageWrite -> 'StorageWrite
   StorageReadWrite -> 'StorageReadWrite
-
-typeLayoutToExp :: TypeLayout -> Q Exp
-typeLayoutToExp layout =
-  case layout of
-    TLScalar s a sz ->
-      TH.appE (TH.appE (TH.appE (TH.conE 'TLScalar) (scalarToExp s)) (TH.litE (TH.integerL (fromIntegral a))))
-        (TH.litE (TH.integerL (fromIntegral sz)))
-    TLVector n s a sz ->
-      TH.appE
-        (TH.appE (TH.appE (TH.appE (TH.conE 'TLVector) (TH.litE (TH.integerL (fromIntegral n)))) (scalarToExp s)) (TH.litE (TH.integerL (fromIntegral a))))
-        (TH.litE (TH.integerL (fromIntegral sz)))
-    TLMatrix cols rows s a sz stride ->
-      TH.appE
-        (TH.appE (TH.appE (TH.appE (TH.appE (TH.appE (TH.conE 'TLMatrix) (TH.litE (TH.integerL (fromIntegral cols)))) (TH.litE (TH.integerL (fromIntegral rows)))) (scalarToExp s)) (TH.litE (TH.integerL (fromIntegral a))))
-          (TH.litE (TH.integerL (fromIntegral sz))))
-        (TH.litE (TH.integerL (fromIntegral stride)))
-    TLArray mlen stride elemLayout a sz -> do
-      elemExp <- typeLayoutToExp elemLayout
-      mlenExp <- case mlen of
-        Nothing -> TH.conE 'Nothing
-        Just n -> TH.appE (TH.conE 'Just) (TH.litE (TH.integerL (fromIntegral n)))
-      let exp1 = TH.AppE (TH.ConE 'TLArray) mlenExp
-          exp2 = TH.AppE exp1 (TH.LitE (TH.integerL (fromIntegral stride)))
-          exp3 = TH.AppE exp2 elemExp
-          exp4 = TH.AppE exp3 (TH.LitE (TH.integerL (fromIntegral a)))
-          exp5 = TH.AppE exp4 (TH.LitE (TH.integerL (fromIntegral sz)))
-      pure exp5
-    TLStruct name fields a sz -> do
-      fieldsExp <- TH.listE (map fieldLayoutToExp fields)
-      let exp1 = TH.AppE (TH.ConE 'TLStruct) (TH.LitE (TH.stringL name))
-          exp2 = TH.AppE exp1 fieldsExp
-          exp3 = TH.AppE exp2 (TH.LitE (TH.integerL (fromIntegral a)))
-          exp4 = TH.AppE exp3 (TH.LitE (TH.integerL (fromIntegral sz)))
-      pure exp4
-    TLPointer storageClass access elemLayout -> do
-      elemExp <- typeLayoutToExp elemLayout
-      accessExp <- case access of
-        Nothing -> TH.conE 'Nothing
-        Just a -> TH.appE (TH.conE 'Just) (storageAccessToExp a)
-      let exp1 = TH.AppE (TH.ConE 'TLPointer) (TH.LitE (TH.integerL (fromIntegral storageClass)))
-          exp2 = TH.AppE exp1 accessExp
-          exp3 = TH.AppE exp2 elemExp
-      pure exp3
-    TLSampler -> TH.conE 'TLSampler
-    TLSamplerComparison -> TH.conE 'TLSamplerComparison
-    TLTexture1D s -> TH.appE (TH.conE 'TLTexture1D) (scalarToExp s)
-    TLTexture1DArray s -> TH.appE (TH.conE 'TLTexture1DArray) (scalarToExp s)
-    TLTexture2D s -> TH.appE (TH.conE 'TLTexture2D) (scalarToExp s)
-    TLTexture2DArray s -> TH.appE (TH.conE 'TLTexture2DArray) (scalarToExp s)
-    TLTexture3D s -> TH.appE (TH.conE 'TLTexture3D) (scalarToExp s)
-    TLTextureCube s -> TH.appE (TH.conE 'TLTextureCube) (scalarToExp s)
-    TLTextureCubeArray s -> TH.appE (TH.conE 'TLTextureCubeArray) (scalarToExp s)
-    TLTextureMultisampled2D s -> TH.appE (TH.conE 'TLTextureMultisampled2D) (scalarToExp s)
-    TLTextureDepth2D -> TH.conE 'TLTextureDepth2D
-    TLTextureDepth2DArray -> TH.conE 'TLTextureDepth2DArray
-    TLTextureDepthCube -> TH.conE 'TLTextureDepthCube
-    TLTextureDepthCubeArray -> TH.conE 'TLTextureDepthCubeArray
-    TLTextureDepthMultisampled2D -> TH.conE 'TLTextureDepthMultisampled2D
-    TLStorageTexture1D fmt access ->
-      TH.appE (TH.appE (TH.conE 'TLStorageTexture1D) (storageFormatToExp fmt)) (storageAccessToExp access)
-    TLStorageTexture2D fmt access ->
-      TH.appE (TH.appE (TH.conE 'TLStorageTexture2D) (storageFormatToExp fmt)) (storageAccessToExp access)
-    TLStorageTexture2DArray fmt access ->
-      TH.appE (TH.appE (TH.conE 'TLStorageTexture2DArray) (storageFormatToExp fmt)) (storageAccessToExp access)
-    TLStorageTexture3D fmt access ->
-      TH.appE (TH.appE (TH.conE 'TLStorageTexture3D) (storageFormatToExp fmt)) (storageAccessToExp access)
-    TLAtomic s -> TH.appE (TH.conE 'TLAtomic) (scalarToExp s)
-
-fieldLayoutToExp :: FieldLayout -> Q Exp
-fieldLayoutToExp fld =
-  TH.recConE 'FieldLayout
-    [ TH.fieldExp 'flName (TH.litE (TH.stringL fld.flName))
-    , TH.fieldExp 'flOffset (TH.litE (TH.integerL (fromIntegral fld.flOffset)))
-    , TH.fieldExp 'flType (typeLayoutToExp fld.flType)
-    , TH.fieldExp 'flAlign (TH.litE (TH.integerL (fromIntegral fld.flAlign)))
-    , TH.fieldExp 'flSize (TH.litE (TH.integerL (fromIntegral fld.flSize)))
-    ]
-
-scalarToExp :: Scalar -> Q Exp
-scalarToExp s = case s of
-  I32 -> TH.conE 'I32
-  U32 -> TH.conE 'U32
-  F16 -> TH.conE 'F16
-  F32 -> TH.conE 'F32
-  Bool -> TH.conE 'Bool
-
-storageFormatToExp :: StorageFormat -> Q Exp
-storageFormatToExp fmt = TH.conE (storageFormatCon fmt)
-
-storageAccessToExp :: StorageAccess -> Q Exp
-storageAccessToExp access = TH.conE (storageAccessCon access)
 
 interfaceToType :: ShaderInterface -> Either String TH.Type
 interfaceToType (ShaderInterface bindings _ _ _ _) =

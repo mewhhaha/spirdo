@@ -253,7 +253,7 @@ resetHistory :: Maybe History -> Maybe History
 resetHistory = fmap (\h -> h { historyValid = False })
 
 historyValidFrom :: Maybe History -> Bool
-historyValidFrom = maybe False historyValid
+historyValidFrom = maybe False (\h -> h.historyValid)
 
 historyTargetFrom :: Maybe History -> RenderTarget
 historyTargetFrom history =
@@ -300,26 +300,26 @@ bindingsFromInputs inputs =
       samplers =
         case iface.siSamplerMode of
           SamplerCombined ->
-            [ fSamplerWith (textureBinding t) (textureFromHandle (textureHandle t)) (samplerFromHandle (resolveSampler t))
+            [ fSamplerWith t.textureBinding (textureFromHandle t.textureHandle) (samplerFromHandle (resolveSampler t))
             | t <- inputsTextures inputs
             ]
           SamplerSeparate ->
-            [ fSamplerWith (samplerBinding s) (textureFromHandle (TextureHandle (samplerTex s))) (samplerFromHandle (samplerHandle s))
+            [ fSamplerWith s.samplerBinding (textureFromHandle (TextureHandle (samplerTex s))) (samplerFromHandle s.samplerHandle)
             | s <- inputsSamplers inputs
             ]
       storage =
-        [ fStorageTexture (storageTextureBinding t) (storageTextureFromHandle (storageTextureHandle t))
+        [ fStorageTexture t.storageTextureBinding (storageTextureFromHandle t.storageTextureHandle)
         | t <- inputsStorageTextures inputs
         ]
   in uniforms <> samplers <> storage
   where
     resolveSampler texInput =
-      case textureSampler texInput of
+      case texInput.textureSampler of
         Just handle -> handle
         Nothing ->
-          case findSamplerForTexture (textureName texInput) (inputsSamplers inputs) of
+          case findSamplerForTexture texInput.textureName (inputsSamplers inputs) of
             Just handle -> handle
-            Nothing -> error ("missing sampler for texture: " <> textureName texInput)
+            Nothing -> error ("missing sampler for texture: " <> texInput.textureName)
     samplerTex (SamplerInput samplerName _ _ _) =
       case findSamplerTexture samplerName (inputsTextures inputs) of
         Just tex -> unTexture tex
@@ -336,10 +336,10 @@ bindingsFromInputs inputs =
         <|> findSampler (name <> "_sampler") samplers
         <|> findSampler (name <> "Sampler") samplers
     findSampler name samplers =
-      samplerHandle <$> find (\s -> samplerName s == name) samplers
+      (.samplerHandle) <$> find (\s -> s.samplerName == name) samplers
 
     findTexture name =
-      foldr (\t acc -> if textureName t == name then Just t else acc) Nothing
+      foldr (\t acc -> if t.textureName == name then Just t else acc) Nothing
 
     stripSuffix suffix value =
       let suffixLen = length suffix

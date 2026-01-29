@@ -86,6 +86,8 @@ module Spirdo.Wesl
   , discoverPackageInfo
   , wesl
   , weslWith
+  , weslBatch
+  , weslBatchWith
   ) where
 
 import Spirdo.Wesl.Compiler

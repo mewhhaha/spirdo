@@ -70,7 +70,7 @@ withSamplerMode mode k =
 compileToCompiled :: CompileOptions -> CompileResult -> SomeCompiledShader
 compileToCompiled opts result =
   withSamplerMode opts.samplerBindingMode $ \(_ :: SamplerModeProxy mode) ->
-    SomeCompiledShader (CompiledShader @mode (crSpirv result) (crInterface result))
+    SomeCompiledShader (CompiledShader @mode (result.crSpirv) (result.crInterface))
 
 -- | Compile inline WESL to a prepared shader (runtime).
 prepareWesl :: String -> Either CompileError SomePreparedShader
@@ -92,7 +92,7 @@ prepareWeslWithDiagnostics opts src = do
   case compileToCompiled opts result of
     SomeCompiledShader shader -> do
       prep <- toCompileError (prepareShader shader)
-      pure (SomePreparedShader prep, crDiagnostics result)
+      pure (SomePreparedShader prep, result.crDiagnostics)
 
 -- | Compile a WESL file (imports supported).
 prepareWeslFile :: FilePath -> IO (Either CompileError SomePreparedShader)
@@ -118,7 +118,7 @@ prepareWeslFileWithDiagnostics opts path = do
     case compileToCompiled opts cr of
       SomeCompiledShader shader -> do
         prep <- toCompileError (prepareShader shader)
-        pure (SomePreparedShader prep, crDiagnostics cr)
+        pure (SomePreparedShader prep, cr.crDiagnostics)
 
 compileInlineResult :: CompileOptions -> Bool -> String -> Either CompileError CompileResult
 compileInlineResult opts wantDiagnostics src = do
@@ -236,8 +236,8 @@ weslCacheKey opts src =
         intercalate
           "\n"
           [ weslCacheVersion
-          , "v=" <> show (spirvVersion opts)
-          , "features=" <> show (enabledFeatures opts)
+          , "v=" <> show (opts.spirvVersion)
+          , "features=" <> show (opts.enabledFeatures)
           , "overrides=" <> show opts.overrideValues
           , "spec=" <> show opts.overrideSpecMode
           , "samplerMode=" <> show opts.samplerBindingMode
@@ -263,7 +263,7 @@ weslCachePaths opts src =
 
 loadWeslCache :: CompileOptions -> String -> IO (Maybe (ByteString, ShaderInterface))
 loadWeslCache opts src =
-  if not (cacheEnabled opts)
+  if not (opts.cacheEnabled)
     then pure Nothing
     else do
       let (spvPath, ifacePath) = weslCachePaths opts src
@@ -282,7 +282,7 @@ loadWeslCache opts src =
 
 writeWeslCache :: CompileOptions -> String -> ByteString -> ShaderInterface -> IO ()
 writeWeslCache opts src bytes iface =
-  if not (cacheEnabled opts)
+  if not (opts.cacheEnabled)
     then pure ()
     else
       let (spvPath, ifacePath) = weslCachePaths opts src
@@ -310,42 +310,62 @@ weslWith opts =
 
 weslExpWith :: CompileOptions -> String -> Q Exp
 weslExpWith opts src = do
+  (bytes, iface) <- compileInlineCached opts src
+  preparedExpWith opts bytes iface
+
+compileInlineCached :: CompileOptions -> String -> Q (ByteString, ShaderInterface)
+compileInlineCached opts src = do
   cached <- TH.runIO (timed opts "cache-read" (loadWeslCache opts src))
   case cached of
-    Just (bytes, iface) -> emitPreparedExp opts bytes iface
+    Just (bytes, iface) -> pure (bytes, iface)
     Nothing ->
       case compileInlineResult opts False src of
         Left err -> fail (renderError err)
         Right result -> do
-          let bytes = crSpirv result
-              iface = crInterface result
+          let bytes = result.crSpirv
+              iface = result.crInterface
           TH.runIO (timed opts "cache-write" (writeWeslCache opts src bytes iface))
-          emitPreparedExp opts bytes iface
+          pure (bytes, iface)
+
+preparedExpWith :: CompileOptions -> ByteString -> ShaderInterface -> Q Exp
+preparedExpWith opts bytes iface = do
+  bytesExp <- bytesToExp bytes
+  ifaceExp <- interfaceToExp iface
+  ifaceTy <- case interfaceToType iface of
+    Left err -> fail ("wesl: " <> err)
+    Right ty -> pure ty
+  let modeTy =
+        case opts.samplerBindingMode of
+          SamplerCombined -> TH.PromotedT 'SamplerCombined
+          SamplerSeparate -> TH.PromotedT 'SamplerSeparate
+  let compiledTy =
+        TH.AppT
+          (TH.AppT (TH.ConT ''CompiledShader) modeTy)
+          ifaceTy
+  let compiledExp =
+        TH.SigE
+          (TH.AppE (TH.AppE (TH.ConE 'CompiledShader) bytesExp) ifaceExp)
+          compiledTy
+  let prepExp = TH.AppE (TH.VarE 'unsafePrepareInline) compiledExp
+  pure (TH.SigE prepExp (TH.AppT (TH.AppT (TH.ConT ''PreparedShader) modeTy) ifaceTy))
+
+-- | Compile multiple inline WESL shaders in a single splice.
+weslBatch :: [(String, String)] -> Q [TH.Dec]
+weslBatch = weslBatchWith defaultCompileOptions
+
+-- | Compile multiple inline WESL shaders with explicit options.
+weslBatchWith :: CompileOptions -> [(String, String)] -> Q [TH.Dec]
+weslBatchWith opts entries = fmap concat (mapM compileOne entries)
   where
-    emitPreparedExp opts'' bytes iface = do
-      bytesExp <- bytesToExp bytes
-      ifaceExp <- interfaceToExp iface
-      ifaceTy <- case interfaceToType iface of
-        Left err -> fail ("wesl: " <> err)
-        Right ty -> pure ty
-      let modeTy =
-            case opts''.samplerBindingMode of
-              SamplerCombined -> TH.PromotedT 'SamplerCombined
-              SamplerSeparate -> TH.PromotedT 'SamplerSeparate
-      let compiledTy =
-            TH.AppT
-              (TH.AppT (TH.ConT ''CompiledShader) modeTy)
-              ifaceTy
-      let compiledExp =
-            TH.SigE
-              (TH.AppE (TH.AppE (TH.ConE 'CompiledShader) bytesExp) ifaceExp)
-              compiledTy
-      let prepExp = TH.AppE (TH.VarE 'unsafePrepareInline) compiledExp
-      pure (TH.SigE prepExp (TH.AppT (TH.AppT (TH.ConT ''PreparedShader) modeTy) ifaceTy))
+    compileOne (nameStr, src) = do
+      (bytes, iface) <- compileInlineCached opts src
+      expr <- preparedExpWith opts bytes iface
+      let name = TH.mkName nameStr
+      pure [TH.ValD (TH.VarP name) (TH.NormalB expr) []]
 
 timed :: CompileOptions -> String -> IO a -> IO a
 timed opts label action =
-  if not (cacheVerbose opts)
+  if not (opts.cacheVerbose)
     then action
     else do
       t0 <- getCurrentTime
@@ -356,7 +376,7 @@ timed opts label action =
 
 timedPhase :: CompileOptions -> String -> IO a -> IO a
 timedPhase opts label action =
-  if not (timingVerbose opts)
+  if not (opts.timingVerbose)
     then action
     else do
       t0 <- getMonotonicTimeNSec
@@ -459,7 +479,7 @@ parseWeslToml path = do
                         _ -> (section, mName, mVersion, mSource, deps)
                     TomlSectionDependencies ->
                       let (dep, deps') = parseDependencyLine root key' val' deps
-                      in (section, mName, mVersion, mSource, Map.insert (depName dep) dep deps')
+                      in (section, mName, mVersion, mSource, Map.insert (dep.depName) dep deps')
                     TomlSectionDependency depName ->
                       let deps' = updateDependency root depName key' val' deps
                       in (section, mName, mVersion, mSource, deps')
