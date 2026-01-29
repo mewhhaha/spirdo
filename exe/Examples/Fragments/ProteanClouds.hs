@@ -8,7 +8,6 @@ import Spirdo.Wesl (wesl)
 
 fragmentProteanCloudsShader =
       [wesl|
-// spirdo:sampler=combined
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;

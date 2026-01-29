@@ -34,12 +34,6 @@ module Spirdo.Wesl.Inputs
   , texture
   , storageBuffer
   , storageTexture
-  , uniforms
-  , samplers
-  , textures
-  , storageBuffers
-  , storageTextures
-  , inputsFrom
   , inputsFromPrepared
   , ShaderInputs(..)
   , emptyInputs
@@ -49,6 +43,7 @@ module Spirdo.Wesl.Inputs
 import Control.Monad (foldM)
 import Data.ByteString (ByteString)
 import Data.List (intercalate, sortOn)
+import qualified Data.Set as Set
 import qualified Data.Kind as K
 import Data.Proxy (Proxy(..))
 import Data.Word (Word32, Word64)
@@ -59,12 +54,12 @@ import Spirdo.Wesl.Types
   , BindingInfo(..)
   , BindingKind(..)
   , BindingMap
-  , CompiledShader(..)
   , PreparedShader(..)
   , ShaderInterface(..)
   , SamplerBindingMode(..)
   , UniformValue
   , ToUniform(..)
+  , preparedInterface
   , bindingInfoForMap
   , bindingMap
   , isSamplerKind
@@ -227,7 +222,7 @@ data StorageTextureInput = StorageTextureInput
   } deriving (Eq, Show)
 
 data ShaderInputs (iface :: [Binding]) = ShaderInputs
-  { siShader :: !(CompiledShader iface)
+  { siInterface :: !ShaderInterface
   , siUniforms :: ![UniformInput]
   , siSamplers :: ![SamplerInput]
   , siTextures :: ![TextureInput]
@@ -235,10 +230,10 @@ data ShaderInputs (iface :: [Binding]) = ShaderInputs
   , siStorageTextures :: ![StorageTextureInput]
   }
 
-emptyInputs :: CompiledShader iface -> ShaderInputs iface
-emptyInputs shader =
+emptyInputs :: ShaderInterface -> ShaderInputs iface
+emptyInputs iface =
   ShaderInputs
-    { siShader = shader
+    { siInterface = iface
     , siUniforms = []
     , siSamplers = []
     , siTextures = []
@@ -318,29 +313,14 @@ storageBuffer handle = InputsBuilder [InputStorageBuffer (symbolVal (Proxy @name
 storageTexture :: forall name iface. (KnownSymbol name, RequireStorageTexture name iface) => StorageTextureHandle -> InputsBuilder iface
 storageTexture handle = InputsBuilder [InputStorageTexture (symbolVal (Proxy @name)) handle]
 
-uniforms :: InputsBuilder iface -> InputsBuilder iface
-uniforms = id
-
-samplers :: InputsBuilder iface -> InputsBuilder iface
-samplers = id
-
-textures :: InputsBuilder iface -> InputsBuilder iface
-textures = id
-
-storageBuffers :: InputsBuilder iface -> InputsBuilder iface
-storageBuffers = id
-
-storageTextures :: InputsBuilder iface -> InputsBuilder iface
-storageTextures = id
-
-inputsFrom :: forall iface. CompiledShader iface -> InputsBuilder iface -> Either String (ShaderInputs iface)
-inputsFrom shader (InputsBuilder items) =
-  let bmap = bindingMap (shaderInterface shader)
-      initInputs = emptyInputs shader
+inputsFrom :: forall iface. ShaderInterface -> InputsBuilder iface -> Either String (ShaderInputs iface)
+inputsFrom iface (InputsBuilder items) =
+  let bmap = bindingMap iface
+      initInputs = emptyInputs iface
   in do
-      inputs <- foldM (applyItem bmap) initInputs items
+      (inputs, _) <- foldM (applyItem bmap) (initInputs, Set.empty) items
       let normalized = normalizeInputs inputs
-      case siSamplerMode (shaderInterface shader) of
+      case siSamplerMode iface of
         SamplerCombined ->
           case [textureName t | t <- siTextures normalized, textureSampler t == Nothing] of
             [] -> Right normalized
@@ -350,93 +330,98 @@ inputsFrom shader (InputsBuilder items) =
 
 inputsFromPrepared :: forall iface. PreparedShader iface -> InputsBuilder iface -> Either String (ShaderInputs iface)
 inputsFromPrepared prepared inputs =
-  inputsFrom (psShader prepared) inputs
+  inputsFrom (preparedInterface prepared) inputs
 
-applyItem :: BindingMap -> ShaderInputs iface -> InputItem -> Either String (ShaderInputs iface)
-applyItem bmap inputs item = do
+applyItem :: BindingMap -> (ShaderInputs iface, Set.Set String) -> InputItem -> Either String (ShaderInputs iface, Set.Set String)
+applyItem bmap (inputs, seen) item = do
   let name = itemName item
-  info <- case bindingInfoForMap name bmap of
-    Nothing -> Left ("binding not found in interface: " <> name)
-    Just bi -> Right bi
-  case (item, biKind info) of
-    (InputUniform _ val, kind)
-      | isUniformKind kind ->
-          case packUniform (biType info) val of
-            Left err -> Left ("binding " <> name <> ": " <> err)
-            Right bytes ->
-              Right inputs
-                { siUniforms =
-                    UniformInput
-                      { uiName = biName info
-                      , uiGroup = biGroup info
-                      , uiBinding = biBinding info
-                      , uiBytes = bytes
+  if Set.member name seen
+    then Left ("duplicate binding entry: " <> name)
+    else do
+      info <- case bindingInfoForMap name bmap of
+        Nothing -> Left ("binding not found in interface: " <> name)
+        Just bi -> Right bi
+      inputs' <-
+        case (item, biKind info) of
+          (InputUniform _ val, kind)
+            | isUniformKind kind ->
+                case packUniform (biType info) val of
+                  Left err -> Left ("binding " <> name <> ": " <> err)
+                  Right bytes ->
+                    Right inputs
+                      { siUniforms =
+                          UniformInput
+                            { uiName = biName info
+                            , uiGroup = biGroup info
+                            , uiBinding = biBinding info
+                            , uiBytes = bytes
+                            }
+                            : siUniforms inputs
                       }
-                      : siUniforms inputs
-                }
-    (InputSampler _ handle, kind)
-      | isSamplerKind kind ->
-          Right inputs
-            { siSamplers =
-                SamplerInput
-                  { samplerName = biName info
-                  , samplerGroup = biGroup info
-                  , samplerBinding = biBinding info
-                  , samplerHandle = handle
+          (InputSampler _ handle, kind)
+            | isSamplerKind kind ->
+                Right inputs
+                  { siSamplers =
+                      SamplerInput
+                        { samplerName = biName info
+                        , samplerGroup = biGroup info
+                        , samplerBinding = biBinding info
+                        , samplerHandle = handle
+                        }
+                        : siSamplers inputs
                   }
-                  : siSamplers inputs
-            }
-    (InputTexture _ handle, kind)
-      | isTextureKind kind ->
-          Right inputs
-            { siTextures =
-                TextureInput
-                  { textureName = biName info
-                  , textureGroup = biGroup info
-                  , textureBinding = biBinding info
-                  , textureHandle = handle
-                  , textureSampler = Nothing
+          (InputTexture _ handle, kind)
+            | isTextureKind kind ->
+                Right inputs
+                  { siTextures =
+                      TextureInput
+                        { textureName = biName info
+                        , textureGroup = biGroup info
+                        , textureBinding = biBinding info
+                        , textureHandle = handle
+                        , textureSampler = Nothing
+                        }
+                        : siTextures inputs
                   }
-                  : siTextures inputs
-            }
-    (InputSampledTexture _ handle sampHandle, kind)
-      | isTextureKind kind ->
-          Right inputs
-            { siTextures =
-                TextureInput
-                  { textureName = biName info
-                  , textureGroup = biGroup info
-                  , textureBinding = biBinding info
-                  , textureHandle = handle
-                  , textureSampler = Just sampHandle
+          (InputSampledTexture _ handle sampHandle, kind)
+            | isTextureKind kind ->
+                Right inputs
+                  { siTextures =
+                      TextureInput
+                        { textureName = biName info
+                        , textureGroup = biGroup info
+                        , textureBinding = biBinding info
+                        , textureHandle = handle
+                        , textureSampler = Just sampHandle
+                        }
+                        : siTextures inputs
                   }
-                  : siTextures inputs
-            }
-    (InputStorageBuffer _ handle, kind)
-      | isStorageBufferKind kind ->
-          Right inputs
-            { siStorageBuffers =
-                StorageBufferInput
-                  { storageBufferName = biName info
-                  , storageBufferGroup = biGroup info
-                  , storageBufferBinding = biBinding info
-                  , storageBufferHandle = handle
+          (InputStorageBuffer _ handle, kind)
+            | isStorageBufferKind kind ->
+                Right inputs
+                  { siStorageBuffers =
+                      StorageBufferInput
+                        { storageBufferName = biName info
+                        , storageBufferGroup = biGroup info
+                        , storageBufferBinding = biBinding info
+                        , storageBufferHandle = handle
+                        }
+                        : siStorageBuffers inputs
                   }
-                  : siStorageBuffers inputs
-            }
-    (InputStorageTexture _ handle, kind)
-      | isStorageTextureKind kind ->
-          Right inputs
-            { siStorageTextures =
-                StorageTextureInput
-                  { storageTextureName = biName info
-                  , storageTextureGroup = biGroup info
-                  , storageTextureBinding = biBinding info
-                  , storageTextureHandle = handle
+          (InputStorageTexture _ handle, kind)
+            | isStorageTextureKind kind ->
+                Right inputs
+                  { siStorageTextures =
+                      StorageTextureInput
+                        { storageTextureName = biName info
+                        , storageTextureGroup = biGroup info
+                        , storageTextureBinding = biBinding info
+                        , storageTextureHandle = handle
+                        }
+                        : siStorageTextures inputs
                   }
-                  : siStorageTextures inputs
-            }
-    _ -> Left ("binding " <> name <> ": kind mismatch")
+          _ -> Left ("binding " <> name <> ": kind mismatch")
+      Right (inputs', Set.insert name seen)
 
 itemName :: InputItem -> String
 itemName item =

@@ -3,26 +3,26 @@ module Main (main) where
 
 import qualified Data.ByteString as BS
 import GHC.Clock (getMonotonicTimeNSec)
-import Spirdo.Wesl (CompileOptions(..), compileWeslToSpirvBytes, compileWeslToSpirvBytesWithTimings, defaultCompileOptions)
+import Spirdo.Wesl (CompileOptions(..), SomePreparedShader(..), defaultCompileOptions, prepareWesl, prepareWeslWith, preparedSpirv)
 import System.Exit (exitFailure)
 import System.Environment (lookupEnv)
 
 compileOnce :: String -> IO Int
 compileOnce src =
-  case compileWeslToSpirvBytes src of
+  case prepareWesl src of
     Left err -> do
       putStrLn ("compile failed: " <> show err)
       exitFailure
-    Right bs -> pure (BS.length bs)
+    Right (SomePreparedShader prep) -> pure (BS.length (preparedSpirv prep))
 
 compileOnceTimed :: String -> IO Int
 compileOnceTimed src = do
-  result <- compileWeslToSpirvBytesWithTimings (defaultCompileOptions { timingVerbose = True }) src
+  result <- prepareWeslWith (defaultCompileOptions { timingVerbose = True }) src
   case result of
     Left err -> do
       putStrLn ("compile failed: " <> show err)
       exitFailure
-    Right bs -> pure (BS.length bs)
+    Right (SomePreparedShader prep) -> pure (BS.length (preparedSpirv prep))
 
 main :: IO ()
 main = do

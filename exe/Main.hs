@@ -19,13 +19,14 @@ import Slop.SDL.Raw (GPUDevice(..), GPUSampler(..), GPUTexture(..))
 import Spirdo.Wesl
   ( BindingPlan(..)
   , BindingInfo(..)
-  , CompiledShader(..)
-  , PreparedShader(..)
-  , SamplerBindingMode(..)
+  , PreparedShader
   , ShaderInterface(..)
+  , SamplerBindingMode(..)
   , ToUniform
   , V4(..)
-  , prepareShader
+  , preparedInterface
+  , preparedPlan
+  , preparedSpirv
   )
 import Spirdo.Wesl.Inputs
   ( SamplerHandle(..)
@@ -98,7 +99,7 @@ data Variant where
   Variant :: RequireUniform "params" iface => String -> BlendMode -> Pipeline -> PreparedShader iface -> (ParamsU -> InputsBuilder iface) -> Variant
 
 data FragmentVariant where
-  FragmentVariant :: RequireUniform "params" iface => String -> BlendMode -> CompiledShader iface -> (ParamsU -> InputsBuilder iface) -> FragmentVariant
+  FragmentVariant :: RequireUniform "params" iface => String -> BlendMode -> PreparedShader iface -> (ParamsU -> InputsBuilder iface) -> FragmentVariant
 
 data History = History
   { historyTarget :: RenderTarget
@@ -122,8 +123,8 @@ main = do
           }
   runWindow cfg $ do
     mesh <- createMesh vertexLayout quadVertices
-    vprep <- unsafePrepare "vertexShader" vertexShader
-    vshader <- createVertexShader (shaderSpirv (psShader vprep)) (countsFromPrepared vprep)
+    let vprep = vertexShader
+    vshader <- createVertexShader (preparedSpirv vprep) (countsFromPrepared vprep)
 
     noiseSampler <- createSampler (defaultSamplerDesc { samplerAddressU = SamplerRepeat, samplerAddressV = SamplerRepeat, samplerAddressW = SamplerRepeat })
     baseNoise3D <-
@@ -216,16 +217,9 @@ main = do
                   pure (Continue (DemoState idx' historyOpt))
     pure ()
 
-unsafePrepare :: String -> CompiledShader iface -> WindowM (PreparedShader iface)
-unsafePrepare label shader =
-  case prepareShader shader of
-    Left err -> error (label <> ": " <> err)
-    Right value -> pure value
-
-mkVariant :: RequireUniform "params" iface => String -> BlendMode -> CompiledShader iface -> (ParamsU -> InputsBuilder iface) -> VertexShader -> WindowM Variant
-mkVariant name blend fragShader mkInputs vshader = do
-  prep <- unsafePrepare ("fragment:" <> name) fragShader
-  fshader <- createFragmentShader (shaderSpirv (psShader prep)) (countsFromPrepared prep)
+mkVariant :: RequireUniform "params" iface => String -> BlendMode -> PreparedShader iface -> (ParamsU -> InputsBuilder iface) -> VertexShader -> WindowM Variant
+mkVariant name blend prep mkInputs vshader = do
+  fshader <- createFragmentShader (preparedSpirv prep) (countsFromPrepared prep)
   pipeline <- graphicsPipeline
     GraphicsDesc
       { gfxVertex = vshader
@@ -272,8 +266,8 @@ historyUpdated history valid =
 
 countsFromPrepared :: PreparedShader iface -> ShaderCounts
 countsFromPrepared prepared =
-  let bindingPlan = psPlan prepared
-      iface = shaderInterface (psShader prepared)
+  let bindingPlan = preparedPlan prepared
+      iface = preparedInterface prepared
       samplerBindings =
         case siSamplerMode iface of
           SamplerCombined -> bpTextures bindingPlan
@@ -294,7 +288,7 @@ countsFromPrepared prepared =
 
 bindingsFromInputs :: ShaderInputs iface -> [Binding]
 bindingsFromInputs inputs =
-  let iface = shaderInterface (siShader inputs)
+  let iface = siInterface inputs
       uniforms =
         [ fUniformBytes (uiBinding u) (uiBytes u)
         | u <- orderedUniforms inputs

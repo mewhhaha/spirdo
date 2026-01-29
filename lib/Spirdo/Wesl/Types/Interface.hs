@@ -16,23 +16,21 @@ module Spirdo.Wesl.Types.Interface
   , Field(..)
   , Ty(..)
   , Binding(..)
-  , BindingDesc(..)
   , ShaderStage(..)
   , IOParam(..)
   , StageIO(..)
   , BindingPlan(..)
-  , ReflectBindings(..)
-  , HasBinding
-  , binding
   , shaderStage
-  , VertexShader(..)
-  , FragmentShader(..)
-  , ComputeShader(..)
-  , asVertexShader
-  , asFragmentShader
-  , asComputeShader
   , PreparedShader(..)
+  , SomePreparedShader(..)
   , prepareShader
+  , preparedSpirv
+  , preparedInterface
+  , preparedStage
+  , preparedPlan
+  , preparedVertexAttributes
+  , somePreparedSpirv
+  , somePreparedInterface
   , stageIO
   , stageInputs
   , stageOutputs
@@ -53,32 +51,20 @@ module Spirdo.Wesl.Types.Interface
   , bindingMap
   , bindingInfoFor
   , bindingInfoForMap
-  , Layout(..)
-  , LayoutBinding(..)
-  , layoutFromPrepared
-  , layoutFromShader
-  , BindingTable(..)
-  , bindingTable
-  , bindingTableFromPrepared
   , OverrideInfo(..)
   , ShaderInterface(..)
   , specializableOverrides
   , CompiledShader(..)
   , SomeCompiledShader(..)
-  , samplerBindings
-  , uniformBindings
-  , storageBufferBindings
-  , storageTextureBindings
   ) where
 
 import Data.ByteString (ByteString)
-import Data.List (find, sortBy)
+import Data.List (sortBy)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, mapMaybe)
-import Data.Proxy (Proxy(..))
 import Data.Word (Word32)
 import Data.Ord (comparing)
-import GHC.TypeLits (KnownNat, KnownSymbol, Nat, Symbol, natVal, symbolVal)
+import GHC.TypeLits (Symbol, Nat)
 
 import Spirdo.Wesl.Types.Layout
   ( StorageAccess(..)
@@ -185,151 +171,6 @@ data BindingPlan = BindingPlan
   , bpStorageTextures :: ![BindingInfo]
   } deriving (Eq, Show, Read)
 
-data BindingDesc = BindingDesc
-  { descName :: !String
-  , descKind :: !BindingKind
-  , descGroup :: !Word32
-  , descBinding :: !Word32
-  } deriving (Eq, Show, Read)
-
-class KnownBindingKind (k :: BindingKind) where
-  bindingKindVal :: Proxy k -> BindingKind
-
-instance KnownBindingKind 'BUniform where
-  bindingKindVal _ = BUniform
-
-instance KnownBindingKind 'BStorageRead where
-  bindingKindVal _ = BStorageRead
-
-instance KnownBindingKind 'BStorageReadWrite where
-  bindingKindVal _ = BStorageReadWrite
-
-instance KnownBindingKind 'BSampler where
-  bindingKindVal _ = BSampler
-
-instance KnownBindingKind 'BSamplerComparison where
-  bindingKindVal _ = BSamplerComparison
-
-instance KnownBindingKind 'BTexture1D where
-  bindingKindVal _ = BTexture1D
-
-instance KnownBindingKind 'BTexture1DArray where
-  bindingKindVal _ = BTexture1DArray
-
-instance KnownBindingKind 'BTexture2D where
-  bindingKindVal _ = BTexture2D
-
-instance KnownBindingKind 'BTexture2DArray where
-  bindingKindVal _ = BTexture2DArray
-
-instance KnownBindingKind 'BTexture3D where
-  bindingKindVal _ = BTexture3D
-
-instance KnownBindingKind 'BTextureCube where
-  bindingKindVal _ = BTextureCube
-
-instance KnownBindingKind 'BTextureCubeArray where
-  bindingKindVal _ = BTextureCubeArray
-
-instance KnownBindingKind 'BTextureMultisampled2D where
-  bindingKindVal _ = BTextureMultisampled2D
-
-instance KnownBindingKind 'BTextureDepth2D where
-  bindingKindVal _ = BTextureDepth2D
-
-instance KnownBindingKind 'BTextureDepth2DArray where
-  bindingKindVal _ = BTextureDepth2DArray
-
-instance KnownBindingKind 'BTextureDepthCube where
-  bindingKindVal _ = BTextureDepthCube
-
-instance KnownBindingKind 'BTextureDepthCubeArray where
-  bindingKindVal _ = BTextureDepthCubeArray
-
-instance KnownBindingKind 'BTextureDepthMultisampled2D where
-  bindingKindVal _ = BTextureDepthMultisampled2D
-
-instance KnownBindingKind 'BStorageTexture1D where
-  bindingKindVal _ = BStorageTexture1D
-
-instance KnownBindingKind 'BStorageTexture2D where
-  bindingKindVal _ = BStorageTexture2D
-
-instance KnownBindingKind 'BStorageTexture2DArray where
-  bindingKindVal _ = BStorageTexture2DArray
-
-instance KnownBindingKind 'BStorageTexture3D where
-  bindingKindVal _ = BStorageTexture3D
-
-class ReflectBinding (b :: Binding) where
-  reflectBinding :: Proxy b -> BindingDesc
-
-instance (KnownSymbol name, KnownBindingKind kind, KnownNat set, KnownNat binding) => ReflectBinding ('Binding name kind set binding ty) where
-  reflectBinding _ =
-    BindingDesc
-      { descName = symbolVal (Proxy @name)
-      , descKind = bindingKindVal (Proxy @kind)
-      , descGroup = fromIntegral (natVal (Proxy @set))
-      , descBinding = fromIntegral (natVal (Proxy @binding))
-      }
-
-class ReflectBindings (iface :: [Binding]) where
-  reflectBindings :: Proxy iface -> [BindingDesc]
-
-instance ReflectBindings '[] where
-  reflectBindings _ = []
-
-instance (ReflectBinding b, ReflectBindings bs) => ReflectBindings (b ': bs) where
-  reflectBindings _ = reflectBinding (Proxy @b) : reflectBindings (Proxy @bs)
-
-type family HasBinding (name :: Symbol) (iface :: [Binding]) :: Bool where
-  HasBinding _ '[] = 'False
-  HasBinding name ('Binding name _ _ _ _ ': _) = 'True
-  HasBinding name (_ ': rest) = HasBinding name rest
-
-binding :: forall name iface. (KnownSymbol name, HasBinding name iface ~ 'True, ReflectBindings iface) => CompiledShader iface -> BindingDesc
-binding _ =
-  let key = symbolVal (Proxy @name)
-  in case find (\b -> descName b == key) (reflectBindings (Proxy @iface)) of
-      Just b -> b
-      Nothing -> error ("binding: missing " <> key <> " (impossible)")
-
-samplerBindings :: forall iface. ReflectBindings iface => Proxy iface -> [BindingDesc]
-samplerBindings _ =
-  filter
-    (\b ->
-      descKind b `elem`
-        [ BSampler
-        , BSamplerComparison
-        , BTexture1D
-        , BTexture1DArray
-        , BTexture2D
-        , BTexture2DArray
-        , BTexture3D
-        , BTextureCube
-        , BTextureCubeArray
-        , BTextureMultisampled2D
-        , BTextureDepth2D
-        , BTextureDepth2DArray
-        , BTextureDepthCube
-        , BTextureDepthCubeArray
-        , BTextureDepthMultisampled2D
-        ])
-    (reflectBindings (Proxy @iface))
-
-uniformBindings :: forall iface. ReflectBindings iface => Proxy iface -> [BindingDesc]
-uniformBindings _ =
-  filter (\b -> descKind b == BUniform) (reflectBindings (Proxy @iface))
-
-storageBufferBindings :: forall iface. ReflectBindings iface => Proxy iface -> [BindingDesc]
-storageBufferBindings _ =
-  filter (\b -> descKind b == BStorageRead || descKind b == BStorageReadWrite) (reflectBindings (Proxy @iface))
-
-storageTextureBindings :: forall iface. ReflectBindings iface => Proxy iface -> [BindingDesc]
-storageTextureBindings _ =
-  filter (\b -> descKind b `elem` [BStorageTexture1D, BStorageTexture2D, BStorageTexture2DArray, BStorageTexture3D]) (reflectBindings (Proxy @iface))
-
-
 -- Runtime interface representation
 
 data BindingInfo = BindingInfo
@@ -354,66 +195,6 @@ bindingInfoFor name iface =
 
 bindingInfoForMap :: String -> BindingMap -> Maybe BindingInfo
 bindingInfoForMap name (BindingMap m) = Map.lookup name m
-
-data LayoutBinding = LayoutBinding
-  { lbStage :: !ShaderStage
-  , lbName :: !String
-  , lbKind :: !BindingKind
-  , lbGroup :: !Word32
-  , lbBinding :: !Word32
-  , lbType :: !TypeLayout
-  } deriving (Eq, Show, Read)
-
-newtype Layout = Layout
-  { layoutBindings :: [LayoutBinding]
-  } deriving (Eq, Show, Read)
-
-layoutFromShader :: CompiledShader iface -> Either String Layout
-layoutFromShader shader =
-  case shaderStage (shaderInterface shader) of
-    Nothing -> Left "shader has no entry point"
-    Just stage -> Right (layoutFromStage stage (shaderInterface shader))
-
-layoutFromPrepared :: PreparedShader iface -> Layout
-layoutFromPrepared prepared =
-  layoutFromStage (psStage prepared) (shaderInterface (psShader prepared))
-
-layoutFromStage :: ShaderStage -> ShaderInterface -> Layout
-layoutFromStage stage iface =
-  Layout
-    [ LayoutBinding
-        { lbStage = stage
-        , lbName = biName info
-        , lbKind = biKind info
-        , lbGroup = biGroup info
-        , lbBinding = biBinding info
-        , lbType = biType info
-        }
-    | info <- siBindings iface
-    ]
-
-data BindingTable = BindingTable
-  { btUniforms :: [(String, Word32, Word32)]
-  , btSamplers :: [(String, Word32, Word32)]
-  , btTextures :: [(String, Word32, Word32)]
-  , btStorageBuffers :: [(String, Word32, Word32)]
-  , btStorageTextures :: [(String, Word32, Word32)]
-  } deriving (Eq, Show, Read)
-
-bindingTable :: ShaderInterface -> BindingTable
-bindingTable iface =
-  let uniforms = [slot info | info <- siBindings iface, isUniformKind (biKind info)]
-      samplers = [slot info | info <- siBindings iface, isSamplerKind (biKind info)]
-      textures = [slot info | info <- siBindings iface, isTextureKind (biKind info)]
-      storageBuffers = [slot info | info <- siBindings iface, isStorageBufferKind (biKind info)]
-      storageTextures = [slot info | info <- siBindings iface, isStorageTextureKind (biKind info)]
-  in BindingTable uniforms samplers textures storageBuffers storageTextures
-  where
-    slot info = (biName info, biGroup info, biBinding info)
-
-bindingTableFromPrepared :: PreparedShader iface -> BindingTable
-bindingTableFromPrepared prepared =
-  bindingTable (shaderInterface (psShader prepared))
 
 data OverrideInfo = OverrideInfo
   { oiName :: !String
@@ -590,40 +371,14 @@ data CompiledShader (iface :: [Binding]) = CompiledShader
 -- | Existential wrapper for runtime compilation.
 data SomeCompiledShader = forall iface. SomeCompiledShader (CompiledShader iface)
 
-newtype VertexShader iface = VertexShader { unVertexShader :: CompiledShader iface }
-newtype FragmentShader iface = FragmentShader { unFragmentShader :: CompiledShader iface }
-newtype ComputeShader iface = ComputeShader { unComputeShader :: CompiledShader iface }
-
-asVertexShader :: CompiledShader iface -> Either String (VertexShader iface)
-asVertexShader shader =
-  case shaderStage (shaderInterface shader) of
-    Just ShaderStageVertex -> Right (VertexShader shader)
-    Just ShaderStageFragment -> Left "expected vertex shader, found fragment shader"
-    Just ShaderStageCompute -> Left "expected vertex shader, found compute shader"
-    Nothing -> Left "expected vertex shader, but shader has no entry point"
-
-asFragmentShader :: CompiledShader iface -> Either String (FragmentShader iface)
-asFragmentShader shader =
-  case shaderStage (shaderInterface shader) of
-    Just ShaderStageFragment -> Right (FragmentShader shader)
-    Just ShaderStageVertex -> Left "expected fragment shader, found vertex shader"
-    Just ShaderStageCompute -> Left "expected fragment shader, found compute shader"
-    Nothing -> Left "expected fragment shader, but shader has no entry point"
-
-asComputeShader :: CompiledShader iface -> Either String (ComputeShader iface)
-asComputeShader shader =
-  case shaderStage (shaderInterface shader) of
-    Just ShaderStageCompute -> Right (ComputeShader shader)
-    Just ShaderStageVertex -> Left "expected compute shader, found vertex shader"
-    Just ShaderStageFragment -> Left "expected compute shader, found fragment shader"
-    Nothing -> Left "expected compute shader, but shader has no entry point"
-
 data PreparedShader iface = PreparedShader
   { psShader :: CompiledShader iface
   , psStage :: ShaderStage
   , psPlan :: BindingPlan
   , psVertexAttributes :: Maybe [VertexAttribute]
   }
+
+data SomePreparedShader = forall iface. SomePreparedShader (PreparedShader iface)
 
 prepareShader :: CompiledShader iface -> Either String (PreparedShader iface)
 prepareShader shader =
@@ -640,3 +395,24 @@ prepareShader shader =
         , psPlan = bindingPlan iface
         , psVertexAttributes = vattrs
         }
+
+preparedSpirv :: PreparedShader iface -> ByteString
+preparedSpirv = shaderSpirv . psShader
+
+preparedInterface :: PreparedShader iface -> ShaderInterface
+preparedInterface = shaderInterface . psShader
+
+preparedStage :: PreparedShader iface -> ShaderStage
+preparedStage = psStage
+
+preparedPlan :: PreparedShader iface -> BindingPlan
+preparedPlan = psPlan
+
+preparedVertexAttributes :: PreparedShader iface -> Maybe [VertexAttribute]
+preparedVertexAttributes = psVertexAttributes
+
+somePreparedSpirv :: SomePreparedShader -> ByteString
+somePreparedSpirv (SomePreparedShader prep) = preparedSpirv prep
+
+somePreparedInterface :: SomePreparedShader -> ShaderInterface
+somePreparedInterface (SomePreparedShader prep) = preparedInterface prep

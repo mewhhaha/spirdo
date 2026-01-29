@@ -152,7 +152,7 @@
 - DONE: Bits shader now exercises `countLeadingZeros`, `countTrailingZeros`, `dot4*`, and `bitcast`
 - DONE: Additional vertex/compute shader examples emitted to `vertex-1.spv`/`vertex-2.spv` and `compute-1.spv`/`compute-2.spv`
 - DONE: SPIR-V outputs are gated behind `SPIRDO_WRITE_SPV=1`
-- DONE: Added combined-sampler mode (inline `// spirdo:sampler=combined`) and `sampledTexture` inputs; clouds now use combined bindings.
+- DONE: Added combined-sampler mode (now default) and `sampledTexture` inputs; clouds use combined bindings.
 
 ## Remaining WESL Parity Gap (Override Specialization)
 `spirv-val` rejects `SpecId` on `OpSpecConstantOp`, which is what derived overrides lower to when they depend on other overrides. We now support parity via an opt-in mode.

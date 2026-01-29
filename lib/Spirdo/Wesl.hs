@@ -24,23 +24,18 @@ module Spirdo.Wesl
   , Field(..)
   , Ty(..)
   , Binding(..)
-  , BindingDesc(..)
   , ShaderStage(..)
   , IOParam(..)
   , StageIO(..)
   , BindingPlan(..)
-  , ReflectBindings(..)
-  , HasBinding
-  , binding
   , shaderStage
-  , VertexShader(..)
-  , FragmentShader(..)
-  , ComputeShader(..)
-  , asVertexShader
-  , asFragmentShader
-  , asComputeShader
-  , PreparedShader(..)
-  , prepareShader
+  , PreparedShader
+  , SomePreparedShader(..)
+  , preparedSpirv
+  , preparedInterface
+  , preparedStage
+  , preparedPlan
+  , preparedVertexAttributes
   , UniformValue(..)
   , ToUniform(..)
   , uniform
@@ -63,35 +58,12 @@ module Spirdo.Wesl
   , vertexAttributes
   , VertexFormat(..)
   , VertexAttribute(..)
-  , bindingPlan
-  , isUniformKind
-  , isSamplerKind
-  , isTextureKind
-  , isStorageBufferKind
-  , isStorageTextureKind
   , pushConstantLayout
-  , samplerBindings
-  , uniformBindings
-  , storageBufferBindings
-  , storageTextureBindings
-  , CompiledShader(..)
-  , SomeCompiledShader(..)
   , ShaderInterface(..)
   , OverrideInfo(..)
   , BindingInfo(..)
-  , BindingMap(..)
-  , Layout(..)
-  , LayoutBinding(..)
-  , layoutFromPrepared
-  , layoutFromShader
-  , BindingTable(..)
-  , bindingTable
-  , bindingTableFromPrepared
   , TypeLayout(..)
   , FieldLayout(..)
-  , bindingMap
-  , bindingInfoFor
-  , bindingInfoForMap
   , specializableOverrides
   , CompileError(..)
   , CompileOptions(..)
@@ -101,17 +73,12 @@ module Spirdo.Wesl
   , Diagnostic(..)
   , DiagnosticSeverity(..)
   , defaultCompileOptions
-  , compileWeslToSpirv
-  , compileWeslToSpirvWith
-  , compileWeslToSpirvFile
-  , compileWeslToSpirvFileWith
-  , compileWeslToSpirvBytes
-  , compileWeslToSpirvBytesWith
-  , compileWeslToSpirvWithDiagnostics
-  , compileWeslToSpirvFileWithDiagnostics
-  , compileWeslToSpirvBytesWithDiagnostics
-  , compileWeslToSpirvWithTimings
-  , compileWeslToSpirvBytesWithTimings
+  , prepareWesl
+  , prepareWeslWith
+  , prepareWeslFile
+  , prepareWeslFileWith
+  , prepareWeslWithDiagnostics
+  , prepareWeslFileWithDiagnostics
   , PackageInfo(..)
   , PackageDependency(..)
   , discoverPackageInfo

@@ -9,12 +9,12 @@ Haskell WESL compiler with an optional Slop/SDL3 demo that renders shader varian
 - Override specialization constants with `SpecStrict` (validator‑friendly) and `SpecParity` (full WESL parity).
 - Diagnostics surfaced as warnings (unused/shadowing/constant conditions/unreachable/duplicate cases).
 - Typed interface reflection with binding metadata and ordering helpers.
-- Layout extraction (`layoutFromPrepared`) and name→slot tables (`bindingTable`).
+- Binding plan metadata (counts + sorted bindings) for pipeline layout.
 - Declarative input builder for type‑safe binding submission.
 - Uniform packing with layout validation + Storable packing helpers.
 - Vertex input reflection (`vertexAttributes`) for pipeline setup.
 - Optional SPIR‑V validation (tests use `spirv-val` when available).
-- Optional combined‑sampler emission for backends that require it (inline pragma or `weslWith` + `SamplerCombined`).
+- Combined‑sampler emission by default, with opt‑in separate sampler mode when needed.
 - Minimal `wesl.toml` package metadata parsing.
 
 ## Build and Run
@@ -42,20 +42,19 @@ Set `SPIRDO_WRITE_SPV=1` to emit SPIR-V files (`fragment-*.spv`, `vertex*.spv`,
 {-# LANGUAGE QuasiQuotes #-}
 
 import qualified Data.ByteString as BS
-import Spirdo.Wesl (compileWeslToSpirvWith, defaultCompileOptions, wesl)
+import Spirdo.Wesl (PreparedShader, preparedSpirv, wesl)
 
 main :: IO ()
 main = do
-  let shader = [wesl|
+  let shader :: PreparedShader iface
+      shader = [wesl|
 @fragment
 fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   let uv = vec2(frag_coord.x / 800.0, frag_coord.y / 600.0);
   return vec4(uv.x, uv.y, 0.4, 1.0);
 }
 |]
-  case compileWeslToSpirvWith defaultCompileOptions shader of
-    Left err -> error (show err)
-    Right compiled -> BS.writeFile "example.spv" (shaderSpirv compiled)
+  BS.writeFile "example.spv" (preparedSpirv shader)
 ```
 
 Note: the public API is exposed from `Spirdo.Wesl` and `Spirdo.Wesl.Inputs`.
@@ -70,30 +69,24 @@ defaultCompileOptions
   { cacheEnabled = True
   , cacheVerbose = False
   , timingVerbose = False
-  , samplerBindingMode = SamplerSeparate
+  , samplerBindingMode = SamplerCombined
   }
 ```
 
-For SDL/Slop-style combined samplers, use an inline pragma with the normal `wesl` quasiquoter:
+Combined samplers are the default. If your backend expects **separate** sampler
+bindings, either set the option explicitly or add an inline pragma:
 
 ```hs
 import Spirdo.Wesl (wesl)
 
 shader = [wesl|
-// spirdo:sampler=combined
+// spirdo:sampler=separate
 // WESL...
 |]
 ```
 
 Set `cacheVerbose = True` to print basic timing output (cache read/write).
 Set `timingVerbose = True` to print per‑phase compiler timings (parse/validate/emit).
-
-You can also time a single compile in code:
-```hs
-import Spirdo.Wesl (compileWeslToSpirvBytesWithTimings, defaultCompileOptions)
-
-_ <- compileWeslToSpirvBytesWithTimings defaultCompileOptions shaderSrc
-```
 
 ## Declarative Binding Flow (Preferred)
 The recommended path is: **prepare → inputsFromPrepared → submit**.
@@ -114,13 +107,12 @@ import Spirdo.Wesl.Inputs
   , ShaderInputs
   , TextureHandle(..)
   , inputsFromPrepared
-  , sampler
-  , texture
+  , sampledTexture
   , uniform
   )
-import Spirdo.Wesl (CompiledShader, prepareShader, wesl)
+import Spirdo.Wesl (PreparedShader, wesl)
 
-shader :: CompiledShader iface
+shader :: PreparedShader iface
 shader = [wesl|
 struct Params { time_res: vec4<f32>; };
 @group(0) @binding(0) var<uniform> params: Params;
@@ -133,12 +125,10 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 |]
 
 inputs :: Either String (ShaderInputs iface)
-inputs = do
-  prep <- prepareShader shader
-  inputsFromPrepared prep $
+inputs =
+  inputsFromPrepared shader $
     uniform @"params" (V4 0.0 0.0 0.0 0.0 :: V4 Float)
-    <> sampler @"samp0" (SamplerHandle 1)
-    <> texture @"tex0" (TextureHandle 2)
+    <> sampledTexture @"tex0" (TextureHandle 2) (SamplerHandle 1)
 ```
 
 Note: `SamplerHandle`/`TextureHandle` values are **your runtime resource IDs**, not shader binding indices. They must correspond to real resources in your renderer.
@@ -159,31 +149,71 @@ If you need deterministic uniform ordering (by group/binding/name), use
 Notes:
 - Record field names must match the WESL struct field names (extra or missing
   fields are errors).
- - `PreparedShader` is the preferred entrypoint; it caches stage, binding plan,
-   and vertex attributes.
+- `PreparedShader` is the preferred entrypoint; it caches stage, binding plan,
+  and vertex attributes.
 
-### Layout & Binding Tables
-If you need a renderer‑friendly view of bindings (stage, group, slot, kind),
-use the layout helpers. They are pure and derived from the prepared shader.
-
+### Full End‑to‑End Example (Fragment + Combined Texture)
 ```hs
-import Spirdo.Wesl (layoutFromPrepared, bindingTableFromPrepared)
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TypeApplications #-}
 
-Right prep = prepareShader shader
-let layout = layoutFromPrepared prep        -- [LayoutBinding]
-let table  = bindingTableFromPrepared prep  -- name -> (group, binding)
+import Spirdo.Wesl
+  ( PreparedShader
+  , ToUniform(..)
+  , V4(..)
+  , preparedInterface
+  , preparedPlan
+  , preparedSpirv
+  , wesl
+  )
+import Spirdo.Wesl.Inputs
+  ( SamplerHandle(..)
+  , TextureHandle(..)
+  , inputsFromPrepared
+  , sampledTexture
+  , uniform
+  )
+
+data ParamsU = ParamsU { time_res :: V4 Float }
+instance ToUniform ParamsU
+
+fragment :: PreparedShader iface
+fragment = [wesl|
+struct Params { time_res: vec4<f32>; };
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var tex0: texture_2d<f32>;
+@group(0) @binding(2) var samp0: sampler;
+@fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = p.xy / params.time_res.zw;
+  let n = textureSample(tex0, samp0, uv).x;
+  return vec4(n, n, n, 1.0);
+}
+|]
+
+-- Pipeline setup (renderer‑agnostic):
+let spv  = preparedSpirv fragment
+let plan = preparedPlan fragment
+-- Use plan counts to size descriptor bindings, then create pipeline.
+
+-- Per‑frame bindings:
+let inputs =
+      inputsFromPrepared fragment $
+        uniform @"params" (ParamsU (V4 t w h 0))
+        <> sampledTexture @"tex0" (TextureHandle texId) (SamplerHandle sampId)
 ```
 
-### Combined Samplers (SDL/Slop-Friendly)
-Some backends expose **combined image+sampler** slots. For those, compile with
-`SamplerCombined` and pass samplers *inline* with textures.
+### Sampler Modes
+Spirdo defaults to **combined samplers** (texture + sampler are bound together
+on the host). If your backend wants separate sampler slots, opt into
+`SamplerSeparate` via `CompileOptions` or the inline pragma shown earlier.
 
 ```hs
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 
-import Spirdo.Wesl (prepareShader, wesl)
+import Spirdo.Wesl (PreparedShader, wesl)
 import Spirdo.Wesl.Inputs
   ( InputsBuilder
   , SamplerHandle(..)
@@ -193,8 +223,8 @@ import Spirdo.Wesl.Inputs
   , uniform
   )
 
+shader :: PreparedShader iface
 shader = [wesl|
-// spirdo:sampler=combined
 struct Params { time_res: vec4<f32>; };
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(0) var tex0: texture_2d<f32>;
@@ -210,21 +240,19 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 }
 |]
 
-inputs = do
-  prep <- prepareShader shader
-  inputsFromPrepared prep $
+inputs =
+  inputsFromPrepared shader $
     uniform @"params" (V4 0 0 0 0 :: V4 Float)
     <> sampledTexture @"tex0" (TextureHandle 1) (SamplerHandle 7)
     <> sampledTexture @"tex1" (TextureHandle 2) (SamplerHandle 7)
 ```
 
-In `SamplerCombined` mode, **sampler bindings are not part of the interface
-type**, so you provide samplers via `sampledTexture`. If your backend expects
-contiguous sampler slots (like Slop), make sure your *texture* bindings are
-contiguous starting at 0.
+In combined mode, **sampler bindings are not part of the interface type**, so
+you provide samplers via `sampledTexture`. If your backend expects sampler
+slots starting at 0, keep *texture* bindings contiguous for predictability.
 
-If you need to customize compile options, use `weslWith` and set
-`samplerBindingMode = SamplerCombined`.
+To opt into **separate** samplers for a shader, use:
+`samplerBindingMode = SamplerSeparate` or `// spirdo:sampler=separate`.
 
 ### Storage Buffers & Storage Textures (Builder)
 ```hs
@@ -257,11 +285,9 @@ Spirdo does **not** bind you to any graphics API. The idea is:
 {-# LANGUAGE DataKinds #-}
 
 import Spirdo.Wesl
-  ( CompiledShader
-  , PreparedShader
-  , ShaderInterface(..)
-  , bindingPlan
-  , prepareShader
+  ( PreparedShader
+  , preparedInterface
+  , preparedPlan
   , vertexAttributes
   )
 import Spirdo.Wesl.Types.Interface
@@ -281,13 +307,12 @@ data PipelineDesc = PipelineDesc
   }
 
 buildPipelineDesc
-  :: CompiledShader vIface
-  -> CompiledShader fIface
+  :: PreparedShader vIface
+  -> PreparedShader fIface
   -> Either String PipelineDesc
 buildPipelineDesc vShader fShader = do
-  let vIface = shaderInterface vShader
-      fPlan = bindingPlan (shaderInterface fShader)
-  vAttrs <- vertexAttributes vIface
+  vAttrs <- vertexAttributes (preparedInterface vShader)
+  let fPlan = preparedPlan fShader
   pure PipelineDesc
     { pdVertexAttributes = vAttrs
     , pdUniformCount = length (bpUniforms fPlan)
@@ -296,10 +321,6 @@ buildPipelineDesc vShader fShader = do
     , pdStorageBufferCount = length (bpStorageBuffers fPlan)
     , pdStorageTextureCount = length (bpStorageTextures fPlan)
     }
-
--- Optional: precompute interface data once.
-preparedExample :: CompiledShader iface -> Either String (PreparedShader iface)
-preparedExample = prepareShader
 
 -- Feeding inputs into your backend (pseudo‑API).
 submitInputs
@@ -315,31 +336,30 @@ submitInputs inputs = do
   mapM_ bindStorageTexture (siStorageTextures inputs)
 ```
 
-### Compilation API (Common Paths)
+### Runtime Compilation (Optional)
+If you need runtime compilation (e.g., loading `.wesl` from disk), use the
+`prepare*` helpers:
+
 ```hs
 import Spirdo.Wesl
-  ( compileWeslToSpirvWith
-  , compileWeslToSpirvFileWith
-  , compileWeslToSpirvBytesWith
-  , compileWeslToSpirvWithDiagnostics
-  , defaultCompileOptions
+  ( defaultCompileOptions
+  , prepareWesl
+  , prepareWeslFile
+  , prepareWeslWithDiagnostics
+  , preparedSpirv
   )
 
--- Inline source
-Right shader = compileWeslToSpirvWith defaultCompileOptions src
+Right (SomePreparedShader prep) = prepareWesl src
+bytes = preparedSpirv prep
 
--- File-based (supports imports)
-Right shaderFile <- compileWeslToSpirvFileWith defaultCompileOptions "shaders/main.wesl"
+Right (SomePreparedShader prepFile) <- prepareWeslFile "shaders/main.wesl"
 
--- Bytes only
-Right bytes = compileWeslToSpirvBytesWith defaultCompileOptions src
-
--- Diagnostics
-Right (shaderDiag, diags) = compileWeslToSpirvWithDiagnostics defaultCompileOptions src
+Right (SomePreparedShader prepDiag, diags) =
+  prepareWeslWithDiagnostics defaultCompileOptions src
 ```
 
-If you need a *deterministic bind order*, use `bindingPlan` and
-sort by `(group, binding)` or use `bpBindings` directly.
+If you need a *deterministic bind order*, use `preparedPlan` and `bpBindings`
+from the prepared shader.
 
 ### SDL (Example‑only, Not in the Library)
 Spirdo stays SDL‑agnostic, but SDL integration can be very declarative. The
@@ -352,10 +372,11 @@ direct SDL GPU wiring variant in minimal form:
 {-# LANGUAGE QuasiQuotes #-}
 
 import Spirdo.Wesl
-  ( PreparedShader(..)
+  ( PreparedShader
   , ToUniform(..)
   , V4(..)
-  , prepareShader
+  , preparedPlan
+  , preparedSpirv
   , wesl
   )
 import Spirdo.Wesl.Inputs (inputsFromPrepared, uniform, uniformSlots)
@@ -372,11 +393,12 @@ struct Params { time_res: vec4<f32>; };
 data ParamsU = ParamsU { time_res :: V4 Float }
 instance ToUniform ParamsU
 
--- 1) Prepare once
-Right prepared = prepareShader fragment
+-- 1) Prepare once (wesl returns PreparedShader)
+let prepared = fragment
 
 -- 2) Create SDL shader using BindingPlan counts
-let plan = psPlan prepared
+let plan = preparedPlan prepared
+    bytes = preparedSpirv prepared
     mkShaderInfo bytes stage =
       SDL_GPUShaderCreateInfo
         { shaderCode = bytesPtr, shaderCodeSize = bytesLen
@@ -402,14 +424,18 @@ Notes:
 - `inputsFromPrepared` already normalizes ordering; you can bind `siSamplers`,
   `siTextures`, etc. directly in `(group, binding)` order.
 - `SamplerHandle`/`TextureHandle` are *your* runtime IDs, not shader bindings.
+- If you’re using **Slop’s** Sprite/Shader2D override path, its ABI expects
+  fragment uniforms in `@group(3)` and textures/samplers in `@group(2)`.
+  Slop also auto-binds a `SlopGlobals` uniform at
+  `@group(3) @binding(0)`; start your own uniforms at `@binding(1)`.
 
 #### Vertex + Pipeline sketch (SDL GPU)
 ```hs
 {-# LANGUAGE QuasiQuotes #-}
 
 import Spirdo.Wesl
-  ( PreparedShader(..)
-  , prepareShader
+  ( PreparedShader
+  , preparedInterface
   , vertexAttributes
   , wesl
   )
@@ -424,8 +450,8 @@ struct VSOut { @builtin(position) pos: vec4<f32>; };
 }
 |]
 
-Right vprep = prepareShader vertex
-Right vattrs = vertexAttributes (shaderInterface (psShader vprep))
+let vprep = vertex
+Right vattrs = vertexAttributes (preparedInterface vprep)
 
 -- Use vattrs to fill SDL_GPUVertexInputState
 -- Then create SDL_GPUGraphicsPipeline with vs+fs shaders.
@@ -435,7 +461,7 @@ Right vattrs = vertexAttributes (shaderInterface (psShader vprep))
 ```hs
 {-# LANGUAGE QuasiQuotes #-}
 
-import Spirdo.Wesl (prepareShader, wesl)
+import Spirdo.Wesl (preparedPlan, wesl)
 
 compute = [wesl|
 @group(0) @binding(0) var<storage, read_write> data: array<u32>;
@@ -446,17 +472,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 |]
 
-Right cprep = prepareShader compute
--- Use psPlan cprep to size descriptor bindings and create your graphics pipeline.
+let cprep = compute
+-- Use preparedPlan cprep to size descriptor bindings and create your graphics pipeline.
 ```
 
 ### Binding Plans and Vertex Attributes (Advanced)
-If you need explicit layout info, use `bindingPlan` and `vertexAttributes` on
-the prepared shader’s interface:
+If you need explicit layout info, use `preparedPlan` and `vertexAttributes`:
 
 ```hs
-plan = bindingPlan (shaderInterface (psShader prepared))
-attrs = vertexAttributes (shaderInterface (psShader prepared))
+plan = preparedPlan prepared
+attrs = vertexAttributes (preparedInterface prepared)
 ```
 
 ### Demo (exe only)
@@ -501,3 +526,63 @@ When enabled, files are written to the repo root:
 - `fragment-*.spv` for each fragment variant
 - `compute*.spv` for compute examples
 - `vertex*.spv` for vertex examples
+
+## API Reference (Public)
+Public surface area is **`Spirdo.Wesl`** and **`Spirdo.Wesl.Inputs`**.
+Everything else is internal.
+
+### `Spirdo.Wesl` functions
+Compilation / preparation
+- `wesl` — Quasiquoter that compiles inline WESL at build time to `PreparedShader`.
+- `weslWith` — Same as `wesl`, but with explicit `CompileOptions` (features, cache, sampler mode).
+- `prepareWesl` — Compile inline WESL at runtime to `SomePreparedShader`.
+- `prepareWeslWith` — Runtime compile with explicit `CompileOptions`.
+- `prepareWeslFile` — Compile a `.wesl` file (imports supported).
+- `prepareWeslFileWith` — File compile with explicit `CompileOptions`.
+- `prepareWeslWithDiagnostics` — Runtime compile returning `PreparedShader` + diagnostics.
+- `prepareWeslFileWithDiagnostics` — File compile returning `PreparedShader` + diagnostics.
+- `defaultCompileOptions` — Sensible defaults (combined samplers, caching on).
+
+Prepared‑shader accessors
+- `preparedSpirv` — SPIR‑V bytes for a `PreparedShader`.
+- `preparedInterface` — `ShaderInterface` for reflection/binding info.
+- `preparedStage` — Shader stage (vertex/fragment/compute).
+- `preparedPlan` — `BindingPlan` (counts + sorted bindings).
+- `preparedVertexAttributes` — Precomputed vertex attributes (only for vertex stages).
+
+Reflection helpers
+- `shaderStage` — Get stage from a `ShaderInterface`.
+- `stageIO` — Combined stage IO (`StageIO`) if present.
+- `stageInputs`, `stageOutputs` — Stage IO split into inputs/outputs.
+- `vertexInputs`, `vertexOutputs` — Vertex‑stage IO helpers.
+- `vertexAttributes` — Extract vertex attribute formats/locations.
+- `pushConstantLayout` — Push‑constant layout if present.
+- `specializableOverrides` — Overrides with runtime specialization IDs.
+
+Uniform packing helpers (advanced)
+- `uniform` — Build a `UniformValue` for manual packing.
+- `packUniform` — Pack a `UniformValue` against a `TypeLayout`.
+- `packUniformFrom` — Pack any `ToUniform` value against a layout.
+- `validateUniformStorable` — Check that a `Storable` matches a layout.
+- `packUniformStorable` — Pack a `Storable` into a layout‑compatible blob.
+
+Package helpers
+- `discoverPackageInfo` — Find and parse `wesl.toml` metadata.
+
+### `Spirdo.Wesl.Inputs` functions
+Input builder (host‑agnostic)
+- `inputsFromPrepared` — Validate + normalize inputs against a `PreparedShader`.
+- `emptyInputs` — Start from an empty `ShaderInputs` (rarely needed directly).
+- `orderedUniforms` — Uniforms sorted by `(group, binding, name)`.
+- `uniformSlots` — Compact `(group, binding, bytes)` view of uniforms.
+
+InputsBuilder constructors
+- `uniform` — Add a uniform binding (uses `ToUniform`).
+- `sampledTexture` — Add a combined texture+sampler binding.
+- `texture` — Add a texture binding (separate‑sampler mode).
+- `sampler` — Add a sampler binding (separate‑sampler mode).
+- `storageBuffer` — Add a storage buffer binding.
+- `storageTexture` — Add a storage texture binding.
+
+Note: `Spirdo.Wesl.uniform` builds a `UniformValue` (for packing).  
+`Spirdo.Wesl.Inputs.uniform` builds a `ShaderInputs` entry.

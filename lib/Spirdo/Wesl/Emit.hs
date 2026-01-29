@@ -3920,8 +3920,8 @@ emitExpr st fs expr =
             Just val -> Right (st, fs, val)
             Nothing ->
               case Map.lookup name (gsSamplerLayouts st) of
-                Just samplerLayout | gsSamplerMode st == SamplerCombined ->
-                  Right (st, fs, Value samplerLayout 0)
+                Just _ | gsSamplerMode st == SamplerCombined ->
+                  Left (CompileError "sampler values are unavailable in combined mode; pass the sampler directly to textureSample" Nothing Nothing)
                 _ -> emitLoadFromExpr st fs expr
     EField base field -> emitFieldExpr st fs base field
     EIndex _ _ -> emitLoadFromExpr st fs expr
