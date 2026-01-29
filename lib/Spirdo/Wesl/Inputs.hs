@@ -27,6 +27,8 @@ module Spirdo.Wesl.Inputs
   , StorageTextureInput(..)
   , UniformSlot(..)
   , uniformSlots
+  , InputsCombined
+  , InputsSeparate
   , InputsBuilder
   , uniform
   , sampler
@@ -285,35 +287,39 @@ data InputItem
   | InputStorageTexture !String !StorageTextureHandle
   deriving (Eq, Show)
 
-newtype InputsBuilder (iface :: [Binding]) = InputsBuilder [InputItem]
+type InputsCombined iface = InputsBuilder 'SamplerCombined iface
+
+type InputsSeparate iface = InputsBuilder 'SamplerSeparate iface
+
+newtype InputsBuilder (mode :: SamplerBindingMode) (iface :: [Binding]) = InputsBuilder [InputItem]
   deriving (Eq, Show)
 
-instance Semigroup (InputsBuilder iface) where
+instance Semigroup (InputsBuilder mode iface) where
   InputsBuilder a <> InputsBuilder b = InputsBuilder (a <> b)
 
-instance Monoid (InputsBuilder iface) where
+instance Monoid (InputsBuilder mode iface) where
   mempty = InputsBuilder []
 
-uniform :: forall name iface a. (KnownSymbol name, RequireUniform name iface, ToUniform a) => a -> InputsBuilder iface
+uniform :: forall name mode iface a. (KnownSymbol name, RequireUniform name iface, ToUniform a) => a -> InputsBuilder mode iface
 uniform val = InputsBuilder [InputUniform (symbolVal (Proxy @name)) (toUniform val)]
 
-sampler :: forall name iface. (KnownSymbol name, RequireSampler name iface) => SamplerHandle -> InputsBuilder iface
+sampler :: forall name mode iface. (KnownSymbol name, RequireSampler name iface) => SamplerHandle -> InputsBuilder mode iface
 sampler handle = InputsBuilder [InputSampler (symbolVal (Proxy @name)) handle]
 
-texture :: forall name iface. (KnownSymbol name, RequireTexture name iface) => TextureHandle -> InputsBuilder iface
+texture :: forall name mode iface. (KnownSymbol name, RequireTexture name iface) => TextureHandle -> InputsBuilder mode iface
 texture handle = InputsBuilder [InputTexture (symbolVal (Proxy @name)) handle]
 
-sampledTexture :: forall name iface. (KnownSymbol name, RequireTexture name iface) => TextureHandle -> SamplerHandle -> InputsBuilder iface
+sampledTexture :: forall name mode iface. (KnownSymbol name, RequireTexture name iface) => TextureHandle -> SamplerHandle -> InputsBuilder mode iface
 sampledTexture texHandle samplerHandle =
   InputsBuilder [InputSampledTexture (symbolVal (Proxy @name)) texHandle samplerHandle]
 
-storageBuffer :: forall name iface. (KnownSymbol name, RequireStorageBuffer name iface) => BufferHandle -> InputsBuilder iface
+storageBuffer :: forall name mode iface. (KnownSymbol name, RequireStorageBuffer name iface) => BufferHandle -> InputsBuilder mode iface
 storageBuffer handle = InputsBuilder [InputStorageBuffer (symbolVal (Proxy @name)) handle]
 
-storageTexture :: forall name iface. (KnownSymbol name, RequireStorageTexture name iface) => StorageTextureHandle -> InputsBuilder iface
+storageTexture :: forall name mode iface. (KnownSymbol name, RequireStorageTexture name iface) => StorageTextureHandle -> InputsBuilder mode iface
 storageTexture handle = InputsBuilder [InputStorageTexture (symbolVal (Proxy @name)) handle]
 
-inputsFrom :: forall iface. ShaderInterface -> InputsBuilder iface -> Either String (ShaderInputs iface)
+inputsFrom :: forall mode iface. ShaderInterface -> InputsBuilder mode iface -> Either String (ShaderInputs iface)
 inputsFrom iface (InputsBuilder items) =
   let bmap = bindingMap iface
       initInputs = emptyInputs iface
@@ -328,7 +334,7 @@ inputsFrom iface (InputsBuilder items) =
               Left ("missing sampler for textures: " <> intercalate ", " missing)
         SamplerSeparate -> Right normalized
 
-inputsFromPrepared :: forall iface. PreparedShader iface -> InputsBuilder iface -> Either String (ShaderInputs iface)
+inputsFromPrepared :: forall mode iface. PreparedShader mode iface -> InputsBuilder mode iface -> Either String (ShaderInputs iface)
 inputsFromPrepared prepared inputs =
   inputsFrom (preparedInterface prepared) inputs
 

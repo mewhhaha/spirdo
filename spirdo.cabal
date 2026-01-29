@@ -101,6 +101,7 @@ test-suite spirdo-tests
         directory,
         filepath,
         process,
+        QuickCheck,
         spirdo
     default-language: GHC2024
 

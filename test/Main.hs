@@ -6,13 +6,13 @@
 -- | Executable entry point.
 module Main (main) where
 
-import Control.Monad (forM_, unless)
+import Control.Monad (forM_, unless, when, replicateM)
 import Data.Bits ((.|.), shiftL)
 import qualified Data.ByteString as BS
 import Data.List (find, isInfixOf, isPrefixOf)
 import Data.Maybe (isJust)
 import Data.Proxy (Proxy(..))
-import Data.Word (Word32, Word64)
+import Data.Word (Word16, Word32, Word64)
 import GHC.Float (castFloatToWord32)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable, getTemporaryDirectory, listDirectory, removeFile)
 import System.Environment (lookupEnv)
@@ -20,10 +20,13 @@ import System.FilePath ((</>), takeExtension)
 import System.Exit (ExitCode(..))
 import System.IO (hClose, openBinaryTempFile)
 import System.Process (readProcessWithExitCode)
+import Test.QuickCheck (Gen, arbitrary, generate)
 
 import Spirdo.Wesl
 import Spirdo.Wesl.Inputs
   ( ShaderInputs(..)
+  , SamplerHandle(..)
+  , TextureHandle(..)
   , UniformInput(..)
   , inputsFromPrepared
   )
@@ -44,6 +47,7 @@ data ParamsU = ParamsU
   } deriving (Generic)
 
 instance ToUniform ParamsU
+
 
 defaultOpts :: CompileOptions
 defaultOpts = defaultCompileOptions
@@ -117,6 +121,8 @@ main = do
   checkDiagnosticConstantCondition
   checkDiagnosticDuplicateCase
   checkSamplerInterface
+  checkCombinedSamplerInterface
+  checkSamplerValueCombinedError
   checkPackUniformLayout
   checkPackUniformErrors
   checkPackUniformFrom
@@ -124,6 +130,10 @@ main = do
   checkVertexAttributes
   checkBindingPlan
   checkInputOrdering
+  checkInputsCombinedMissingSampler
+  checkInputsCombinedOk
+  checkInputsDuplicateBuilder
+  checkQuickCheck
   checkDuplicateBindings
   checkGoldenSpirv
   putStrLn "All tests passed."
@@ -144,6 +154,12 @@ word32At bytes offset =
       b2 = fromIntegral (BS.index bytes (offset + 2)) :: Word32
       b3 = fromIntegral (BS.index bytes (offset + 3)) :: Word32
   in b0 .|. (b1 `shiftL` 8) .|. (b2 `shiftL` 16) .|. (b3 `shiftL` 24)
+
+word16At :: BS.ByteString -> Int -> Word16
+word16At bytes offset =
+  let b0 = fromIntegral (BS.index bytes offset) :: Word16
+      b1 = fromIntegral (BS.index bytes (offset + 1)) :: Word16
+  in b0 .|. (b1 `shiftL` 8)
 
 validateSpirvVal :: Maybe FilePath -> String -> BS.ByteString -> IO ()
 validateSpirvVal mSpirvVal label bytes =
@@ -174,6 +190,24 @@ checkSamplerInterface =
       let kinds = map biKind (siBindings (preparedInterface prep))
       unless (BTexture2D `elem` kinds && BSampler `elem` kinds) $
         fail "sampler-interface: expected texture_2d and sampler bindings"
+
+checkCombinedSamplerInterface :: IO ()
+checkCombinedSamplerInterface =
+  case prepareWesl samplerShader of
+    Left err -> fail ("sampler-combined-interface: " <> show err)
+    Right (SomePreparedShader prep) -> do
+      let kinds = map biKind (siBindings (preparedInterface prep))
+      when (BSampler `elem` kinds) $
+        fail "sampler-combined-interface: sampler binding should be omitted in combined mode"
+
+checkSamplerValueCombinedError :: IO ()
+checkSamplerValueCombinedError =
+  case prepareWesl samplerValueShader of
+    Left (CompileError msg _ _) ->
+      unless ("sampler values are unavailable in combined mode" `isInfixOf` msg) $
+        fail ("sampler-combined-error: unexpected error: " <> msg)
+    Right _ ->
+      fail "sampler-combined-error: expected failure when say using sampler value in combined mode"
 
 checkPackUniformLayout :: IO ()
 checkPackUniformLayout =
@@ -352,6 +386,459 @@ checkInputOrdering =
       unless (names == ["a", "b"]) $
         fail ("input-ordering: expected [\"a\",\"b\"], got " <> show names)
 
+checkInputsCombinedMissingSampler :: IO ()
+checkInputsCombinedMissingSampler =
+  case inputsFromPrepared combinedInputShader
+        (Inputs.uniform @"params" (ParamsU (V4 1 2 3 4) :: ParamsU)
+          <> Inputs.texture @"tex" (TextureHandle 9)) of
+    Left err ->
+      unless ("missing sampler for textures" `isInfixOf` err) $
+        fail ("inputs-combined-missing: unexpected error: " <> err)
+    Right _ ->
+      fail "inputs-combined-missing: expected error for missing sampler"
+
+checkInputsCombinedOk :: IO ()
+checkInputsCombinedOk =
+  case inputsFromPrepared combinedInputShader
+        (Inputs.uniform @"params" (ParamsU (V4 1 2 3 4) :: ParamsU)
+          <> Inputs.sampledTexture @"tex" (TextureHandle 9) (SamplerHandle 3)) of
+    Left err -> fail ("inputs-combined-ok: " <> err)
+    Right _ -> pure ()
+
+checkInputsDuplicateBuilder :: IO ()
+checkInputsDuplicateBuilder =
+  case inputsFromPrepared combinedInputShader
+        (Inputs.uniform @"params" (ParamsU (V4 1 2 3 4) :: ParamsU)
+          <> Inputs.uniform @"params" (ParamsU (V4 5 6 7 8) :: ParamsU)) of
+    Left err ->
+      unless ("duplicate binding entry" `isInfixOf` err) $
+        fail ("inputs-duplicate: unexpected error: " <> err)
+    Right _ ->
+      fail "inputs-duplicate: expected duplicate binding error"
+
+checkQuickCheck :: IO ()
+checkQuickCheck = do
+  forM_ [1 :: Int .. 200] $ \_ -> do
+    value <- generate arbitrary
+    checkPackScalarF32 value
+  forM_ [1 :: Int .. 200] $ \_ -> do
+    value <- generate genV2
+    checkPackVec2F32 value
+  forM_ [1 :: Int .. 200] $ \_ -> do
+    value <- generate genV3
+    checkPackVec3F32 value
+  forM_ [1 :: Int .. 200] $ \_ -> do
+    value <- generate genV4
+    checkPackVec4F32 value
+  forM_ [1 :: Int .. 200] $ \_ -> do
+    value <- generate genM2
+    checkPackMat2F32 value
+  checkPackUniformExtendedRandom
+  checkPackUniformExtended2
+
+checkPackScalarF32 :: Float -> IO ()
+checkPackScalarF32 value =
+  case packUniform (TLScalar F32 4 4) (uniform value) of
+    Left err -> fail ("quickcheck: packScalarF32 failed: " <> err)
+    Right bytes -> do
+      unless (BS.length bytes == 4) $
+        fail "quickcheck: packScalarF32 wrong byte size"
+      unless (word32At bytes 0 == castFloatToWord32 value) $
+        fail "quickcheck: packScalarF32 wrong bits"
+
+checkPackVec2F32 :: V2 Float -> IO ()
+checkPackVec2F32 (V2 x y) =
+  let align = 8 :: Word32
+      size = 8 :: Word32
+      layout = TLVector 2 F32 align size
+  in case packUniform layout (uniform (V2 x y)) of
+      Left err -> fail ("quickcheck: packVec2F32 failed: " <> err)
+      Right bytes -> do
+        unless (BS.length bytes == fromIntegral size) $
+          fail "quickcheck: packVec2F32 wrong byte size"
+        unless (word32At bytes 0 == castFloatToWord32 x) $
+          fail "quickcheck: packVec2F32 wrong x bits"
+        unless (word32At bytes 4 == castFloatToWord32 y) $
+          fail "quickcheck: packVec2F32 wrong y bits"
+
+checkPackVec3F32 :: V3 Float -> IO ()
+checkPackVec3F32 (V3 x y z) =
+  let align = 16 :: Word32
+      size = 16 :: Word32
+      layout = TLVector 3 F32 align size
+  in case packUniform layout (uniform (V3 x y z)) of
+      Left err -> fail ("quickcheck: packVec3F32 failed: " <> err)
+      Right bytes -> do
+        unless (BS.length bytes == fromIntegral size) $
+          fail "quickcheck: packVec3F32 wrong byte size"
+        unless (word32At bytes 0 == castFloatToWord32 x) $
+          fail "quickcheck: packVec3F32 wrong x bits"
+        unless (word32At bytes 4 == castFloatToWord32 y) $
+          fail "quickcheck: packVec3F32 wrong y bits"
+        unless (word32At bytes 8 == castFloatToWord32 z) $
+          fail "quickcheck: packVec3F32 wrong z bits"
+        let paddingBytes = [BS.index bytes (12 + i) | i <- [0 .. 3]]
+        unless (all (== 0) paddingBytes) $
+          fail "quickcheck: packVec3F32 padding not zeroed"
+
+checkPackVec4F32 :: V4 Float -> IO ()
+checkPackVec4F32 (V4 x y z w) =
+  let align = 16 :: Word32
+      size = 16 :: Word32
+      layout = TLVector 4 F32 align size
+  in case packUniform layout (uniform (V4 x y z w)) of
+      Left err -> fail ("quickcheck: packVec4F32 failed: " <> err)
+      Right bytes -> do
+        unless (BS.length bytes == fromIntegral size) $
+          fail "quickcheck: packVec4F32 wrong byte size"
+        unless (word32At bytes 0 == castFloatToWord32 x) $
+          fail "quickcheck: packVec4F32 wrong x bits"
+        unless (word32At bytes 4 == castFloatToWord32 y) $
+          fail "quickcheck: packVec4F32 wrong y bits"
+        unless (word32At bytes 8 == castFloatToWord32 z) $
+          fail "quickcheck: packVec4F32 wrong z bits"
+        unless (word32At bytes 12 == castFloatToWord32 w) $
+          fail "quickcheck: packVec4F32 wrong w bits"
+
+checkPackMat2F32 :: M2 Float -> IO ()
+checkPackMat2F32 (M2 (V2 a b) (V2 c d)) =
+  let align = 8 :: Word32
+      stride = 8 :: Word32
+      size = 16 :: Word32
+      layout = TLMatrix 2 2 F32 align size stride
+  in case packUniform layout (uniform (M2 (V2 a b) (V2 c d))) of
+      Left err -> fail ("quickcheck: packMat2F32 failed: " <> err)
+      Right bytes -> do
+        unless (BS.length bytes == fromIntegral size) $
+          fail "quickcheck: packMat2F32 wrong byte size"
+        unless (word32At bytes 0 == castFloatToWord32 a) $
+          fail "quickcheck: packMat2F32 wrong a bits"
+        unless (word32At bytes 4 == castFloatToWord32 b) $
+          fail "quickcheck: packMat2F32 wrong b bits"
+        unless (word32At bytes 8 == castFloatToWord32 c) $
+          fail "quickcheck: packMat2F32 wrong c bits"
+        unless (word32At bytes 12 == castFloatToWord32 d) $
+          fail "quickcheck: packMat2F32 wrong d bits"
+
+genV4 :: Gen (V4 Float)
+genV4 = V4 <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
+
+genV2 :: Gen (V2 Float)
+genV2 = V2 <$> arbitrary <*> arbitrary
+
+genV3 :: Gen (V3 Float)
+genV3 = V3 <$> arbitrary <*> arbitrary <*> arbitrary
+
+genM2 :: Gen (M2 Float)
+genM2 = M2 <$> genV2 <*> genV2
+
+genM3 :: Gen (M3 Float)
+genM3 = M3 <$> genV3 <*> genV3 <*> genV3
+
+genM4 :: Gen (M4 Float)
+genM4 = M4 <$> genV4 <*> genV4 <*> genV4 <*> genV4
+
+genInner :: Gen (V2 Float, Float)
+genInner = (,) <$> genV2 <*> arbitrary
+
+checkPackUniformExtendedRandom :: IO ()
+checkPackUniformExtendedRandom =
+  case prepareWesl packUniformExtendedShader of
+    Left err -> fail ("quickcheck: pack-uniform-extended: " <> show err)
+    Right (SomePreparedShader prep) -> do
+      info <- case find (\b -> biName b == "params") (siBindings (preparedInterface prep)) of
+        Nothing -> fail "quickcheck: pack-uniform-extended: missing params binding"
+        Just bi -> pure bi
+      case biType info of
+        TLStruct _ fields _ size -> do
+          fieldM3 <- findFieldLayout "m3" fields
+          fieldM4 <- findFieldLayout "m4" fields
+          fieldArr2 <- findFieldLayout "arr2" fields
+          fieldArr3 <- findFieldLayout "arr3" fields
+          fieldInner <- findFieldLayout "inner" fields
+          forM_ [1 :: Int .. 80] $ \_ -> do
+            m3 <- generate genM3
+            m4 <- generate genM4
+            arr2 <- generate (sequence [genV2, genV2, genV2, genV2])
+            arr3 <- generate (sequence [genV3, genV3, genV3])
+            (innerA, innerB) <- generate genInner
+            let value =
+                  UVStruct
+                    [ ("m3", uniform m3)
+                    , ("m4", uniform m4)
+                    , ("arr2", uniform arr2)
+                    , ("arr3", uniform arr3)
+                    , ("inner", UVStruct [("a", uniform innerA), ("b", uniform innerB)])
+                    ]
+            bytes <-
+              case packUniform (biType info) value of
+                Left err -> fail ("quickcheck: pack-uniform-extended: " <> err)
+                Right bs -> pure bs
+            unless (BS.length bytes == fromIntegral size) $
+              fail "quickcheck: pack-uniform-extended size mismatch"
+            assertMatrix3 "m3" bytes fieldM3 m3
+            assertMatrix4 "m4" bytes fieldM4 m4
+            assertArrayVec2 "arr2" bytes fieldArr2 arr2
+            assertArrayVec3 "arr3" bytes fieldArr3 arr3
+            assertInner "inner" bytes fieldInner innerA innerB
+        _ -> fail "quickcheck: pack-uniform-extended: expected struct layout"
+  where
+    findFieldLayout name fields =
+      case find (\fld -> flName fld == name) fields of
+        Just fld -> pure fld
+        Nothing -> fail ("quickcheck: pack-uniform-extended missing field " <> name)
+
+    assertMatrix3 label bytes field mat =
+      case flType field of
+        TLMatrix cols rows _ _ _ stride -> do
+          let base = fromIntegral (flOffset field)
+          case mat of
+            M3 c0 c1 c2 | cols == 3 && rows == 3 -> do
+              assertVec3At (label <> ":c0") bytes base stride c0
+              assertVec3At (label <> ":c1") bytes (base + fromIntegral stride) stride c1
+              assertVec3At (label <> ":c2") bytes (base + fromIntegral stride * 2) stride c2
+            _ -> fail ("quickcheck: pack-uniform-extended: unexpected matrix shape for " <> label)
+        _ -> fail ("quickcheck: pack-uniform-extended: expected matrix for " <> label)
+
+    assertMatrix4 label bytes field mat =
+      case flType field of
+        TLMatrix cols rows _ _ _ stride -> do
+          let base = fromIntegral (flOffset field)
+          case mat of
+            M4 c0 c1 c2 c3 | cols == 4 && rows == 4 -> do
+              assertVec4At (label <> ":c0") bytes base c0
+              assertVec4At (label <> ":c1") bytes (base + fromIntegral stride) c1
+              assertVec4At (label <> ":c2") bytes (base + fromIntegral stride * 2) c2
+              assertVec4At (label <> ":c3") bytes (base + fromIntegral stride * 3) c3
+            _ -> fail ("quickcheck: pack-uniform-extended: unexpected matrix shape for " <> label)
+        _ -> fail ("quickcheck: pack-uniform-extended: expected matrix for " <> label)
+
+    assertArrayVec2 label bytes field values =
+      case flType field of
+        TLArray (Just len) stride _ _ _ -> do
+          unless (len == length values) $
+            fail ("quickcheck: pack-uniform-extended: " <> label <> " length mismatch")
+          let base = fromIntegral (flOffset field)
+          forM_ (zip [0 ..] values) $ \(ix, v) ->
+            assertVec2At (label <> ":" <> show ix) bytes (base + fromIntegral stride * ix) v
+        _ -> fail ("quickcheck: pack-uniform-extended: expected array for " <> label)
+
+    assertArrayVec3 label bytes field values =
+      case flType field of
+        TLArray (Just len) stride _ _ _ -> do
+          unless (len == length values) $
+            fail ("quickcheck: pack-uniform-extended: " <> label <> " length mismatch")
+          let base = fromIntegral (flOffset field)
+          forM_ (zip [0 ..] values) $ \(ix, v) ->
+            assertVec3At (label <> ":" <> show ix) bytes (base + fromIntegral stride * ix) stride v
+        _ -> fail ("quickcheck: pack-uniform-extended: expected array for " <> label)
+
+    assertInner label bytes field innerA innerB =
+      case flType field of
+        TLStruct _ innerFields _ size -> do
+          fieldA <- findFieldLayout "a" innerFields
+          fieldB <- findFieldLayout "b" innerFields
+          let base = fromIntegral (flOffset field)
+          let offA = base + fromIntegral (flOffset fieldA)
+          let offB = base + fromIntegral (flOffset fieldB)
+          assertVec2At (label <> ".a") bytes offA innerA
+          assertScalarAt (label <> ".b") bytes offB innerB
+          let used = fromIntegral (flOffset fieldB) + 4
+          let padBytes = [BS.index bytes (base + used + i) | i <- [0 .. fromIntegral size - used - 1], size > fromIntegral used]
+          unless (all (== 0) padBytes) $
+            fail ("quickcheck: pack-uniform-extended: " <> label <> " padding not zeroed")
+        _ -> fail ("quickcheck: pack-uniform-extended: expected struct for " <> label)
+
+    assertScalarAt label bytes offset value =
+      unless (word32At bytes offset == castFloatToWord32 value) $
+        fail ("quickcheck: pack-uniform-extended: " <> label <> " wrong bits")
+
+    assertVec2At label bytes offset (V2 x y) = do
+      assertScalarAt (label <> ".x") bytes offset x
+      assertScalarAt (label <> ".y") bytes (offset + 4) y
+
+    assertVec3At label bytes offset stride (V3 x y z) = do
+      assertScalarAt (label <> ".x") bytes offset x
+      assertScalarAt (label <> ".y") bytes (offset + 4) y
+      assertScalarAt (label <> ".z") bytes (offset + 8) z
+      let paddingBytes = [BS.index bytes (offset + 12 + i) | i <- [0 .. fromIntegral stride - 12 - 1], stride > 12]
+      unless (all (== 0) paddingBytes) $
+        fail ("quickcheck: pack-uniform-extended: " <> label <> " padding not zeroed")
+
+    assertVec4At label bytes offset (V4 x y z w) = do
+      assertScalarAt (label <> ".x") bytes offset x
+      assertScalarAt (label <> ".y") bytes (offset + 4) y
+      assertScalarAt (label <> ".z") bytes (offset + 8) z
+      assertScalarAt (label <> ".w") bytes (offset + 12) w
+
+checkPackUniformExtended2 :: IO ()
+checkPackUniformExtended2 =
+  case prepareWesl packUniformExtendedShader2 of
+    Left err -> fail ("quickcheck: pack-uniform-extended2: " <> show err)
+    Right (SomePreparedShader prep) -> do
+      info <- case find (\b -> biName b == "params2") (siBindings (preparedInterface prep)) of
+        Nothing -> fail "quickcheck: pack-uniform-extended2: missing params2 binding"
+        Just bi -> pure bi
+      case biType info of
+        TLStruct _ fields _ size -> do
+          fieldM34 <- findFieldLayout "m34" fields
+          fieldM43 <- findFieldLayout "m43" fields
+          fieldMats <- findFieldLayout "mats" fields
+          fieldNested <- findFieldLayout "nested" fields
+          fieldH <- findFieldLayout "h" fields
+          fieldHv <- findFieldLayout "hv" fields
+          fieldHv4 <- findFieldLayout "hv4" fields
+          forM_ [1 :: Int .. 60] $ \_ -> do
+            m34Vals <- replicateM 12 (generate arbitrary)
+            m43Vals <- replicateM 12 (generate arbitrary)
+            mats <- generate (sequence [genM2, genM2])
+            inners <- replicateM 2 (generate ((,) <$> genV3 <*> arbitrary))
+            h0 <- generate arbitrary
+            h1 <- generate arbitrary
+            h2 <- generate arbitrary
+            h3 <- generate arbitrary
+            h4 <- generate arbitrary
+            h5 <- generate arbitrary
+            let innerValues =
+                  UVArray
+                    [ UVStruct [("v", uniform v0), ("w", uniform w0)]
+                    | (v0, w0) <- inners
+                    ]
+            let value =
+                  UVStruct
+                    [ ("m34", UVMatrix 3 4 (map SVF32 m34Vals))
+                    , ("m43", UVMatrix 4 3 (map SVF32 m43Vals))
+                    , ("mats", uniform mats)
+                    , ("nested", UVStruct [("inners", innerValues)])
+                    , ("h", uniform (Half h0))
+                    , ("hv", uniform (V3 (Half h1) (Half h2) (Half h3)))
+                    , ("hv4", uniform (V4 (Half h2) (Half h3) (Half h4) (Half h5)))
+                    ]
+            bytes <-
+              case packUniform (biType info) value of
+                Left err -> fail ("quickcheck: pack-uniform-extended2: " <> err)
+                Right bs -> pure bs
+            unless (BS.length bytes == fromIntegral size) $
+              fail "quickcheck: pack-uniform-extended2 size mismatch"
+            assertMatrixF32 "m34" bytes fieldM34 3 4 m34Vals
+            assertMatrixF32 "m43" bytes fieldM43 4 3 m43Vals
+            assertArrayMat2 "mats" bytes fieldMats mats
+            assertNestedArray "nested" bytes fieldNested inners
+            assertHalfScalar "h" bytes fieldH h0
+            assertHalfVector "hv" bytes fieldHv [h1, h2, h3]
+            assertHalfVector "hv4" bytes fieldHv4 [h2, h3, h4, h5]
+        _ -> fail "quickcheck: pack-uniform-extended2: expected struct layout"
+  where
+    findFieldLayout name fields =
+      case find (\fld -> flName fld == name) fields of
+        Just fld -> pure fld
+        Nothing -> fail ("quickcheck: pack-uniform-extended2 missing field " <> name)
+
+    assertMatrixF32 label bytes field cols rows vals =
+      case flType field of
+        TLMatrix c r _ _ _ stride
+          | c == cols && r == rows -> do
+              let base = fromIntegral (flOffset field)
+              unless (length vals == cols * rows) $
+                fail ("quickcheck: pack-uniform-extended2: " <> label <> " value count mismatch")
+              forM_ (zip [0 ..] vals) $ \(ix, v) -> do
+                let col = ix `div` rows
+                let row = ix `mod` rows
+                let off = base + fromIntegral stride * col + row * 4
+                unless (word32At bytes off == castFloatToWord32 v) $
+                  fail ("quickcheck: pack-uniform-extended2: " <> label <> " wrong bits at " <> show ix)
+          | otherwise -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " unexpected matrix shape")
+        _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected matrix")
+
+    assertArrayMat2 label bytes field mats =
+      case flType field of
+        TLArray (Just len) stride elemLayout _ _ -> do
+          unless (len == length mats) $
+            fail ("quickcheck: pack-uniform-extended2: " <> label <> " length mismatch")
+          let base = fromIntegral (flOffset field)
+          forM_ (zip [0 ..] mats) $ \(ix, mat) ->
+            case elemLayout of
+              TLMatrix 2 2 _ _ _ elemStride -> do
+                let off = base + fromIntegral stride * ix
+                case mat of
+                  M2 (V2 a b) (V2 c d) -> do
+                    unless (word32At bytes off == castFloatToWord32 a) $
+                      fail ("quickcheck: pack-uniform-extended2: " <> label <> " m2 a")
+                    unless (word32At bytes (off + 4) == castFloatToWord32 b) $
+                      fail ("quickcheck: pack-uniform-extended2: " <> label <> " m2 b")
+                    unless (word32At bytes (off + fromIntegral elemStride) == castFloatToWord32 c) $
+                      fail ("quickcheck: pack-uniform-extended2: " <> label <> " m2 c")
+                    unless (word32At bytes (off + fromIntegral elemStride + 4) == castFloatToWord32 d) $
+                      fail ("quickcheck: pack-uniform-extended2: " <> label <> " m2 d")
+              _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected mat2 element")
+        _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected array")
+
+    assertNestedArray label bytes field inners =
+      case flType field of
+        TLStruct _ nestedFields _ _ -> do
+          innerField <- findFieldLayout "inners" nestedFields
+          case flType innerField of
+            TLArray (Just len) stride elemLayout _ _ -> do
+              unless (len == length inners) $
+                fail ("quickcheck: pack-uniform-extended2: " <> label <> " inner length mismatch")
+              let base = fromIntegral (flOffset field) + fromIntegral (flOffset innerField)
+              forM_ (zip [0 ..] inners) $ \(ix, (v0, w0)) ->
+                case elemLayout of
+                  TLStruct _ innerFields _ innerSize -> do
+                    let off = base + fromIntegral stride * ix
+                    fieldV <- findFieldLayout "v" innerFields
+                    fieldW <- findFieldLayout "w" innerFields
+                    let offV = off + fromIntegral (flOffset fieldV)
+                    let offW = off + fromIntegral (flOffset fieldW)
+                    let vStride = case flType fieldV of
+                          TLVector _ _ _ s -> fromIntegral s
+                          _ -> 16
+                    assertVec3At (label <> ".inners[" <> show ix <> "].v") bytes offV vStride v0
+                    assertScalarAt (label <> ".inners[" <> show ix <> "].w") bytes offW w0
+                    let used = maximum (map (\fld -> fromIntegral (flOffset fld + flSize fld)) innerFields)
+                    let paddingBytes =
+                          [BS.index bytes (off + used + j) | j <- [0 .. fromIntegral innerSize - used - 1], innerSize > fromIntegral used]
+                    unless (all (== 0) paddingBytes) $
+                      fail ("quickcheck: pack-uniform-extended2: " <> label <> " inner padding not zeroed")
+                  _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected inner struct")
+            _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected inner array")
+        _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected struct")
+
+    assertScalarAt label bytes offset value =
+      unless (word32At bytes offset == castFloatToWord32 value) $
+        fail ("quickcheck: pack-uniform-extended2: " <> label <> " wrong bits")
+
+    assertVec3At label bytes offset stride (V3 x y z) = do
+      assertScalarAt (label <> ".x") bytes offset x
+      assertScalarAt (label <> ".y") bytes (offset + 4) y
+      assertScalarAt (label <> ".z") bytes (offset + 8) z
+      let paddingBytes = [BS.index bytes (offset + 12 + i) | i <- [0 .. stride - 12 - 1], stride > 12]
+      unless (all (== 0) paddingBytes) $
+        fail ("quickcheck: pack-uniform-extended2: " <> label <> " padding not zeroed")
+
+    assertHalfScalar label bytes field val =
+      case flType field of
+        TLScalar F16 _ _ -> do
+          let off = fromIntegral (flOffset field)
+          unless (word16At bytes off == val) $
+            fail ("quickcheck: pack-uniform-extended2: " <> label <> " half bits mismatch")
+        _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected f16 scalar")
+
+    assertHalfVector label bytes field vals =
+      case flType field of
+        TLVector n F16 _ size -> do
+          let off = fromIntegral (flOffset field)
+          unless (n == length vals) $
+            fail ("quickcheck: pack-uniform-extended2: " <> label <> " length mismatch")
+          forM_ (zip [0 ..] vals) $ \(ix, v) -> do
+            unless (word16At bytes (off + ix * 2) == v) $
+              fail ("quickcheck: pack-uniform-extended2: " <> label <> " half bits mismatch")
+          let padding = fromIntegral size - n * 2
+          let paddingBytes = [BS.index bytes (off + n * 2 + i) | i <- [0 .. padding - 1], padding > 0]
+          unless (all (== 0) paddingBytes) $
+            fail ("quickcheck: pack-uniform-extended2: " <> label <> " padding not zeroed")
+        _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected f16 vector")
+
 checkDuplicateBindings :: IO ()
 checkDuplicateBindings =
   case prepareWesl duplicateBindingShader of
@@ -360,7 +847,7 @@ checkDuplicateBindings =
         fail ("duplicate-bindings: unexpected error: " <> msg)
     Right _ -> fail "duplicate-bindings: expected failure"
 
-orderingShader :: PreparedShader
+orderingShader :: PreparedShader 'SamplerCombined
   '[ 'Binding "b" 'BUniform 0 1 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
    , 'Binding "a" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
    ]
@@ -777,6 +1264,41 @@ samplerShader =
     , "  return textureSample(tex, samp, uv);"
     , "}"
     ]
+
+samplerValueShader :: String
+samplerValueShader =
+  unlines
+    [ "@group(0) @binding(0)"
+    , "var tex: texture_2d<f32>;"
+    , "@group(0) @binding(1)"
+    , "var samp: sampler;"
+    , "@fragment"
+    , "fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {"
+    , "  let _ = samp;"
+    , "  let uv = vec2(frag_coord.x / 640.0, frag_coord.y / 480.0);"
+    , "  let c = textureSample(tex, samp, uv);"
+    , "  return c;"
+    , "}"
+    ]
+
+combinedInputShader :: PreparedShader 'SamplerCombined
+  '[ 'Binding "params" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
+   , 'Binding "tex" 'BTexture2D 0 1 ('TTexture2D 'SF32)
+   ]
+combinedInputShader =
+  [wesl|
+struct Params { v: vec4<f32>; };
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+@fragment
+fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = vec2(frag_coord.x / 640.0, frag_coord.y / 480.0);
+  return textureSample(tex, samp, uv);
+}
+|]
 
 bitwiseShader :: String
 bitwiseShader =
@@ -1423,6 +1945,57 @@ packUniformShader =
     , "@fragment"
     , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
     , "  let _ = payload.a + payload.b.x + payload.c[0][0] + payload.d[0].x;"
+    , "  return vec4(0.0, 0.0, 0.0, 1.0);"
+    , "}"
+    ]
+
+packUniformExtendedShader :: String
+packUniformExtendedShader =
+  unlines
+    [ "struct Inner {"
+    , "  a: vec2<f32>;"
+    , "  b: f32;"
+    , "};"
+    , "struct Params {"
+    , "  m3: mat3x3<f32>;"
+    , "  m4: mat4x4<f32>;"
+    , "  arr2: array<vec2<f32>, 4>;"
+    , "  arr3: array<vec3<f32>, 3>;"
+    , "  inner: Inner;"
+    , "};"
+    , "@group(0) @binding(0)"
+    , "var<uniform> params: Params;"
+    , "@fragment"
+    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
+    , "  let _ = params.m3[0][0] + params.m4[0][0] + params.arr2[0].x + params.arr3[0].x + params.inner.a.x + params.inner.b;"
+    , "  return vec4(0.0, 0.0, 0.0, 1.0);"
+    , "}"
+    ]
+
+packUniformExtendedShader2 :: String
+packUniformExtendedShader2 =
+  unlines
+    [ "struct Inner2 {"
+    , "  v: vec3<f32>;"
+    , "  w: f32;"
+    , "};"
+    , "struct Outer2 {"
+    , "  inners: array<Inner2, 2>;"
+    , "};"
+    , "struct Params2 {"
+    , "  m34: mat3x4<f32>;"
+    , "  m43: mat4x3<f32>;"
+    , "  mats: array<mat2x2<f32>, 2>;"
+    , "  nested: Outer2;"
+    , "  h: f16;"
+    , "  hv: vec3<f16>;"
+    , "  hv4: vec4<f16>;"
+    , "};"
+    , "@group(0) @binding(0)"
+    , "var<uniform> params2: Params2;"
+    , "@fragment"
+    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
+    , "  let _ = params2.m34[0][0] + params2.m43[0][0] + params2.mats[0][0][0] + params2.nested.inners[0].v.x + f32(params2.h) + f32(params2.hv.x) + f32(params2.hv4.x);"
     , "  return vec4(0.0, 0.0, 0.0, 1.0);"
     , "}"
     ]

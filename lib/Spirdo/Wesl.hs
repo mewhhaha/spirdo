@@ -37,6 +37,8 @@ module Spirdo.Wesl
   , preparedPlan
   , preparedVertexAttributes
   , UniformValue(..)
+  , ScalarValue(..)
+  , ToScalar(..)
   , ToUniform(..)
   , uniform
   , packUniform

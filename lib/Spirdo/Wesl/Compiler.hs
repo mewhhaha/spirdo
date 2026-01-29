@@ -57,6 +57,21 @@ data CompileResult = CompileResult
   , crDiagnostics :: ![Diagnostic]
   }
 
+data SamplerModeProxy (mode :: SamplerBindingMode) where
+  SamplerCombinedP :: SamplerModeProxy 'SamplerCombined
+  SamplerSeparateP :: SamplerModeProxy 'SamplerSeparate
+
+withSamplerMode :: SamplerBindingMode -> (forall mode. SamplerModeProxy mode -> r) -> r
+withSamplerMode mode k =
+  case mode of
+    SamplerCombined -> k SamplerCombinedP
+    SamplerSeparate -> k SamplerSeparateP
+
+compileToCompiled :: CompileOptions -> CompileResult -> SomeCompiledShader
+compileToCompiled opts result =
+  withSamplerMode (samplerBindingMode opts) $ \(_ :: SamplerModeProxy mode) ->
+    SomeCompiledShader (CompiledShader @mode (crSpirv result) (crInterface result))
+
 -- Public API
 
 compileWeslToSpirv :: String -> Either CompileError SomeCompiledShader
@@ -65,8 +80,7 @@ compileWeslToSpirv = compileWeslToSpirvWith defaultCompileOptions
 compileWeslToSpirvWith :: CompileOptions -> String -> Either CompileError SomeCompiledShader
 compileWeslToSpirvWith opts src = do
   result <- compileInlineResult opts False src
-  let shader = CompiledShader (crSpirv result) (crInterface result)
-  pure (SomeCompiledShader shader)
+  pure (compileToCompiled opts result)
 
 prepareWesl :: String -> Either CompileError SomePreparedShader
 prepareWesl = prepareWeslWith defaultCompileOptions
@@ -74,29 +88,28 @@ prepareWesl = prepareWeslWith defaultCompileOptions
 prepareWeslWith :: CompileOptions -> String -> Either CompileError SomePreparedShader
 prepareWeslWith opts src = do
   result <- compileInlineResult opts False src
-  let shader = CompiledShader (crSpirv result) (crInterface result)
-  prep <- toCompileError (prepareShader shader)
-  pure (SomePreparedShader prep)
+  case compileToCompiled opts result of
+    SomeCompiledShader shader -> do
+      prep <- toCompileError (prepareShader shader)
+      pure (SomePreparedShader prep)
 
 compileWeslToSpirvWithDiagnostics :: CompileOptions -> String -> Either CompileError (SomeCompiledShader, [Diagnostic])
 compileWeslToSpirvWithDiagnostics opts src = do
   result <- compileInlineResult opts True src
-  let shader = CompiledShader (crSpirv result) (crInterface result)
-  pure (SomeCompiledShader shader, crDiagnostics result)
+  pure (compileToCompiled opts result, crDiagnostics result)
 
 prepareWeslWithDiagnostics :: CompileOptions -> String -> Either CompileError (SomePreparedShader, [Diagnostic])
 prepareWeslWithDiagnostics opts src = do
   result <- compileInlineResult opts True src
-  let shader = CompiledShader (crSpirv result) (crInterface result)
-  prep <- toCompileError (prepareShader shader)
-  pure (SomePreparedShader prep, crDiagnostics result)
+  case compileToCompiled opts result of
+    SomeCompiledShader shader -> do
+      prep <- toCompileError (prepareShader shader)
+      pure (SomePreparedShader prep, crDiagnostics result)
 
 compileWeslToSpirvWithTimings :: CompileOptions -> String -> IO (Either CompileError SomeCompiledShader)
 compileWeslToSpirvWithTimings opts src = do
   result <- compileInlineResultIO (opts { timingVerbose = True }) False src
-  pure (fmap toSome result)
-  where
-    toSome cr = SomeCompiledShader (CompiledShader (crSpirv cr) (crInterface cr))
+  pure (fmap (compileToCompiled opts) result)
 
 compileWeslToSpirvFile :: FilePath -> IO (Either CompileError SomeCompiledShader)
 compileWeslToSpirvFile = compileWeslToSpirvFileWith defaultCompileOptions
@@ -106,16 +119,14 @@ compileWeslToSpirvFileWith opts path = do
   result <- compileFileResult opts False path
   pure $ do
     cr <- result
-    let shader = CompiledShader (crSpirv cr) (crInterface cr)
-    pure (SomeCompiledShader shader)
+    pure (compileToCompiled opts cr)
 
 compileWeslToSpirvFileWithDiagnostics :: CompileOptions -> FilePath -> IO (Either CompileError (SomeCompiledShader, [Diagnostic]))
 compileWeslToSpirvFileWithDiagnostics opts path = do
   result <- compileFileResult opts True path
   pure $ do
     cr <- result
-    let shader = CompiledShader (crSpirv cr) (crInterface cr)
-    pure (SomeCompiledShader shader, crDiagnostics cr)
+    pure (compileToCompiled opts cr, crDiagnostics cr)
 
 prepareWeslFile :: FilePath -> IO (Either CompileError SomePreparedShader)
 prepareWeslFile = prepareWeslFileWith defaultCompileOptions
@@ -125,18 +136,20 @@ prepareWeslFileWith opts path = do
   result <- compileFileResult opts False path
   pure $ do
     cr <- result
-    let shader = CompiledShader (crSpirv cr) (crInterface cr)
-    prep <- toCompileError (prepareShader shader)
-    pure (SomePreparedShader prep)
+    case compileToCompiled opts cr of
+      SomeCompiledShader shader -> do
+        prep <- toCompileError (prepareShader shader)
+        pure (SomePreparedShader prep)
 
 prepareWeslFileWithDiagnostics :: CompileOptions -> FilePath -> IO (Either CompileError (SomePreparedShader, [Diagnostic]))
 prepareWeslFileWithDiagnostics opts path = do
   result <- compileFileResult opts True path
   pure $ do
     cr <- result
-    let shader = CompiledShader (crSpirv cr) (crInterface cr)
-    prep <- toCompileError (prepareShader shader)
-    pure (SomePreparedShader prep, crDiagnostics cr)
+    case compileToCompiled opts cr of
+      SomeCompiledShader shader -> do
+        prep <- toCompileError (prepareShader shader)
+        pure (SomePreparedShader prep, crDiagnostics cr)
 
 compileWeslToSpirvBytes :: String -> Either CompileError ByteString
 compileWeslToSpirvBytes src = compileWeslToSpirvBytesWith defaultCompileOptions src
@@ -347,23 +360,34 @@ weslExpWith opts src = do
   let opts' = applyInlinePragmas opts src
   cached <- TH.runIO (timed opts' "cache-read" (loadWeslCache opts' src))
   case cached of
-    Just (bytes, iface) -> emitPreparedExp bytes iface
+    Just (bytes, iface) -> emitPreparedExp opts' bytes iface
     Nothing ->
       case compileWeslToSpirvWith opts' src of
         Left err -> fail (renderError err)
         Right (SomeCompiledShader (CompiledShader bytes iface)) -> do
           TH.runIO (timed opts' "cache-write" (writeWeslCache opts' src bytes iface))
-          emitPreparedExp bytes iface
+          emitPreparedExp opts' bytes iface
   where
-    emitPreparedExp bytes iface = do
+    emitPreparedExp opts'' bytes iface = do
       bytesExp <- bytesToExp bytes
       ifaceExp <- interfaceToExp iface
       ifaceTy <- case interfaceToType iface of
         Left err -> fail ("wesl: " <> err)
         Right ty -> pure ty
-      let compiledExp = TH.AppE (TH.AppE (TH.ConE 'CompiledShader) bytesExp) ifaceExp
+      let modeTy =
+            case samplerBindingMode opts'' of
+              SamplerCombined -> TH.PromotedT 'SamplerCombined
+              SamplerSeparate -> TH.PromotedT 'SamplerSeparate
+      let compiledTy =
+            TH.AppT
+              (TH.AppT (TH.ConT ''CompiledShader) modeTy)
+              ifaceTy
+      let compiledExp =
+            TH.SigE
+              (TH.AppE (TH.AppE (TH.ConE 'CompiledShader) bytesExp) ifaceExp)
+              compiledTy
       let prepExp = TH.AppE (TH.VarE 'unsafePrepareInline) compiledExp
-      pure (TH.SigE prepExp (TH.AppT (TH.ConT ''PreparedShader) ifaceTy))
+      pure (TH.SigE prepExp (TH.AppT (TH.AppT (TH.ConT ''PreparedShader) modeTy) ifaceTy))
 
 timed :: CompileOptions -> String -> IO a -> IO a
 timed opts label action =
@@ -396,7 +420,7 @@ toCompileError :: Either String a -> Either CompileError a
 toCompileError =
   either (\msg -> Left (CompileError msg Nothing Nothing)) Right
 
-unsafePrepareInline :: CompiledShader iface -> PreparedShader iface
+unsafePrepareInline :: CompiledShader mode iface -> PreparedShader mode iface
 unsafePrepareInline shader =
   case prepareShader shader of
     Left err -> error ("prepareShader: " <> err)

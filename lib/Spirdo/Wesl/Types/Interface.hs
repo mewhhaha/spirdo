@@ -362,25 +362,25 @@ isStorageTextureKind kind =
 pushConstantLayout :: ShaderInterface -> Maybe TypeLayout
 pushConstantLayout = siPushConstants
 
--- | Compiled shader with a type-level interface description.
-data CompiledShader (iface :: [Binding]) = CompiledShader
+-- | Compiled shader with a type-level interface description and sampler binding mode.
+data CompiledShader (mode :: SamplerBindingMode) (iface :: [Binding]) = CompiledShader
   { shaderSpirv :: ByteString
   , shaderInterface :: ShaderInterface
   }
 
 -- | Existential wrapper for runtime compilation.
-data SomeCompiledShader = forall iface. SomeCompiledShader (CompiledShader iface)
+data SomeCompiledShader = forall mode iface. SomeCompiledShader (CompiledShader mode iface)
 
-data PreparedShader iface = PreparedShader
-  { psShader :: CompiledShader iface
+data PreparedShader (mode :: SamplerBindingMode) iface = PreparedShader
+  { psShader :: CompiledShader mode iface
   , psStage :: ShaderStage
   , psPlan :: BindingPlan
   , psVertexAttributes :: Maybe [VertexAttribute]
   }
 
-data SomePreparedShader = forall iface. SomePreparedShader (PreparedShader iface)
+data SomePreparedShader = forall mode iface. SomePreparedShader (PreparedShader mode iface)
 
-prepareShader :: CompiledShader iface -> Either String (PreparedShader iface)
+prepareShader :: CompiledShader mode iface -> Either String (PreparedShader mode iface)
 prepareShader shader =
   case shaderStage (shaderInterface shader) of
     Nothing -> Left "shader has no entry point"
@@ -396,19 +396,19 @@ prepareShader shader =
         , psVertexAttributes = vattrs
         }
 
-preparedSpirv :: PreparedShader iface -> ByteString
+preparedSpirv :: PreparedShader mode iface -> ByteString
 preparedSpirv = shaderSpirv . psShader
 
-preparedInterface :: PreparedShader iface -> ShaderInterface
+preparedInterface :: PreparedShader mode iface -> ShaderInterface
 preparedInterface = shaderInterface . psShader
 
-preparedStage :: PreparedShader iface -> ShaderStage
+preparedStage :: PreparedShader mode iface -> ShaderStage
 preparedStage = psStage
 
-preparedPlan :: PreparedShader iface -> BindingPlan
+preparedPlan :: PreparedShader mode iface -> BindingPlan
 preparedPlan = psPlan
 
-preparedVertexAttributes :: PreparedShader iface -> Maybe [VertexAttribute]
+preparedVertexAttributes :: PreparedShader mode iface -> Maybe [VertexAttribute]
 preparedVertexAttributes = psVertexAttributes
 
 somePreparedSpirv :: SomePreparedShader -> ByteString

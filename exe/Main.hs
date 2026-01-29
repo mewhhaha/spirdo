@@ -96,10 +96,10 @@ quadVertices = fmap Vertex
   ]
 
 data Variant where
-  Variant :: RequireUniform "params" iface => String -> BlendMode -> Pipeline -> PreparedShader iface -> (ParamsU -> InputsBuilder iface) -> Variant
+  Variant :: RequireUniform "params" iface => String -> BlendMode -> Pipeline -> PreparedShader mode iface -> (ParamsU -> InputsBuilder mode iface) -> Variant
 
 data FragmentVariant where
-  FragmentVariant :: RequireUniform "params" iface => String -> BlendMode -> PreparedShader iface -> (ParamsU -> InputsBuilder iface) -> FragmentVariant
+  FragmentVariant :: RequireUniform "params" iface => String -> BlendMode -> PreparedShader mode iface -> (ParamsU -> InputsBuilder mode iface) -> FragmentVariant
 
 data History = History
   { historyTarget :: RenderTarget
@@ -217,7 +217,7 @@ main = do
                   pure (Continue (DemoState idx' historyOpt))
     pure ()
 
-mkVariant :: RequireUniform "params" iface => String -> BlendMode -> PreparedShader iface -> (ParamsU -> InputsBuilder iface) -> VertexShader -> WindowM Variant
+mkVariant :: RequireUniform "params" iface => String -> BlendMode -> PreparedShader mode iface -> (ParamsU -> InputsBuilder mode iface) -> VertexShader -> WindowM Variant
 mkVariant name blend prep mkInputs vshader = do
   fshader <- createFragmentShader (preparedSpirv prep) (countsFromPrepared prep)
   pipeline <- graphicsPipeline
@@ -264,7 +264,7 @@ historyUpdated history valid =
     Nothing -> error "missing history render target"
 
 
-countsFromPrepared :: PreparedShader iface -> ShaderCounts
+countsFromPrepared :: PreparedShader mode iface -> ShaderCounts
 countsFromPrepared prepared =
   let bindingPlan = preparedPlan prepared
       iface = preparedInterface prepared
