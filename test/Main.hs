@@ -11,7 +11,7 @@ import Control.Monad (forM_, unless, when, replicateM)
 import Data.Bits ((.|.), shiftL)
 import qualified Data.ByteString as BS
 import Data.List (find, isInfixOf, isPrefixOf)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Proxy (Proxy(..))
 import Data.Word (Word16, Word32, Word64)
 import GHC.Float (castFloatToWord32)
@@ -43,13 +43,13 @@ data PayloadU = PayloadU
 
 instance ToUniform PayloadU
 
-data ParamsU = ParamsU
+newtype ParamsU = ParamsU
   { v :: V4 Float
   } deriving (Generic)
 
 instance ToUniform ParamsU
 
-data PayloadMissingU = PayloadMissingU
+newtype PayloadMissingU = PayloadMissingU
   { a :: Float
   } deriving (Generic)
 
@@ -89,7 +89,7 @@ data Inner2U = Inner2U
 
 instance ToUniform Inner2U
 
-data Outer2U = Outer2U
+newtype Outer2U = Outer2U
   { inners :: [Inner2U]
   } deriving (Generic)
 
@@ -112,7 +112,7 @@ defaultOpts :: CompileOptions
 defaultOpts = defaultCompileOptions
 
 separateOpts :: CompileOptions
-separateOpts = defaultCompileOptions { samplerBindingMode = SamplerSeparate }
+separateOpts = withSamplerMode SamplerSeparate defaultCompileOptions
 
 prepareBytes :: CompileOptions -> String -> Either CompileError BS.ByteString
 prepareBytes opts src = do
@@ -129,6 +129,7 @@ main = do
   spirvVal <- findExecutable "spirv-val"
   let tests =
         [ ("compute-atomics", computeShader)
+        , ("typed-ctors", typedCtorShader)
         , ("fragment-derivatives", fragmentShader)
         , ("vertex-struct-io", vertexShader)
         , ("storage-texture", storageTextureShader)
@@ -703,7 +704,7 @@ checkPackUniformExtendedRandom =
           assertVec2At (label <> ".a") bytes offA innerA
           assertScalarAt (label <> ".b") bytes offB innerB
           let used = fromIntegral fieldB.flOffset + 4
-          let padBytes = [BS.index bytes (base + used + i) | i <- [0 .. fromIntegral size - used - 1], size > fromIntegral used]
+          let padBytes = [BS.index bytes (base + used + i) | size > fromIntegral used, i <- [0 .. fromIntegral size - used - 1]]
           unless (all (== 0) padBytes) $
             fail ("quickcheck: pack-uniform-extended: " <> label <> " padding not zeroed")
         _ -> fail ("quickcheck: pack-uniform-extended: expected struct for " <> label)
@@ -720,7 +721,7 @@ checkPackUniformExtendedRandom =
       assertScalarAt (label <> ".x") bytes offset x
       assertScalarAt (label <> ".y") bytes (offset + 4) y
       assertScalarAt (label <> ".z") bytes (offset + 8) z
-      let paddingBytes = [BS.index bytes (offset + 12 + i) | i <- [0 .. fromIntegral stride - 12 - 1], stride > 12]
+      let paddingBytes = [BS.index bytes (offset + 12 + i) | stride > 12, i <- [0 .. fromIntegral stride - 12 - 1]]
       unless (all (== 0) paddingBytes) $
         fail ("quickcheck: pack-uniform-extended: " <> label <> " padding not zeroed")
 
@@ -866,7 +867,7 @@ checkPackUniformExtended2 =
                     assertScalarAt (label <> ".inners[" <> show ix <> "].w") bytes offW w0
                     let used = maximum (map (\fld -> fromIntegral (fld.flOffset + fld.flSize)) innerFields)
                     let paddingBytes =
-                          [BS.index bytes (off + used + j) | j <- [0 .. fromIntegral innerSize - used - 1], innerSize > fromIntegral used]
+                          [BS.index bytes (off + used + j) | innerSize > fromIntegral used, j <- [0 .. fromIntegral innerSize - used - 1]]
                     unless (all (== 0) paddingBytes) $
                       fail ("quickcheck: pack-uniform-extended2: " <> label <> " inner padding not zeroed")
                   _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected inner struct")
@@ -881,7 +882,7 @@ checkPackUniformExtended2 =
       assertScalarAt (label <> ".x") bytes offset x
       assertScalarAt (label <> ".y") bytes (offset + 4) y
       assertScalarAt (label <> ".z") bytes (offset + 8) z
-      let paddingBytes = [BS.index bytes (offset + 12 + i) | i <- [0 .. stride - 12 - 1], stride > 12]
+      let paddingBytes = [BS.index bytes (offset + 12 + i) | stride > 12, i <- [0 .. stride - 12 - 1]]
       unless (all (== 0) paddingBytes) $
         fail ("quickcheck: pack-uniform-extended2: " <> label <> " padding not zeroed")
 
@@ -903,7 +904,7 @@ checkPackUniformExtended2 =
             unless (word16At bytes (off + ix * 2) == v) $
               fail ("quickcheck: pack-uniform-extended2: " <> label <> " half bits mismatch")
           let padding = fromIntegral size - n * 2
-          let paddingBytes = [BS.index bytes (off + n * 2 + i) | i <- [0 .. padding - 1], padding > 0]
+          let paddingBytes = [BS.index bytes (off + n * 2 + i) | padding > 0, i <- [0 .. padding - 1]]
           unless (all (== 0) paddingBytes) $
             fail ("quickcheck: pack-uniform-extended2: " <> label <> " padding not zeroed")
         _ -> fail ("quickcheck: pack-uniform-extended2: " <> label <> " expected f16 vector")
@@ -974,7 +975,7 @@ checkGoldenSpirv = do
 
 checkIfTranslation :: IO ()
 checkIfTranslation = do
-  let opts = defaultCompileOptions { enabledFeatures = ["FOO"] }
+  let opts = withFeatures ["FOO"] defaultCompileOptions
   case prepareBytes opts ifShader of
     Left err -> fail ("if-translation: " <> show err)
     Right _ -> pure ()
@@ -1046,7 +1047,7 @@ checkConstAssertValidation =
 
 checkOverrideSpecialization :: Maybe FilePath -> IO ()
 checkOverrideSpecialization spirvVal = do
-  let opts = defaultCompileOptions { overrideValues = [("scale", OVI32 4)] }
+  let opts = withOverrides [("scale", OVI32 4)] defaultCompileOptions
   case prepareBytes opts overrideSpecShader of
     Left err -> fail ("override-specialization: " <> show err)
     Right bytes -> assertSpirv spirvVal "override-specialization" bytes
@@ -1058,24 +1059,24 @@ checkOverrideDefault spirvVal =
     Right (SomePreparedShader prep) -> do
       assertSpirv spirvVal "override-default" (preparedSpirv prep)
       let overrides = (preparedInterface prep).siOverrides
-      case find (\o -> oiName o == "scale") overrides of
+      case find (\o -> o.oiName == "scale") overrides of
         Nothing -> fail "override-default: missing scale override"
         Just info -> do
-          case oiType info of
+          case info.oiType of
             TLScalar scalar _ _ ->
               unless (show scalar == "I32") $
                 fail "override-default: scale should be i32"
             _ -> fail "override-default: scale should be scalar"
-          unless (oiSpecId info /= Nothing) $
+          unless (isJust info.oiSpecId) $
             fail "override-default: scale should be runtime-specializable"
-      case find (\o -> oiName o == "mode") overrides of
+      case find (\o -> o.oiName == "mode") overrides of
         Nothing -> fail "override-default: missing mode override"
         Just info -> do
-          unless (oiId info == Just 7) $
+          unless (info.oiId == Just 7) $
             fail "override-default: expected @id(7) for mode"
-          unless (oiSpecId info == Just 7) $
+          unless (info.oiSpecId == Just 7) $
             fail "override-default: expected spec id 7 for mode"
-          case oiType info of
+          case info.oiType of
             TLScalar scalar _ _ ->
               unless (show scalar == "U32") $
                 fail "override-default: mode should be u32"
@@ -1087,7 +1088,7 @@ checkOverrideMissing =
     Left err -> fail ("override-missing: " <> show err)
     Right (SomePreparedShader prep) -> do
       let overrides = (preparedInterface prep).siOverrides
-      unless (any (\o -> oiName o == "scale") overrides) $
+      unless (any (\o -> o.oiName == "scale") overrides) $
         fail "override-missing: expected scale override in interface"
 
 checkOverrideDependency :: Maybe FilePath -> IO ()
@@ -1097,23 +1098,23 @@ checkOverrideDependency spirvVal =
     Right (SomePreparedShader prep) -> do
       assertSpirv spirvVal "override-dependency" (preparedSpirv prep)
       let overrides = (preparedInterface prep).siOverrides
-      case find (\o -> oiName o == "scale") overrides of
+      case find (\o -> o.oiName == "scale") overrides of
         Nothing -> fail "override-dependency: missing scale override"
         Just info ->
-          unless (oiSpecId info == Nothing) $
+          unless (isNothing info.oiSpecId) $
             fail "override-dependency: derived override should not be runtime-specializable"
 
 checkOverrideParityMode :: IO ()
 checkOverrideParityMode = do
-  let opts = defaultCompileOptions { overrideSpecMode = SpecParity }
+  let opts = withOverrideSpecMode SpecParity defaultCompileOptions
   case prepareWeslWith opts overrideSpecOpShader of
     Left err -> fail ("override-parity: " <> show err)
     Right (SomePreparedShader prep) -> do
       let overrides = (preparedInterface prep).siOverrides
-      case find (\o -> oiName o == "scale") overrides of
+      case find (\o -> o.oiName == "scale") overrides of
         Nothing -> fail "override-parity: missing scale override"
         Just info ->
-          unless (oiSpecId info /= Nothing) $
+          unless (isJust info.oiSpecId) $
             fail "override-parity: expected derived override to be runtime-specializable"
 
 checkDiagnosticOverride :: IO ()
@@ -1129,10 +1130,10 @@ checkDiagnosticWarning =
   case prepareBytesWithDiagnostics defaultOpts diagnosticWarnShader of
     Left err -> fail ("diagnostic-warning: " <> show err)
     Right (_, diags) ->
-      case find (\d -> diagRule d == "const_assert" && diagSeverity d == DiagWarning) diags of
+      case find (\d -> d.diagRule == "const_assert" && d.diagSeverity == DiagWarning) diags of
         Nothing -> fail "diagnostic-warning: expected warning diagnostic"
         Just d ->
-          unless (diagLine d /= Nothing && diagColumn d /= Nothing) $
+          unless (isJust d.diagLine && isJust d.diagColumn) $
             fail "diagnostic-warning: expected source location on diagnostic"
 
 checkDiagnosticUnreachable :: IO ()
@@ -1140,7 +1141,7 @@ checkDiagnosticUnreachable =
   case prepareBytesWithDiagnostics defaultOpts diagnosticUnreachableShader of
     Left err -> fail ("diagnostic-unreachable: " <> show err)
     Right (_, diags) ->
-      unless (any (\d -> diagRule d == "unreachable_code" && diagSeverity d == DiagWarning) diags) $
+      unless (any (\d -> d.diagRule == "unreachable_code" && d.diagSeverity == DiagWarning) diags) $
         fail "diagnostic-unreachable: expected unreachable_code warning"
 
 checkDiagnosticUnusedExpr :: IO ()
@@ -1148,7 +1149,7 @@ checkDiagnosticUnusedExpr =
   case prepareBytesWithDiagnostics defaultOpts diagnosticUnusedExprShader of
     Left err -> fail ("diagnostic-unused-expr: " <> show err)
     Right (_, diags) ->
-      unless (any (\d -> diagRule d == "unused_expression" && diagSeverity d == DiagWarning) diags) $
+      unless (any (\d -> d.diagRule == "unused_expression" && d.diagSeverity == DiagWarning) diags) $
         fail "diagnostic-unused-expr: expected unused_expression warning"
 
 checkDiagnosticUnusedVar :: IO ()
@@ -1156,7 +1157,7 @@ checkDiagnosticUnusedVar =
   case prepareBytesWithDiagnostics defaultOpts diagnosticUnusedVarShader of
     Left err -> fail ("diagnostic-unused-var: " <> show err)
     Right (_, diags) ->
-      unless (any (\d -> diagRule d == "unused_variable" && diagSeverity d == DiagWarning) diags) $
+      unless (any (\d -> d.diagRule == "unused_variable" && d.diagSeverity == DiagWarning) diags) $
         fail "diagnostic-unused-var: expected unused_variable warning"
 
 checkDiagnosticUnusedParam :: IO ()
@@ -1164,7 +1165,7 @@ checkDiagnosticUnusedParam =
   case prepareBytesWithDiagnostics defaultOpts diagnosticUnusedParamShader of
     Left err -> fail ("diagnostic-unused-param: " <> show err)
     Right (_, diags) ->
-      unless (any (\d -> diagRule d == "unused_parameter" && diagSeverity d == DiagWarning) diags) $
+      unless (any (\d -> d.diagRule == "unused_parameter" && d.diagSeverity == DiagWarning) diags) $
         fail "diagnostic-unused-param: expected unused_parameter warning"
 
 checkDiagnosticShadowing :: IO ()
@@ -1172,7 +1173,7 @@ checkDiagnosticShadowing =
   case prepareBytesWithDiagnostics defaultOpts diagnosticShadowingShader of
     Left err -> fail ("diagnostic-shadowing: " <> show err)
     Right (_, diags) ->
-      unless (any (\d -> diagRule d == "shadowing" && diagSeverity d == DiagWarning) diags) $
+      unless (any (\d -> d.diagRule == "shadowing" && d.diagSeverity == DiagWarning) diags) $
         fail "diagnostic-shadowing: expected shadowing warning"
 
 checkDiagnosticConstantCondition :: IO ()
@@ -1180,7 +1181,7 @@ checkDiagnosticConstantCondition =
   case prepareBytesWithDiagnostics defaultOpts diagnosticConstantCondShader of
     Left err -> fail ("diagnostic-constant-condition: " <> show err)
     Right (_, diags) ->
-      unless (any (\d -> diagRule d == "constant_condition" && diagSeverity d == DiagWarning) diags) $
+      unless (any (\d -> d.diagRule == "constant_condition" && d.diagSeverity == DiagWarning) diags) $
         fail "diagnostic-constant-condition: expected constant_condition warning"
 
 checkDiagnosticDuplicateCase :: IO ()
@@ -1188,7 +1189,7 @@ checkDiagnosticDuplicateCase =
   case prepareBytesWithDiagnostics defaultOpts diagnosticDuplicateCaseShader of
     Left err -> fail ("diagnostic-duplicate-case: " <> show err)
     Right (_, diags) ->
-      unless (any (\d -> diagRule d == "duplicate_case" && diagSeverity d == DiagWarning) diags) $
+      unless (any (\d -> d.diagRule == "duplicate_case" && d.diagSeverity == DiagWarning) diags) $
         fail "diagnostic-duplicate-case: expected duplicate_case warning"
 
 computeShader :: String
@@ -1261,6 +1262,26 @@ computeShader =
     , "    let _m5 = atomicExchange(data.accum, 4);"
     , "    data.values[idx] = data.values[idx] + u32(sum);"
     , "  }"
+    , "}"
+    ]
+
+typedCtorShader :: String
+typedCtorShader =
+  unlines
+    [ "@fragment"
+    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
+    , "  let a = vec4<f32>(1.0);"
+    , "  let b = vec2<f32>(0.5);"
+    , "  let c = vec3<f32>(a.x, b.x, b.y);"
+    , "  let d = vec3<f32>(b, 1.0);"
+    , "  let sf: vec2f = vec2f(1.0);"
+    , "  let si = vec2i(1i, 2i);"
+    , "  let su = vec3u(1u, 2u, 3u);"
+    , "  let sh = vec2h(1.0h);"
+    , "  let m = mat2x2<f32>(1.0, 0.0, 0.0, 1.0);"
+    , "  let m2 = mat2x2<f32>(1.0);"
+    , "  let _ = m[0][0] + m2[1][1] + sf.x + f32(si.x) + f32(su.x) + f32(sh.x);"
+    , "  return vec4(d.x, d.y, d.z, a.w);"
     , "}"
     ]
 

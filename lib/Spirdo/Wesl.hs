@@ -1,18 +1,3 @@
-{-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DefaultSignatures #-}
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE QuasiQuotes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE UndecidableInstances #-}
-
 -- | Public API for compiling WESL to SPIR-V and reflecting shader interfaces.
 module Spirdo.Wesl
   ( -- * Compile-time interface types
@@ -68,22 +53,27 @@ module Spirdo.Wesl
   , FieldLayout(..)
   , specializableOverrides
   , CompileError(..)
-  , CompileOptions(..)
+  , CompileOptions
   , SamplerBindingMode(..)
   , OverrideSpecMode(..)
   , OverrideValue(..)
   , Diagnostic(..)
   , DiagnosticSeverity(..)
   , defaultCompileOptions
+  , withSpirvVersion
+  , withFeatures
+  , withOverrides
+  , withOverrideSpecMode
+  , withSamplerMode
+  , withCache
+  , withCacheVerbose
+  , withTimingVerbose
   , prepareWesl
   , prepareWeslWith
   , prepareWeslFile
   , prepareWeslFileWith
   , prepareWeslWithDiagnostics
   , prepareWeslFileWithDiagnostics
-  , PackageInfo(..)
-  , PackageDependency(..)
-  , discoverPackageInfo
   , wesl
   , weslWith
   , weslBatch

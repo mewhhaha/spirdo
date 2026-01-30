@@ -17,7 +17,7 @@ compileOnce src =
 
 compileOnceTimed :: String -> IO Int
 compileOnceTimed src = do
-  result <- prepareWeslWith (defaultCompileOptions { timingVerbose = True }) src
+  result <- prepareWeslWith (withTimingVerbose True defaultCompileOptions) src
   case result of
     Left err -> do
       putStrLn ("compile failed: " <> show err)

@@ -19,6 +19,9 @@ module Spirdo.Wesl.Util
   , toBindingKind
   , bindingKindFromType
   , parseMatrixName
+  , parseMatrixCtorName
+  , parseVectorCtorName
+  , parseTypedScalarSuffix
   , vecSize
   , selectIntLiteralScalar
   , exprToLValue
@@ -48,32 +51,31 @@ module Spirdo.Wesl.Util
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.Char (isDigit)
 import Data.Int (Int32)
+import Data.Maybe (listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word16, Word32)
 import GHC.Float (castFloatToWord32)
-import Spirdo.Wesl.Syntax (Expr(..), LValue(..), SrcPos(..), Stage(..), Token(..), UnaryOp(..))
+import Spirdo.Wesl.Syntax (Expr(..), LValue(..), SrcPos(..), Stage(..), Token(..), UnaryOp(..), WorkgroupSize(..))
 import Spirdo.Wesl.Types
 
 errorAt :: [Token] -> String -> CompileError
 errorAt toks msg =
-  case toks of
-    (Token _ (SrcPos l c) : _) -> CompileError msg (Just l) (Just c)
-    [] -> CompileError msg Nothing Nothing
+  case listToMaybe toks of
+    Just (Token _ (SrcPos l c)) -> CompileError msg (Just l) (Just c)
+    Nothing -> CompileError msg Nothing Nothing
 
 errorAtPos :: SrcPos -> String -> CompileError
 errorAtPos (SrcPos l c) msg = CompileError msg (Just l) (Just c)
 
 withPos :: SrcPos -> Either CompileError a -> Either CompileError a
-withPos pos result =
-  case result of
-    Left err ->
-      let err' =
-            case (err.ceLine, err.ceColumn) of
-              (Nothing, Nothing) -> err { ceLine = Just pos.spLine, ceColumn = Just pos.spCol }
-              _ -> err
-      in Left err'
-    Right val -> Right val
+withPos pos =
+  either (Left . annotate) Right
+  where
+    annotate err =
+      case (err.ceLine, err.ceColumn) of
+        (Nothing, Nothing) -> err { ceLine = Just pos.spLine, ceColumn = Just pos.spCol }
+        _ -> err
 
 renderError :: CompileError -> String
 renderError err =
@@ -87,9 +89,7 @@ textToString = T.unpack
 
 attrInt :: Text -> [Attr] -> Maybe Integer
 attrInt name attrs =
-  case [v | Attr n args <- attrs, n == name, AttrInt v <- args] of
-    (x:_) -> Just x
-    _ -> Nothing
+  listToMaybe [v | Attr n args <- attrs, n == name, AttrInt v <- args]
 
 attrIntMaybe :: Text -> [Attr] -> Maybe Word32
 attrIntMaybe name attrs = fmap fromIntegral (attrInt name attrs)
@@ -99,15 +99,16 @@ attrLocation = attrIntMaybe "location"
 
 attrBuiltin :: [Attr] -> Maybe Text
 attrBuiltin attrs =
-  case [name | Attr n args <- attrs, n == "builtin", AttrIdent name <- args] of
-    (x:_) -> Just x
-    _ -> Nothing
+  listToMaybe [name | Attr n args <- attrs, n == "builtin", AttrIdent name <- args]
+
+attrArgs :: Text -> [Attr] -> Maybe [AttrArg]
+attrArgs name attrs =
+  listToMaybe [args | Attr n args <- attrs, n == name]
 
 attrInts :: Text -> [Attr] -> Maybe [Integer]
 attrInts name attrs =
-  case [nums | Attr n args <- attrs, n == name, let nums = [v | AttrInt v <- args], not (null nums)] of
-    (x:_) -> Just x
-    _ -> Nothing
+  listToMaybe
+    [nums | Attr n args <- attrs, n == name, let nums = [v | AttrInt v <- args], not (null nums)]
 
 paramLocation :: [Attr] -> Maybe Word32
 paramLocation = attrLocation
@@ -117,34 +118,35 @@ paramBuiltin = attrBuiltin
 
 bindingNumbers :: [Attr] -> Either CompileError (Word32, Word32)
 bindingNumbers attrs =
-  let grp = attrInt "group" attrs
-      bind = attrInt "binding" attrs
-  in case (grp, bind) of
-       (Just g, Just b) -> Right (fromIntegral g, fromIntegral b)
-       _ -> Left (CompileError "@group and @binding are required for bindings" Nothing Nothing)
+  maybe
+    (Left (CompileError "@group and @binding are required for bindings" Nothing Nothing))
+    Right
+    ( do
+        grp <- attrInt "group" attrs
+        bind <- attrInt "binding" attrs
+        pure (fromIntegral grp, fromIntegral bind)
+    )
 
-entryAttributesMaybe :: [Attr] -> Maybe (Stage, Maybe (Word32, Word32, Word32))
+entryAttributesMaybe :: [Attr] -> Maybe (Stage, Maybe WorkgroupSize)
 entryAttributesMaybe attrs =
   let isCompute = any (hasAttr "compute") attrs
       isFragment = any (hasAttr "fragment") attrs
       isVertex = any (hasAttr "vertex") attrs
-      wg = attrInts "workgroup_size" attrs
+      wgArgs = attrArgs "workgroup_size" attrs
   in case (isCompute, isFragment, isVertex) of
        (True, True, _) -> Nothing
        (True, _, True) -> Nothing
        (_, True, True) -> Nothing
        (True, False, False) ->
-         case wg of
-           Just [x] -> Just (StageCompute, Just (fromIntegral x, 1, 1))
-           Just [x, y] -> Just (StageCompute, Just (fromIntegral x, fromIntegral y, 1))
-           Just [x, y, z] -> Just (StageCompute, Just (fromIntegral x, fromIntegral y, fromIntegral z))
-           _ -> Nothing
+         case wgArgs of
+           Just args -> Just (StageCompute, Just (WorkgroupSizeExpr (map attrArgToConstExpr args)))
+           Nothing -> Nothing
        (False, True, False) ->
-         case wg of
+         case wgArgs of
            Nothing -> Just (StageFragment, Nothing)
            Just _ -> Nothing
        (False, False, True) ->
-         case wg of
+         case wgArgs of
            Nothing -> Just (StageVertex, Nothing)
            Just _ -> Nothing
        (False, False, False) -> Nothing
@@ -153,6 +155,13 @@ entryAttributesMaybe attrs =
       case attr of
         Attr name _ -> name == target
         AttrIf _ -> False
+
+attrArgToConstExpr :: AttrArg -> ConstExpr
+attrArgToConstExpr arg =
+  case arg of
+    AttrInt v -> CEInt v
+    AttrIdent name -> CEIdent name
+    AttrExpr expr -> expr
 
 toBindingKind :: Text -> Maybe Text -> Type -> Either CompileError BindingKind
 toBindingKind addrSpace access ty =
@@ -220,6 +229,66 @@ vecSize name = case T.unpack name of
   "vec4" -> 4
   _ -> 4
 
+parseScalarName :: Text -> Maybe Scalar
+parseScalarName name =
+  case name of
+    "f16" -> Just F16
+    "f32" -> Just F32
+    "i32" -> Just I32
+    "u32" -> Just U32
+    "bool" -> Just Bool
+    _ -> Nothing
+
+parseVectorCtorName :: Text -> Maybe (Int, Maybe Scalar)
+parseVectorCtorName name =
+  case parseTypedScalarSuffix name of
+    Just (base, scalar) ->
+      case vecSizeMaybe base of
+        Just n -> Just (n, Just scalar)
+        Nothing -> Nothing
+    Nothing ->
+      case vecSizeMaybe name of
+        Just n -> Just (n, Nothing)
+        Nothing -> Nothing
+  where
+    vecSizeMaybe base =
+      case base of
+        "vec2" -> Just 2
+        "vec3" -> Just 3
+        "vec4" -> Just 4
+        _ -> Nothing
+
+parseMatrixCtorName :: Text -> Maybe (Int, Int, Maybe Scalar)
+parseMatrixCtorName name =
+  case parseTypedScalarSuffix name of
+    Just (base, scalar) -> (\(c, r) -> (c, r, Just scalar)) <$> parseMatrixName base
+    Nothing -> (\(c, r) -> (c, r, Nothing)) <$> parseMatrixName name
+
+parseTypedScalarSuffix :: Text -> Maybe (Text, Scalar)
+parseTypedScalarSuffix name =
+  case T.breakOn "<" name of
+    (base, rest)
+      | not (T.null rest) && T.isSuffixOf ">" rest ->
+          let inner = T.dropEnd 1 (T.drop 1 rest)
+          in case parseScalarName inner of
+               Just s -> Just (base, s)
+               Nothing -> Nothing
+    _ ->
+      case T.unsnoc name of
+        Just (base, suf)
+          | not (T.null base)
+          , Just s <- parseScalarSuffixChar suf -> Just (base, s)
+        _ -> Nothing
+
+parseScalarSuffixChar :: Char -> Maybe Scalar
+parseScalarSuffixChar ch =
+  case ch of
+    'f' -> Just F32
+    'h' -> Just F16
+    'i' -> Just I32
+    'u' -> Just U32
+    _ -> Nothing
+
 parseMatrixName :: Text -> Maybe (Int, Int)
 parseMatrixName name =
   case T.unpack name of
@@ -271,9 +340,7 @@ ptrAccessAllowsWrite acc =
 
 ptrAccessCompatible :: Maybe StorageAccess -> Maybe StorageAccess -> Bool
 ptrAccessCompatible expected actual =
-  if ptrAccessAllowsWrite expected
-    then ptrAccessAllowsWrite actual
-    else True
+  not (ptrAccessAllowsWrite expected) || ptrAccessAllowsWrite actual
 
 vectorFieldIndex :: Text -> Int -> Either CompileError Int
 vectorFieldIndex field n =

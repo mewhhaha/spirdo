@@ -3,6 +3,8 @@ module Spirdo.Wesl.Syntax
   ( SrcPos(..)
   , Token(..)
   , TokKind(..)
+  , IntSuffix(..)
+  , FloatSuffix(..)
   , ImportRelative(..)
   , ImportItem(..)
   , ImportDecl(..)
@@ -15,6 +17,7 @@ module Spirdo.Wesl.Syntax
   , GlobalVarDecl(..)
   , ConstDecl(..)
   , Stage(..)
+  , WorkgroupSize(..)
   , Param(..)
   , EntryPoint(..)
   , FunctionDecl(..)
@@ -28,7 +31,7 @@ module Spirdo.Wesl.Syntax
 
 import Data.Text (Text)
 import Data.Word (Word32)
-import Spirdo.Wesl.Types (Attr, BindingKind, DiagnosticSeverity, StructDecl, Type)
+import Spirdo.Wesl.Types (Attr, BindingKind, ConstExpr, DiagnosticSeverity, StructDecl, Type)
 
 data SrcPos = SrcPos
   { spLine :: !Int
@@ -40,10 +43,16 @@ data Token = Token
   , tkPos :: !SrcPos
   } deriving (Eq, Show)
 
+data IntSuffix = IntSuffixI | IntSuffixU
+  deriving (Eq, Show)
+
+data FloatSuffix = FloatSuffixF | FloatSuffixH
+  deriving (Eq, Show)
+
 data TokKind
   = TkIdent !Text
-  | TkInt !Integer
-  | TkFloat !Float
+  | TkInt !Integer !(Maybe IntSuffix)
+  | TkFloat !Float !(Maybe FloatSuffix)
   | TkString !Text
   | TkSymbol !Text
   deriving (Eq, Show)
@@ -76,7 +85,7 @@ data AliasDecl = AliasDecl
 data OverrideDecl = OverrideDecl
   { odName :: !Text
   , odId :: !(Maybe Word32)
-  , odType :: !Type
+  , odType :: !(Maybe Type)
   , odExpr :: !(Maybe Expr)
   } deriving (Eq, Show)
 
@@ -96,7 +105,7 @@ data ModuleAst = ModuleAst
   , modOverrides :: ![OverrideDecl]
   , modConstAsserts :: ![ConstAssert]
   , modFunctions :: ![FunctionDecl]
-  , modEntry :: !(Maybe EntryPoint)
+  , modEntries :: ![EntryPoint]
   } deriving (Eq, Show)
 
 data BindingDecl = BindingDecl
@@ -116,10 +125,16 @@ data GlobalVarDecl = GlobalVarDecl
 
 data ConstDecl = ConstDecl
   { cdName :: !Text
+  , cdType :: !(Maybe Type)
   , cdExpr :: !Expr
   } deriving (Eq, Show)
 
 data Stage = StageCompute | StageFragment | StageVertex
+  deriving (Eq, Show)
+
+data WorkgroupSize
+  = WorkgroupSizeExpr ![ConstExpr]
+  | WorkgroupSizeValue !(Word32, Word32, Word32)
   deriving (Eq, Show)
 
 data Param = Param
@@ -131,7 +146,7 @@ data Param = Param
 data EntryPoint = EntryPoint
   { epName :: !Text
   , epStage :: !Stage
-  , epWorkgroupSize :: !(Maybe (Word32, Word32, Word32))
+  , epWorkgroupSize :: !(Maybe WorkgroupSize)
   , epParams :: ![Param]
   , epReturnType :: !(Maybe Type)
   , epReturnLocation :: !(Maybe Word32)
@@ -147,8 +162,8 @@ data FunctionDecl = FunctionDecl
   } deriving (Eq, Show)
 
 data Stmt
-  = SLet !Text !Expr
-  | SVar !Text !Expr
+  = SLet !Text !(Maybe Type) !Expr
+  | SVar !Text !(Maybe Type) !(Maybe Expr)
   | SAssign !LValue !Expr
   | SAssignOp !LValue !BinOp !Expr
   | SInc !LValue

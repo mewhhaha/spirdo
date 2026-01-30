@@ -2,7 +2,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 
 module Main (main) where
@@ -146,12 +145,12 @@ main = do
     let weatherHandle = textureHandleFromSlop weather2D
 
     let baseVariants =
-          [ FragmentVariant "Feature Mix" BlendNone fragmentFeatureShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Raymarch" BlendNone fragmentRaymarchShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Triangle" BlendNone fragmentTriangleShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Plasma" BlendNone fragmentPlasmaShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Grid" BlendNone fragmentGridShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "SDF Text" BlendNone fragmentSdfTextShader (\params -> Inputs.uniform @"params" params)
+          [ FragmentVariant "Feature Mix" BlendNone fragmentFeatureShader (Inputs.uniform @"params")
+          , FragmentVariant "Raymarch" BlendNone fragmentRaymarchShader (Inputs.uniform @"params")
+          , FragmentVariant "Triangle" BlendNone fragmentTriangleShader (Inputs.uniform @"params")
+          , FragmentVariant "Plasma" BlendNone fragmentPlasmaShader (Inputs.uniform @"params")
+          , FragmentVariant "Grid" BlendNone fragmentGridShader (Inputs.uniform @"params")
+          , FragmentVariant "SDF Text" BlendNone fragmentSdfTextShader (Inputs.uniform @"params")
           , FragmentVariant "Clouds" BlendAlpha fragmentCloudShader
               (\params ->
                 Inputs.uniform @"params" params
@@ -159,14 +158,14 @@ main = do
                   <> Inputs.sampledTexture @"detailNoise" detailNoiseHandle noiseSamplerHandle
                   <> Inputs.sampledTexture @"weatherTex" weatherHandle noiseSamplerHandle
               )
-          , FragmentVariant "Bits" BlendNone fragmentBitsShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Aurora" BlendNone fragmentAuroraShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Starfield" BlendNone fragmentStarfieldShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Tunnel" BlendNone fragmentTunnelShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Voronoi" BlendNone fragmentVoronoiShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Mandelbrot" BlendNone fragmentMandelbrotShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Terrain" BlendNone fragmentTerrainShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Seascape" BlendNone fragmentSeascapeShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Bits" BlendNone fragmentBitsShader (Inputs.uniform @"params")
+          , FragmentVariant "Aurora" BlendNone fragmentAuroraShader (Inputs.uniform @"params")
+          , FragmentVariant "Starfield" BlendNone fragmentStarfieldShader (Inputs.uniform @"params")
+          , FragmentVariant "Tunnel" BlendNone fragmentTunnelShader (Inputs.uniform @"params")
+          , FragmentVariant "Voronoi" BlendNone fragmentVoronoiShader (Inputs.uniform @"params")
+          , FragmentVariant "Mandelbrot" BlendNone fragmentMandelbrotShader (Inputs.uniform @"params")
+          , FragmentVariant "Terrain" BlendNone fragmentTerrainShader (Inputs.uniform @"params")
+          , FragmentVariant "Seascape" BlendNone fragmentSeascapeShader (Inputs.uniform @"params")
           , FragmentVariant "Protean Clouds" BlendAlpha fragmentProteanCloudsShader
               (\params ->
                 Inputs.uniform @"params" params
@@ -174,8 +173,8 @@ main = do
                   <> Inputs.sampledTexture @"detailNoise" detailNoiseHandle noiseSamplerHandle
                   <> Inputs.sampledTexture @"weatherTex" weatherHandle noiseSamplerHandle
               )
-          , FragmentVariant "Primitives" BlendNone fragmentPrimitivesShader (\params -> Inputs.uniform @"params" params)
-          , FragmentVariant "Grass" BlendNone fragmentGrassShader (\params -> Inputs.uniform @"params" params)
+          , FragmentVariant "Primitives" BlendNone fragmentPrimitivesShader (Inputs.uniform @"params")
+          , FragmentVariant "Grass" BlendNone fragmentGrassShader (Inputs.uniform @"params")
           ]
 
     variants <- mapM (\(FragmentVariant name blend shader mkInputs) -> mkVariant name blend shader mkInputs vshader) baseVariants
@@ -243,10 +242,10 @@ ensureHistory size existing =
     Just h | h.historySize == size -> pure h
     Just h -> do
       destroyTarget h.historyTarget
-      target <- createRenderTarget (fst size) (snd size)
+      target <- uncurry createRenderTarget size
       pure (History target size False)
     Nothing -> do
-      target <- createRenderTarget (fst size) (snd size)
+      target <- uncurry createRenderTarget size
       pure (History target size False)
 
 resetHistory :: Maybe History -> Maybe History
@@ -321,9 +320,7 @@ bindingsFromInputs inputs =
             Just handle -> handle
             Nothing -> error ("missing sampler for texture: " <> texInput.textureName)
     samplerTex (SamplerInput samplerName _ _ _) =
-      case findSamplerTexture samplerName (inputsTextures inputs) of
-        Just tex -> unTexture tex
-        Nothing -> 0
+      maybe 0 unTexture (findSamplerTexture samplerName (inputsTextures inputs))
     unTexture (TextureInput _ _ _ textureHandle _) =
       case textureHandle of
         TextureHandle v -> v

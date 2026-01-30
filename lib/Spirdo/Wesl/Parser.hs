@@ -1,25 +1,21 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 -- | Parser for WESL source.
 module Spirdo.Wesl.Parser where
 
-import Control.Monad (when)
-import Data.Char (isAlpha, isAlphaNum, isDigit)
+import Control.Applicative ((<|>))
+import Control.Monad (unless, when)
+import Data.Char (isAlpha, isAlphaNum, isDigit, isHexDigit)
 import Data.List (partition)
 import Data.Maybe (isJust)
+import Numeric (readHex)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -51,9 +47,8 @@ lexWesl = go (SrcPos 1 1)
               let (_, rest, pos') = consumeLine (advance (advance pos '/') '/') (T.drop 2 src)
               in go pos' rest
           | c == '/' && prefix "/*" src ->
-              case consumeBlockComment (advance (advance pos '/') '*') (T.drop 2 src) of
-                Left err -> Left err
-                Right (rest, pos') -> go pos' rest
+              (\(rest, pos') -> go pos' rest)
+                =<< consumeBlockComment (advance (advance pos '/') '*') (T.drop 2 src)
           | isAlpha c || c == '_' ->
               let (ident, rest, pos') = consumeIdent pos src
               in (Token (TkIdent ident) pos :) <$> go pos' rest
@@ -61,9 +56,8 @@ lexWesl = go (SrcPos 1 1)
               let (tok, rest, pos') = consumeNumber pos src
               in (Token tok pos :) <$> go pos' rest
           | c == '"' ->
-              case consumeString pos cs of
-                Left err -> Left err
-                Right (str, rest, pos') -> (Token (TkString str) pos :) <$> go pos' rest
+              (\(str, rest, pos') -> (Token (TkString str) pos :) <$> go pos' rest)
+                =<< consumeString pos cs
           | prefix "::" src -> token2 "::" pos c src
           | prefix "==" src -> token2 "==" pos c src
           | prefix "!=" src -> token2 "!=" pos c src
@@ -95,8 +89,8 @@ lexWesl = go (SrcPos 1 1)
     symbolChars = "@:{}();,<>=[]+-*/.%!&|^"
 
     prefix s xs = s `T.isPrefixOf` xs
-    advance2 p a b = advance (advance p a) b
-    advance3 p a b c = advance (advance2 p a b) c
+    advance2 p a = advance (advance p a)
+    advance3 p a b = advance (advance2 p a b)
 
     token2 sym p ch s =
       let c2 = T.index s 1
@@ -134,21 +128,93 @@ lexWesl = go (SrcPos 1 1)
       in (ident, rest, pos')
 
     consumeNumber p cs =
-      let (digits, rest) = T.span isDigit cs
-      in case T.uncons rest of
-          Just ('.', r) ->
-            case T.uncons r of
-              Just (d, _rest1) | isDigit d ->
-                let (frac, rest') = T.span isDigit r
-                    numTxt = digits <> "." <> frac
-                    pos' = T.foldl' advance p numTxt
-                in (TkFloat (read (T.unpack numTxt)), rest', pos')
+      case T.stripPrefix "0x" cs <|> T.stripPrefix "0X" cs of
+        Just restHex ->
+          let (hexRaw, rest) = T.span isHexDigitOrUnderscore restHex
+              hexDigits = T.filter (/= '_') hexRaw
+              consumed = "0x" <> hexRaw
+              pos' = T.foldl' advance p consumed
+          in if T.null hexDigits
+              then (TkInt 0 Nothing, restHex, p)
+              else
+                let val = case readHex (T.unpack hexDigits) of
+                      ((v, _):_) -> v
+                      _ -> 0
+                in applySuffix (TkInt val Nothing) rest pos'
+        Nothing ->
+          let (intRaw, rest0) = T.span isDigitOrUnderscore cs
+              intDigits = T.filter (/= '_') intRaw
+          in case T.uncons rest0 of
+              Just ('.', r) ->
+                case T.uncons r of
+                  Just (d, _rest1) | isDigit d ->
+                    let (fracRaw, rest1) = T.span isDigitOrUnderscore r
+                        fracDigits = T.filter (/= '_') fracRaw
+                        (expTxt, rest2, okExp) = parseExponent rest1
+                        numTxt = intDigits <> "." <> fracDigits <> expTxt
+                        consumed = intRaw <> "." <> fracRaw <> expTxt
+                        pos' = T.foldl' advance p consumed
+                    in if okExp
+                        then applySuffix (TkFloat (read (T.unpack numTxt)) Nothing) rest2 pos'
+                        else applySuffix (TkFloat (read (T.unpack (intDigits <> "." <> fracDigits))) Nothing) rest1 (T.foldl' advance p (intRaw <> "." <> fracRaw))
+                  _ ->
+                    let (expTxt, rest1, okExp) = parseExponent rest0
+                        numTxt = intDigits <> expTxt
+                        pos' = T.foldl' advance p (intRaw <> expTxt)
+                    in if okExp
+                        then applySuffix (TkFloat (read (T.unpack numTxt)) Nothing) rest1 pos'
+                        else applySuffix (TkInt (read (T.unpack intDigits)) Nothing) rest0 (T.foldl' advance p intRaw)
               _ ->
-                let pos' = T.foldl' advance p digits
-                in (TkInt (read (T.unpack digits)), rest, pos')
-          _ ->
-            let pos' = T.foldl' advance p digits
-            in (TkInt (read (T.unpack digits)), rest, pos')
+                let (expTxt, rest1, okExp) = parseExponent rest0
+                    numTxt = intDigits <> expTxt
+                    pos' = T.foldl' advance p (intRaw <> expTxt)
+                in if okExp
+                    then applySuffix (TkFloat (read (T.unpack numTxt)) Nothing) rest1 pos'
+                    else applySuffix (TkInt (read (T.unpack intDigits)) Nothing) rest0 (T.foldl' advance p intRaw)
+      where
+        isDigitOrUnderscore c = isDigit c || c == '_'
+        isHexDigitOrUnderscore c = isHexDigit c || c == '_'
+
+        applySuffix tok rest pos' =
+          case T.uncons rest of
+            Just (s, rest1) ->
+              case tok of
+                TkInt n _ ->
+                  case intSuffix s of
+                    Just suf -> (TkInt n (Just suf), rest1, advance pos' s)
+                    Nothing -> (TkInt n Nothing, rest, pos')
+                TkFloat f _ ->
+                  case floatSuffix s of
+                    Just suf -> (TkFloat f (Just suf), rest1, advance pos' s)
+                    Nothing -> (TkFloat f Nothing, rest, pos')
+                _ -> (tok, rest, pos')
+            _ -> (tok, rest, pos')
+
+        intSuffix s =
+          case s of
+            'i' -> Just IntSuffixI
+            'u' -> Just IntSuffixU
+            _ -> Nothing
+
+        floatSuffix s =
+          case s of
+            'f' -> Just FloatSuffixF
+            'h' -> Just FloatSuffixH
+            _ -> Nothing
+
+        parseExponent rest =
+          case T.uncons rest of
+            Just (e, more) | e == 'e' || e == 'E' ->
+              let (signTxt, rest1) =
+                    case T.uncons more of
+                      Just (s, restSign) | s == '+' || s == '-' -> (T.singleton s, restSign)
+                      _ -> ("", more)
+                  (expRaw, rest2) = T.span isDigitOrUnderscore rest1
+                  expDigits = T.filter (/= '_') expRaw
+              in if T.null expDigits
+                  then ("", rest, False)
+                  else (T.singleton e <> signTxt <> expDigits, rest2, True)
+            _ -> ("", rest, False)
 
     consumeString p cs =
       let goStr acc pos' src' =
@@ -169,10 +235,10 @@ lexWesl = go (SrcPos 1 1)
 
 parseModuleTokensWith :: FeatureSet -> [Token] -> Either CompileError ModuleAst
 parseModuleTokensWith feats toks =
-  let loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntry seenNonDirective seenNonImport rest =
+  let loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntries seenNonDirective seenNonImport rest =
         case rest of
           [] ->
-            Right (ModuleAst (reverse accDirectives) (reverse accImports) (reverse accAliases) (reverse accStructs) (reverse accBindings) (reverse accGlobals) (reverse accConsts) (reverse accOverrides) (reverse accAsserts) (reverse accFns) accEntry)
+            Right (ModuleAst (reverse accDirectives) (reverse accImports) (reverse accAliases) (reverse accStructs) (reverse accBindings) (reverse accGlobals) (reverse accConsts) (reverse accOverrides) (reverse accAsserts) (reverse accFns) (reverse accEntries))
           _ -> do
             (attrs, rest1) <- parseAttributes rest
             (keep, attrs') <- applyIf attrs feats rest1
@@ -180,45 +246,45 @@ parseModuleTokensWith feats toks =
               (Token (TkIdent "enable") _ : _) -> do
                 when (seenNonDirective && keep) $
                   Left (errorAt rest1 "directives must appear before any declarations")
-                when (not (null attrs')) $
+                unless (null attrs') $
                   Left (errorAt rest1 "enable does not accept attributes other than @if")
                 (dir, rest2) <- parseEnableDirective rest1
                 let accDirectives' = if keep then dir : accDirectives else accDirectives
-                loop accDirectives' accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntry seenNonDirective seenNonImport rest2
+                loop accDirectives' accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntries seenNonDirective seenNonImport rest2
               (Token (TkIdent "diagnostic") _ : _) -> do
                 when (seenNonDirective && keep) $
                   Left (errorAt rest1 "directives must appear before any declarations")
-                when (not (null attrs')) $
+                unless (null attrs') $
                   Left (errorAt rest1 "diagnostic does not accept attributes other than @if")
                 (dir, rest2) <- parseDiagnosticDirective rest1
                 let accDirectives' = if keep then dir : accDirectives else accDirectives
-                loop accDirectives' accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntry seenNonDirective seenNonImport rest2
+                loop accDirectives' accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntries seenNonDirective seenNonImport rest2
               (Token (TkIdent "import") _ : _) -> do
                 when (seenNonImport && keep) $
                   Left (errorAt rest1 "imports must appear before other declarations")
-                when (not (null attrs')) $
+                unless (null attrs') $
                   Left (errorAt rest1 "import does not accept attributes other than @if")
                 (importDecl, rest2) <- parseImportStatement rest1
                 let accImports' = if keep then importDecl : accImports else accImports
-                loop accDirectives accImports' accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntry True seenNonImport rest2
+                loop accDirectives accImports' accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntries True seenNonImport rest2
               (Token (TkIdent "alias") _ : _) -> do
-                when (not (null attrs')) $
+                unless (null attrs') $
                   Left (errorAt rest1 "alias does not accept attributes other than @if")
                 (aliasDecl, rest2) <- parseAliasDecl rest1
                 let accAliases' = if keep then aliasDecl : accAliases else accAliases
-                loop accDirectives accImports accAliases' accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntry True True rest2
+                loop accDirectives accImports accAliases' accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntries True True rest2
               (Token (TkIdent "const_assert") _ : _) -> do
-                when (not (null attrs')) $
+                unless (null attrs') $
                   Left (errorAt rest1 "const_assert does not accept attributes other than @if")
                 (assertDecl, rest2) <- parseConstAssert rest1
                 let accAsserts' = if keep then assertDecl : accAsserts else accAsserts
-                loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts' accFns accEntry True True rest2
+                loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts' accFns accEntries True True rest2
               (Token (TkIdent "struct") _ : _) -> do
                 (mStruct, rest2) <- parseStruct feats rest1
                 let accStructs' = case (keep, mStruct) of
                       (True, Just structDecl) -> structDecl : accStructs
                       _ -> accStructs
-                loop accDirectives accImports accAliases accStructs' accBindings accGlobals accConsts accOverrides accAsserts accFns accEntry True True rest2
+                loop accDirectives accImports accAliases accStructs' accBindings accGlobals accConsts accOverrides accAsserts accFns accEntries True True rest2
               (Token (TkIdent "var") _ : _) -> do
                 let hasBindingAttrs = isJust (attrInt "group" attrs') || isJust (attrInt "binding" attrs')
                 (addrSpace, _access, _rest) <- parseAddressSpaceMaybe (drop 1 rest1)
@@ -227,15 +293,15 @@ parseModuleTokensWith feats toks =
                   then do
                     (bindingDecl, rest2) <- parseBinding attrs' rest1
                     let accBindings' = if keep then bindingDecl : accBindings else accBindings
-                    loop accDirectives accImports accAliases accStructs accBindings' accGlobals accConsts accOverrides accAsserts accFns accEntry True True rest2
+                    loop accDirectives accImports accAliases accStructs accBindings' accGlobals accConsts accOverrides accAsserts accFns accEntries True True rest2
                   else do
                     (globalDecl, rest2) <- parseGlobalVar attrs' rest1
                     let accGlobals' = if keep then globalDecl : accGlobals else accGlobals
-                    loop accDirectives accImports accAliases accStructs accBindings accGlobals' accConsts accOverrides accAsserts accFns accEntry True True rest2
+                    loop accDirectives accImports accAliases accStructs accBindings accGlobals' accConsts accOverrides accAsserts accFns accEntries True True rest2
               (Token (TkIdent "let") _ : _) -> do
                 (constDecl, rest2) <- parseConstDecl attrs' rest1
                 let accConsts' = if keep then constDecl : accConsts else accConsts
-                loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts' accOverrides accAsserts accFns accEntry True True rest2
+                loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts' accOverrides accAsserts accFns accEntries True True rest2
               (Token (TkIdent "override") _ : _) -> do
                 let idAttr =
                       case attrInt "id" attrs' of
@@ -247,11 +313,11 @@ parseModuleTokensWith feats toks =
                 when (maybe False (\v -> v < 0 || v > fromIntegral (maxBound :: Word32)) (attrInt "id" attrs')) $
                   Left (errorAt rest1 "@id must be a non-negative 32-bit integer")
                 let otherAttrs = [a | a <- attrs', not (isIdAttr a)]
-                when (not (null otherAttrs)) $
+                unless (null otherAttrs) $
                   Left (errorAt rest1 "override only accepts @id and @if attributes")
                 (overrideDecl, rest2) <- parseOverrideDecl idAttr rest1
                 let accOverrides' = if keep then overrideDecl : accOverrides else accOverrides
-                loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides' accAsserts accFns accEntry True True rest2
+                loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides' accAsserts accFns accEntries True True rest2
               (Token (TkIdent "fn") _ : _) -> do
                 (name, params, retType, retLoc, retBuiltin, body, rest2) <- parseFunctionGeneric feats rest1
                 let hasStageAttr = any isStageAttr attrs'
@@ -268,17 +334,13 @@ parseModuleTokensWith feats toks =
                           Just _ -> Left (errorAt rest1 "return builtin is only allowed on entry points")
                         let fnDecl = FunctionDecl name params retType body
                         let accFns' = if keep then fnDecl : accFns else accFns
-                        loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns' accEntry True True rest2
+                        loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns' accEntries True True rest2
                   Just (stage, workgroup) -> do
                     let entry = EntryPoint name stage workgroup params retType retLoc retBuiltin body
-                    case accEntry of
-                      Nothing ->
-                        if keep
-                          then loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns (Just entry) True True rest2
-                          else loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntry True True rest2
-                      Just _ -> Left (errorAt rest1 "multiple entry points are not supported")
+                    let accEntries' = if keep then entry : accEntries else accEntries
+                    loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntries' True True rest2
               _ -> Left (errorAt rest1 "expected directive, import, alias, struct, var, let, override, const_assert, or fn")
-  in loop [] [] [] [] [] [] [] [] [] [] Nothing False False toks
+  in loop [] [] [] [] [] [] [] [] [] [] [] False False toks
   where
     isStageAttr attr =
       case attr of
@@ -330,10 +392,142 @@ parseAttrArgs toks =
             _ -> Left (errorAt rest1 "expected ',' or ')' in attribute arguments")
 
     parseAttrArg rest =
+      case parseConstExpr [",", ")"] rest of
+        Right (expr, more) ->
+          case expr of
+            CEInt n -> Right (AttrInt n, more)
+            CEIdent name -> Right (AttrIdent name, more)
+            _ -> Right (AttrExpr expr, more)
+        Left _ -> Left (errorAt rest "expected attribute argument")
+
+parseConstExpr :: [Text] -> [Token] -> Either CompileError (ConstExpr, [Token])
+parseConstExpr stop toks = parseConstBitOr toks
+  where
+    isStop rest =
       case rest of
-        (Token (TkInt n) _ : more) -> Right (AttrInt n, more)
-        (Token (TkIdent name) _ : more) -> Right (AttrIdent name, more)
-        _ -> Left (errorAt rest "expected attribute argument")
+        (Token (TkSymbol sym) _ : _) -> sym `elem` stop
+        _ -> False
+
+    parseConstBitOr ts = do
+      (lhs, rest) <- parseConstBitXor ts
+      parseConstBitOrTail lhs rest
+    parseConstBitOrTail lhs rest
+      | isStop rest = Right (lhs, rest)
+      | otherwise =
+          case rest of
+            (Token (TkSymbol "|") _ : more) -> do
+              (rhs, rest1) <- parseConstBitXor more
+              parseConstBitOrTail (CEBinary CBitOr lhs rhs) rest1
+            _ -> Right (lhs, rest)
+
+    parseConstBitXor ts = do
+      (lhs, rest) <- parseConstBitAnd ts
+      parseConstBitXorTail lhs rest
+    parseConstBitXorTail lhs rest
+      | isStop rest = Right (lhs, rest)
+      | otherwise =
+          case rest of
+            (Token (TkSymbol "^") _ : more) -> do
+              (rhs, rest1) <- parseConstBitAnd more
+              parseConstBitXorTail (CEBinary CBitXor lhs rhs) rest1
+            _ -> Right (lhs, rest)
+
+    parseConstBitAnd ts = do
+      (lhs, rest) <- parseConstShift ts
+      parseConstBitAndTail lhs rest
+    parseConstBitAndTail lhs rest
+      | isStop rest = Right (lhs, rest)
+      | otherwise =
+          case rest of
+            (Token (TkSymbol "&") _ : more) -> do
+              (rhs, rest1) <- parseConstShift more
+              parseConstBitAndTail (CEBinary CBitAnd lhs rhs) rest1
+            _ -> Right (lhs, rest)
+
+    parseConstShift ts = do
+      (lhs, rest) <- parseConstAddSub ts
+      parseConstShiftTail lhs rest
+    parseConstShiftTail lhs rest
+      | isStop rest = Right (lhs, rest)
+      | otherwise =
+          case rest of
+            (Token (TkSymbol "<<") _ : more) -> do
+              (rhs, rest1) <- parseConstAddSub more
+              parseConstShiftTail (CEBinary CShl lhs rhs) rest1
+            (Token (TkSymbol ">>") _ : more) -> do
+              (rhs, rest1) <- parseConstAddSub more
+              parseConstShiftTail (CEBinary CShr lhs rhs) rest1
+            _ -> Right (lhs, rest)
+
+    parseConstAddSub ts = do
+      (lhs, rest) <- parseConstMulDiv ts
+      parseConstAddSubTail lhs rest
+    parseConstAddSubTail lhs rest
+      | isStop rest = Right (lhs, rest)
+      | otherwise =
+          case rest of
+            (Token (TkSymbol "+") _ : more) -> do
+              (rhs, rest1) <- parseConstMulDiv more
+              parseConstAddSubTail (CEBinary CAdd lhs rhs) rest1
+            (Token (TkSymbol "-") _ : more) -> do
+              (rhs, rest1) <- parseConstMulDiv more
+              parseConstAddSubTail (CEBinary CSub lhs rhs) rest1
+            _ -> Right (lhs, rest)
+
+    parseConstMulDiv ts = do
+      (lhs, rest) <- parseConstUnary ts
+      parseConstMulDivTail lhs rest
+    parseConstMulDivTail lhs rest
+      | isStop rest = Right (lhs, rest)
+      | otherwise =
+          case rest of
+            (Token (TkSymbol "*") _ : more) -> do
+              (rhs, rest1) <- parseConstUnary more
+              parseConstMulDivTail (CEBinary CMul lhs rhs) rest1
+            (Token (TkSymbol "/") _ : more) -> do
+              (rhs, rest1) <- parseConstUnary more
+              parseConstMulDivTail (CEBinary CDiv lhs rhs) rest1
+            (Token (TkSymbol "%") _ : more) -> do
+              (rhs, rest1) <- parseConstUnary more
+              parseConstMulDivTail (CEBinary CMod lhs rhs) rest1
+            _ -> Right (lhs, rest)
+
+    parseConstUnary ts =
+      case ts of
+        (Token (TkSymbol "-") _ : more) -> do
+          (expr, rest) <- parseConstUnary more
+          Right (CEUnaryNeg expr, rest)
+        _ -> parseConstPrimary ts
+
+    parseConstPrimary ts =
+      case ts of
+        (Token (TkInt n mSuffix) _ : rest) ->
+          Right (constIntExpr n mSuffix, rest)
+        (Token (TkIdent name) _ : Token (TkSymbol "(") _ : more) -> do
+          (args, rest1) <- parseConstCallArgs [] more
+          Right (CECall name args, rest1)
+        (Token (TkIdent name) _ : rest) -> Right (CEIdent name, rest)
+        (Token (TkSymbol "(") _ : more) -> do
+          (expr, rest1) <- parseConstExpr [")"] more
+          rest2 <- expectSymbol ")" rest1
+          Right (expr, rest2)
+        _ -> Left (errorAt ts "expected constant expression")
+      where
+        constIntExpr n mSuffix =
+          case mSuffix of
+            Nothing -> CEInt n
+            Just IntSuffixU -> CECall "u32" [CEInt n]
+            Just IntSuffixI -> CECall "i32" [CEInt n]
+
+    parseConstCallArgs acc ts =
+      case ts of
+        (Token (TkSymbol ")") _ : rest) -> Right (reverse acc, rest)
+        _ -> do
+          (expr, rest1) <- parseConstExpr [",", ")"] ts
+          case rest1 of
+            (Token (TkSymbol ",") _ : more) -> parseConstCallArgs (expr:acc) more
+            (Token (TkSymbol ")") _ : more) -> Right (reverse (expr:acc), more)
+            _ -> Left (errorAt rest1 "expected ',' or ')' in call arguments")
 
 parseTTExpr :: [Token] -> Either CompileError (TTExpr, [Token])
 parseTTExpr = parseTTOr
@@ -540,7 +734,7 @@ parseBinding attrs toks =
 
 parseGlobalVar :: [Attr] -> [Token] -> Either CompileError (GlobalVarDecl, [Token])
 parseGlobalVar attrs toks = do
-  when (not (null attrs)) $
+  unless (null attrs) $
     Left (errorAt toks "global variables do not accept attributes other than @if")
   case toks of
     (Token (TkIdent "var") _ : rest) -> do
@@ -548,7 +742,7 @@ parseGlobalVar attrs toks = do
       space <- case addrSpace of
         Just s -> Right s
         Nothing -> Left (errorAt rest "global variables require an explicit address space (e.g. var<private>)")
-      when (access /= Nothing) $
+      when (isJust access) $
         Left (errorAt rest "global variables do not support access qualifiers")
       (name, rest2) <- parseIdent rest1
       rest3 <- expectSymbol ":" rest2
@@ -567,15 +761,16 @@ parseGlobalVar attrs toks = do
 
 parseConstDecl :: [Attr] -> [Token] -> Either CompileError (ConstDecl, [Token])
 parseConstDecl attrs toks = do
-  when (not (null attrs)) $
+  unless (null attrs) $
     Left (errorAt toks "const declarations do not accept attributes other than @if")
   case toks of
-    (Token (TkIdent "let") _ : rest) -> do
+    (Token (TkIdent kw) _ : rest) | kw == "let" || kw == "const" -> do
       (name, rest1) <- parseIdent rest
-      rest2 <- expectSymbol "=" rest1
-      (expr, rest3) <- parseExpr rest2
-      rest4 <- expectSymbol ";" rest3
-      Right (ConstDecl name expr, rest4)
+      (mType, rest2) <- parseTypeAnnotationMaybe rest1
+      rest3 <- expectSymbol "=" rest2
+      (expr, rest4) <- parseExpr rest3
+      rest5 <- expectSymbol ";" rest4
+      Right (ConstDecl name mType expr, rest5)
     _ -> Left (errorAt toks "expected let declaration")
 
 parseAliasDecl :: [Token] -> Either CompileError (AliasDecl, [Token])
@@ -597,10 +792,11 @@ parseOverrideDecl overrideId toks =
       (mType, rest2) <- parseOverrideTypeMaybe rest1
       (mExpr, rest3) <- parseOverrideInitMaybe rest2
       rest4 <- expectSymbol ";" rest3
-      ty <- case mType of
-        Nothing -> Left (errorAt rest1 "override declarations require an explicit type for now")
-        Just t -> Right t
-      Right (OverrideDecl name overrideId ty mExpr, rest4)
+      case (mType, mExpr) of
+        (Nothing, Nothing) ->
+          Left (errorAt rest1 "override declarations require a type or initializer")
+        _ ->
+          Right (OverrideDecl name overrideId mType mExpr, rest4)
     _ -> Left (errorAt toks "expected override declaration")
   where
     parseOverrideTypeMaybe rest =
@@ -741,8 +937,6 @@ parseStatements feats acc toks =
     _ -> do
       (attrs, rest1) <- parseAttributes toks
       (keep, attrs') <- applyIf attrs feats rest1
-      when (not (null attrs')) $
-        Left (errorAt rest1 "statement attributes are not supported (except @if)")
       (stmt, rest) <- parseStmt feats rest1
       let acc' = if keep then stmt : acc else acc
       parseStatements feats acc' rest
@@ -815,16 +1009,24 @@ parseStmt feats toks =
       Right (SFallthrough, rest1)
     (Token (TkIdent "let") _ : rest) -> do
       (name, rest1) <- parseIdent rest
-      rest2 <- expectSymbol "=" rest1
-      (expr, rest3) <- parseExpr rest2
-      rest4 <- expectSymbol ";" rest3
-      Right (SLet name expr, rest4)
+      (mType, rest2) <- parseTypeAnnotationMaybe rest1
+      rest3 <- expectSymbol "=" rest2
+      (expr, rest4) <- parseExpr rest3
+      rest5 <- expectSymbol ";" rest4
+      Right (SLet name mType expr, rest5)
     (Token (TkIdent "var") _ : rest) -> do
       (name, rest1) <- parseIdent rest
-      rest2 <- expectSymbol "=" rest1
-      (expr, rest3) <- parseExpr rest2
-      rest4 <- expectSymbol ";" rest3
-      Right (SVar name expr, rest4)
+      (mType, rest2) <- parseTypeAnnotationMaybe rest1
+      case rest2 of
+        (Token (TkSymbol "=") _ : more) -> do
+          (expr, rest3) <- parseExpr more
+          rest4 <- expectSymbol ";" rest3
+          Right (SVar name mType (Just expr), rest4)
+        (Token (TkSymbol ";") _ : more) ->
+          case mType of
+            Nothing -> Left (errorAt rest2 "var declaration requires a type or initializer")
+            Just _ -> Right (SVar name mType Nothing, more)
+        _ -> Left (errorAt rest2 "expected '=' or ';' in var declaration")
     (Token (TkIdent "return") _ : rest) ->
       case rest of
         (Token (TkSymbol ";") _ : more) -> Right (SReturn Nothing, more)
@@ -855,6 +1057,14 @@ parseStmt feats toks =
           rest3 <- expectSymbol ";" rest2
           Right (SExpr expr, rest3)
 
+parseTypeAnnotationMaybe :: [Token] -> Either CompileError (Maybe Type, [Token])
+parseTypeAnnotationMaybe toks =
+  case toks of
+    (Token (TkSymbol ":") _ : rest) -> do
+      (ty, rest1) <- parseType rest
+      Right (Just ty, rest1)
+    _ -> Right (Nothing, toks)
+
 parseSwitchBody :: FeatureSet -> [Token] -> Either CompileError ([SwitchCase], Maybe [Stmt], [Token])
 parseSwitchBody feats toks =
   case toks of
@@ -866,9 +1076,7 @@ parseSwitchBody feats toks =
         (Token (TkSymbol "}") _ : more) -> Right (reverse acc, def, more)
         _ -> do
           (attrs, rest1) <- parseAttributes rest
-          (keep, attrs') <- applyIf attrs feats rest1
-          when (not (null attrs')) $
-            Left (errorAt rest1 "switch case attributes are not supported (except @if)")
+          (keep, _attrs) <- applyIf attrs feats rest1
           case rest1 of
             (Token (TkIdent "case") _ : more) -> do
               (selectors, rest2) <- parseCaseSelectors more
@@ -906,19 +1114,15 @@ parseLoopBody feats toks =
         (Token (TkSymbol "}") _ : more) -> Right (reverse acc, Nothing, more)
         _ -> do
           (attrs, rest1) <- parseAttributes rest
-          (keep, attrs') <- applyIf attrs feats rest1
+          (keep, _attrs) <- applyIf attrs feats rest1
           case rest1 of
             (Token (TkIdent "continuing") _ : more) -> do
-              when (not (null attrs')) $
-                Left (errorAt rest1 "continuing attributes are not supported (except @if)")
               (contBody, rest2) <- parseBody feats more
               case rest2 of
                 (Token (TkSymbol "}") _ : more2) ->
                   Right (reverse acc, if keep then Just contBody else Nothing, more2)
                 _ -> Left (errorAt rest2 "expected '}' after continuing block")
             _ -> do
-              when (not (null attrs')) $
-                Left (errorAt rest1 "statement attributes are not supported (except @if)")
               (stmt, rest2) <- parseStmt feats rest1
               let acc' = if keep then stmt : acc else acc
               parseLoopStmts acc' rest2
@@ -936,14 +1140,21 @@ parseForClause toks =
       Right (Just (SDec lv), rest1)
     (Token (TkIdent "let") _ : rest) -> do
       (name, rest1) <- parseIdent rest
-      rest2 <- expectSymbol "=" rest1
-      (expr, rest3) <- parseExpr rest2
-      Right (Just (SLet name expr), rest3)
+      (mType, rest2) <- parseTypeAnnotationMaybe rest1
+      rest3 <- expectSymbol "=" rest2
+      (expr, rest4) <- parseExpr rest3
+      Right (Just (SLet name mType expr), rest4)
     (Token (TkIdent "var") _ : rest) -> do
       (name, rest1) <- parseIdent rest
-      rest2 <- expectSymbol "=" rest1
-      (expr, rest3) <- parseExpr rest2
-      Right (Just (SVar name expr), rest3)
+      (mType, rest2) <- parseTypeAnnotationMaybe rest1
+      case rest2 of
+        (Token (TkSymbol "=") _ : more) -> do
+          (expr, rest3) <- parseExpr more
+          Right (Just (SVar name mType (Just expr)), rest3)
+        _ ->
+          case mType of
+            Nothing -> Left (errorAt rest2 "var declaration requires a type or initializer")
+            Just _ -> Right (Just (SVar name mType Nothing), rest2)
     _ -> do
       (lv, rest1) <- parseLValue toks
       case rest1 of
@@ -1184,8 +1395,8 @@ parsePostfixExpr toks = do
 parsePrimaryExpr :: [Token] -> Either CompileError (Expr, [Token])
 parsePrimaryExpr toks =
   case toks of
-    (Token (TkInt n) _ : rest) -> Right (EInt n, rest)
-    (Token (TkFloat f) _ : rest) -> Right (EFloat f, rest)
+    (Token (TkInt n mSuffix) _ : rest) -> Right (intLiteralExpr n mSuffix, rest)
+    (Token (TkFloat f mSuffix) _ : rest) -> Right (floatLiteralExpr f mSuffix, rest)
     (Token (TkIdent "true") _ : rest) -> Right (EBool True, rest)
     (Token (TkIdent "false") _ : rest) -> Right (EBool False, rest)
     (Token (TkIdent _) _ : _) -> do
@@ -1201,6 +1412,21 @@ parsePrimaryExpr toks =
               case args of
                 [arg] -> Right (EBitcast targetTy arg, rest5)
                 _ -> Left (errorAt rest4 "bitcast expects one argument")
+        (Token (TkSymbol "<") _ : _)
+          | name `elem` ["vec2", "vec3", "vec4"] || isJust (parseMatrixName name) -> do
+              let isVec = name `elem` ["vec2", "vec3", "vec4"]
+              rest1 <- expectSymbol "<" rest
+              (inner, rest2) <- parseType rest1
+              rest3 <- expectSymbol ">" rest2
+              rest4 <- expectSymbol "(" rest3
+              (args, rest5) <- parseCallArgs [] rest4
+              scalar <- case inner of
+                TyScalar s -> Right s
+                _ ->
+                  Left
+                    (errorAt rest1 (if isVec then "vector element must be a scalar" else "matrix element must be a scalar"))
+              let name' = name <> "<" <> scalarName scalar <> ">"
+              Right (ECall name' args, rest5)
         (Token (TkSymbol "(") _ : more) -> do
           (args, rest1) <- parseCallArgs [] more
           Right (ECall name args, rest1)
@@ -1210,6 +1436,17 @@ parsePrimaryExpr toks =
       rest2 <- expectSymbol ")" rest1
       Right (expr, rest2)
     _ -> Left (errorAt toks "expected expression")
+  where
+    intLiteralExpr n mSuffix =
+      case mSuffix of
+        Nothing -> EInt n
+        Just IntSuffixU -> ECall "u32" [EInt n]
+        Just IntSuffixI -> ECall "i32" [EInt n]
+    floatLiteralExpr f mSuffix =
+      case mSuffix of
+        Nothing -> EFloat f
+        Just FloatSuffixF -> ECall "f32" [EFloat f]
+        Just FloatSuffixH -> ECall "f16" [EFloat f]
 
 parseCallArgs :: [Expr] -> [Token] -> Either CompileError ([Expr], [Token])
 parseCallArgs acc toks =
@@ -1221,6 +1458,15 @@ parseCallArgs acc toks =
         (Token (TkSymbol ",") _ : rest2) -> parseCallArgs (expr:acc) rest2
         (Token (TkSymbol ")") _ : rest2) -> Right (reverse (expr:acc), rest2)
         _ -> Left (errorAt rest1 "expected ',' or ')' in call arguments")
+
+scalarName :: Scalar -> Text
+scalarName scalar =
+  case scalar of
+    F16 -> "f16"
+    F32 -> "f32"
+    I32 -> "i32"
+    U32 -> "u32"
+    Bool -> "bool"
 
 -- Shared parse helpers
 
@@ -1373,12 +1619,21 @@ parseType toks = do
               rest1 <- expectSymbol "<" rest
               (elemTy, rest2) <- parseType rest1
               case rest2 of
-                (Token (TkSymbol ",") _ : Token (TkInt n) _ : rest3) -> do
-                  rest4 <- expectSymbol ">" rest3
-                  Right (TyArray elemTy (Just (fromIntegral n)), rest4)
+                (Token (TkSymbol ",") _ : rest3) -> do
+                  (lenExpr, rest4) <- parseConstExpr [">"] rest3
+                  rest5 <- expectSymbol ">" rest4
+                  Right (TyArray elemTy (ArrayLenExpr lenExpr), rest5)
                 _ -> do
                   rest3 <- expectSymbol ">" rest2
-                  Right (TyArray elemTy Nothing, rest3)
+                  Right (TyArray elemTy ArrayLenRuntime, rest3)
+        _ | Just (base, scalar) <- parseTypedScalarSuffix name ->
+              case base of
+                "vec2" -> Right (TyVector 2 scalar, rest)
+                "vec3" -> Right (TyVector 3 scalar, rest)
+                "vec4" -> Right (TyVector 4 scalar, rest)
+                _ | Just (cols, rows) <- parseMatrixName base ->
+                      Right (TyMatrix cols rows scalar, rest)
+                _ -> Right (TyStructRef name, rest)
         _ -> Right (TyStructRef name, rest)
 
 parseFullIdent :: [Token] -> Either CompileError (Text, [Token])

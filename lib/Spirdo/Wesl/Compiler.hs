@@ -4,11 +4,9 @@
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
@@ -18,9 +16,10 @@
 module Spirdo.Wesl.Compiler where
 
 import Control.Exception (SomeException, catch, evaluate)
-import Control.Monad (when)
+import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Trans.Except (ExceptT(..), runExceptT)
+import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE)
+import Data.Bifunctor (first)
 import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -48,7 +47,7 @@ import System.FilePath (dropExtension, isRelative, normalise, takeDirectory, (<.
 import Text.Read (readMaybe)
 
 overrideValuesText :: [(String, OverrideValue)] -> [(Text, OverrideValue)]
-overrideValuesText = map (\(k, v) -> (T.pack k, v))
+overrideValuesText = map (first T.pack)
 
 data CompileResult = CompileResult
   { crAst :: !ModuleAst
@@ -61,16 +60,25 @@ data SamplerModeProxy (mode :: SamplerBindingMode) where
   SamplerCombinedP :: SamplerModeProxy 'SamplerCombined
   SamplerSeparateP :: SamplerModeProxy 'SamplerSeparate
 
-withSamplerMode :: SamplerBindingMode -> (forall mode. SamplerModeProxy mode -> r) -> r
-withSamplerMode mode k =
+withSamplerModeProxy :: SamplerBindingMode -> (forall mode. SamplerModeProxy mode -> r) -> r
+withSamplerModeProxy mode k =
   case mode of
     SamplerCombined -> k SamplerCombinedP
     SamplerSeparate -> k SamplerSeparateP
 
 compileToCompiled :: CompileOptions -> CompileResult -> SomeCompiledShader
 compileToCompiled opts result =
-  withSamplerMode opts.samplerBindingMode $ \(_ :: SamplerModeProxy mode) ->
+  withSamplerModeProxy opts.samplerBindingMode $ \(_ :: SamplerModeProxy mode) ->
     SomeCompiledShader (CompiledShader @mode (result.crSpirv) (result.crInterface))
+
+withCompiled ::
+  CompileOptions ->
+  CompileResult ->
+  (forall mode iface. CompiledShader mode iface -> Either CompileError a) ->
+  Either CompileError a
+withCompiled opts result k =
+  case compileToCompiled opts result of
+    SomeCompiledShader shader -> k shader
 
 -- | Compile inline WESL to a prepared shader (runtime).
 prepareWesl :: String -> Either CompileError SomePreparedShader
@@ -80,19 +88,17 @@ prepareWesl = prepareWeslWith defaultCompileOptions
 prepareWeslWith :: CompileOptions -> String -> Either CompileError SomePreparedShader
 prepareWeslWith opts src = do
   result <- compileInlineResult opts False src
-  case compileToCompiled opts result of
-    SomeCompiledShader shader -> do
-      prep <- toCompileError (prepareShader shader)
-      pure (SomePreparedShader prep)
+  withCompiled opts result $ \shader -> do
+    prep <- toCompileError (prepareShader shader)
+    pure (SomePreparedShader prep)
 
 -- | Compile inline WESL with diagnostics (runtime).
 prepareWeslWithDiagnostics :: CompileOptions -> String -> Either CompileError (SomePreparedShader, [Diagnostic])
 prepareWeslWithDiagnostics opts src = do
   result <- compileInlineResult opts True src
-  case compileToCompiled opts result of
-    SomeCompiledShader shader -> do
-      prep <- toCompileError (prepareShader shader)
-      pure (SomePreparedShader prep, result.crDiagnostics)
+  withCompiled opts result $ \shader -> do
+    prep <- toCompileError (prepareShader shader)
+    pure (SomePreparedShader prep, result.crDiagnostics)
 
 -- | Compile a WESL file (imports supported).
 prepareWeslFile :: FilePath -> IO (Either CompileError SomePreparedShader)
@@ -104,10 +110,9 @@ prepareWeslFileWith opts path = do
   result <- compileFileResult opts False path
   pure $ do
     cr <- result
-    case compileToCompiled opts cr of
-      SomeCompiledShader shader -> do
-        prep <- toCompileError (prepareShader shader)
-        pure (SomePreparedShader prep)
+    withCompiled opts cr $ \shader -> do
+      prep <- toCompileError (prepareShader shader)
+      pure (SomePreparedShader prep)
 
 -- | Compile a WESL file and return diagnostics.
 prepareWeslFileWithDiagnostics :: CompileOptions -> FilePath -> IO (Either CompileError (SomePreparedShader, [Diagnostic]))
@@ -115,17 +120,18 @@ prepareWeslFileWithDiagnostics opts path = do
   result <- compileFileResult opts True path
   pure $ do
     cr <- result
-    case compileToCompiled opts cr of
-      SomeCompiledShader shader -> do
-        prep <- toCompileError (prepareShader shader)
-        pure (SomePreparedShader prep, cr.crDiagnostics)
+    withCompiled opts cr $ \shader -> do
+      prep <- toCompileError (prepareShader shader)
+      pure (SomePreparedShader prep, cr.crDiagnostics)
 
 compileInlineResult :: CompileOptions -> Bool -> String -> Either CompileError CompileResult
 compileInlineResult opts wantDiagnostics src = do
   moduleAst0 <- parseModuleWith opts.enabledFeatures src
   moduleAst1 <- resolveTypeAliases moduleAst0
-  moduleAst <- lowerOverridesWith [] (overrideValuesText opts.overrideValues) moduleAst1
-  when (not (null moduleAst.modImports)) $
+  moduleAst2 <- inferOverrideTypes [] "" moduleAst1
+  moduleAst2' <- lowerOverridesWith [] (overrideValuesText opts.overrideValues) moduleAst2
+  moduleAst <- resolveConstExprs [] "" moduleAst2'
+  unless (null moduleAst.modImports) $
     Left (CompileError "imports require file-based compilation" Nothing Nothing)
   let node = ModuleNode "<inline>" [] moduleAst []
   let constIndex = buildConstIndex [node]
@@ -147,55 +153,33 @@ compileInlineResult opts wantDiagnostics src = do
     }
 
 compileInlineResultIO :: CompileOptions -> Bool -> String -> IO (Either CompileError CompileResult)
-compileInlineResultIO opts wantDiagnostics src = do
-  moduleAst0 <- timedPhase opts "parse" (evaluate (parseModuleWith opts.enabledFeatures src))
-  case moduleAst0 of
-    Left err -> pure (Left err)
-    Right ast0 -> do
-      moduleAst1 <- timedPhase opts "type-aliases" (evaluate (resolveTypeAliases ast0))
-      case moduleAst1 of
-        Left err -> pure (Left err)
-        Right ast1 -> do
-          moduleAst2 <- timedPhase opts "overrides" (evaluate (lowerOverridesWith [] (overrideValuesText opts.overrideValues) ast1))
-          case moduleAst2 of
-            Left err -> pure (Left err)
-            Right moduleAst -> do
-              if not (null moduleAst.modImports)
-                then pure (Left (CompileError "imports require file-based compilation" Nothing Nothing))
-                else do
-                  let node = ModuleNode "<inline>" [] moduleAst []
-                  let constIndex = buildConstIndex [node]
-                  let fnIndex = buildFunctionIndex [node]
-                  let structIndex = buildStructIndex [node]
-                  let overrideIndex = buildOverrideIndex [node]
-                  validation <- timedPhase opts "validate" (evaluate (validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node]))
-                  case validation of
-                    Left err -> pure (Left err)
-                    Right () -> do
-                      ifaceRes <- timedPhase opts "interface" (evaluate (buildInterface opts moduleAst))
-                      case ifaceRes of
-                        Left err -> pure (Left err)
-                        Right iface -> do
-                          spirvRes <- timedPhase opts "emit" (evaluate (emitSpirv opts moduleAst iface))
-                          case spirvRes of
-                            Left err -> pure (Left err)
-                            Right spirv -> do
-                              diags <-
-                                if wantDiagnostics
-                                  then timedPhase opts "diagnostics" (evaluate (collectDiagnosticsMerged opts [] moduleAst))
-                                  else pure (Right [])
-                              case diags of
-                                Left err -> pure (Left err)
-                                Right diagList ->
-                                  pure
-                                    ( Right
-                                        CompileResult
-                                          { crAst = moduleAst
-                                          , crInterface = iface
-                                          , crSpirv = spirv
-                                          , crDiagnostics = diagList
-                                          }
-                                    )
+compileInlineResultIO opts wantDiagnostics src = runExceptT $ do
+  moduleAst0 <- ExceptT (timedPhase opts "parse" (evaluate (parseModuleWith opts.enabledFeatures src)))
+  moduleAst1 <- ExceptT (timedPhase opts "type-aliases" (evaluate (resolveTypeAliases moduleAst0)))
+  moduleAst2 <- ExceptT (timedPhase opts "infer-overrides" (evaluate (inferOverrideTypes [] "" moduleAst1)))
+  moduleAst2' <- ExceptT (timedPhase opts "overrides" (evaluate (lowerOverridesWith [] (overrideValuesText opts.overrideValues) moduleAst2)))
+  moduleAst <- ExceptT (timedPhase opts "resolve-const" (evaluate (resolveConstExprs [] "" moduleAst2')))
+  unless (null moduleAst.modImports) $
+    throwE (CompileError "imports require file-based compilation" Nothing Nothing)
+  let node = ModuleNode "<inline>" [] moduleAst []
+  let constIndex = buildConstIndex [node]
+  let fnIndex = buildFunctionIndex [node]
+  let structIndex = buildStructIndex [node]
+  let overrideIndex = buildOverrideIndex [node]
+  _ <- ExceptT (timedPhase opts "validate" (evaluate (validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node])))
+  iface <- ExceptT (timedPhase opts "interface" (evaluate (buildInterface opts moduleAst)))
+  spirv <- ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts moduleAst iface)))
+  diagList <-
+    if wantDiagnostics
+      then ExceptT (timedPhase opts "diagnostics" (evaluate (collectDiagnosticsMerged opts [] moduleAst)))
+      else pure []
+  pure
+    CompileResult
+      { crAst = moduleAst
+      , crInterface = iface
+      , crSpirv = spirv
+      , crDiagnostics = diagList
+      }
 
 compileFileResult :: CompileOptions -> Bool -> FilePath -> IO (Either CompileError CompileResult)
 compileFileResult opts wantDiagnostics path =
@@ -208,7 +192,9 @@ compileFileResult opts wantDiagnostics path =
     linked' <- ExceptT (timedPhase opts "type-aliases" (evaluate (resolveTypeAliases linked)))
     let rootDir = takeDirectory filePath
         rootPath = modulePathFromFile rootDir filePath
-    lowered <- ExceptT (timedPhase opts "overrides" (evaluate (lowerOverridesWith rootPath (overrideValuesText opts.overrideValues) linked')))
+    linked'' <- ExceptT (timedPhase opts "infer-overrides" (evaluate (inferOverrideTypes rootPath rootDir linked')))
+    lowered0 <- ExceptT (timedPhase opts "overrides" (evaluate (lowerOverridesWith rootPath (overrideValuesText opts.overrideValues) linked'')))
+    lowered <- ExceptT (timedPhase opts "resolve-const" (evaluate (resolveConstExprs rootPath rootDir lowered0)))
     diags <-
       if wantDiagnostics
         then ExceptT (timedPhase opts "diagnostics" (evaluate (collectDiagnosticsMerged opts rootPath lowered)))
@@ -241,6 +227,7 @@ weslCacheKey opts src =
           , "overrides=" <> show opts.overrideValues
           , "spec=" <> show opts.overrideSpecMode
           , "samplerMode=" <> show opts.samplerBindingMode
+          , "entry=" <> show opts.entryPointName
           , src
           ]
       bytes = BS.pack (map (fromIntegral . ord) keySrc)
@@ -316,24 +303,24 @@ weslExpWith opts src = do
 compileInlineCached :: CompileOptions -> String -> Q (ByteString, ShaderInterface)
 compileInlineCached opts src = do
   cached <- TH.runIO (timed opts "cache-read" (loadWeslCache opts src))
-  case cached of
-    Just (bytes, iface) -> pure (bytes, iface)
-    Nothing ->
-      case compileInlineResult opts False src of
-        Left err -> fail (renderError err)
-        Right result -> do
-          let bytes = result.crSpirv
-              iface = result.crInterface
-          TH.runIO (timed opts "cache-write" (writeWeslCache opts src bytes iface))
-          pure (bytes, iface)
+  maybe compileFresh pure cached
+  where
+    compileFresh =
+      either
+        (fail . renderError)
+        (\result -> do
+            let bytes = result.crSpirv
+                iface = result.crInterface
+            TH.runIO (timed opts "cache-write" (writeWeslCache opts src bytes iface))
+            pure (bytes, iface)
+        )
+        (compileInlineResult opts False src)
 
 preparedExpWith :: CompileOptions -> ByteString -> ShaderInterface -> Q Exp
 preparedExpWith opts bytes iface = do
   bytesExp <- bytesToExp bytes
   ifaceExp <- interfaceToExp iface
-  ifaceTy <- case interfaceToType iface of
-    Left err -> fail ("wesl: " <> err)
-    Right ty -> pure ty
+  ifaceTy <- either (fail . ("wesl: " <>)) pure (interfaceToType iface)
   let modeTy =
         case opts.samplerBindingMode of
           SamplerCombined -> TH.PromotedT 'SamplerCombined
@@ -507,15 +494,13 @@ parseWeslToml path = do
 
     emptyDep name = PackageDependency name Nothing Nothing
 
-    applyDepFields root dep fields =
+    applyDepFields root =
       foldl
         (\d (k, v) ->
            case k of
              "version" -> d { depVersion = Just v }
              "path" -> d { depPath = Just (resolvePath root v) }
              _ -> d)
-        dep
-        fields
 
     parseInlineTable raw =
       let inner = trim (dropWhile (== '{') (dropWhileEnd (== '}') raw))

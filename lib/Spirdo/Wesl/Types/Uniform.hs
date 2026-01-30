@@ -52,40 +52,112 @@ import Spirdo.Wesl.Types.Layout
 -- | Typed uniform values for packing.
 
 -- | 16-bit float storage (IEEE 754 half).
-data Half = Half !Word16
+newtype Half = Half Word16
   deriving (Eq, Show)
 
 -- | 2D vector.
 data V2 a = V2 !a !a
   deriving (Eq, Show)
 
+instance Functor V2 where
+  fmap f (V2 a b) = V2 (f a) (f b)
+
+instance Foldable V2 where
+  foldMap f (V2 a b) = f a <> f b
+
+instance Traversable V2 where
+  traverse f (V2 a b) = V2 <$> f a <*> f b
+
 -- | 3D vector.
 data V3 a = V3 !a !a !a
   deriving (Eq, Show)
+
+instance Functor V3 where
+  fmap f (V3 a b c) = V3 (f a) (f b) (f c)
+
+instance Foldable V3 where
+  foldMap f (V3 a b c) = f a <> f b <> f c
+
+instance Traversable V3 where
+  traverse f (V3 a b c) = V3 <$> f a <*> f b <*> f c
 
 -- | 4D vector.
 data V4 a = V4 !a !a !a !a
   deriving (Eq, Show)
 
+instance Functor V4 where
+  fmap f (V4 a b c d) = V4 (f a) (f b) (f c) (f d)
+
+instance Foldable V4 where
+  foldMap f (V4 a b c d) = f a <> f b <> f c <> f d
+
+instance Traversable V4 where
+  traverse f (V4 a b c d) = V4 <$> f a <*> f b <*> f c <*> f d
+
 -- | 2x2 matrix (column-major).
 data M2 a = M2 !(V2 a) !(V2 a)
   deriving (Eq, Show)
+
+instance Functor M2 where
+  fmap f (M2 a b) = M2 (fmap f a) (fmap f b)
+
+instance Foldable M2 where
+  foldMap f (M2 a b) = foldMap f a <> foldMap f b
+
+instance Traversable M2 where
+  traverse f (M2 a b) = M2 <$> traverse f a <*> traverse f b
 
 -- | 3x3 matrix (column-major).
 data M3 a = M3 !(V3 a) !(V3 a) !(V3 a)
   deriving (Eq, Show)
 
+instance Functor M3 where
+  fmap f (M3 a b c) = M3 (fmap f a) (fmap f b) (fmap f c)
+
+instance Foldable M3 where
+  foldMap f (M3 a b c) = foldMap f a <> foldMap f b <> foldMap f c
+
+instance Traversable M3 where
+  traverse f (M3 a b c) = M3 <$> traverse f a <*> traverse f b <*> traverse f c
+
 -- | 4x4 matrix (column-major).
 data M4 a = M4 !(V4 a) !(V4 a) !(V4 a) !(V4 a)
   deriving (Eq, Show)
+
+instance Functor M4 where
+  fmap f (M4 a b c d) = M4 (fmap f a) (fmap f b) (fmap f c) (fmap f d)
+
+instance Foldable M4 where
+  foldMap f (M4 a b c d) = foldMap f a <> foldMap f b <> foldMap f c <> foldMap f d
+
+instance Traversable M4 where
+  traverse f (M4 a b c d) = M4 <$> traverse f a <*> traverse f b <*> traverse f c <*> traverse f d
 
 -- | 3x4 matrix (column-major).
 data M3x4 a = M3x4 !(V4 a) !(V4 a) !(V4 a)
   deriving (Eq, Show)
 
+instance Functor M3x4 where
+  fmap f (M3x4 a b c) = M3x4 (fmap f a) (fmap f b) (fmap f c)
+
+instance Foldable M3x4 where
+  foldMap f (M3x4 a b c) = foldMap f a <> foldMap f b <> foldMap f c
+
+instance Traversable M3x4 where
+  traverse f (M3x4 a b c) = M3x4 <$> traverse f a <*> traverse f b <*> traverse f c
+
 -- | 4x3 matrix (column-major).
 data M4x3 a = M4x3 !(V3 a) !(V3 a) !(V3 a) !(V3 a)
   deriving (Eq, Show)
+
+instance Functor M4x3 where
+  fmap f (M4x3 a b c d) = M4x3 (fmap f a) (fmap f b) (fmap f c) (fmap f d)
+
+instance Foldable M4x3 where
+  foldMap f (M4x3 a b c d) = foldMap f a <> foldMap f b <> foldMap f c <> foldMap f d
+
+instance Traversable M4x3 where
+  traverse f (M4x3 a b c d) = M4x3 <$> traverse f a <*> traverse f b <*> traverse f c <*> traverse f d
 
 -- | Scalar leaf for manual uniform construction.
 data ScalarValue
@@ -249,22 +321,19 @@ packUniformStorable layout value =
       let size = fromIntegral (layoutSize layout)
       alloca $ \ptr -> do
         poke ptr value
-        bytes <- BS.packCStringLen (castPtr ptr, size)
-        pure (Right bytes)
+        Right <$> BS.packCStringLen (castPtr ptr, size)
 
 emitValue :: Int -> UniformPath -> Int -> TypeLayout -> UniformValue -> Int -> Either String (Builder, Int)
 emitValue size ctx off layout value pos =
   case (layout, value) of
     (TLScalar s _ _, UVScalar v) ->
-      case scalarValueBytes s v of
-        Left err -> Left (formatAt ctx err)
-        Right bytes -> emitSegment size off (BS.pack bytes) pos
+      emitScalar ctx s v >>= \bytes ->
+        emitSegment size off bytes pos
     (TLVector n s _ _, UVVector n' vals)
       | n == n' ->
           foldMBuilder pos (zip [0 ..] vals) $ \(ix, val) curPos ->
-            case scalarValueBytes s val of
-              Left err -> Left (formatAt (ctxIndex ctx ix) err)
-              Right bytes -> emitSegment size (off + ix * scalarByteSize s) (BS.pack bytes) curPos
+            emitScalar (ctxIndex ctx ix) s val >>= \bytes ->
+              emitSegment size (off + ix * scalarByteSize s) bytes curPos
       | otherwise ->
           Left (formatAt ctx ("vector length mismatch: expected " <> show n <> ", got " <> show n'))
     (TLMatrix cols rows s _ _ stride, UVMatrix c r vals)
@@ -277,9 +346,8 @@ emitValue size ctx off layout value pos =
                 let col = ix `div` rows
                     row = ix `mod` rows
                     base = off + col * fromIntegral stride + row * scalarByteSize s
-                in case scalarValueBytes s val of
-                    Left err -> Left (formatAt (ctxIndex (ctxIndex ctx col) row) err)
-                    Right bytes -> emitSegment size base (BS.pack bytes) curPos
+                in emitScalar (ctxIndex (ctxIndex ctx col) row) s val >>= \bytes ->
+                    emitSegment size base bytes curPos
       | otherwise ->
           Left (formatAt ctx ("matrix size mismatch: expected " <> show cols <> "x" <> show rows <> ", got " <> show c <> "x" <> show r))
     (TLArray mlen stride elemLayout _ _, UVArray elems) ->
@@ -303,13 +371,16 @@ emitValue size ctx off layout value pos =
             then Left (formatAt structCtx ("unexpected struct fields: " <> intercalate ", " extra))
             else
               let valMap = Map.fromList vals
-              in foldMBuilder pos fields $ \fld curPos ->
-                  case Map.lookup fld.flName valMap of
-                    Nothing -> Left (formatAt structCtx ("missing struct field: " <> fld.flName))
-                    Just v ->
-                      emitValue size (ctxField structCtx fld.flName) (off + fromIntegral fld.flOffset) fld.flType v curPos
+              in foldMBuilder pos fields $ \fld curPos -> do
+                  v <- maybe (Left (formatAt structCtx ("missing struct field: " <> fld.flName))) Right
+                    (Map.lookup fld.flName valMap)
+                  emitValue size (ctxField structCtx fld.flName) (off + fromIntegral fld.flOffset) fld.flType v curPos
     _ ->
       Left (formatAt ctx ("uniform value does not match layout: " <> show layout))
+
+emitScalar :: UniformPath -> Scalar -> ScalarValue -> Either String ByteString
+emitScalar ctx scalar value =
+  BS.pack <$> either (Left . formatAt ctx) Right (scalarValueBytes scalar value)
 
 emitSegment :: Int -> Int -> ByteString -> Int -> Either String (Builder, Int)
 emitSegment size off bytes pos

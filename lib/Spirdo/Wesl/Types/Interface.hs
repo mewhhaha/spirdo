@@ -1,11 +1,8 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 -- | Type-level interface and reflection types.
@@ -341,7 +338,7 @@ bindingPlan :: ShaderInterface -> BindingPlan
 bindingPlan iface =
   let sorted =
         sortBy
-          (comparing (\b -> b.biGroup) <> comparing (\b -> b.biBinding) <> comparing (\b -> b.biName))
+          (comparing (.biGroup) <> comparing (.biBinding) <> comparing (.biName))
           iface.siBindings
       grouped = Map.fromListWith (<>) [(info.biGroup, [info]) | info <- sorted]
   in BindingPlan

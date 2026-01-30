@@ -15,7 +15,6 @@ Haskell WESL compiler with an optional Slop/SDL3 demo that renders shader varian
 - Vertex input reflection (`vertexAttributes`) for pipeline setup.
 - Optional SPIR‑V validation (tests use `spirv-val` when available).
 - Combined‑sampler emission by default, with opt‑in separate sampler mode when needed.
-- Minimal `wesl.toml` package metadata parsing.
 
 ## Build and Run
 Library/test builds (no demo):
@@ -63,22 +62,40 @@ Internal modules are not part of the supported surface area.
 
 ### Compile-Time Cache & Timings
 WESL quasiquotes use an on-disk cache under `dist-newstyle/.wesl-cache`.
-You can control it via `CompileOptions`:
+You can control it via `CompileOptions` helpers:
 
 ```hs
-defaultCompileOptions
-  { cacheEnabled = True
-  , cacheVerbose = False
-  , timingVerbose = False
-  , samplerBindingMode = SamplerCombined
-  }
+let opts =
+      withSamplerMode SamplerCombined
+    . withCache True
+    . withCacheVerbose False
+    . withTimingVerbose False
+    $ defaultCompileOptions
 ```
 
 Combined samplers are the default. If your backend expects **separate** sampler
-bindings, set the option explicitly via `weslWith` / `prepareWeslWith`.
+and texture bindings (e.g. explicit texture+sampler slots), set
+`withSamplerMode SamplerSeparate` via `weslWith` / `prepareWeslWith`.
+Use separate mode when your renderer provides distinct bindings for textures and
+samplers; keep combined mode for SDL‑style backends or when you want a single
+binding per sampled texture.
 
-Set `cacheVerbose = True` to print basic timing output (cache read/write).
-Set `timingVerbose = True` to print per‑phase compiler timings (parse/validate/emit).
+CompileOptions helpers you’ll typically use:
+- `withSamplerMode`
+- `withOverrides`
+- `withOverrideSpecMode`
+- `withFeatures`
+- `withCache`, `withCacheVerbose`, `withTimingVerbose`
+- `withSpirvVersion`
+
+### Fast dev mode (no API change)
+For faster iteration without changing the API:
+- Keep the cache on (default): `withCache True`.
+- Use `weslBatch`/`weslBatchWith` when you have many shaders in a single module.
+- Avoid diagnostics in hot loops (use `prepareWesl`/`wesl`, not the `*WithDiagnostics` variants).
+
+Set `withCacheVerbose True` to print basic timing output (cache read/write).
+Set `withTimingVerbose True` to print per‑phase compiler timings (parse/validate/emit).
 
 ## Declarative Binding Flow (Preferred)
 The recommended path is: **prepare → inputsFromPrepared → submit**.
@@ -142,7 +159,7 @@ lists (`inputsUniforms`, `inputsSamplers`, `inputsTextures`, ...) are ready to h
 renderer.
 
 If you need deterministic uniform ordering (by group/binding/name), use
-`orderedUniforms` (or `uniformSlots` for a tiny, backend‑ready view).
+`orderedUniforms`.
 
 `inputsFromPrepared` is pure; handle `Either` as you prefer.
 
@@ -261,7 +278,7 @@ import Spirdo.Wesl.Inputs
   , uniform
   )
 
-let opts = defaultCompileOptions { samplerBindingMode = SamplerSeparate }
+let opts = withSamplerMode SamplerSeparate defaultCompileOptions
 
 shader :: PreparedShader 'SamplerSeparate iface
 shader = [weslWith opts|
@@ -292,7 +309,7 @@ you provide samplers via `sampledTexture`. If your backend expects sampler
 slots starting at 0, keep *texture* bindings contiguous for predictability.
 
 To opt into **separate** samplers for a shader, set:
-`samplerBindingMode = SamplerSeparate`.
+`withSamplerMode SamplerSeparate`.
 
 ### Storage Buffers & Storage Textures (Builder)
 ```hs
@@ -420,7 +437,7 @@ import Spirdo.Wesl
   , preparedSpirv
   , wesl
   )
-import Spirdo.Wesl.Inputs (inputsFromPrepared, uniform, uniformSlots)
+import Spirdo.Wesl.Inputs (inputsFromPrepared, orderedUniforms, uniform)
 
 fragment :: PreparedShader 'SamplerCombined iface
 fragment = [wesl|
@@ -457,8 +474,8 @@ Right si =
     ( uniform @"params" (ParamsU (V4 t 800 600 mode)) )
 
 -- 4) Upload uniform (first/only in this shader)
-case uniformSlots si of
-  (u:_) -> sdlSetGPURenderStateFragmentUniforms rs (usBinding u) (usBytes u)
+case orderedUniforms si of
+  (u:_) -> sdlSetGPURenderStateFragmentUniforms rs (uiBinding u) (uiBytes u)
   [] -> pure ()
 ```
 
@@ -609,15 +626,11 @@ Uniform packing helpers (advanced)
 - `validateUniformStorable` — Check that a `Storable` matches a layout.
 - `packUniformStorable` — Pack a `Storable` into a layout‑compatible blob.
 
-Package helpers
-- `discoverPackageInfo` — Find and parse `wesl.toml` metadata.
-
 ### `Spirdo.Wesl.Inputs` functions
 Input builder (host‑agnostic)
 - `inputsFromPrepared` — Validate + normalize inputs against a `PreparedShader mode`.
 - `emptyInputs` — Start from an empty `ShaderInputs` (rarely needed directly).
 - `orderedUniforms` — Uniforms sorted by `(group, binding, name)`.
-- `uniformSlots` — Compact `(group, binding, bytes)` view of uniforms.
 - `inputsInterface` — Access the reflected `ShaderInterface`.
 - `inputsUniforms`, `inputsSamplers`, `inputsTextures` — Access sorted inputs.
 - `inputsStorageBuffers`, `inputsStorageTextures` — Access storage inputs.

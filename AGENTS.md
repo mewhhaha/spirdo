@@ -176,3 +176,9 @@ This keeps default builds fully validated while providing an opt-in path to stri
 - DONE: add golden SPIR-V tests (created `test/golden/`, update/compare logic in `test/Main.hs`, seeded 2 fixtures).
 - DONE: add tests for `packUniformFrom`, `validateUniformStorable`, and `packUniformStorable` in `test/Main.hs`.
 - DONE: update README to mention public API is `Spirdo.Wesl` + `Spirdo.Wesl.Inputs`, and document uniform packing helpers.
+
+## WESL Syntax Gap Closure (Complete)
+- DONE: typed numeric literal suffixes (`1i`, `1u`, `1.0f`, `1.0h`)
+- DONE: shorthand vector/matrix type names (`vec2f`, `vec3u`, `vec2h`, `mat2x2f`, etc.)
+- DONE: typed constructors with scalar splat (e.g., `vec4<f32>(1.0)` and `vec2h(1.0h)`)
+- DONE: constant expressions for array lengths and `@workgroup_size` (resolved during typecheck)

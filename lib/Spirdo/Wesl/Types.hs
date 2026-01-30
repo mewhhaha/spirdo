@@ -16,6 +16,15 @@ module Spirdo.Wesl.Types
   , OverrideSpecMode(..)
   , OverrideValue(..)
   , defaultCompileOptions
+  , withSpirvVersion
+  , withFeatures
+  , withOverrides
+  , withOverrideSpecMode
+  , withSamplerMode
+  , withEntryPoint
+  , withCache
+  , withCacheVerbose
+  , withTimingVerbose
   , FieldDecl(..)
   , StructDecl(..)
   ) where
@@ -45,7 +54,11 @@ data Attr
   deriving (Eq, Show)
 
 -- | Attribute argument.
-data AttrArg = AttrInt !Integer | AttrIdent !Text deriving (Eq, Show)
+data AttrArg
+  = AttrInt !Integer
+  | AttrIdent !Text
+  | AttrExpr !ConstExpr
+  deriving (Eq, Show)
 
 -- | Diagnostic severity.
 data DiagnosticSeverity = DiagError | DiagWarning | DiagInfo | DiagOff
@@ -74,6 +87,7 @@ data CompileOptions = CompileOptions
   , overrideValues :: [(String, OverrideValue)]
   , overrideSpecMode :: OverrideSpecMode
   , samplerBindingMode :: SamplerBindingMode
+  , entryPointName :: Maybe String
   , cacheEnabled :: Bool
   , cacheVerbose :: Bool
   , timingVerbose :: Bool
@@ -97,7 +111,43 @@ data OverrideValue
 
 -- | Default options (SPIR-V 1.6, combined samplers, caching enabled).
 defaultCompileOptions :: CompileOptions
-defaultCompileOptions = CompileOptions 0x00010600 [] [] SpecStrict SamplerCombined True False False
+defaultCompileOptions = CompileOptions 0x00010600 [] [] SpecStrict SamplerCombined Nothing True False False
+
+-- | Set the SPIR-V version (default is 1.6).
+withSpirvVersion :: Word32 -> CompileOptions -> CompileOptions
+withSpirvVersion v opts = opts { spirvVersion = v }
+
+-- | Enable WGSL/WESL feature toggles (e.g. translate-time @\@if@ flags).
+withFeatures :: [String] -> CompileOptions -> CompileOptions
+withFeatures feats opts = opts { enabledFeatures = feats }
+
+-- | Provide override specialization values.
+withOverrides :: [(String, OverrideValue)] -> CompileOptions -> CompileOptions
+withOverrides values opts = opts { overrideValues = values }
+
+-- | Choose override specialization mode (validator-friendly vs parity).
+withOverrideSpecMode :: OverrideSpecMode -> CompileOptions -> CompileOptions
+withOverrideSpecMode mode opts = opts { overrideSpecMode = mode }
+
+-- | Select sampler binding mode (combined vs separate).
+withSamplerMode :: SamplerBindingMode -> CompileOptions -> CompileOptions
+withSamplerMode mode opts = opts { samplerBindingMode = mode }
+
+-- | Select a specific entry point by name when a module defines multiple entry points.
+withEntryPoint :: String -> CompileOptions -> CompileOptions
+withEntryPoint name opts = opts { entryPointName = Just name }
+
+-- | Enable or disable the on-disk WESL cache.
+withCache :: Bool -> CompileOptions -> CompileOptions
+withCache enabled opts = opts { cacheEnabled = enabled }
+
+-- | Toggle cache logging.
+withCacheVerbose :: Bool -> CompileOptions -> CompileOptions
+withCacheVerbose verbose opts = opts { cacheVerbose = verbose }
+
+-- | Toggle compiler timing output.
+withTimingVerbose :: Bool -> CompileOptions -> CompileOptions
+withTimingVerbose verbose opts = opts { timingVerbose = verbose }
 
 -- | Parsed struct field (name, type, attributes).
 data FieldDecl = FieldDecl

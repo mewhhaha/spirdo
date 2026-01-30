@@ -6,6 +6,9 @@ module Spirdo.Wesl.Types.Layout
   ( StorageAccess(..)
   , StorageFormat(..)
   , Scalar(..)
+  , ConstExpr(..)
+  , ConstBinOp(..)
+  , ArrayLen(..)
   , Type(..)
   , FieldLayout(..)
   , TypeLayout(..)
@@ -75,12 +78,40 @@ data StorageFormat
 data Scalar = I32 | U32 | F16 | F32 | Bool
   deriving (Eq, Show, Read)
 
+-- | Constant integer expression (subset) used in array lengths and attributes.
+data ConstExpr
+  = CEInt !Integer
+  | CEIdent !Text
+  | CEUnaryNeg !ConstExpr
+  | CEBinary !ConstBinOp !ConstExpr !ConstExpr
+  | CECall !Text ![ConstExpr]
+  deriving (Eq, Show, Read)
+
+data ConstBinOp
+  = CAdd
+  | CSub
+  | CMul
+  | CDiv
+  | CMod
+  | CShl
+  | CShr
+  | CBitAnd
+  | CBitOr
+  | CBitXor
+  deriving (Eq, Show, Read)
+
+data ArrayLen
+  = ArrayLenRuntime
+  | ArrayLenFixed !Int
+  | ArrayLenExpr !ConstExpr
+  deriving (Eq, Show, Read)
+
 -- | Parsed WGSL type for reflection and layout.
 data Type
   = TyScalar Scalar
   | TyVector Int Scalar
   | TyMatrix Int Int Scalar
-  | TyArray Type (Maybe Int)
+  | TyArray Type ArrayLen
   | TyStructRef Text
   | TySampler
   | TySamplerComparison
@@ -154,7 +185,7 @@ layoutAlign tl = case tl of
   TLMatrix _ _ _ a _ _ -> a
   TLArray _ _ _ a _ -> a
   TLStruct _ _ a _ -> a
-  TLPointer _ _ _ -> 0
+  TLPointer {} -> 0
   TLSampler -> 0
   TLSamplerComparison -> 0
   TLTexture1D _ -> 0
@@ -184,7 +215,7 @@ layoutSize tl = case tl of
   TLMatrix _ _ _ _ s _ -> s
   TLArray _ _ _ _ s -> s
   TLStruct _ _ _ s -> s
-  TLPointer _ _ _ -> 0
+  TLPointer {} -> 0
   TLSampler -> 0
   TLSamplerComparison -> 0
   TLTexture1D _ -> 0
