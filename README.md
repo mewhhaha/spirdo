@@ -42,7 +42,7 @@ Set `SPIRDO_WRITE_SPV=1` to emit SPIR-V files (`fragment-*.spv`, `vertex*.spv`,
 {-# LANGUAGE QuasiQuotes #-}
 
 import qualified Data.ByteString as BS
-import Spirdo.Wesl (Shader, SamplerBindingMode(..), shaderSpirv, wesl)
+import Spirdo.Wesl.Reflection (Shader, SamplerBindingMode(..), shaderSpirv, wesl)
 
 main :: IO ()
 main = do
@@ -55,6 +55,22 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 }
 |]
   BS.writeFile "example.spv" (shaderSpirv shader)
+```
+
+## Example Usage (Runtime Compile)
+```hs
+import qualified Data.ByteString as BS
+import Spirdo.Wesl (compile, shaderBindings, shaderSpirv, shaderStage, sourceText)
+
+main :: IO ()
+main = do
+  let src = "@fragment fn main() -> @location(0) vec4<f32> { return vec4(1.0); }"
+  result <- compile [] (sourceText src)
+  case result of
+    Left err -> putStrLn ("compile failed: " <> show err)
+    Right bundle -> do
+      BS.writeFile "example.spv" (shaderSpirv bundle)
+      print (shaderStage bundle, shaderBindings bundle)
 ```
 
 ### WESL Syntax Notes (Shorthands)
@@ -72,12 +88,13 @@ let c = vec2h(1.0h);
 let d = vec4<f32>(1.0); // splat
 ```
 
-Note: the public API is exposed from `Spirdo.Wesl` and `Spirdo.Wesl.Inputs`.
-Internal modules are not part of the supported surface area.
+Note: the public API is exposed from `Spirdo.Wesl` (minimal bundle API),
+`Spirdo.Wesl.Reflection` (advanced reflection + raw compile), `Spirdo.Wesl.Uniform`,
+and `Spirdo.Wesl.Inputs`. Internal modules are not part of the supported surface area.
 
 ### Compile-Time Cache & Timings
-WESL quasiquotes use an on-disk cache under `dist-newstyle/.wesl-cache`.
-You can control it via `CompileOptions` helpers:
+WESL quasiquotes (from `Spirdo.Wesl.Reflection`) use an on-disk cache under
+`dist-newstyle/.wesl-cache`. You can control it via `CompileOptions` helpers:
 
 ```hs
 let opts =
@@ -88,14 +105,20 @@ let opts =
     $ defaultCompileOptions
 ```
 
+Runtime compilation via `Spirdo.Wesl.compile` uses `[Option]`:
+```hs
+let opts = [OptSamplerMode SamplerSeparate, OptCache (CacheInDir "dist-newstyle/.wesl-cache")]
+```
+
 Combined samplers are the default. If your backend expects **separate** sampler
 and texture bindings (e.g. explicit texture+sampler slots), set
-`withSamplerMode SamplerSeparate` via `weslWith` / `compileWith` (using `OptSamplerMode`).
+`withSamplerMode SamplerSeparate` via `weslWith` / `compileWith` in
+`Spirdo.Wesl.Reflection`, or use `OptSamplerMode` in the runtime API.
 Use separate mode when your renderer provides distinct bindings for textures and
 samplers; keep combined mode for SDL‑style backends or when you want a single
 binding per sampled texture.
 
-CompileOptions helpers you’ll typically use:
+CompileOptions helpers you’ll typically use (Reflection API):
 - `withSamplerMode`
 - `withOverrides`
 - `withOverrideSpecMode`
@@ -113,8 +136,9 @@ Set `withCacheVerbose True` to print basic timing output (cache read/write).
 Set `withTimingVerbose True` to print per‑phase compiler timings (parse/validate/emit).
 
 ## Declarative Binding Flow (Preferred)
-The recommended path is: **compile → inputsFor → submit**.
-It’s concise, type‑safe, and renderer‑agnostic.
+For typed binding submission, use the Reflection API:
+**wesl/compileWith → inputsFor → submit**. It’s concise, type‑safe, and renderer‑agnostic.
+If you only need SPIR‑V + minimal layout info, use the `Spirdo.Wesl` bundle API instead.
 
 ### Minimal, Declarative Inputs (Host-Agnostic)
 Use the small input builder DSL to keep callsites short while preserving
@@ -136,7 +160,8 @@ import Spirdo.Wesl.Inputs
   , sampledTexture
   , uniform
   )
-import Spirdo.Wesl (Shader, SamplerBindingMode(..), wesl)
+import Spirdo.Wesl.Reflection (Shader, SamplerBindingMode(..), wesl)
+import Spirdo.Wesl.Uniform (V4(..))
 
 shader :: Shader 'SamplerCombined iface
 shader = [wesl|
@@ -227,15 +252,14 @@ Notes:
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 
-import Spirdo.Wesl
+import Spirdo.Wesl.Reflection
   ( Shader
   , SamplerBindingMode(..)
-  , ToUniform(..)
-  , V4(..)
   , shaderSpirv
   , shaderPlan
   , wesl
   )
+import Spirdo.Wesl.Uniform (ToUniform(..), V4(..))
 import Spirdo.Wesl.Inputs
   ( SamplerHandle(..)
   , TextureHandle(..)
@@ -282,7 +306,8 @@ on the host). If your backend wants separate sampler slots, opt into
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 
-import Spirdo.Wesl (Shader, SamplerBindingMode(..), defaultCompileOptions, weslWith)
+import Spirdo.Wesl.Reflection (Shader, SamplerBindingMode(..), defaultCompileOptions, withSamplerMode, weslWith)
+import Spirdo.Wesl.Uniform (V4(..))
 import Spirdo.Wesl.Inputs
   ( InputsBuilder
   , SamplerHandle(..)
@@ -346,6 +371,7 @@ The high‑level path (`inputsFor`) already packs uniforms for you.
 Use these only if you need raw layout control:
 - `packUniformFrom` for `ToUniform` values
 - `packUniformStorable` for pre‑laid‑out `Storable` records
+These live in `Spirdo.Wesl.Uniform` (also re‑exported by `Spirdo.Wesl.Reflection`).
 
 ### Pipeline Integration (Renderer‑Agnostic)
 Spirdo does **not** bind you to any graphics API. The idea is:
@@ -355,15 +381,13 @@ Spirdo does **not** bind you to any graphics API. The idea is:
 ```hs
 {-# LANGUAGE DataKinds #-}
 
-import Spirdo.Wesl
+import Spirdo.Wesl.Reflection
   ( Shader
+  , BindingPlan(..)
+  , VertexAttribute(..)
   , shaderInterface
   , shaderPlan
   , vertexAttributes
-  )
-import Spirdo.Wesl.Types.Interface
-  ( BindingPlan(..)
-  , VertexAttribute(..)
   )
 import Spirdo.Wesl.Inputs (ShaderInputs(..))
 
@@ -409,28 +433,29 @@ submitInputs inputs = do
 
 ### Runtime Compilation (Optional)
 If you need runtime compilation (e.g., loading `.wesl` from disk), use the
-`compile*` helpers:
+bundle API:
 
 ```hs
 import Spirdo.Wesl
-  ( Source(..)
-  , compile
-  , compileFile
+  ( compile
   , compileWithDiagnostics
   , shaderSpirv
+  , sourceFile
+  , sourceText
   )
 
-Right (SomeShader shader) = compile (SourceInline "<inline>" src)
-bytes = (shaderSpirv shader)
+Right bundle <- compile [] (sourceText src)
+let bytes = shaderSpirv bundle
 
-Right (SomeShader fileShader) <- compileFile "shaders/main.wesl"
+Right fileBundle <- compile [] (sourceFile "shaders/main.wesl")
 
-Right (SomeShader diagShader, diags) =
-  compileWithDiagnostics [] (SourceInline "<inline>" src)
+Right (diagBundle, diags) <-
+  compileWithDiagnostics [] (sourceText src)
 ```
 
 If you need a *deterministic bind order*, use `shaderPlan` and `bpBindings`
 from the shader.
+That requires the Reflection API (`Spirdo.Wesl.Reflection`).
 
 ### SDL (Example‑only, Not in the Library)
 Spirdo stays SDL‑agnostic, but SDL integration can be very declarative. The
@@ -442,15 +467,14 @@ direct SDL GPU wiring variant in minimal form:
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
 
-import Spirdo.Wesl
+import Spirdo.Wesl.Reflection
   ( Shader
   , SamplerBindingMode(..)
-  , ToUniform(..)
-  , V4(..)
   , shaderPlan
   , shaderSpirv
   , wesl
   )
+import Spirdo.Wesl.Uniform (ToUniform(..), V4(..))
 import Spirdo.Wesl.Inputs (inputsFor, orderedUniforms, uniform)
 
 fragment :: Shader 'SamplerCombined iface
@@ -506,7 +530,7 @@ Notes:
 ```hs
 {-# LANGUAGE QuasiQuotes #-}
 
-import Spirdo.Wesl
+import Spirdo.Wesl.Reflection
   ( Shader
   , shaderInterface
   , vertexAttributes
@@ -534,7 +558,7 @@ Right vattrs = vertexAttributes (shaderInterface vprep)
 ```hs
 {-# LANGUAGE QuasiQuotes #-}
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 compute = [wesl|
 @group(0) @binding(0) var<storage, read_write> data: array<u32>;
@@ -601,46 +625,45 @@ When enabled, files are written to the repo root:
 - `vertex*.spv` for vertex examples
 
 ## API Reference (Public)
-Public surface area is **`Spirdo.Wesl`** and **`Spirdo.Wesl.Inputs`**.
-Everything else is internal.
+Public surface area:
+- `Spirdo.Wesl` — minimal bundle API (runtime compile)
+- `Spirdo.Wesl.Reflection` — advanced reflection + raw compile + quasiquoter
+- `Spirdo.Wesl.Uniform` — uniform packing helpers
+- `Spirdo.Wesl.Inputs` — typed input builder DSL
 
-### `Spirdo.Wesl` functions
-Compilation / preparation
-- `wesl` — Quasiquoter that compiles inline WESL at build time to `Shader mode` (mode inferred from options).
-- `wesl` — Quasiquoter that compiles inline WESL at build time to `Shader mode` (mode inferred from options).
-- `weslWith` — Same as `wesl`, but with explicit `CompileOptions` (features, cache, sampler mode).
-- `compile` — Compile inline WESL at runtime to `SomeShader` (via `SourceInline`).
-- `compileWith` — Runtime compile with explicit `Option` overrides.
-- `compileFile` — Compile a `.wesl` file (imports supported).
-- `compileFileWith` — File compile with explicit `Option` overrides.
-- `compileWithDiagnostics` — Runtime compile returning `SomeShader` + diagnostics.
-- `compileFileWithDiagnostics` — File compile returning `SomeShader` + diagnostics.
-- `defaultCompileOptions` — Sensible defaults (combined samplers, caching on).
+### `Spirdo.Wesl`
+Compilation
+- `compile` — Compile a `Source` (inline or file) to `ShaderBundle` (IO).
+- `compileWithDiagnostics` — Same, but returns diagnostics.
+- `sourceText`, `sourceFile` — Construct a `Source` without exposing constructors.
+- `Option` constructors (`Opt*`) — sampler mode, overrides, cache, entry point, etc.
 
-Shader accessors
-- `shaderSpirv` — SPIR‑V bytes for a `Shader mode`.
-- `shaderInterface` — `ShaderInterface` for reflection/binding info.
-- `shaderStageCached` — Cached stage on `Shader`.
-- `shaderPlan` — `BindingPlan` (counts + sorted bindings).
-- `shaderVertexAttributes` — Precomputed vertex attributes (only for vertex stages).
+Bundle accessors
+- `shaderSpirv` — SPIR‑V bytes for a bundle.
+- `shaderStage` — Stage for a bundle.
+- `shaderBindings` — Binding list (name/kind/group/binding).
+- `shaderVertexAttributes` — Vertex attributes (empty for non‑vertex stages).
+- `shaderOverrides` — Override names + spec IDs.
+- `shaderSamplerMode` — Combined vs separate sampler mode.
+- `shaderWorkgroupSize` — Workgroup size (compute only).
 
-Reflection helpers
-- `shaderStage` — Get stage from a `ShaderInterface`.
-- `stageIO` — Combined stage IO (`StageIO`) if present.
-- `stageInputs`, `stageOutputs` — Stage IO split into inputs/outputs.
-- `vertexInputs`, `vertexOutputs` — Vertex‑stage IO helpers.
-- `vertexAttributes` — Extract vertex attribute formats/locations.
-- `pushConstantLayout` — Push‑constant layout if present.
-- `specializableOverrides` — Overrides with runtime specialization IDs.
+### `Spirdo.Wesl.Reflection`
+Compile + quasiquote
+- `wesl`, `weslWith`, `weslBatch`, `weslBatchWith`
+- `compile`, `compileWith`, `compileWithDiagnostics`
+- `compileFile`, `compileFileWith`, `compileFileWithDiagnostics`
+- `CompileOptions` + helpers (`withSamplerMode`, `withOverrides`, `withFeatures`, ...)
 
-Uniform packing helpers (advanced)
-- `uniform` — Build a `UniformValue` for manual packing.
-- `packUniform` — Pack a `UniformValue` against a `TypeLayout`.
-- `packUniformFrom` — Pack any `ToUniform` value against a layout.
-- `validateUniformStorable` — Check that a `Storable` matches a layout.
-- `packUniformStorable` — Pack a `Storable` into a layout‑compatible blob.
+Shader accessors + reflection
+- `shaderSpirv`, `shaderInterface`, `shaderPlan`, `shaderStageCached`, `shaderVertexAttributes`
+- `shaderStage`, `vertexAttributes`, `pushConstantLayout`, `specializableOverrides`
 
-### `Spirdo.Wesl.Inputs` functions
+### `Spirdo.Wesl.Uniform`
+Uniform packing helpers
+- `uniform`, `packUniform`, `packUniformFrom`, `validateUniformStorable`, `packUniformStorable`
+- `V2/V3/V4`, `M2/M3/M4/M3x4/M4x3`, `Half`, `ToUniform`, `UniformValue`
+
+### `Spirdo.Wesl.Inputs`
 Input builder (host‑agnostic)
 - `inputsFor` — Validate + normalize inputs against a `Shader mode`.
 - `emptyInputs` — Start from an empty `ShaderInputs` (rarely needed directly).
@@ -657,5 +680,5 @@ InputsBuilder constructors
 - `storageBuffer` — Add a storage buffer binding.
 - `storageTexture` — Add a storage texture binding.
 
-Note: `Spirdo.Wesl.uniform` builds a `UniformValue` (for packing).  
+Note: `Spirdo.Wesl.Uniform.uniform` builds a `UniformValue` (for packing).  
 `Spirdo.Wesl.Inputs.uniform` builds a `ShaderInputs` entry.

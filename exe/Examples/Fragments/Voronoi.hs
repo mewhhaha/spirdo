@@ -4,7 +4,7 @@
 -- | Example fragment shader: Voronoi.
 module Examples.Fragments.Voronoi (fragmentVoronoiShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentVoronoiShader =
       [wesl|

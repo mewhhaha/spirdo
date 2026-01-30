@@ -8,7 +8,7 @@ module Examples.Vertex
   , vertexFullscreenShader
   ) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 vertexShader =
       [wesl|

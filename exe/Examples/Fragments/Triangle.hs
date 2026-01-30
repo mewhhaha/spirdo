@@ -4,7 +4,7 @@
 -- | Example fragment shader: Triangle.
 module Examples.Fragments.Triangle (fragmentTriangleShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentTriangleShader =
       [wesl|

@@ -4,7 +4,7 @@
 -- | Example fragment shader: FeatureMix.
 module Examples.Fragments.FeatureMix (fragmentFeatureShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentFeatureShader =
       [wesl|

@@ -4,7 +4,7 @@
 -- | Example fragment shader: Raymarch.
 module Examples.Fragments.Raymarch (fragmentRaymarchShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentRaymarchShader =
       [wesl|

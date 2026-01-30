@@ -15,17 +15,19 @@ import GHC.Generics (Generic)
 import Slop hiding (Shader, V4)
 import Slop.SDL.Raw (GPUDevice(..), GPUSampler(..), GPUTexture(..))
 
-import Spirdo.Wesl
+import Spirdo.Wesl.Reflection
   ( BindingInfo(..)
   , BindingPlan(..)
   , Shader
   , ShaderInterface(..)
   , SamplerBindingMode(..)
-  , ToUniform
-  , V4(..)
   , shaderSpirv
   , shaderPlan
   , shaderInterface
+  )
+import Spirdo.Wesl.Uniform
+  ( ToUniform
+  , V4(..)
   )
 import Spirdo.Wesl.Inputs
   ( SamplerHandle(..)

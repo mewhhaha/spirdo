@@ -4,7 +4,7 @@
 -- | Example fragment shader: Bits.
 module Examples.Fragments.Bits (fragmentBitsShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentBitsShader =
       [wesl|

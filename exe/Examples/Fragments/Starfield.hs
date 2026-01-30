@@ -4,7 +4,7 @@
 -- | Example fragment shader: Starfield.
 module Examples.Fragments.Starfield (fragmentStarfieldShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentStarfieldShader =
       [wesl|

@@ -4,7 +4,7 @@
 -- | Example fragment shader: Seascape.
 module Examples.Fragments.Seascape (fragmentSeascapeShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentSeascapeShader =
       [wesl|

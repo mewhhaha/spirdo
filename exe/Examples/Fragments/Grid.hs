@@ -4,7 +4,7 @@
 -- | Example fragment shader: Grid.
 module Examples.Fragments.Grid (fragmentGridShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentGridShader =
       [wesl|

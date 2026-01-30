@@ -8,7 +8,7 @@ module Examples.Compute
   , computeTilesShader
   ) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 computeShader =
       [wesl|

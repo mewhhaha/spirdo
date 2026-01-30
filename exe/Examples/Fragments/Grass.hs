@@ -4,7 +4,7 @@
 -- | Example fragment shader: Grass.
 module Examples.Fragments.Grass (fragmentGrassShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentGrassShader =
       [wesl|

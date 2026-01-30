@@ -4,7 +4,7 @@
 -- | Example fragment shader: Mandelbrot.
 module Examples.Fragments.Mandelbrot (fragmentMandelbrotShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentMandelbrotShader =
       [wesl|

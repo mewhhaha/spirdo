@@ -4,7 +4,7 @@
 -- | Example fragment shader: Plasma.
 module Examples.Fragments.Plasma (fragmentPlasmaShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentPlasmaShader =
       [wesl|

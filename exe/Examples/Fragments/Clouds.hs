@@ -4,7 +4,7 @@
 -- | Example fragment shader: Volumetric Clouds (Horizon-inspired).
 module Examples.Fragments.Clouds (fragmentCloudShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentCloudShader =
       [wesl|

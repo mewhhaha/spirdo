@@ -4,7 +4,7 @@
 -- | Example fragment shader: SdfText.
 module Examples.Fragments.SdfText (fragmentSdfTextShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentSdfTextShader =
       [wesl|

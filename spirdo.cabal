@@ -35,6 +35,8 @@ library
     exposed-modules:
                      , Spirdo.Wesl
                      , Spirdo.Wesl.Inputs
+                     , Spirdo.Wesl.Reflection
+                     , Spirdo.Wesl.Uniform
     other-modules:
         Spirdo.Wesl.Types
         Spirdo.Wesl.Types.Interface

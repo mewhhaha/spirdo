@@ -4,7 +4,7 @@
 -- | Example fragment shader: Volumetric Clouds (Protean, high turbulence).
 module Examples.Fragments.ProteanClouds (fragmentProteanCloudsShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentProteanCloudsShader =
       [wesl|

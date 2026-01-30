@@ -4,7 +4,7 @@
 -- | Example fragment shader: Tunnel.
 module Examples.Fragments.Tunnel (fragmentTunnelShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentTunnelShader =
       [wesl|

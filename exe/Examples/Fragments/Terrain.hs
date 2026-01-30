@@ -4,7 +4,7 @@
 -- | Example fragment shader: Terrain.
 module Examples.Fragments.Terrain (fragmentTerrainShader) where
 
-import Spirdo.Wesl (wesl)
+import Spirdo.Wesl.Reflection (wesl)
 
 fragmentTerrainShader =
       [wesl|
