@@ -15,7 +15,12 @@ module Spirdo.Wesl.Types
   , SamplerBindingMode(..)
   , OverrideSpecMode(..)
   , OverrideValue(..)
+  , Source(..)
+  , CachePolicy(..)
+  , Option(..)
   , defaultCompileOptions
+  , defaultOptions
+  , applyOptions
   , withSpirvVersion
   , withFeatures
   , withOverrides
@@ -23,6 +28,7 @@ module Spirdo.Wesl.Types
   , withSamplerMode
   , withEntryPoint
   , withCache
+  , withCacheDir
   , withCacheVerbose
   , withTimingVerbose
   , FieldDecl(..)
@@ -31,6 +37,7 @@ module Spirdo.Wesl.Types
 
 import Data.Text (Text)
 import Data.Word (Word32)
+import Data.List (nub)
 
 import Spirdo.Wesl.Types.Interface
 import Spirdo.Wesl.Types.Layout
@@ -89,6 +96,7 @@ data CompileOptions = CompileOptions
   , samplerBindingMode :: SamplerBindingMode
   , entryPointName :: Maybe String
   , cacheEnabled :: Bool
+  , cacheDir :: FilePath
   , cacheVerbose :: Bool
   , timingVerbose :: Bool
   }
@@ -109,9 +117,71 @@ data OverrideValue
   | OVComposite [OverrideValue]
   deriving (Eq, Show, Read)
 
+-- | Source input for compilation.
+data Source
+  = SourceInline
+      { sourceName :: FilePath
+      , sourceText :: String
+      }
+  | SourceFile FilePath
+  deriving (Eq, Show, Read)
+
+-- | Cache configuration for the compile pipeline.
+data CachePolicy
+  = CacheDisabled
+  | CacheInDir FilePath
+  deriving (Eq, Show, Read)
+
+-- | Compile option overrides for ergonomic APIs.
+data Option
+  = OptSpirvVersion Word32
+  | OptEnableFeature String
+  | OptOverrides [(String, OverrideValue)]
+  | OptOverrideSpecMode OverrideSpecMode
+  | OptSamplerMode SamplerBindingMode
+  | OptEntryPoint String
+  | OptCache CachePolicy
+  | OptCacheVerbose Bool
+  | OptTimingVerbose Bool
+  deriving (Eq, Show, Read)
+
 -- | Default options (SPIR-V 1.6, combined samplers, caching enabled).
 defaultCompileOptions :: CompileOptions
-defaultCompileOptions = CompileOptions 0x00010600 [] [] SpecStrict SamplerCombined Nothing True False False
+defaultCompileOptions =
+  CompileOptions
+    0x00010600
+    []
+    []
+    SpecStrict
+    SamplerCombined
+    Nothing
+    True
+    "dist-newstyle/.wesl-cache"
+    False
+    False
+
+-- | Default options alias for the ergonomic API.
+defaultOptions :: CompileOptions
+defaultOptions = defaultCompileOptions
+
+-- | Apply a list of option overrides to compile options.
+applyOptions :: [Option] -> CompileOptions -> CompileOptions
+applyOptions opts0 base = foldl applyOne base opts0
+  where
+    applyOne opts opt =
+      case opt of
+        OptSpirvVersion v -> opts { spirvVersion = v }
+        OptEnableFeature feat ->
+          let feats = nub (feat : opts.enabledFeatures)
+          in opts { enabledFeatures = feats }
+        OptOverrides values -> opts { overrideValues = values }
+        OptOverrideSpecMode mode -> opts { overrideSpecMode = mode }
+        OptSamplerMode mode -> opts { samplerBindingMode = mode }
+        OptEntryPoint name -> opts { entryPointName = Just name }
+        OptCache CacheDisabled -> opts { cacheEnabled = False }
+        OptCache (CacheInDir dir) -> opts { cacheEnabled = True, cacheDir = dir }
+        OptCacheVerbose verbose -> opts { cacheVerbose = verbose }
+        OptTimingVerbose verbose -> opts { timingVerbose = verbose }
 
 -- | Set the SPIR-V version (default is 1.6).
 withSpirvVersion :: Word32 -> CompileOptions -> CompileOptions
@@ -140,6 +210,10 @@ withEntryPoint name opts = opts { entryPointName = Just name }
 -- | Enable or disable the on-disk WESL cache.
 withCache :: Bool -> CompileOptions -> CompileOptions
 withCache enabled opts = opts { cacheEnabled = enabled }
+
+-- | Set the cache directory used for compile-time caching.
+withCacheDir :: FilePath -> CompileOptions -> CompileOptions
+withCacheDir dir opts = opts { cacheDir = dir }
 
 -- | Toggle cache logging.
 withCacheVerbose :: Bool -> CompileOptions -> CompileOptions

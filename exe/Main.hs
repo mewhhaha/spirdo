@@ -12,20 +12,20 @@ import Data.Word (Word32)
 import Foreign.Ptr (nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (Storable(..))
 import GHC.Generics (Generic)
-import Slop hiding (V4)
+import Slop hiding (Shader, V4)
 import Slop.SDL.Raw (GPUDevice(..), GPUSampler(..), GPUTexture(..))
 
 import Spirdo.Wesl
-  ( BindingPlan(..)
-  , BindingInfo(..)
-  , PreparedShader
+  ( BindingInfo(..)
+  , BindingPlan(..)
+  , Shader
   , ShaderInterface(..)
   , SamplerBindingMode(..)
   , ToUniform
   , V4(..)
-  , preparedInterface
-  , preparedPlan
-  , preparedSpirv
+  , shaderSpirv
+  , shaderPlan
+  , shaderInterface
   )
 import Spirdo.Wesl.Inputs
   ( SamplerHandle(..)
@@ -38,7 +38,7 @@ import Spirdo.Wesl.Inputs
   , StorageTextureInput(..)
   , ShaderInputs
   , InputsBuilder
-  , inputsFromPrepared
+  , inputsFor
   , inputsInterface
   , inputsSamplers
   , inputsStorageTextures
@@ -99,10 +99,10 @@ quadVertices = fmap Vertex
   ]
 
 data Variant where
-  Variant :: RequireUniform "params" iface => String -> BlendMode -> Pipeline -> PreparedShader mode iface -> (ParamsU -> InputsBuilder mode iface) -> Variant
+  Variant :: RequireUniform "params" iface => String -> BlendMode -> Pipeline -> Shader mode iface -> (ParamsU -> InputsBuilder mode iface) -> Variant
 
 data FragmentVariant where
-  FragmentVariant :: RequireUniform "params" iface => String -> BlendMode -> PreparedShader mode iface -> (ParamsU -> InputsBuilder mode iface) -> FragmentVariant
+  FragmentVariant :: RequireUniform "params" iface => String -> BlendMode -> Shader mode iface -> (ParamsU -> InputsBuilder mode iface) -> FragmentVariant
 
 data History = History
   { historyTarget :: RenderTarget
@@ -127,7 +127,7 @@ main = do
   runWindow cfg $ do
     mesh <- createMesh vertexLayout quadVertices
     let vprep = vertexShader
-    vshader <- createVertexShader (preparedSpirv vprep) (countsFromPrepared vprep)
+    vshader <- createVertexShader (shaderSpirv vprep) (countsFromShader vprep)
 
     noiseSampler <- createSampler (defaultSamplerDesc { samplerAddressU = SamplerRepeat, samplerAddressV = SamplerRepeat, samplerAddressW = SamplerRepeat })
     baseNoise3D <-
@@ -201,8 +201,8 @@ main = do
                   { time_res = V4 frame.time (fromIntegral w) (fromIntegral h) mixFactor
                   , color = V4 1 1 1 1
                   }
-          case inputsFromPrepared fprep (mkInputs params) of
-            Left err -> error (vName <> ": " <> err)
+          case inputsFor fprep (mkInputs params) of
+            Left err -> error (vName <> ": " <> err.ieMessage)
             Right inputs -> do
               if useTemporal
                 then do
@@ -220,9 +220,9 @@ main = do
                   pure (Continue (DemoState idx' historyOpt))
     pure ()
 
-mkVariant :: RequireUniform "params" iface => String -> BlendMode -> PreparedShader mode iface -> (ParamsU -> InputsBuilder mode iface) -> VertexShader -> WindowM Variant
+mkVariant :: RequireUniform "params" iface => String -> BlendMode -> Shader mode iface -> (ParamsU -> InputsBuilder mode iface) -> VertexShader -> WindowM Variant
 mkVariant name blend prep mkInputs vshader = do
-  fshader <- createFragmentShader (preparedSpirv prep) (countsFromPrepared prep)
+  fshader <- createFragmentShader (shaderSpirv prep) (countsFromShader prep)
   pipeline <- graphicsPipeline
     GraphicsDesc
       { gfxVertex = vshader
@@ -267,18 +267,26 @@ historyUpdated history valid =
     Nothing -> error "missing history render target"
 
 
-countsFromPrepared :: PreparedShader mode iface -> ShaderCounts
-countsFromPrepared prepared =
-  let bindingPlan = preparedPlan prepared
-      iface = preparedInterface prepared
+countsFromShader :: Shader mode iface -> ShaderCounts
+countsFromShader shader =
+  let bindingPlan = shaderPlan shader
+      iface = shaderInterface shader
+      BindingPlan
+        { bpSamplers = planSamplers
+        , bpTextures = planTextures
+        , bpStorageTextures = planStorageTextures
+        , bpStorageBuffers = planStorageBuffers
+        , bpUniforms = planUniforms
+        } = bindingPlan
+      ShaderInterface { siSamplerMode = samplerMode } = iface
       samplerBindings =
-        case iface.siSamplerMode of
-          SamplerCombined -> bindingPlan.bpTextures
-          SamplerSeparate -> bindingPlan.bpSamplers
+        case samplerMode of
+          SamplerCombined -> planTextures
+          SamplerSeparate -> planSamplers
       samplerCount = bindingCount samplerBindings
-      storageTextureCount = bindingCount bindingPlan.bpStorageTextures
-      storageBufferCount = bindingCount bindingPlan.bpStorageBuffers
-      uniformCount = bindingCount bindingPlan.bpUniforms
+      storageTextureCount = bindingCount planStorageTextures
+      storageBufferCount = bindingCount planStorageBuffers
+      uniformCount = bindingCount planUniforms
   in ShaderCounts
       samplerCount
       storageTextureCount
@@ -297,12 +305,12 @@ bindingsFromInputs inputs =
         | u <- orderedUniforms inputs
         ]
       samplers =
-        case iface.siSamplerMode of
-          SamplerCombined ->
+        case iface of
+          ShaderInterface { siSamplerMode = SamplerCombined } ->
             [ fSamplerWith t.textureBinding (textureFromHandle t.textureHandle) (samplerFromHandle (resolveSampler t))
             | t <- inputsTextures inputs
             ]
-          SamplerSeparate ->
+          ShaderInterface { siSamplerMode = SamplerSeparate } ->
             [ fSamplerWith s.samplerBinding (textureFromHandle (TextureHandle (samplerTex s))) (samplerFromHandle s.samplerHandle)
             | s <- inputsSamplers inputs
             ]

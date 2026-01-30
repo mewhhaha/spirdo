@@ -27,8 +27,7 @@ import Spirdo.Wesl
 import Spirdo.Wesl.Inputs
   ( SamplerHandle(..)
   , TextureHandle(..)
-  , UniformInput(..)
-  , inputsFromPrepared
+  , inputsFor
   , inputsUniforms
   )
 import qualified Spirdo.Wesl.Inputs as Inputs
@@ -108,21 +107,27 @@ data ParamsExtended2U = ParamsExtended2U
 instance ToUniform ParamsExtended2U
 
 
-defaultOpts :: CompileOptions
-defaultOpts = defaultCompileOptions
+defaultOpts :: [Option]
+defaultOpts = []
 
-separateOpts :: CompileOptions
-separateOpts = withSamplerMode SamplerSeparate defaultCompileOptions
+separateOpts :: [Option]
+separateOpts = [OptSamplerMode SamplerSeparate]
 
-prepareBytes :: CompileOptions -> String -> Either CompileError BS.ByteString
-prepareBytes opts src = do
-  SomePreparedShader prep <- prepareWeslWith opts src
-  pure (preparedSpirv prep)
+inlineSource :: String -> Source
+inlineSource = SourceInline "<inline>"
 
-prepareBytesWithDiagnostics :: CompileOptions -> String -> Either CompileError (BS.ByteString, [Diagnostic])
-prepareBytesWithDiagnostics opts src = do
-  (SomePreparedShader prep, diags) <- prepareWeslWithDiagnostics opts src
-  pure (preparedSpirv prep, diags)
+compileInline :: [Option] -> String -> Either CompileError SomeShader
+compileInline opts src = compileWith opts (inlineSource src)
+
+compileBytes :: [Option] -> String -> Either CompileError BS.ByteString
+compileBytes opts src = do
+  SomeShader shader <- compileInline opts src
+  pure (shaderSpirv shader)
+
+compileBytesWithDiagnostics :: [Option] -> String -> Either CompileError (BS.ByteString, [Diagnostic])
+compileBytesWithDiagnostics opts src = do
+  (SomeShader shader, diags) <- compileWithDiagnostics opts (inlineSource src)
+  pure ((shaderSpirv shader), diags)
 
 main :: IO ()
 main = do
@@ -154,7 +159,7 @@ main = do
         , ("texture-advanced", textureAdvancedShader)
         ]
   forM_ tests $ \(label, src) -> do
-    bytes <- case prepareBytes defaultOpts src of
+    bytes <- case compileBytes defaultOpts src of
       Left err -> fail (label <> ": " <> show err)
       Right bs -> pure bs
     assertSpirv spirvVal label bytes
@@ -244,25 +249,25 @@ validateSpirvVal mSpirvVal label bytes =
 
 checkSamplerInterface :: IO ()
 checkSamplerInterface =
-  case prepareWeslWith separateOpts samplerShader of
+  case compileInline separateOpts samplerShader of
     Left err -> fail ("sampler-interface: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      let kinds = map (.biKind) (preparedInterface prep).siBindings
+    Right (SomeShader shader) -> do
+      let kinds = map (.biKind) (shaderInterface shader).siBindings
       unless (BTexture2D `elem` kinds && BSampler `elem` kinds) $
         fail "sampler-interface: expected texture_2d and sampler bindings"
 
 checkCombinedSamplerInterface :: IO ()
 checkCombinedSamplerInterface =
-  case prepareWesl samplerShader of
+  case compileInline defaultOpts samplerShader of
     Left err -> fail ("sampler-combined-interface: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      let kinds = map (.biKind) (preparedInterface prep).siBindings
+    Right (SomeShader shader) -> do
+      let kinds = map (.biKind) (shaderInterface shader).siBindings
       when (BSampler `elem` kinds) $
         fail "sampler-combined-interface: sampler binding should be omitted in combined mode"
 
 checkSamplerValueCombinedError :: IO ()
 checkSamplerValueCombinedError =
-  case prepareWesl samplerValueShader of
+  case compileInline defaultOpts samplerValueShader of
     Left (CompileError msg _ _) ->
       unless ("sampler values are unavailable in combined mode" `isInfixOf` msg) $
         fail ("sampler-combined-error: unexpected error: " <> msg)
@@ -271,10 +276,10 @@ checkSamplerValueCombinedError =
 
 checkPackUniformLayout :: IO ()
 checkPackUniformLayout =
-  case prepareWesl packUniformShader of
+  case compileInline defaultOpts packUniformShader of
     Left err -> fail ("pack-uniform-layout: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      info <- case find (\b -> b.biName == "payload") (preparedInterface prep).siBindings of
+    Right (SomeShader shader) -> do
+      info <- case find (\b -> b.biName == "payload") (shaderInterface shader).siBindings of
         Nothing -> fail "pack-uniform-layout: missing payload binding"
         Just bi -> pure bi
       let value =
@@ -338,10 +343,10 @@ checkPackUniformLayout =
 
 checkPackUniformErrors :: IO ()
 checkPackUniformErrors =
-  case prepareWesl packUniformShader of
+  case compileInline defaultOpts packUniformShader of
     Left err -> fail ("pack-uniform-errors: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      info <- case find (\b -> b.biName == "payload") (preparedInterface prep).siBindings of
+    Right (SomeShader shader) -> do
+      info <- case find (\b -> b.biName == "payload") (shaderInterface shader).siBindings of
         Nothing -> fail "pack-uniform-errors: missing payload binding"
         Just bi -> pure bi
       let missing =
@@ -371,10 +376,10 @@ checkPackUniformErrors =
 
 checkPackUniformFrom :: IO ()
 checkPackUniformFrom =
-  case prepareWesl packUniformShader of
+  case compileInline defaultOpts packUniformShader of
     Left err -> fail ("pack-uniform-from: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      info <- case find (\b -> b.biName == "payload") (preparedInterface prep).siBindings of
+    Right (SomeShader shader) -> do
+      info <- case find (\b -> b.biName == "payload") (shaderInterface shader).siBindings of
         Nothing -> fail "pack-uniform-from: missing payload binding"
         Just bi -> pure bi
       let payload =
@@ -406,10 +411,10 @@ checkUniformStorable = do
 
 checkVertexAttributes :: IO ()
 checkVertexAttributes =
-  case prepareWesl vertexShader of
+  case compileInline defaultOpts vertexShader of
     Left err -> fail ("vertex-attributes: " <> show err)
-    Right (SomePreparedShader prep) ->
-      case vertexAttributes (preparedInterface prep) of
+    Right (SomeShader shader) ->
+      case vertexAttributes (shaderInterface shader) of
         Left err -> fail ("vertex-attributes: " <> err)
         Right attrs ->
           case attrs of
@@ -422,11 +427,11 @@ checkVertexAttributes =
 
 checkBindingPlan :: IO ()
 checkBindingPlan =
-  case prepareWeslWith separateOpts samplerShader of
+  case compileInline separateOpts samplerShader of
     Left err -> fail ("binding-plan: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      let iface = preparedInterface prep
-      let plan = preparedPlan prep
+    Right (SomeShader shader) -> do
+      let iface = (shaderInterface shader)
+      let plan = (shaderPlan shader)
       unless (length plan.bpBindings == length iface.siBindings) $
         fail "binding-plan: binding count mismatch"
       let group0 = filter (\b -> b.biGroup == 0) plan.bpBindings
@@ -439,8 +444,8 @@ checkBindingPlan =
 
 checkInputOrdering :: IO ()
 checkInputOrdering =
-  case inputsFromPrepared orderingShader (Inputs.uniform @"b" (ParamsU (V4 1 2 3 4) :: ParamsU) <> Inputs.uniform @"a" (ParamsU (V4 0 0 0 0) :: ParamsU)) of
-    Left err -> fail ("input-ordering: " <> err)
+  case inputsFor orderingShader (Inputs.uniform @"b" (ParamsU (V4 1 2 3 4) :: ParamsU) <> Inputs.uniform @"a" (ParamsU (V4 0 0 0 0) :: ParamsU)) of
+    Left err -> fail ("input-ordering: " <> err.ieMessage)
     Right inputs -> do
       let names = map (.uiName) (inputsUniforms inputs)
       unless (names == ["a", "b"]) $
@@ -448,31 +453,31 @@ checkInputOrdering =
 
 checkInputsCombinedMissingSampler :: IO ()
 checkInputsCombinedMissingSampler =
-  case inputsFromPrepared combinedInputShader
+  case inputsFor combinedInputShader
         (Inputs.uniform @"params" (ParamsU (V4 1 2 3 4) :: ParamsU)
           <> Inputs.texture @"tex" (TextureHandle 9)) of
     Left err ->
-      unless ("missing sampler for textures" `isInfixOf` err) $
-        fail ("inputs-combined-missing: unexpected error: " <> err)
+      unless ("missing sampler for textures" `isInfixOf` err.ieMessage) $
+        fail ("inputs-combined-missing: unexpected error: " <> err.ieMessage)
     Right _ ->
       fail "inputs-combined-missing: expected error for missing sampler"
 
 checkInputsCombinedOk :: IO ()
 checkInputsCombinedOk =
-  case inputsFromPrepared combinedInputShader
+  case inputsFor combinedInputShader
         (Inputs.uniform @"params" (ParamsU (V4 1 2 3 4) :: ParamsU)
           <> Inputs.sampledTexture @"tex" (TextureHandle 9) (SamplerHandle 3)) of
-    Left err -> fail ("inputs-combined-ok: " <> err)
+    Left err -> fail ("inputs-combined-ok: " <> err.ieMessage)
     Right _ -> pure ()
 
 checkInputsDuplicateBuilder :: IO ()
 checkInputsDuplicateBuilder =
-  case inputsFromPrepared combinedInputShader
+  case inputsFor combinedInputShader
         (Inputs.uniform @"params" (ParamsU (V4 1 2 3 4) :: ParamsU)
           <> Inputs.uniform @"params" (ParamsU (V4 5 6 7 8) :: ParamsU)) of
     Left err ->
-      unless ("duplicate binding entry" `isInfixOf` err) $
-        fail ("inputs-duplicate: unexpected error: " <> err)
+      unless ("duplicate binding entry" `isInfixOf` err.ieMessage) $
+        fail ("inputs-duplicate: unexpected error: " <> err.ieMessage)
     Right _ ->
       fail "inputs-duplicate: expected duplicate binding error"
 
@@ -603,10 +608,10 @@ genInner = (,) <$> genV2 <*> arbitrary
 
 checkPackUniformExtendedRandom :: IO ()
 checkPackUniformExtendedRandom =
-  case prepareWesl packUniformExtendedShader of
+  case compileInline defaultOpts packUniformExtendedShader of
     Left err -> fail ("quickcheck: pack-uniform-extended: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      info <- case find (\b -> b.biName == "params") (preparedInterface prep).siBindings of
+    Right (SomeShader shader) -> do
+      info <- case find (\b -> b.biName == "params") (shaderInterface shader).siBindings of
         Nothing -> fail "quickcheck: pack-uniform-extended: missing params binding"
         Just bi -> pure bi
       case info.biType of
@@ -733,10 +738,10 @@ checkPackUniformExtendedRandom =
 
 checkPackUniformExtended2 :: IO ()
 checkPackUniformExtended2 =
-  case prepareWesl packUniformExtendedShader2 of
+  case compileInline defaultOpts packUniformExtendedShader2 of
     Left err -> fail ("quickcheck: pack-uniform-extended2: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      info <- case find (\b -> b.biName == "params2") (preparedInterface prep).siBindings of
+    Right (SomeShader shader) -> do
+      info <- case find (\b -> b.biName == "params2") (shaderInterface shader).siBindings of
         Nothing -> fail "quickcheck: pack-uniform-extended2: missing params2 binding"
         Just bi -> pure bi
       case info.biType of
@@ -911,13 +916,13 @@ checkPackUniformExtended2 =
 
 checkDuplicateBindings :: IO ()
 checkDuplicateBindings =
-  case prepareWesl duplicateBindingShader of
+  case compileInline defaultOpts duplicateBindingShader of
     Left (CompileError msg _ _) ->
       unless ("duplicate binding" `isInfixOf` msg) $
         fail ("duplicate-bindings: unexpected error: " <> msg)
     Right _ -> fail "duplicate-bindings: expected failure"
 
-orderingShader :: PreparedShader 'SamplerCombined
+orderingShader :: Shader 'SamplerCombined
   '[ 'Binding "b" 'BUniform 0 1 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
    , 'Binding "a" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
    ]
@@ -956,7 +961,7 @@ checkGoldenSpirv = do
         ]
   whenUpdate update (createDirectoryIfMissing True dir)
   forM_ fixtures $ \(label, src) -> do
-    bytes <- case prepareBytes defaultOpts src of
+    bytes <- case compileBytes defaultOpts src of
       Left err -> fail ("golden:" <> label <> ": " <> show err)
       Right bs -> pure bs
     let path = dir </> (label <> ".spv.golden")
@@ -975,50 +980,50 @@ checkGoldenSpirv = do
 
 checkIfTranslation :: IO ()
 checkIfTranslation = do
-  let opts = withFeatures ["FOO"] defaultCompileOptions
-  case prepareBytes opts ifShader of
+  let opts = [OptEnableFeature "FOO"]
+  case compileBytes opts ifShader of
     Left err -> fail ("if-translation: " <> show err)
     Right _ -> pure ()
-  case prepareBytes defaultOpts ifShader of
+  case compileBytes defaultOpts ifShader of
     Left _ -> pure ()
     Right _ -> fail "if-translation: expected failure without FOO feature"
 
 checkImportCompile :: Maybe FilePath -> IO ()
 checkImportCompile spirvVal = do
   let path = "test" </> "fixtures" </> "main.wesl"
-  result <- prepareWeslFile path
+  result <- compileFile path
   case result of
     Left err -> fail ("import-compile: " <> show err)
-    Right (SomePreparedShader prep) -> assertSpirv spirvVal "import-compile" (preparedSpirv prep)
+    Right (SomeShader shader) -> assertSpirv spirvVal "import-compile" (shaderSpirv shader)
 
 checkImportItemCompile :: Maybe FilePath -> IO ()
 checkImportItemCompile spirvVal = do
   let path = "test" </> "fixtures" </> "main_item.wesl"
-  result <- prepareWeslFile path
+  result <- compileFile path
   case result of
     Left err -> fail ("import-item: " <> show err)
-    Right (SomePreparedShader prep) -> assertSpirv spirvVal "import-item" (preparedSpirv prep)
+    Right (SomeShader shader) -> assertSpirv spirvVal "import-item" (shaderSpirv shader)
 
 checkImportAliasCompile :: Maybe FilePath -> IO ()
 checkImportAliasCompile spirvVal = do
   let path = "test" </> "fixtures" </> "main_alias.wesl"
-  result <- prepareWeslFile path
+  result <- compileFile path
   case result of
     Left err -> fail ("import-alias: " <> show err)
-    Right (SomePreparedShader prep) -> assertSpirv spirvVal "import-alias" (preparedSpirv prep)
+    Right (SomeShader shader) -> assertSpirv spirvVal "import-alias" (shaderSpirv shader)
 
 checkCtsFixtures :: Maybe FilePath -> IO ()
 checkCtsFixtures spirvVal = do
   positive <- collectCtsFixtures ("test" </> "cts" </> "positive")
   negative <- collectCtsFixtures ("test" </> "cts" </> "negative")
   forM_ positive $ \path -> do
-    result <- prepareWeslFile path
+    result <- compileFile path
     case result of
       Left err -> fail ("cts-positive: " <> path <> ": " <> show err)
-      Right (SomePreparedShader prep) ->
-        assertSpirv spirvVal ("cts-positive:" <> path) (preparedSpirv prep)
+      Right (SomeShader shader) ->
+        assertSpirv spirvVal ("cts-positive:" <> path) (shaderSpirv shader)
   forM_ negative $ \path -> do
-    result <- prepareWeslFile path
+    result <- compileFile path
     case result of
       Left _ -> pure ()
       Right _ -> fail ("cts-negative: expected failure for " <> path)
@@ -1035,30 +1040,30 @@ collectCtsFixtures dir = do
 
 checkSwitchConstValidation :: IO ()
 checkSwitchConstValidation =
-  case prepareBytes defaultOpts badSwitchShader of
+  case compileBytes defaultOpts badSwitchShader of
     Left _ -> pure ()
     Right _ -> fail "switch-const: expected failure for non-const selector"
 
 checkConstAssertValidation :: IO ()
 checkConstAssertValidation =
-  case prepareBytes defaultOpts badConstAssertShader of
+  case compileBytes defaultOpts badConstAssertShader of
     Left _ -> pure ()
     Right _ -> fail "const-assert: expected failure for false const_assert"
 
 checkOverrideSpecialization :: Maybe FilePath -> IO ()
 checkOverrideSpecialization spirvVal = do
-  let opts = withOverrides [("scale", OVI32 4)] defaultCompileOptions
-  case prepareBytes opts overrideSpecShader of
+  let opts = [OptOverrides [("scale", OVI32 4)]]
+  case compileBytes opts overrideSpecShader of
     Left err -> fail ("override-specialization: " <> show err)
     Right bytes -> assertSpirv spirvVal "override-specialization" bytes
 
 checkOverrideDefault :: Maybe FilePath -> IO ()
 checkOverrideDefault spirvVal =
-  case prepareWesl overrideDefaultShader of
+  case compileInline defaultOpts overrideDefaultShader of
     Left err -> fail ("override-default: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      assertSpirv spirvVal "override-default" (preparedSpirv prep)
-      let overrides = (preparedInterface prep).siOverrides
+    Right (SomeShader shader) -> do
+      assertSpirv spirvVal "override-default" (shaderSpirv shader)
+      let overrides = (shaderInterface shader).siOverrides
       case find (\o -> o.oiName == "scale") overrides of
         Nothing -> fail "override-default: missing scale override"
         Just info -> do
@@ -1084,20 +1089,20 @@ checkOverrideDefault spirvVal =
 
 checkOverrideMissing :: IO ()
 checkOverrideMissing =
-  case prepareWesl overrideShader of
+  case compileInline defaultOpts overrideShader of
     Left err -> fail ("override-missing: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      let overrides = (preparedInterface prep).siOverrides
+    Right (SomeShader shader) -> do
+      let overrides = (shaderInterface shader).siOverrides
       unless (any (\o -> o.oiName == "scale") overrides) $
         fail "override-missing: expected scale override in interface"
 
 checkOverrideDependency :: Maybe FilePath -> IO ()
 checkOverrideDependency spirvVal =
-  case prepareWesl overrideSpecOpShader of
+  case compileInline defaultOpts overrideSpecOpShader of
     Left err -> fail ("override-dependency: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      assertSpirv spirvVal "override-dependency" (preparedSpirv prep)
-      let overrides = (preparedInterface prep).siOverrides
+    Right (SomeShader shader) -> do
+      assertSpirv spirvVal "override-dependency" (shaderSpirv shader)
+      let overrides = (shaderInterface shader).siOverrides
       case find (\o -> o.oiName == "scale") overrides of
         Nothing -> fail "override-dependency: missing scale override"
         Just info ->
@@ -1106,11 +1111,11 @@ checkOverrideDependency spirvVal =
 
 checkOverrideParityMode :: IO ()
 checkOverrideParityMode = do
-  let opts = withOverrideSpecMode SpecParity defaultCompileOptions
-  case prepareWeslWith opts overrideSpecOpShader of
+  let opts = [OptOverrideSpecMode SpecParity]
+  case compileInline opts overrideSpecOpShader of
     Left err -> fail ("override-parity: " <> show err)
-    Right (SomePreparedShader prep) -> do
-      let overrides = (preparedInterface prep).siOverrides
+    Right (SomeShader shader) -> do
+      let overrides = (shaderInterface shader).siOverrides
       case find (\o -> o.oiName == "scale") overrides of
         Nothing -> fail "override-parity: missing scale override"
         Just info ->
@@ -1119,7 +1124,7 @@ checkOverrideParityMode = do
 
 checkDiagnosticOverride :: IO ()
 checkDiagnosticOverride =
-  case prepareBytesWithDiagnostics defaultOpts diagnosticShader of
+  case compileBytesWithDiagnostics defaultOpts diagnosticShader of
     Left err -> fail ("diagnostic-override: " <> show err)
     Right (_, diags) ->
       unless (null diags) $
@@ -1127,7 +1132,7 @@ checkDiagnosticOverride =
 
 checkDiagnosticWarning :: IO ()
 checkDiagnosticWarning =
-  case prepareBytesWithDiagnostics defaultOpts diagnosticWarnShader of
+  case compileBytesWithDiagnostics defaultOpts diagnosticWarnShader of
     Left err -> fail ("diagnostic-warning: " <> show err)
     Right (_, diags) ->
       case find (\d -> d.diagRule == "const_assert" && d.diagSeverity == DiagWarning) diags of
@@ -1138,7 +1143,7 @@ checkDiagnosticWarning =
 
 checkDiagnosticUnreachable :: IO ()
 checkDiagnosticUnreachable =
-  case prepareBytesWithDiagnostics defaultOpts diagnosticUnreachableShader of
+  case compileBytesWithDiagnostics defaultOpts diagnosticUnreachableShader of
     Left err -> fail ("diagnostic-unreachable: " <> show err)
     Right (_, diags) ->
       unless (any (\d -> d.diagRule == "unreachable_code" && d.diagSeverity == DiagWarning) diags) $
@@ -1146,7 +1151,7 @@ checkDiagnosticUnreachable =
 
 checkDiagnosticUnusedExpr :: IO ()
 checkDiagnosticUnusedExpr =
-  case prepareBytesWithDiagnostics defaultOpts diagnosticUnusedExprShader of
+  case compileBytesWithDiagnostics defaultOpts diagnosticUnusedExprShader of
     Left err -> fail ("diagnostic-unused-expr: " <> show err)
     Right (_, diags) ->
       unless (any (\d -> d.diagRule == "unused_expression" && d.diagSeverity == DiagWarning) diags) $
@@ -1154,7 +1159,7 @@ checkDiagnosticUnusedExpr =
 
 checkDiagnosticUnusedVar :: IO ()
 checkDiagnosticUnusedVar =
-  case prepareBytesWithDiagnostics defaultOpts diagnosticUnusedVarShader of
+  case compileBytesWithDiagnostics defaultOpts diagnosticUnusedVarShader of
     Left err -> fail ("diagnostic-unused-var: " <> show err)
     Right (_, diags) ->
       unless (any (\d -> d.diagRule == "unused_variable" && d.diagSeverity == DiagWarning) diags) $
@@ -1162,7 +1167,7 @@ checkDiagnosticUnusedVar =
 
 checkDiagnosticUnusedParam :: IO ()
 checkDiagnosticUnusedParam =
-  case prepareBytesWithDiagnostics defaultOpts diagnosticUnusedParamShader of
+  case compileBytesWithDiagnostics defaultOpts diagnosticUnusedParamShader of
     Left err -> fail ("diagnostic-unused-param: " <> show err)
     Right (_, diags) ->
       unless (any (\d -> d.diagRule == "unused_parameter" && d.diagSeverity == DiagWarning) diags) $
@@ -1170,7 +1175,7 @@ checkDiagnosticUnusedParam =
 
 checkDiagnosticShadowing :: IO ()
 checkDiagnosticShadowing =
-  case prepareBytesWithDiagnostics defaultOpts diagnosticShadowingShader of
+  case compileBytesWithDiagnostics defaultOpts diagnosticShadowingShader of
     Left err -> fail ("diagnostic-shadowing: " <> show err)
     Right (_, diags) ->
       unless (any (\d -> d.diagRule == "shadowing" && d.diagSeverity == DiagWarning) diags) $
@@ -1178,7 +1183,7 @@ checkDiagnosticShadowing =
 
 checkDiagnosticConstantCondition :: IO ()
 checkDiagnosticConstantCondition =
-  case prepareBytesWithDiagnostics defaultOpts diagnosticConstantCondShader of
+  case compileBytesWithDiagnostics defaultOpts diagnosticConstantCondShader of
     Left err -> fail ("diagnostic-constant-condition: " <> show err)
     Right (_, diags) ->
       unless (any (\d -> d.diagRule == "constant_condition" && d.diagSeverity == DiagWarning) diags) $
@@ -1186,7 +1191,7 @@ checkDiagnosticConstantCondition =
 
 checkDiagnosticDuplicateCase :: IO ()
 checkDiagnosticDuplicateCase =
-  case prepareBytesWithDiagnostics defaultOpts diagnosticDuplicateCaseShader of
+  case compileBytesWithDiagnostics defaultOpts diagnosticDuplicateCaseShader of
     Left err -> fail ("diagnostic-duplicate-case: " <> show err)
     Right (_, diags) ->
       unless (any (\d -> d.diagRule == "duplicate_case" && d.diagSeverity == DiagWarning) diags) $
@@ -1371,7 +1376,7 @@ samplerValueShader =
     , "}"
     ]
 
-combinedInputShader :: PreparedShader 'SamplerCombined
+combinedInputShader :: Shader 'SamplerCombined
   '[ 'Binding "params" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
    , 'Binding "tex" 'BTexture2D 0 1 ('TTexture2D 'SF32)
    ]

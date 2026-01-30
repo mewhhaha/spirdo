@@ -19,6 +19,7 @@ module Spirdo.Wesl.Inputs
   , RequireTexture
   , RequireStorageBuffer
   , RequireStorageTexture
+  , InputsError(..)
   , UniformInput(..)
   , SamplerInput(..)
   , TextureInput(..)
@@ -33,7 +34,7 @@ module Spirdo.Wesl.Inputs
   , texture
   , storageBuffer
   , storageTexture
-  , inputsFromPrepared
+  , inputsFor
   , ShaderInputs
   , inputsInterface
   , inputsUniforms
@@ -61,12 +62,12 @@ import Spirdo.Wesl.Types
   , BindingInfo(..)
   , BindingKind(..)
   , BindingMap
-  , PreparedShader(..)
+  , Shader(..)
+  , shaderInterface
   , ShaderInterface(..)
   , SamplerBindingMode(..)
   , UniformValue
   , ToUniform(..)
-  , preparedInterface
   , bindingInfoForMap
   , bindingMap
   , isSamplerKind
@@ -238,6 +239,12 @@ data StorageTextureInput = StorageTextureInput
   , storageTextureHandle :: !StorageTextureHandle
   } deriving (Eq, Show)
 
+-- | Validation error when building inputs.
+data InputsError = InputsError
+  { ieMessage :: !String
+  , ieBinding :: !(Maybe String)
+  } deriving (Eq, Show)
+
 -- | Fully validated, normalized inputs derived from a shader interface.
 data ShaderInputs (iface :: [Binding]) = ShaderInputs
   { siInterface :: !ShaderInterface
@@ -366,7 +373,7 @@ storageBuffer handle = InputsBuilder [InputStorageBuffer (symbolVal (Proxy @name
 storageTexture :: forall name mode iface. (KnownSymbol name, RequireStorageTexture name iface) => StorageTextureHandle -> InputsBuilder mode iface
 storageTexture handle = InputsBuilder [InputStorageTexture (symbolVal (Proxy @name)) handle]
 
-inputsFrom :: forall mode iface. ShaderInterface -> InputsBuilder mode iface -> Either String (ShaderInputs iface)
+inputsFrom :: forall mode iface. ShaderInterface -> InputsBuilder mode iface -> Either InputsError (ShaderInputs iface)
 inputsFrom iface (InputsBuilder items) =
   let bmap = bindingMap iface
       initInputs = emptyInputs iface
@@ -378,28 +385,28 @@ inputsFrom iface (InputsBuilder items) =
           let missing = [t.textureName | t <- normalized.siTextures, isNothing t.textureSampler]
           in if null missing
               then Right normalized
-              else Left ("missing sampler for textures: " <> intercalate ", " missing)
+              else Left (InputsError ("missing sampler for textures: " <> intercalate ", " missing) Nothing)
         SamplerSeparate -> Right normalized
 
--- | Validate and normalize inputs against a prepared shader.
-inputsFromPrepared :: forall mode iface. PreparedShader mode iface -> InputsBuilder mode iface -> Either String (ShaderInputs iface)
-inputsFromPrepared prepared = inputsFrom (preparedInterface prepared)
+-- | Validate and normalize inputs against a shader.
+inputsFor :: forall mode iface. Shader mode iface -> InputsBuilder mode iface -> Either InputsError (ShaderInputs iface)
+inputsFor shader = inputsFrom (shaderInterface shader)
 
-applyItem :: BindingMap -> (ShaderInputs iface, Set.Set String) -> InputItem -> Either String (ShaderInputs iface, Set.Set String)
+applyItem :: BindingMap -> (ShaderInputs iface, Set.Set String) -> InputItem -> Either InputsError (ShaderInputs iface, Set.Set String)
 applyItem bmap (inputs, seen) item = do
   let name = itemName item
   when (Set.member name seen) $
-    Left ("duplicate binding entry: " <> name)
-  info <- maybe (Left ("binding not found in interface: " <> name)) Right (bindingInfoForMap name bmap)
+    Left (InputsError ("duplicate binding entry: " <> name) (Just name))
+  info <- maybe (Left (InputsError ("binding not found in interface: " <> name) (Just name))) Right (bindingInfoForMap name bmap)
   inputs' <- applyBinding name info item inputs
   pure (inputs', Set.insert name seen)
 
-applyBinding :: String -> BindingInfo -> InputItem -> ShaderInputs iface -> Either String (ShaderInputs iface)
+applyBinding :: String -> BindingInfo -> InputItem -> ShaderInputs iface -> Either InputsError (ShaderInputs iface)
 applyBinding name info item inputs =
   case (item, info.biKind) of
     (InputUniform _ val, kind)
       | isUniformKind kind -> do
-          bytes <- first (\err -> "binding " <> name <> ": " <> err) (packUniform info.biType val)
+          bytes <- first (\err -> InputsError ("binding " <> name <> ": " <> err) (Just name)) (packUniform info.biType val)
           pure inputs
             { siUniforms =
                 UniformInput
@@ -472,7 +479,7 @@ applyBinding name info item inputs =
                   }
                   : inputs.siStorageTextures
             }
-    _ -> Left ("binding " <> name <> ": kind mismatch")
+    _ -> Left (InputsError ("binding " <> name <> ": kind mismatch") (Just name))
 
 itemName :: InputItem -> String
 itemName item =

@@ -14,13 +14,13 @@ module Spirdo.Wesl
   , StageIO(..)
   , BindingPlan(..)
   , shaderStage
-  , PreparedShader
-  , SomePreparedShader(..)
-  , preparedSpirv
-  , preparedInterface
-  , preparedStage
-  , preparedPlan
-  , preparedVertexAttributes
+  , Shader(..)
+  , SomeShader(..)
+  , shaderSpirv
+  , shaderInterface
+  , shaderPlan
+  , shaderStageCached
+  , shaderVertexAttributes
   , UniformValue
   , ToUniform(..)
   , uniform
@@ -53,6 +53,9 @@ module Spirdo.Wesl
   , FieldLayout(..)
   , specializableOverrides
   , CompileError(..)
+  , Source(..)
+  , CachePolicy(..)
+  , Option(..)
   , CompileOptions
   , SamplerBindingMode(..)
   , OverrideSpecMode(..)
@@ -60,20 +63,23 @@ module Spirdo.Wesl
   , Diagnostic(..)
   , DiagnosticSeverity(..)
   , defaultCompileOptions
+  , defaultOptions
+  , applyOptions
   , withSpirvVersion
   , withFeatures
   , withOverrides
   , withOverrideSpecMode
   , withSamplerMode
   , withCache
+  , withCacheDir
   , withCacheVerbose
   , withTimingVerbose
-  , prepareWesl
-  , prepareWeslWith
-  , prepareWeslFile
-  , prepareWeslFileWith
-  , prepareWeslWithDiagnostics
-  , prepareWeslFileWithDiagnostics
+  , compile
+  , compileWith
+  , compileWithDiagnostics
+  , compileFile
+  , compileFileWith
+  , compileFileWithDiagnostics
   , wesl
   , weslWith
   , weslBatch

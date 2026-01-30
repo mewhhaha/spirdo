@@ -80,6 +80,62 @@ withCompiled opts result k =
   case compileToCompiled opts result of
     SomeCompiledShader shader -> k shader
 
+-- | Compile WESL source to a fully prepared shader.
+compile :: Source -> Either CompileError SomeShader
+compile = compileWith []
+
+-- | Compile WESL source with option overrides (inline only).
+compileWith :: [Option] -> Source -> Either CompileError SomeShader
+compileWith overrides src =
+  let opts = applyOptions overrides defaultCompileOptions
+  in case src of
+      SourceInline _name text -> do
+        result <- compileInlineResult opts False text
+        withCompiled opts result $ \shader -> do
+          prep <- toCompileError (prepareShader shader)
+          pure (SomeShader (shaderFromPrepared prep))
+      SourceFile _ ->
+        Left (CompileError "file inputs require compileFile/compileFileWith" Nothing Nothing)
+
+-- | Compile WESL source with diagnostics (inline only).
+compileWithDiagnostics :: [Option] -> Source -> Either CompileError (SomeShader, [Diagnostic])
+compileWithDiagnostics overrides src =
+  let opts = applyOptions overrides defaultCompileOptions
+  in case src of
+      SourceInline _name text -> do
+        result <- compileInlineResult opts True text
+        withCompiled opts result $ \shader -> do
+          prep <- toCompileError (prepareShader shader)
+          pure (SomeShader (shaderFromPrepared prep), result.crDiagnostics)
+      SourceFile _ ->
+        Left (CompileError "file inputs require compileFile/compileFileWithDiagnostics" Nothing Nothing)
+
+-- | Compile a WESL file to a fully prepared shader.
+compileFile :: FilePath -> IO (Either CompileError SomeShader)
+compileFile = compileFileWith []
+
+-- | Compile a WESL file with option overrides.
+compileFileWith :: [Option] -> FilePath -> IO (Either CompileError SomeShader)
+compileFileWith overrides path = do
+  let opts = applyOptions overrides defaultCompileOptions
+  result <- compileFileResult opts False path
+  pure $ do
+    cr <- result
+    withCompiled opts cr $ \shader -> do
+      prep <- toCompileError (prepareShader shader)
+      pure (SomeShader (shaderFromPrepared prep))
+
+-- | Compile a WESL file and return diagnostics.
+compileFileWithDiagnostics :: [Option] -> FilePath -> IO (Either CompileError (SomeShader, [Diagnostic]))
+compileFileWithDiagnostics overrides path = do
+  let opts = applyOptions overrides defaultCompileOptions
+  result <- compileFileResult opts True path
+  pure $ do
+    cr <- result
+    withCompiled opts cr $ \shader -> do
+      prep <- toCompileError (prepareShader shader)
+      pure (SomeShader (shaderFromPrepared prep), cr.crDiagnostics)
+
 -- | Compile inline WESL to a prepared shader (runtime).
 prepareWesl :: String -> Either CompileError SomePreparedShader
 prepareWesl = prepareWeslWith defaultCompileOptions
@@ -213,8 +269,8 @@ compileFileResult opts wantDiagnostics path =
 weslCacheVersion :: String
 weslCacheVersion = "wesl-cache-v4"
 
-weslCacheDir :: FilePath
-weslCacheDir = "dist-newstyle" </> ".wesl-cache"
+defaultCacheDir :: FilePath
+defaultCacheDir = "dist-newstyle" </> ".wesl-cache"
 
 weslCacheKey :: CompileOptions -> String -> String
 weslCacheKey opts src =
@@ -245,7 +301,8 @@ fnv1a64 = BS.foldl' step offset
 weslCachePaths :: CompileOptions -> String -> (FilePath, FilePath)
 weslCachePaths opts src =
   let key = weslCacheKey opts src
-      base = weslCacheDir </> key
+      baseDir = if null opts.cacheDir then defaultCacheDir else opts.cacheDir
+      base = baseDir </> key
   in (base <.> "spv", base <.> "iface")
 
 loadWeslCache :: CompileOptions -> String -> IO (Maybe (ByteString, ShaderInterface))
@@ -334,7 +391,8 @@ preparedExpWith opts bytes iface = do
           (TH.AppE (TH.AppE (TH.ConE 'CompiledShader) bytesExp) ifaceExp)
           compiledTy
   let prepExp = TH.AppE (TH.VarE 'unsafePrepareInline) compiledExp
-  pure (TH.SigE prepExp (TH.AppT (TH.AppT (TH.ConT ''PreparedShader) modeTy) ifaceTy))
+  let shaderExp = TH.AppE (TH.VarE 'shaderFromPrepared) prepExp
+  pure (TH.SigE shaderExp (TH.AppT (TH.AppT (TH.ConT ''Shader) modeTy) ifaceTy))
 
 -- | Compile multiple inline WESL shaders in a single splice.
 weslBatch :: [(String, String)] -> Q [TH.Dec]

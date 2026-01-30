@@ -53,6 +53,15 @@ module Spirdo.Wesl.Types.Interface
   , specializableOverrides
   , CompiledShader(..)
   , SomeCompiledShader(..)
+  , Shader(..)
+  , SomeShader(..)
+  , shaderFromPrepared
+  , someShaderFromPrepared
+  , shaderSpirv
+  , shaderInterface
+  , shaderPlan
+  , shaderStageCached
+  , shaderVertexAttributes
   ) where
 
 import Data.ByteString (ByteString)
@@ -401,6 +410,18 @@ data CompiledShader (mode :: SamplerBindingMode) (iface :: [Binding]) = Compiled
 -- | Existential wrapper for runtime compilation output.
 data SomeCompiledShader = forall mode iface. SomeCompiledShader (CompiledShader mode iface)
 
+-- | Fully prepared shader with cached stage and binding plan.
+data Shader (mode :: SamplerBindingMode) (iface :: [Binding]) = Shader
+  { shaderSpirv :: ByteString
+  , shaderInterface :: ShaderInterface
+  , shaderStage :: ShaderStage
+  , shaderPlan :: BindingPlan
+  , shaderVertexAttributes :: Maybe [VertexAttribute]
+  }
+
+-- | Existential wrapper for shaders.
+data SomeShader = forall mode iface. SomeShader (Shader mode iface)
+
 -- | Prepared shader with cached stage and binding plan.
 data PreparedShader (mode :: SamplerBindingMode) iface = PreparedShader
   { psShader :: CompiledShader mode iface
@@ -448,6 +469,41 @@ preparedPlan prep = prep.psPlan
 -- | Cached vertex attributes for vertex shaders.
 preparedVertexAttributes :: PreparedShader mode iface -> Maybe [VertexAttribute]
 preparedVertexAttributes prep = prep.psVertexAttributes
+
+-- | SPIR-V bytes for a shader.
+shaderSpirv :: Shader mode iface -> ByteString
+shaderSpirv (Shader spv _ _ _ _) = spv
+
+-- | Reflected interface for a shader.
+shaderInterface :: Shader mode iface -> ShaderInterface
+shaderInterface (Shader _ iface _ _ _) = iface
+
+-- | Cached binding plan for a shader.
+shaderPlan :: Shader mode iface -> BindingPlan
+shaderPlan (Shader _ _ _ plan _) = plan
+
+-- | Cached stage for a shader.
+shaderStageCached :: Shader mode iface -> ShaderStage
+shaderStageCached (Shader _ _ stage _ _) = stage
+
+-- | Cached vertex attributes for vertex shaders.
+shaderVertexAttributes :: Shader mode iface -> Maybe [VertexAttribute]
+shaderVertexAttributes (Shader _ _ _ _ attrs) = attrs
+
+-- | Convert a prepared shader to the new shader record.
+shaderFromPrepared :: PreparedShader mode iface -> Shader mode iface
+shaderFromPrepared prep =
+  Shader
+    { shaderSpirv = preparedSpirv prep
+    , shaderInterface = preparedInterface prep
+    , shaderStage = preparedStage prep
+    , shaderPlan = preparedPlan prep
+    , shaderVertexAttributes = preparedVertexAttributes prep
+    }
+
+-- | Convert an existential prepared shader to a shader.
+someShaderFromPrepared :: SomePreparedShader -> SomeShader
+someShaderFromPrepared (SomePreparedShader prep) = SomeShader (shaderFromPrepared prep)
 
 -- | SPIR-V bytes for an existential prepared shader.
 somePreparedSpirv :: SomePreparedShader -> ByteString

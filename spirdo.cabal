@@ -11,6 +11,7 @@ maintainer:         kopatheonlyone@hotmail.com
 category:           Graphics
 build-type:         Simple
 extra-doc-files:    CHANGELOG.md
+                   , MIGRATION.md
 extra-source-files:
     bench/fixtures/feature.wesl
 
