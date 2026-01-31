@@ -5,7 +5,6 @@
 module Examples.Compute
   ( computeShader
   , computeParticlesShader
-  , computeTilesShader
   ) where
 
 import Spirdo.Wesl.Reflection (wesl)
@@ -139,30 +138,5 @@ if (p.pos.y > params.bounds.y) { p.pos.y = -params.bounds.y; }
 if (p.pos.y < -params.bounds.y) { p.pos.y = params.bounds.y; }
 
 particles.items[idx] = p;
-}
-|]
-computeTilesShader =
-      [wesl|
-struct Params {
-time: f32;
-res: vec2<f32>;
-};
-
-@group(0) @binding(0)
-var<storage> out_tex: texture_storage_2d<rgba8unorm, write>;
-
-@group(0) @binding(1)
-var<uniform> params: Params;
-
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-let coord = vec2(i32(gid.x), i32(gid.y));
-let uv = vec2(f32(gid.x) / params.res.x, f32(gid.y) / params.res.y);
-let p = vec2(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0);
-let t = params.time;
-let waves = sin(p.x * 12.0 + t) * cos(p.y * 10.0 - t);
-let glow = smoothstep(0.4, 0.0, abs(waves));
-let col = vec3(0.15, 0.3, 0.55) + vec3(glow, glow * 0.6, glow * 0.8);
-textureStore(out_tex, coord, vec4(col.x, col.y, col.z, 1.0));
 }
 |]

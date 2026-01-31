@@ -7,9 +7,11 @@
 module Main (main) where
 
 import Control.Applicative ((<|>))
+import Control.Monad (when)
+import Control.Monad.IO.Class (liftIO)
 import Data.List (find)
 import Data.Word (Word32)
-import Foreign.Ptr (nullPtr, ptrToWordPtr, wordPtrToPtr)
+import Foreign.Ptr (nullPtr, wordPtrToPtr)
 import Foreign.Storable (Storable(..))
 import GHC.Generics (Generic)
 import Slop hiding (Shader, V4)
@@ -131,55 +133,25 @@ main = do
     let vprep = vertexShader
     vshader <- createVertexShader (shaderSpirv vprep) (countsFromShader vprep)
 
-    noiseSampler <- createSampler (defaultSamplerDesc { samplerAddressU = SamplerRepeat, samplerAddressV = SamplerRepeat, samplerAddressW = SamplerRepeat })
-    baseNoise3D <-
-      createNoiseTexture3D 128 128 128
-        (loopNoise3D 128 128 128 (defaultNoiseSettings { noiseType = NoisePerlin, noiseScale = 48, noiseOctaves = 4 }))
-    detailNoise3D <-
-      createNoiseTexture3D 96 96 96
-        (loopNoise3D 96 96 96 (defaultNoiseSettings { noiseType = NoiseVoronoi, noiseScale = 24, noiseOctaves = 1, noiseVoronoiJitter = 1 }))
-    weather2D <-
-      createNoiseTexture2D 512 512
-        (loopNoise2D 512 512 (defaultNoiseSettings { noiseType = NoisePerlin, noiseScale = 128, noiseOctaves = 5, noiseGain = 0.5 }))
-    let noiseSamplerHandle = samplerHandleFromSlop noiseSampler
-    let baseNoiseHandle = textureHandleFromSlop baseNoise3D
-    let detailNoiseHandle = textureHandleFromSlop detailNoise3D
-    let weatherHandle = textureHandleFromSlop weather2D
-
     let baseVariants =
-          [ FragmentVariant "Feature Mix" BlendNone fragmentFeatureShader (Inputs.uniform @"params")
-          , FragmentVariant "Raymarch" BlendNone fragmentRaymarchShader (Inputs.uniform @"params")
-          , FragmentVariant "Triangle" BlendNone fragmentTriangleShader (Inputs.uniform @"params")
-          , FragmentVariant "Plasma" BlendNone fragmentPlasmaShader (Inputs.uniform @"params")
-          , FragmentVariant "Grid" BlendNone fragmentGridShader (Inputs.uniform @"params")
-          , FragmentVariant "SDF Text" BlendNone fragmentSdfTextShader (Inputs.uniform @"params")
-          , FragmentVariant "Clouds" BlendAlpha fragmentCloudShader
-              (\params ->
-                Inputs.uniform @"params" params
-                  <> Inputs.sampledTexture @"baseNoise" baseNoiseHandle noiseSamplerHandle
-                  <> Inputs.sampledTexture @"detailNoise" detailNoiseHandle noiseSamplerHandle
-                  <> Inputs.sampledTexture @"weatherTex" weatherHandle noiseSamplerHandle
-              )
-          , FragmentVariant "Bits" BlendNone fragmentBitsShader (Inputs.uniform @"params")
-          , FragmentVariant "Aurora" BlendNone fragmentAuroraShader (Inputs.uniform @"params")
-          , FragmentVariant "Starfield" BlendNone fragmentStarfieldShader (Inputs.uniform @"params")
-          , FragmentVariant "Tunnel" BlendNone fragmentTunnelShader (Inputs.uniform @"params")
-          , FragmentVariant "Voronoi" BlendNone fragmentVoronoiShader (Inputs.uniform @"params")
-          , FragmentVariant "Mandelbrot" BlendNone fragmentMandelbrotShader (Inputs.uniform @"params")
-          , FragmentVariant "Terrain" BlendNone fragmentTerrainShader (Inputs.uniform @"params")
-          , FragmentVariant "Seascape" BlendNone fragmentSeascapeShader (Inputs.uniform @"params")
-          , FragmentVariant "Protean Clouds" BlendAlpha fragmentProteanCloudsShader
-              (\params ->
-                Inputs.uniform @"params" params
-                  <> Inputs.sampledTexture @"baseNoise" baseNoiseHandle noiseSamplerHandle
-                  <> Inputs.sampledTexture @"detailNoise" detailNoiseHandle noiseSamplerHandle
-                  <> Inputs.sampledTexture @"weatherTex" weatherHandle noiseSamplerHandle
-              )
-          , FragmentVariant "Primitives" BlendNone fragmentPrimitivesShader (Inputs.uniform @"params")
-          , FragmentVariant "Grass" BlendNone fragmentGrassShader (Inputs.uniform @"params")
+          [ FragmentVariant "Gradient Bloom" BlendNone fragmentGradientBloomShader (Inputs.uniform @"params")
+          , FragmentVariant "Circle Pulse" BlendNone fragmentCirclePulseShader (Inputs.uniform @"params")
+          , FragmentVariant "Spectrum Shift" BlendNone fragmentSpectrumShiftShader (Inputs.uniform @"params")
+          , FragmentVariant "Sine Waves" BlendNone fragmentSineWavesShader (Inputs.uniform @"params")
+          , FragmentVariant "Checker Warp" BlendNone fragmentCheckerWarpShader (Inputs.uniform @"params")
+          , FragmentVariant "Ripple Caustics" BlendNone fragmentRippleCausticsShader (Inputs.uniform @"params")
+          , FragmentVariant "Plasma Storm" BlendNone fragmentPlasmaStormShader (Inputs.uniform @"params")
+          , FragmentVariant "Vignette Glow" BlendNone fragmentVignetteGlowShader (Inputs.uniform @"params")
+          , FragmentVariant "Noise Flow" BlendNone fragmentNoiseFlowShader (Inputs.uniform @"params")
+          , FragmentVariant "Swirl Vortex" BlendNone fragmentSwirlVortexShader (Inputs.uniform @"params")
+          , FragmentVariant "Metaballs" BlendNone fragmentMetaballsShader (Inputs.uniform @"params")
+          , FragmentVariant "Kaleidoscope" BlendNone fragmentKaleidoscopeShader (Inputs.uniform @"params")
           ]
 
     variants <- mapM (\(FragmentVariant name blend shader mkInputs) -> mkVariant name blend shader mkInputs vshader) baseVariants
+    case variants of
+      (Variant vName _ _ _ _ : _) -> liftIO (putStrLn ("Demo: " <> vName))
+      [] -> pure ()
 
     _ <- loop (DemoState 0 Nothing) $ \frame state -> do
       let count = length variants
@@ -190,6 +162,8 @@ main = do
       let idx' = if count == 0 then 0 else (state.stateIndex + delta + count) `mod` count
       case variants !! idx' of
         Variant vName vBlend vPipeline fprep mkInputs -> do
+          when (idx' /= state.stateIndex) $
+            liftLoop (liftIO (putStrLn ("Demo: " <> vName)))
           let (w, h) = frame.renderSize
           let size = (w, h)
           let useTemporal = vBlend == BlendAlpha
@@ -364,16 +338,6 @@ textureFromHandle (TextureHandle value) =
     , textureHeight = 0
     , textureDepth = 0
   }
-
-samplerHandleFromSlop :: Sampler -> SamplerHandle
-samplerHandleFromSlop (Sampler sampler) =
-  case sampler of
-    GPUSampler ptr -> SamplerHandle (fromIntegral (ptrToWordPtr ptr))
-
-textureHandleFromSlop :: Texture -> TextureHandle
-textureHandleFromSlop tex =
-  case tex.textureHandle of
-    GPUTexture ptr -> TextureHandle (fromIntegral (ptrToWordPtr ptr))
 
 storageTextureFromHandle :: StorageTextureHandle -> Texture
 storageTextureFromHandle (StorageTextureHandle value) =

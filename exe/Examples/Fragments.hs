@@ -1,42 +1,30 @@
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
--- | Fragment shader example registry.
+-- | Fragment shader example registry (online-inspired gallery).
 module Examples.Fragments
-  ( fragmentFeatureShader
-  , fragmentRaymarchShader
-  , fragmentTriangleShader
-  , fragmentPlasmaShader
-  , fragmentGridShader
-  , fragmentSdfTextShader
-  , fragmentCloudShader
-  , fragmentBitsShader
-  , fragmentAuroraShader
-  , fragmentStarfieldShader
-  , fragmentTunnelShader
-  , fragmentVoronoiShader
-  , fragmentMandelbrotShader
-  , fragmentTerrainShader
-  , fragmentSeascapeShader
-  , fragmentProteanCloudsShader
-  , fragmentPrimitivesShader
-  , fragmentGrassShader
+  ( fragmentGradientBloomShader
+  , fragmentCirclePulseShader
+  , fragmentSpectrumShiftShader
+  , fragmentSineWavesShader
+  , fragmentCheckerWarpShader
+  , fragmentRippleCausticsShader
+  , fragmentPlasmaStormShader
+  , fragmentVignetteGlowShader
+  , fragmentNoiseFlowShader
+  , fragmentSwirlVortexShader
+  , fragmentMetaballsShader
+  , fragmentKaleidoscopeShader
   ) where
 
-import Examples.Fragments.Aurora (fragmentAuroraShader)
-import Examples.Fragments.Bits (fragmentBitsShader)
-import Examples.Fragments.Clouds (fragmentCloudShader)
-import Examples.Fragments.FeatureMix (fragmentFeatureShader)
-import Examples.Fragments.Grass (fragmentGrassShader)
-import Examples.Fragments.Grid (fragmentGridShader)
-import Examples.Fragments.Mandelbrot (fragmentMandelbrotShader)
-import Examples.Fragments.Plasma (fragmentPlasmaShader)
-import Examples.Fragments.Primitives (fragmentPrimitivesShader)
-import Examples.Fragments.ProteanClouds (fragmentProteanCloudsShader)
-import Examples.Fragments.Raymarch (fragmentRaymarchShader)
-import Examples.Fragments.SdfText (fragmentSdfTextShader)
-import Examples.Fragments.Seascape (fragmentSeascapeShader)
-import Examples.Fragments.Starfield (fragmentStarfieldShader)
-import Examples.Fragments.Terrain (fragmentTerrainShader)
-import Examples.Fragments.Triangle (fragmentTriangleShader)
-import Examples.Fragments.Tunnel (fragmentTunnelShader)
-import Examples.Fragments.Voronoi (fragmentVoronoiShader)
+import Examples.Fragments.CheckerWarp (fragmentCheckerWarpShader)
+import Examples.Fragments.CirclePulse (fragmentCirclePulseShader)
+import Examples.Fragments.GradientBloom (fragmentGradientBloomShader)
+import Examples.Fragments.Kaleidoscope (fragmentKaleidoscopeShader)
+import Examples.Fragments.Metaballs (fragmentMetaballsShader)
+import Examples.Fragments.NoiseFlow (fragmentNoiseFlowShader)
+import Examples.Fragments.PlasmaStorm (fragmentPlasmaStormShader)
+import Examples.Fragments.RippleCaustics (fragmentRippleCausticsShader)
+import Examples.Fragments.SineWaves (fragmentSineWavesShader)
+import Examples.Fragments.SpectrumShift (fragmentSpectrumShiftShader)
+import Examples.Fragments.SwirlVortex (fragmentSwirlVortexShader)
+import Examples.Fragments.VignetteGlow (fragmentVignetteGlowShader)
