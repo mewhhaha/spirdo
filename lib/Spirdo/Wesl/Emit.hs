@@ -263,13 +263,13 @@ overrideDependencies decls =
 collectOverrideRefs :: Set.Set Text -> Expr -> Set.Set Text
 collectOverrideRefs names expr =
   case expr of
-    EVar n | Set.member n names -> Set.singleton n
-    EUnary _ e -> collectOverrideRefs names e
-    EBinary _ a b -> collectOverrideRefs names a <> collectOverrideRefs names b
-    ECall _ args -> foldMap (collectOverrideRefs names) args
-    EBitcast _ e -> collectOverrideRefs names e
-    EField e _ -> collectOverrideRefs names e
-    EIndex a b -> collectOverrideRefs names a <> collectOverrideRefs names b
+    EVar _ n | Set.member n names -> Set.singleton n
+    EUnary _ _ e -> collectOverrideRefs names e
+    EBinary _ _ a b -> collectOverrideRefs names a <> collectOverrideRefs names b
+    ECall _ _ args -> foldMap (collectOverrideRefs names) args
+    EBitcast _ _ e -> collectOverrideRefs names e
+    EField _ e _ -> collectOverrideRefs names e
+    EIndex _ a b -> collectOverrideRefs names a <> collectOverrideRefs names b
     _ -> Set.empty
 
 topoSortOverrides :: [Text] -> Map.Map Text (Set.Set Text) -> Either CompileError [Text]
@@ -863,7 +863,7 @@ emitModuleConstants decls st0 = foldM emitOne st0 decls
 emitConstExpr :: GenState -> Expr -> Either CompileError (GenState, Value)
 emitConstExpr st expr =
   case expr of
-    EInt n -> do
+    EInt _ n -> do
       (scalar, val) <- selectIntLiteralScalar n
       case scalar of
         I32 -> do
@@ -877,17 +877,17 @@ emitConstExpr st expr =
           let layout = TLScalar U32 a sz
           Right (st1, Value layout cid)
         _ -> Left (CompileError "integer literal must be i32 or u32" Nothing Nothing)
-    EFloat f -> do
+    EFloat _ f -> do
       let (cid, st1) = emitConstF32 st f
       let (a, sz) = scalarLayout F32
       let layout = TLScalar F32 a sz
       Right (st1, Value layout cid)
-    EBool b -> do
+    EBool _ b -> do
       let (cid, st1) = emitConstBool st b
       let (a, sz) = scalarLayout Bool
       let layout = TLScalar Bool a sz
       Right (st1, Value layout cid)
-    EUnary OpNeg inner -> do
+    EUnary _ OpNeg inner -> do
       (st1, val) <- emitConstExpr st inner
       case val.valType of
         TLScalar I32 _ _ -> do
@@ -914,7 +914,7 @@ emitConstExpr st expr =
           let layout = TLScalar F16 a sz
           Right (st2, Value layout cid)
         _ -> Left (CompileError "unary minus expects a numeric constant" Nothing Nothing)
-    EBinary op a b -> do
+    EBinary _ op a b -> do
       (st1, v1) <- emitConstExpr st a
       (st2, v2) <- emitConstExpr st1 b
       case (v1.valType, v2.valType) of
@@ -926,11 +926,11 @@ emitConstExpr st expr =
             (F16, F32) -> emitFloatBin op F32 st2 v1 v2
             _ -> emitIntBin op s1 s2 st2 v1 v2
         _ -> Left (CompileError "constant operation expects scalar values" Nothing Nothing)
-    EVar name ->
+    EVar _ name ->
       case lookup name (st.gsConstValues) of
         Just val -> Right (st, val)
         Nothing -> Left (CompileError ("unknown constant: " <> textToString name) Nothing Nothing)
-    ECall name args ->
+    ECall _ name args ->
       case parseVectorCtorName name of
         Just (n, targetScalar) -> emitConstVectorCtor n targetScalar args st
         Nothing ->
@@ -1297,7 +1297,7 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
       emitSpecConstValueToLayout layout constVal st
     tryEmit st0 ex =
       case ex of
-        EInt n -> do
+        EInt _ n -> do
           (scalar, val) <- selectIntLiteralScalar n
           case scalar of
             I32 -> do
@@ -1309,15 +1309,15 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
               let (a, sz) = scalarLayout U32
               Right (st1, Value (TLScalar U32 a sz) cid)
             _ -> Left (CompileError "integer literal must be i32 or u32" Nothing Nothing)
-        EFloat f -> do
+        EFloat _ f -> do
           (cid, st1) <- emitSpecConstFloatScalar F32 f st0
           let (a, sz) = scalarLayout F32
           Right (st1, Value (TLScalar F32 a sz) cid)
-        EBool b -> do
+        EBool _ b -> do
           let (cid, st1) = emitSpecConstBool st0 b
           let (a, sz) = scalarLayout Bool
           Right (st1, Value (TLScalar Bool a sz) cid)
-        EUnary OpNeg inner -> do
+        EUnary _ OpNeg inner -> do
           (st1, v) <- tryEmit st0 inner
           case v.valType of
             TLScalar I32 _ _ -> emitSpecConstOp (v.valType) opSNegate [v.valId] st1
@@ -1325,12 +1325,12 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
             TLScalar F32 _ _ -> emitSpecConstOp (v.valType) opFNegate [v.valId] st1
             TLScalar F16 _ _ -> emitSpecConstOp (v.valType) opFNegate [v.valId] st1
             _ -> Left (CompileError "unary minus expects a scalar" Nothing Nothing)
-        EUnary OpNot inner -> do
+        EUnary _ OpNot inner -> do
           (st1, v) <- tryEmit st0 inner
           case v.valType of
             TLScalar Bool _ _ -> emitSpecConstOp (v.valType) opLogicalNot [v.valId] st1
             _ -> Left (CompileError "logical not expects bool" Nothing Nothing)
-        EBinary op a b -> do
+        EBinary _ op a b -> do
           (st1, v1) <- tryEmit st0 a
           (st2, v2) <- tryEmit st1 b
           case (v1.valType, v2.valType) of
@@ -1349,7 +1349,7 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
                 Bool ->
                   emitSpecConstBoolOp layout op opIds st2
             _ -> Left (CompileError "unsupported spec constant binary operation" Nothing Nothing)
-        ECall "select" [aExpr, bExpr, condExpr] -> do
+        ECall _ "select" [aExpr, bExpr, condExpr] -> do
           (st1, vA) <- tryEmit st0 aExpr
           (st2, vB) <- tryEmit st1 bExpr
           (st3, vCond) <- tryEmit st2 condExpr
@@ -1357,7 +1357,7 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
             (layoutA, layoutB, TLScalar Bool _ _) | layoutA == layoutB ->
               emitSpecConstOp layoutA opSelect [vCond.valId, vA.valId, vB.valId] st3
             _ -> Left (CompileError "select requires matching value types and a bool condition" Nothing Nothing)
-        ECall name args ->
+        ECall _ name args ->
           case parseVectorCtorName name of
             Just (n, targetScalar) ->
               emitSpecConstVectorCtor ctx constIndex fnIndex structIndex n targetScalar args st0
@@ -1376,7 +1376,7 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
                       case lookup name (st.gsStructLayouts) of
                         Just layout -> emitSpecConstStructCtor ctx constIndex fnIndex structIndex name layout args st0
                         Nothing -> Left (CompileError ("unsupported spec constant constructor: " <> textToString name) Nothing Nothing)
-        EVar name ->
+        EVar _ name ->
           case lookup name (st0.gsConstValues) of
             Just val -> Right (st0, val)
             Nothing -> Left (CompileError "const reference requires fallback" Nothing Nothing)
@@ -2979,7 +2979,7 @@ emitStageInputs layoutCache stage structEnv entry st0 = do
         go envNext initNext idNext usedLocsNext usedBuiltinsNext stNext rest
   go [] [] [] [] [] st0 params
   where
-    emitParam stg env (Param name ty attrs) (envAcc, initAcc, idAcc, usedLocs, usedBuiltins, st) =
+    emitParam stg env (Param _ name ty attrs) (envAcc, initAcc, idAcc, usedLocs, usedBuiltins, st) =
       case ty of
         TyStructRef structName -> do
           when (isJust (paramBuiltin attrs) || isJust (paramLocation attrs)) $
@@ -3384,9 +3384,9 @@ emitStmtFn retLayout st fs stmt
   | fs.fsTerminated = Right (st, fs)
   | otherwise =
       case stmt of
-        SLet name mType expr -> emitLet name mType expr st fs
-        SVar name mType mExpr -> emitVar name mType mExpr st fs
-        SAssign lv expr -> do
+        SLet _ name mType expr -> emitLet name mType expr st fs
+        SVar _ name mType mExpr -> emitVar name mType mExpr st fs
+        SAssign _ lv expr -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
           case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
@@ -3396,7 +3396,7 @@ emitStmtFn retLayout st fs stmt
           ensureWritable ptrInfo
           let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, val'.valId]) fs3
           Right (st3, fs4)
-        SAssignOp lv op expr -> do
+        SAssignOp _ lv op expr -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
           case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
@@ -3408,7 +3408,7 @@ emitStmtFn retLayout st fs stmt
           (st5, fs5, resVal) <- emitBinary op (ptrInfo.viType) (lhsVal.valId) (rhsVal'.valId) st4 fs4
           let fs6 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs5
           Right (st5, fs6)
-        SInc lv -> do
+        SInc _ lv -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
           case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
@@ -3419,7 +3419,7 @@ emitStmtFn retLayout st fs stmt
           (st4, fs3, resVal) <- emitBinary OpAdd (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
           let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
           Right (st4, fs4)
-        SDec lv -> do
+        SDec _ lv -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
           case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
@@ -3430,32 +3430,32 @@ emitStmtFn retLayout st fs stmt
           (st4, fs3, resVal) <- emitBinary OpSub (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
           let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
           Right (st4, fs4)
-        SExpr expr -> emitExprStmt st fs expr
-        SIf cond thenBody elseBody ->
+        SExpr _ expr -> emitExprStmt st fs expr
+        SIf _ cond thenBody elseBody ->
           emitIfFn retLayout cond thenBody elseBody st fs
-        SWhile cond body ->
+        SWhile _ cond body ->
           emitWhileFn retLayout cond body st fs
-        SLoop body continuing ->
+        SLoop _ body continuing ->
           emitLoopFn retLayout body continuing st fs
-        SFor initStmt condExpr contStmt body ->
+        SFor _ initStmt condExpr contStmt body ->
           emitForFn retLayout initStmt condExpr contStmt body st fs
-        SSwitch expr cases defBody ->
+        SSwitch _ expr cases defBody ->
           emitSwitchFn retLayout expr cases defBody st fs
-        SBreak ->
+        SBreak _ ->
           emitBreak st fs
-        SBreakIf cond ->
-          emitIfFn retLayout cond [SBreak] Nothing st fs
-        SContinue ->
+        SBreakIf pos cond ->
+          emitIfFn retLayout cond [SBreak pos] Nothing st fs
+        SContinue _ ->
           emitContinue st fs
-        SDiscard ->
+        SDiscard _ ->
           if st.gsEntryStage == StageFragment
             then
               let fs1 = addTerminator (Instr opKill []) fs
               in Right (st, fs1)
             else Left (CompileError "discard is only allowed in fragment entry points" Nothing Nothing)
-        SFallthrough ->
+        SFallthrough _ ->
           Left (CompileError "fallthrough is only allowed in switch cases" Nothing Nothing)
-        SReturn mexpr ->
+        SReturn _ mexpr ->
           case retLayout of
             Nothing ->
               case mexpr of
@@ -3763,9 +3763,9 @@ emitStmt entry outTargets st fs stmt
   | fs.fsTerminated = Right (st, fs)
   | otherwise =
       case stmt of
-        SLet name mType expr -> emitLet name mType expr st fs
-        SVar name mType mExpr -> emitVar name mType mExpr st fs
-        SAssign lv expr -> do
+        SLet _ name mType expr -> emitLet name mType expr st fs
+        SVar _ name mType mExpr -> emitVar name mType mExpr st fs
+        SAssign _ lv expr -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
           case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
@@ -3775,7 +3775,7 @@ emitStmt entry outTargets st fs stmt
           ensureWritable ptrInfo
           let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, val'.valId]) fs3
           Right (st3, fs4)
-        SAssignOp lv op expr -> do
+        SAssignOp _ lv op expr -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
           case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
@@ -3787,7 +3787,7 @@ emitStmt entry outTargets st fs stmt
           (st5, fs5, resVal) <- emitBinary op (ptrInfo.viType) (lhsVal.valId) (rhsVal'.valId) st4 fs4
           let fs6 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs5
           Right (st5, fs6)
-        SInc lv -> do
+        SInc _ lv -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
           case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
@@ -3798,7 +3798,7 @@ emitStmt entry outTargets st fs stmt
           (st4, fs3, resVal) <- emitBinary OpAdd (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
           let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
           Right (st4, fs4)
-        SDec lv -> do
+        SDec _ lv -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
           case ptrInfo.viType of
             TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
@@ -3809,32 +3809,32 @@ emitStmt entry outTargets st fs stmt
           (st4, fs3, resVal) <- emitBinary OpSub (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
           let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
           Right (st4, fs4)
-        SExpr expr -> emitExprStmt st fs expr
-        SIf cond thenBody elseBody ->
+        SExpr _ expr -> emitExprStmt st fs expr
+        SIf _ cond thenBody elseBody ->
           emitIf entry outTargets cond thenBody elseBody st fs
-        SWhile cond body ->
+        SWhile _ cond body ->
           emitWhile entry outTargets cond body st fs
-        SLoop body continuing ->
+        SLoop _ body continuing ->
           emitLoop entry outTargets body continuing st fs
-        SFor initStmt condExpr contStmt body ->
+        SFor _ initStmt condExpr contStmt body ->
           emitFor entry outTargets initStmt condExpr contStmt body st fs
-        SSwitch expr cases defBody ->
+        SSwitch _ expr cases defBody ->
           emitSwitch entry outTargets expr cases defBody st fs
-        SBreak ->
+        SBreak _ ->
           emitBreak st fs
-        SBreakIf cond ->
-          emitIf entry outTargets cond [SBreak] Nothing st fs
-        SContinue ->
+        SBreakIf pos cond ->
+          emitIf entry outTargets cond [SBreak pos] Nothing st fs
+        SContinue _ ->
           emitContinue st fs
-        SDiscard ->
+        SDiscard _ ->
           case entry.epStage of
             StageFragment ->
               let fs1 = addTerminator (Instr opKill []) fs
               in Right (st, fs1)
             _ -> Left (CompileError "discard is only allowed in fragment entry points" Nothing Nothing)
-        SFallthrough ->
+        SFallthrough _ ->
           Left (CompileError "fallthrough is only allowed in switch cases" Nothing Nothing)
-        SReturn mexpr ->
+        SReturn _ mexpr ->
           case entry.epStage of
             StageCompute ->
               case mexpr of
@@ -3862,7 +3862,7 @@ emitStmt entry outTargets st fs stmt
 emitExprStmt :: GenState -> FuncState -> Expr -> Either CompileError (GenState, FuncState)
 emitExprStmt st fs expr =
   case expr of
-    ECall name args ->
+    ECall _ name args ->
       case name of
         "textureStore" -> emitTextureStore args st fs
         "atomicStore" -> emitAtomicStore args st fs
@@ -4228,7 +4228,7 @@ emitContinue st fs =
 emitExpr :: GenState -> FuncState -> Expr -> Either CompileError (GenState, FuncState, Value)
 emitExpr st fs expr =
   case expr of
-    EInt n -> do
+    EInt _ n -> do
       (scalar, val) <- selectIntLiteralScalar n
       case scalar of
         I32 -> do
@@ -4242,17 +4242,17 @@ emitExpr st fs expr =
           let layout = TLScalar U32 a sz
           Right (st1, fs, Value layout cid)
         _ -> Left (CompileError "integer literal must be i32 or u32" Nothing Nothing)
-    EFloat f -> do
+    EFloat _ f -> do
       let (cid, st1) = emitConstF32 st f
       let (a, sz) = scalarLayout F32
       let layout = TLScalar F32 a sz
       Right (st1, fs, Value layout cid)
-    EBool b -> do
+    EBool _ b -> do
       let (cid, st1) = emitConstBool st b
       let (a, sz) = scalarLayout Bool
       let layout = TLScalar Bool a sz
       Right (st1, fs, Value layout cid)
-    EVar name ->
+    EVar _ name ->
       case lookup name (fs.fsValues) of
         Just val -> Right (st, fs, val)
         Nothing ->
@@ -4263,9 +4263,9 @@ emitExpr st fs expr =
                 Just _ | st.gsSamplerMode == SamplerCombined ->
                   Left (CompileError "sampler values are unavailable in combined mode; pass the sampler directly to textureSample" Nothing Nothing)
                 _ -> emitLoadFromExpr st fs expr
-    EField base field -> emitFieldExpr st fs base field
-    EIndex _ _ -> emitLoadFromExpr st fs expr
-    EUnary OpNeg inner -> do
+    EField _ base field -> emitFieldExpr st fs base field
+    EIndex _ _ _ -> emitLoadFromExpr st fs expr
+    EUnary _ OpNeg inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
       case val.valType of
         TLScalar U32 _ _ ->
@@ -4293,21 +4293,21 @@ emitExpr st fs expr =
           let (resId, st3) = freshId st2
           let fs2 = addFuncInstr (Instr opcode [tyId, resId, val.valId]) fs1
           Right (st3, fs2, Value (val.valType) resId)
-    EUnary OpNot inner -> do
+    EUnary _ OpNot inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
       ensureBoolScalar (val.valType)
       let (tyId, st2) = emitTypeFromLayout st1 (val.valType)
       let (resId, st3) = freshId st2
       let fs2 = addFuncInstr (Instr opLogicalNot [tyId, resId, val.valId]) fs1
       Right (st3, fs2, Value (val.valType) resId)
-    EUnary OpAddr inner ->
+    EUnary _ OpAddr inner ->
       case exprToLValue inner of
         Nothing -> Left (CompileError "address-of requires an addressable expression" Nothing Nothing)
         Just lv -> do
           (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
           let layout = TLPointer (ptrInfo.viStorage) (varAccessToPtrAccess (ptrInfo.viAccess)) (ptrInfo.viType)
           Right (st1, fs1, Value layout (ptrInfo.viPtrId))
-    EUnary OpDeref inner -> do
+    EUnary _ OpDeref inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
       case val.valType of
         TLPointer _ _ elemLayout -> do
@@ -4316,7 +4316,7 @@ emitExpr st fs expr =
           let fs2 = addFuncInstr (Instr opLoad [tyId, resId, val.valId]) fs1
           Right (st3, fs2, Value elemLayout resId)
         _ -> Left (CompileError "deref requires a pointer value" Nothing Nothing)
-    EBinary op lhs rhs -> do
+    EBinary _ op lhs rhs -> do
       (st1, fs1, lval) <- emitExpr st fs lhs
       (st2, fs2, rval) <- emitExpr st1 fs1 rhs
       case op of
@@ -4357,8 +4357,8 @@ emitExpr st fs expr =
         _ -> do
           (st3, fs3, lval', rval', layout) <- coerceBinaryOperands lval rval st2 fs2
           emitBinary op layout (lval'.valId) (rval'.valId) st3 fs3
-    ECall name args -> emitCall name args st fs
-    EBitcast targetTy inner -> do
+    ECall _ name args -> emitCall name args st fs
+    EBitcast _ targetTy inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
       targetLayout <- resolveBitcastLayout targetTy
       (srcN, srcSz, _) <- bitcastLayoutInfo (val.valType)
@@ -5539,7 +5539,7 @@ emitArrayLengthBuiltin args st fs =
 emitArrayLengthLValue :: LValue -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitArrayLengthLValue lv st fs =
   case lv of
-    LVField base field -> do
+    LVField _ base field -> do
       (st1, fs1, baseInfo) <- emitLValuePtr st fs base
       when (baseInfo.viStorage /= storageClassStorageBuffer) $
         Left (CompileError "arrayLength requires a storage buffer struct" Nothing Nothing)
@@ -7360,14 +7360,14 @@ emitExprList st fs (x:xs) = do
 emitLValuePtr :: GenState -> FuncState -> LValue -> Either CompileError (GenState, FuncState, VarInfo)
 emitLValuePtr st fs lv =
   case lv of
-    LVVar name ->
+    LVVar _ name ->
       case lookup name (fs.fsVars) of
         Just v -> Right (st, fs, v)
         Nothing ->
           case lookup name (fs.fsValues) of
             Just _ -> Left (CompileError "cannot take the address of an immutable let binding" Nothing Nothing)
             Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
-    LVField base field -> do
+    LVField _ base field -> do
       (st1, fs1, baseInfo) <- emitLValuePtr st fs base
       case baseInfo.viType of
         TLStruct _ fields _ _ -> do
@@ -7384,7 +7384,7 @@ emitLValuePtr st fs lv =
               let fieldLayout = TLScalar scalar a sz
               emitAccessChain st2 fs1 baseInfo [ixId] fieldLayout
         _ -> Left (CompileError "field access requires struct or vector type" Nothing Nothing)
-    LVIndex base idxExpr -> do
+    LVIndex _ base idxExpr -> do
       (st1, fs1, baseInfo) <- emitLValuePtr st fs base
       (st2, fs2, idxVal) <- emitExpr st1 fs1 idxExpr
       ensureIndexType (idxVal.valType)
@@ -7398,7 +7398,7 @@ emitLValuePtr st fs lv =
           let elemLayout = uncurry (TLVector rows scalar) (vectorLayout scalar rows)
           in emitAccessChain st2 fs2 baseInfo [idxVal.valId] elemLayout
         _ -> Left (CompileError "indexing requires array or vector type" Nothing Nothing)
-    LVDeref expr -> do
+    LVDeref _ expr -> do
       (st1, fs1, val) <- emitExpr st fs expr
       case val.valType of
         TLPointer storageClass access elemLayout ->

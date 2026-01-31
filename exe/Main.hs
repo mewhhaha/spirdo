@@ -7,13 +7,16 @@
 module Main (main) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (when)
+import Control.Monad (forM_, when)
 import Control.Monad.IO.Class (liftIO)
+import Data.Char (toLower)
 import Data.List (find)
 import Data.Word (Word32)
+import qualified Data.ByteString as BS
 import Foreign.Ptr (nullPtr, wordPtrToPtr)
 import Foreign.Storable (Storable(..))
 import GHC.Generics (Generic)
+import System.Environment (lookupEnv)
 import Slop hiding (Shader, V4)
 import Slop.SDL.Raw (GPUDevice(..), GPUSampler(..), GPUTexture(..))
 
@@ -21,6 +24,7 @@ import Spirdo.Wesl.Reflection
   ( BindingInfo(..)
   , BindingPlan(..)
   , Shader
+  , SomeShader(..)
   , ShaderInterface(..)
   , SamplerBindingMode(..)
   , shaderSpirv
@@ -51,8 +55,44 @@ import Spirdo.Wesl.Inputs
   )
 import qualified Spirdo.Wesl.Inputs as Inputs
 
+import Examples.Compute (computeParticlesShader, computeShader)
 import Examples.Fragments
-import Examples.Vertex (vertexShader)
+import Examples.Vertex (vertexFullscreenShader, vertexShader)
+
+shouldWriteSpv :: IO Bool
+shouldWriteSpv = do
+  env <- lookupEnv "SPIRDO_WRITE_SPV"
+  pure $
+    case fmap (map toLower) env of
+      Just "1" -> True
+      Just "true" -> True
+      Just "yes" -> True
+      _ -> False
+
+spvOutputs :: [(FilePath, SomeShader)]
+spvOutputs =
+  [ ("fragment-0.spv", SomeShader fragmentGradientBloomShader)
+  , ("fragment-1.spv", SomeShader fragmentCirclePulseShader)
+  , ("fragment-2.spv", SomeShader fragmentSpectrumShiftShader)
+  , ("fragment-3.spv", SomeShader fragmentSineWavesShader)
+  , ("fragment-4.spv", SomeShader fragmentCheckerWarpShader)
+  , ("fragment-5.spv", SomeShader fragmentRippleCausticsShader)
+  , ("fragment-6.spv", SomeShader fragmentPlasmaStormShader)
+  , ("fragment-7.spv", SomeShader fragmentVignetteGlowShader)
+  , ("fragment-8.spv", SomeShader fragmentNoiseFlowShader)
+  , ("fragment-9.spv", SomeShader fragmentSwirlVortexShader)
+  , ("fragment-10.spv", SomeShader fragmentMetaballsShader)
+  , ("fragment-11.spv", SomeShader fragmentKaleidoscopeShader)
+  , ("compute-1.spv", SomeShader computeShader)
+  , ("compute-2.spv", SomeShader computeParticlesShader)
+  , ("vertex-1.spv", SomeShader vertexShader)
+  , ("vertex-2.spv", SomeShader vertexFullscreenShader)
+  ]
+
+writeSpvOutputs :: IO ()
+writeSpvOutputs =
+  forM_ spvOutputs $ \(path, SomeShader shader) ->
+    BS.writeFile path (shaderSpirv shader)
 
 -- Uniforms shared by fragment variants.
 data ParamsU = ParamsU
@@ -121,6 +161,8 @@ data DemoState = DemoState
 
 main :: IO ()
 main = do
+  emitSpv <- shouldWriteSpv
+  when emitSpv writeSpvOutputs
   let cfg =
         defaultConfig
           { windowTitle = "Spirdo Slop demo"

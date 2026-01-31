@@ -53,6 +53,8 @@ module Spirdo.Wesl.Reflection
   , FieldLayout(..)
   , specializableOverrides
   , CompileError(..)
+  , renderCompileError
+  , renderCompileErrorWithSource
   , Source(..)
   , CachePolicy(..)
   , Option(..)
@@ -88,3 +90,12 @@ module Spirdo.Wesl.Reflection
 
 import Spirdo.Wesl.Compiler
 import Spirdo.Wesl.Types
+import Spirdo.Wesl.Util (renderErrorWithSource)
+
+-- | Render a compile error (with any embedded source context).
+renderCompileError :: CompileError -> String
+renderCompileError (CompileError msg _ _) = msg
+
+-- | Render a compile error using explicit source text.
+renderCompileErrorWithSource :: Maybe FilePath -> String -> CompileError -> String
+renderCompileErrorWithSource = renderErrorWithSource

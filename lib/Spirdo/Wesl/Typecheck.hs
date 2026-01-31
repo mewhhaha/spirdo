@@ -506,25 +506,25 @@ overrideValueToExpr structEnv ty ov =
   case ty of
     TyScalar Bool ->
       case ov of
-        OVBool b -> Right (EBool b)
+        OVBool b -> Right (EBool syntheticPos b)
         _ -> Left (CompileError "override value must be a bool" Nothing Nothing)
     TyScalar I32 ->
       case ov of
-        OVI32 v -> Right (EInt v)
+        OVI32 v -> Right (EInt syntheticPos v)
         _ -> Left (CompileError "override value must be an i32" Nothing Nothing)
     TyScalar U32 ->
       case ov of
-        OVU32 v -> Right (ECall "u32" [EInt v])
+        OVU32 v -> Right (ECall syntheticPos "u32" [EInt syntheticPos v])
         _ -> Left (CompileError "override value must be a u32" Nothing Nothing)
     TyScalar F32 ->
       case ov of
-        OVF32 v -> Right (EFloat v)
-        OVF16 v -> Right (ECall "f32" [EFloat v])
+        OVF32 v -> Right (EFloat syntheticPos v)
+        OVF16 v -> Right (ECall syntheticPos "f32" [EFloat syntheticPos v])
         _ -> Left (CompileError "override value must be an f32" Nothing Nothing)
     TyScalar F16 ->
       case ov of
-        OVF16 v -> Right (ECall "f16" [EFloat v])
-        OVF32 v -> Right (ECall "f16" [EFloat v])
+        OVF16 v -> Right (ECall syntheticPos "f16" [EFloat syntheticPos v])
+        OVF32 v -> Right (ECall syntheticPos "f16" [EFloat syntheticPos v])
         _ -> Left (CompileError "override value must be an f16" Nothing Nothing)
     TyVector n scalar ->
       case ov of
@@ -532,7 +532,7 @@ overrideValueToExpr structEnv ty ov =
           when (length vals /= n) $
             Left (CompileError "override vector arity does not match" Nothing Nothing)
           args <- mapM (overrideValueToExpr structEnv (TyScalar scalar)) vals
-          Right (ECall ("vec" <> T.pack (show n)) args)
+          Right (ECall syntheticPos ("vec" <> T.pack (show n)) args)
         _ -> Left (CompileError "override value must be a vector" Nothing Nothing)
     TyMatrix cols rows scalar ->
       case ov of
@@ -541,7 +541,7 @@ overrideValueToExpr structEnv ty ov =
             Left (CompileError "override matrix column count does not match" Nothing Nothing)
           let colTy = TyVector rows scalar
           args <- mapM (overrideValueToExpr structEnv colTy) colsVals
-          Right (ECall ("mat" <> T.pack (show cols) <> "x" <> T.pack (show rows)) args)
+          Right (ECall syntheticPos ("mat" <> T.pack (show cols) <> "x" <> T.pack (show rows)) args)
         _ -> Left (CompileError "override value must be a matrix" Nothing Nothing)
     TyArray elemTy (ArrayLenFixed n) ->
       case ov of
@@ -549,7 +549,7 @@ overrideValueToExpr structEnv ty ov =
           when (length vals /= n) $
             Left (CompileError "override array length does not match" Nothing Nothing)
           args <- mapM (overrideValueToExpr structEnv elemTy) vals
-          Right (ECall "array" args)
+          Right (ECall syntheticPos "array" args)
         _ -> Left (CompileError "override value must be an array" Nothing Nothing)
     TyArray _ ArrayLenRuntime ->
       Left (CompileError "override values cannot target runtime-sized arrays" Nothing Nothing)
@@ -565,7 +565,7 @@ overrideValueToExpr structEnv ty ov =
               when (length vals /= length fields) $
                 Left (CompileError "override struct field count does not match" Nothing Nothing)
               args <- zipWithM (\f v -> overrideValueToExpr structEnv f.fdType v) fields vals
-              Right (ECall name args)
+              Right (ECall syntheticPos name args)
             _ -> Left (CompileError "override value must be a struct composite" Nothing Nothing)
     _ -> Left (CompileError "override values are only supported for scalar, vector, matrix, array, and struct types" Nothing Nothing)
 
@@ -656,46 +656,46 @@ resolveTypeAliases ast = do
 
     expandStmt expand stmt =
       case stmt of
-        SLet name mType expr -> SLet name <$> mapM expand mType <*> expandExpr expand expr
-        SVar name mType mExpr -> SVar name <$> mapM expand mType <*> mapM (expandExpr expand) mExpr
-        SAssign lv expr -> SAssign <$> expandLValue expand lv <*> expandExpr expand expr
-        SAssignOp lv op expr -> SAssignOp <$> expandLValue expand lv <*> pure op <*> expandExpr expand expr
-        SInc lv -> SInc <$> expandLValue expand lv
-        SDec lv -> SDec <$> expandLValue expand lv
-        SExpr expr -> SExpr <$> expandExpr expand expr
-        SIf cond thenBody elseBody ->
-          SIf <$> expandExpr expand cond <*> mapM (expandStmt expand) thenBody <*> mapM (mapM (expandStmt expand)) elseBody
-        SWhile cond body -> SWhile <$> expandExpr expand cond <*> mapM (expandStmt expand) body
-        SLoop body cont -> SLoop <$> mapM (expandStmt expand) body <*> mapM (mapM (expandStmt expand)) cont
-        SFor initStmt cond cont body ->
-          SFor <$> mapM (expandStmt expand) initStmt <*> mapM (expandExpr expand) cond <*> mapM (expandStmt expand) cont <*> mapM (expandStmt expand) body
-        SSwitch expr cases defBody ->
-          SSwitch <$> expandExpr expand expr <*> mapM (expandCase expand) cases <*> mapM (mapM (expandStmt expand)) defBody
-        SBreak -> Right SBreak
-        SBreakIf expr -> SBreakIf <$> expandExpr expand expr
-        SContinue -> Right SContinue
-        SDiscard -> Right SDiscard
-        SFallthrough -> Right SFallthrough
-        SReturn expr -> SReturn <$> mapM (expandExpr expand) expr
+        SLet pos name mType expr -> SLet pos name <$> mapM expand mType <*> expandExpr expand expr
+        SVar pos name mType mExpr -> SVar pos name <$> mapM expand mType <*> mapM (expandExpr expand) mExpr
+        SAssign pos lv expr -> SAssign pos <$> expandLValue expand lv <*> expandExpr expand expr
+        SAssignOp pos lv op expr -> SAssignOp pos <$> expandLValue expand lv <*> pure op <*> expandExpr expand expr
+        SInc pos lv -> SInc pos <$> expandLValue expand lv
+        SDec pos lv -> SDec pos <$> expandLValue expand lv
+        SExpr pos expr -> SExpr pos <$> expandExpr expand expr
+        SIf pos cond thenBody elseBody ->
+          SIf pos <$> expandExpr expand cond <*> mapM (expandStmt expand) thenBody <*> mapM (mapM (expandStmt expand)) elseBody
+        SWhile pos cond body -> SWhile pos <$> expandExpr expand cond <*> mapM (expandStmt expand) body
+        SLoop pos body cont -> SLoop pos <$> mapM (expandStmt expand) body <*> mapM (mapM (expandStmt expand)) cont
+        SFor pos initStmt cond cont body ->
+          SFor pos <$> mapM (expandStmt expand) initStmt <*> mapM (expandExpr expand) cond <*> mapM (expandStmt expand) cont <*> mapM (expandStmt expand) body
+        SSwitch pos expr cases defBody ->
+          SSwitch pos <$> expandExpr expand expr <*> mapM (expandCase expand) cases <*> mapM (mapM (expandStmt expand)) defBody
+        SBreak pos -> Right (SBreak pos)
+        SBreakIf pos expr -> SBreakIf pos <$> expandExpr expand expr
+        SContinue pos -> Right (SContinue pos)
+        SDiscard pos -> Right (SDiscard pos)
+        SFallthrough pos -> Right (SFallthrough pos)
+        SReturn pos expr -> SReturn pos <$> mapM (expandExpr expand) expr
 
     expandCase expand (SwitchCase sels body) =
       SwitchCase <$> mapM (expandExpr expand) sels <*> mapM (expandStmt expand) body
 
     expandLValue expand lv =
       case lv of
-        LVVar name -> Right (LVVar name)
-        LVField inner field -> LVField <$> expandLValue expand inner <*> pure field
-        LVIndex inner idx -> LVIndex <$> expandLValue expand inner <*> expandExpr expand idx
-        LVDeref expr -> LVDeref <$> expandExpr expand expr
+        LVVar pos name -> Right (LVVar pos name)
+        LVField pos inner field -> LVField pos <$> expandLValue expand inner <*> pure field
+        LVIndex pos inner idx -> LVIndex pos <$> expandLValue expand inner <*> expandExpr expand idx
+        LVDeref pos expr -> LVDeref pos <$> expandExpr expand expr
 
     expandExpr expand expr =
       case expr of
-        EBinary op a b -> EBinary op <$> expandExpr expand a <*> expandExpr expand b
-        EUnary op a -> EUnary op <$> expandExpr expand a
-        ECall name args -> ECall name <$> mapM (expandExpr expand) args
-        EBitcast ty arg -> EBitcast <$> expand ty <*> expandExpr expand arg
-        EField base field -> EField <$> expandExpr expand base <*> pure field
-        EIndex base idx -> EIndex <$> expandExpr expand base <*> expandExpr expand idx
+        EBinary pos op a b -> EBinary pos op <$> expandExpr expand a <*> expandExpr expand b
+        EUnary pos op a -> EUnary pos op <$> expandExpr expand a
+        ECall pos name args -> ECall pos name <$> mapM (expandExpr expand) args
+        EBitcast pos ty arg -> EBitcast pos <$> expand ty <*> expandExpr expand arg
+        EField pos base field -> EField pos <$> expandExpr expand base <*> pure field
+        EIndex pos base idx -> EIndex pos <$> expandExpr expand base <*> expandExpr expand idx
         _ -> Right expr
 
 inferOverrideTypes :: [Text] -> FilePath -> ModuleAst -> Either CompileError ModuleAst
@@ -828,7 +828,7 @@ resolveConstExprs rootPath rootDir ast = do
       case arg of
         AttrInt v -> Right (AttrInt v)
         AttrIdent name -> do
-          ConstInt _ v <- evalConstIntExpr ctx constIndex fnIndex structIndex (EVar name)
+          ConstInt _ v <- evalConstIntExpr ctx constIndex fnIndex structIndex (EVar syntheticPos name)
           Right (AttrInt v)
         AttrExpr expr -> do
           ConstInt _ v <- evalConstIntExpr ctx constIndex fnIndex structIndex (constExprToExpr expr)
@@ -866,11 +866,11 @@ resolveConstExprs rootPath rootDir ast = do
 constExprToExpr :: ConstExpr -> Expr
 constExprToExpr expr =
   case expr of
-    CEInt n -> EInt n
-    CEIdent name -> EVar name
-    CEUnaryNeg inner -> EUnary OpNeg (constExprToExpr inner)
-    CEBinary op a b -> EBinary (constBinOpToBinOp op) (constExprToExpr a) (constExprToExpr b)
-    CECall name args -> ECall name (map constExprToExpr args)
+    CEInt n -> EInt syntheticPos n
+    CEIdent name -> EVar syntheticPos name
+    CEUnaryNeg inner -> EUnary syntheticPos OpNeg (constExprToExpr inner)
+    CEBinary op a b -> EBinary syntheticPos (constBinOpToBinOp op) (constExprToExpr a) (constExprToExpr b)
+    CECall name args -> ECall syntheticPos name (map constExprToExpr args)
 
 constBinOpToBinOp :: ConstBinOp -> BinOp
 constBinOpToBinOp op =
@@ -1038,37 +1038,37 @@ collectUnreachableDiagnostics diagConfig ast =
     Nothing -> []
     Just DiagOff -> []
     Just sev ->
-      let diag = Diagnostic sev "unreachable_code" "unreachable code" Nothing Nothing
+      let mkDiag pos = Diagnostic sev "unreachable_code" "unreachable code" (Just pos.spLine) (Just pos.spCol)
           bodies = map (.fnBody) ast.modFunctions <> map (.epBody) ast.modEntries
-      in concatMap (unreachableInStmts diag) bodies
+      in concatMap (unreachableInStmts mkDiag) bodies
   where
-    unreachableInStmts diag = go False
+    unreachableInStmts mkDiag = go False
       where
         go _ [] = []
         go unreachable (stmt:rest) =
-          let here = [diag | unreachable]
+          let here = [mkDiag (stmtPos stmt) | unreachable]
               nested =
                 case stmt of
-                  SIf _ thenBody elseBody ->
-                    unreachableInStmts diag thenBody <> maybe [] (unreachableInStmts diag) elseBody
-                  SWhile _ body ->
-                    unreachableInStmts diag body
-                  SLoop body continuing ->
-                    unreachableInStmts diag body <> maybe [] (unreachableInStmts diag) continuing
-                  SFor _ _ _ body ->
-                    unreachableInStmts diag body
-                  SSwitch _ cases defBody ->
-                    concatMap (unreachableInStmts diag . (.scBody)) cases <> maybe [] (unreachableInStmts diag) defBody
+                  SIf _ _ thenBody elseBody ->
+                    unreachableInStmts mkDiag thenBody <> maybe [] (unreachableInStmts mkDiag) elseBody
+                  SWhile _ _ body ->
+                    unreachableInStmts mkDiag body
+                  SLoop _ body continuing ->
+                    unreachableInStmts mkDiag body <> maybe [] (unreachableInStmts mkDiag) continuing
+                  SFor _ _ _ _ body ->
+                    unreachableInStmts mkDiag body
+                  SSwitch _ _ cases defBody ->
+                    concatMap (unreachableInStmts mkDiag . (.scBody)) cases <> maybe [] (unreachableInStmts mkDiag) defBody
                   _ -> []
               unreachable' = unreachable || isTerminator stmt
           in here <> nested <> go unreachable' rest
 
     isTerminator stmt =
       case stmt of
-        SReturn _ -> True
-        SBreak -> True
-        SContinue -> True
-        SDiscard -> True
+        SReturn _ _ -> True
+        SBreak _ -> True
+        SContinue _ -> True
+        SDiscard _ -> True
         _ -> False
 
 collectUnusedExpressionDiagnostics :: DiagnosticConfig -> ModuleAst -> [Diagnostic]
@@ -1077,32 +1077,32 @@ collectUnusedExpressionDiagnostics diagConfig ast =
     Nothing -> []
     Just DiagOff -> []
     Just sev ->
-      let diag = Diagnostic sev "unused_expression" "expression has no effect" Nothing Nothing
+      let mkDiag pos = Diagnostic sev "unused_expression" "expression has no effect" (Just pos.spLine) (Just pos.spCol)
           bodies = map (.fnBody) ast.modFunctions <> map (.epBody) ast.modEntries
-      in concatMap (unusedExprs diag) bodies
+      in concatMap (unusedExprs mkDiag) bodies
   where
-    unusedExprs diag = go
+    unusedExprs mkDiag = go
       where
         go [] = []
         go (stmt:rest) =
           let here =
                 case stmt of
-                  SExpr expr ->
+                  SExpr _ expr ->
                     case expr of
-                      ECall _ _ -> []
-                      _ -> [diag]
+                      ECall _ _ _ -> []
+                      _ -> [mkDiag (exprPos expr)]
                   _ -> []
               nested =
                 case stmt of
-                  SIf _ thenBody elseBody ->
+                  SIf _ _ thenBody elseBody ->
                     go thenBody <> maybe [] go elseBody
-                  SWhile _ body ->
+                  SWhile _ _ body ->
                     go body
-                  SLoop body continuing ->
+                  SLoop _ body continuing ->
                     go body <> maybe [] go continuing
-                  SFor _ _ _ body ->
+                  SFor _ _ _ _ body ->
                     go body
-                  SSwitch _ cases defBody ->
+                  SSwitch _ _ cases defBody ->
                     concatMap (go . (.scBody)) cases <> maybe [] go defBody
                   _ -> []
           in here <> nested <> go rest
@@ -1113,37 +1113,46 @@ collectUnusedVariableDiagnostics diagConfig ast =
     Nothing -> []
     Just DiagOff -> []
     Just sev ->
-      let diag name = Diagnostic sev "unused_variable" ("unused variable: " <> T.unpack name) Nothing Nothing
+      let mkDiag name pos = Diagnostic sev "unused_variable" ("unused variable: " <> T.unpack name) (Just pos.spLine) (Just pos.spCol)
           bodies = map (.fnBody) ast.modFunctions <> map (.epBody) ast.modEntries
-      in concatMap (unusedVarsInBody diag) bodies
+      in concatMap (unusedVarsInBody mkDiag) bodies
   where
     unusedVarsInBody mkDiag stmts =
-      let declaredNames = collectDecls stmts
+      let declaredDecls = collectDecls stmts
+          declaredNames = map fst declaredDecls
           (nt1, declaredPairs) = internNamePairs emptyNameTable declaredNames
+          declaredWithPos = zipWith (\(name, pos) (_, ident) -> (name, pos, ident)) declaredDecls declaredPairs
           (_, usedIds) = internNameSet nt1 (collectUsesInStmts stmts)
           unused =
-            [ name
-            | (name, ident) <- uniqueById declaredPairs
+            [ (name, pos)
+            | (name, pos, ident) <- uniqueByIdWithPos declaredWithPos
             , not (IntSet.member ident usedIds)
             , not (isIgnored name)
             ]
-      in map mkDiag unused
+      in map (uncurry mkDiag) unused
 
     isIgnored = T.isPrefixOf "_"
 
     collectDecls = concatMap declsInStmt
     declsInStmt stmt =
       case stmt of
-        SLet name _ _ -> [name]
-        SVar name _ _ -> [name]
-        SIf _ t e -> collectDecls t <> maybe [] collectDecls e
-        SWhile _ body -> collectDecls body
-        SLoop body cont -> collectDecls body <> maybe [] collectDecls cont
-        SFor initStmt _ contStmt body ->
+        SLet pos name _ _ -> [(name, pos)]
+        SVar pos name _ _ -> [(name, pos)]
+        SIf _ _ t e -> collectDecls t <> maybe [] collectDecls e
+        SWhile _ _ body -> collectDecls body
+        SLoop _ body cont -> collectDecls body <> maybe [] collectDecls cont
+        SFor _ initStmt _ contStmt body ->
           maybe [] declsInStmt initStmt <> maybe [] declsInStmt contStmt <> collectDecls body
-        SSwitch _ cases defBody ->
+        SSwitch _ _ cases defBody ->
           concatMap (collectDecls . (.scBody)) cases <> maybe [] collectDecls defBody
         _ -> []
+
+    uniqueByIdWithPos = go IntSet.empty
+      where
+        go _ [] = []
+        go seen ((name, pos, ident):rest)
+          | IntSet.member ident seen = go seen rest
+          | otherwise = (name, pos, ident) : go (IntSet.insert ident seen) rest
 
 collectUnusedParameterDiagnostics :: DiagnosticConfig -> ModuleAst -> [Diagnostic]
 collectUnusedParameterDiagnostics diagConfig ast =
@@ -1151,33 +1160,44 @@ collectUnusedParameterDiagnostics diagConfig ast =
     Nothing -> []
     Just DiagOff -> []
     Just sev ->
-      let mkDiag name = Diagnostic sev "unused_parameter" ("unused parameter: " <> T.unpack name) Nothing Nothing
+      let mkDiag name pos = Diagnostic sev "unused_parameter" ("unused parameter: " <> T.unpack name) (Just pos.spLine) (Just pos.spCol)
       in concatMap (unusedParamsInFunction mkDiag) (ast.modFunctions)
           <> concatMap (unusedParamsInEntry mkDiag) (ast.modEntries)
   where
     unusedParamsInFunction mkDiag fn =
-      let params = map (.paramName) fn.fnParams
+      let paramDecls = map (\p -> (p.paramName, p.paramPos)) fn.fnParams
+          params = map fst paramDecls
           (nt1, paramPairs) = internNamePairs emptyNameTable params
+          paramWithPos = zipWith (\(name, pos) (_, ident) -> (name, pos, ident)) paramDecls paramPairs
           (_, usedIds) = internNameSet nt1 (collectUsesInStmts fn.fnBody)
           unused =
-            [ name
-            | (name, ident) <- uniqueById paramPairs
+            [ (name, pos)
+            | (name, pos, ident) <- uniqueByIdWithPos paramWithPos
             , not (IntSet.member ident usedIds)
             , not (isIgnored name)
             ]
-      in map mkDiag unused
+      in map (uncurry mkDiag) unused
     unusedParamsInEntry mkDiag entry =
-      let params = map (.paramName) entry.epParams
+      let paramDecls = map (\p -> (p.paramName, p.paramPos)) entry.epParams
+          params = map fst paramDecls
           (nt1, paramPairs) = internNamePairs emptyNameTable params
+          paramWithPos = zipWith (\(name, pos) (_, ident) -> (name, pos, ident)) paramDecls paramPairs
           (_, usedIds) = internNameSet nt1 (collectUsesInStmts entry.epBody)
           unused =
-            [ name
-            | (name, ident) <- uniqueById paramPairs
+            [ (name, pos)
+            | (name, pos, ident) <- uniqueByIdWithPos paramWithPos
             , not (IntSet.member ident usedIds)
             , not (isIgnored name)
             ]
-      in map mkDiag unused
+      in map (uncurry mkDiag) unused
     isIgnored = T.isPrefixOf "_"
+
+    uniqueByIdWithPos = go IntSet.empty
+      where
+        go _ [] = []
+        go seen ((name, pos, ident):rest)
+          | IntSet.member ident seen = go seen rest
+          | otherwise = (name, pos, ident) : go (IntSet.insert ident seen) rest
 
 collectShadowingDiagnostics :: DiagnosticConfig -> ModuleAst -> [Diagnostic]
 collectShadowingDiagnostics diagConfig ast =
@@ -1185,7 +1205,7 @@ collectShadowingDiagnostics diagConfig ast =
     Nothing -> []
     Just DiagOff -> []
     Just sev ->
-      let mkDiag name = Diagnostic sev "shadowing" ("name shadows outer scope: " <> T.unpack name) Nothing Nothing
+      let mkDiag name pos = Diagnostic sev "shadowing" ("name shadows outer scope: " <> T.unpack name) (Just pos.spLine) (Just pos.spCol)
       in concatMap (shadowingInFunction mkDiag) (ast.modFunctions)
           <> concatMap (shadowingInEntry mkDiag) (ast.modEntries)
   where
@@ -1208,24 +1228,24 @@ collectShadowingDiagnostics diagConfig ast =
 
     shadowingInStmt mkDiag table scopes stmt =
       case stmt of
-        SLet name _ _ ->
+        SLet pos name _ _ ->
           let (ident, table') = internName name table
-          in (diagIfShadow mkDiag scopes ident name, table', addToCurrent ident scopes)
-        SVar name _ _ ->
+          in (diagIfShadow mkDiag scopes ident name pos, table', addToCurrent ident scopes)
+        SVar pos name _ _ ->
           let (ident, table') = internName name table
-          in (diagIfShadow mkDiag scopes ident name, table', addToCurrent ident scopes)
-        SIf _ thenBody elseBody ->
+          in (diagIfShadow mkDiag scopes ident name pos, table', addToCurrent ident scopes)
+        SIf _ _ thenBody elseBody ->
           let (diags1, table1) = shadowingInBlock mkDiag table scopes thenBody
               (diags2, table2) = maybe ([], table1) (shadowingInBlock mkDiag table1 scopes) elseBody
           in (diags1 <> diags2, table2, scopes)
-        SWhile _ body ->
+        SWhile _ _ body ->
           let (diags1, table1) = shadowingInBlock mkDiag table scopes body
           in (diags1, table1, scopes)
-        SLoop body continuing ->
+        SLoop _ body continuing ->
           let (diags1, table1) = shadowingInBlock mkDiag table scopes body
               (diags2, table2) = maybe ([], table1) (shadowingInBlock mkDiag table1 scopes) continuing
           in (diags1 <> diags2, table2, scopes)
-        SFor initStmt _ contStmt body ->
+        SFor _ initStmt _ contStmt body ->
           let loopScopes = pushScope scopes
               (diagsInit, table1, loopScopes1) =
                 case initStmt of
@@ -1237,7 +1257,7 @@ collectShadowingDiagnostics diagConfig ast =
                   Just s -> shadowingInStmt mkDiag table1 loopScopes1 s
               (diagsBody, table3) = shadowingInBlock mkDiag table2 loopScopes2 body
           in (diagsInit <> diagsCont <> diagsBody, table3, scopes)
-        SSwitch _ cases defBody ->
+        SSwitch _ _ cases defBody ->
           let (diagsCases, table1) = shadowingInCases mkDiag table scopes cases
               (diagsDef, table2) = maybe ([], table1) (shadowingInBlock mkDiag table1 scopes) defBody
           in (diagsCases <> diagsDef, table2, scopes)
@@ -1261,11 +1281,11 @@ collectShadowingDiagnostics diagConfig ast =
           let (diags, table') = shadowingInBlock mkDiag tableAcc scopes sc.scBody
           in (diagsAcc <> diags, table')
 
-    diagIfShadow mkDiag scopes ident name
+    diagIfShadow mkDiag scopes ident name pos
       | isIgnored name = []
       | otherwise =
           let outers = drop 1 scopes
-          in [mkDiag name | any (IntSet.member ident) outers]
+          in [mkDiag name pos | any (IntSet.member ident) outers]
 
     addToCurrent ident scopes =
       case scopes of
@@ -1282,7 +1302,7 @@ collectConstantConditionDiagnostics diagConfig ctx constIndex fnIndex structInde
     Nothing -> []
     Just DiagOff -> []
     Just sev ->
-      let mkDiag msg = Diagnostic sev "constant_condition" msg Nothing Nothing
+      let mkDiag pos msg = Diagnostic sev "constant_condition" msg (Just pos.spLine) (Just pos.spCol)
       in concatMap (constantCondInStmts mkDiag) (map (.fnBody) ast.modFunctions)
           <> concatMap (constantCondInStmts mkDiag . (.epBody)) ast.modEntries
   where
@@ -1290,28 +1310,28 @@ collectConstantConditionDiagnostics diagConfig ctx constIndex fnIndex structInde
 
     constantCondInStmt mkDiag stmt =
       case stmt of
-        SIf cond thenBody elseBody ->
+        SIf _ cond thenBody elseBody ->
           checkCond mkDiag "if" cond
             <> constantCondInStmts mkDiag thenBody
             <> maybe [] (constantCondInStmts mkDiag) elseBody
-        SWhile cond body ->
+        SWhile _ cond body ->
           checkCond mkDiag "while" cond <> constantCondInStmts mkDiag body
-        SLoop body continuing ->
+        SLoop _ body continuing ->
           constantCondInStmts mkDiag body <> maybe [] (constantCondInStmts mkDiag) continuing
-        SFor initStmt condExpr contStmt body ->
+        SFor _ initStmt condExpr contStmt body ->
           maybe [] (constantCondInStmt mkDiag) initStmt
             <> maybe [] (constantCondInStmt mkDiag) contStmt
-            <> maybe [] (checkCond mkDiag "for" ) condExpr
+            <> maybe [] (checkCond mkDiag "for") condExpr
             <> constantCondInStmts mkDiag body
-        SSwitch _ cases defBody ->
+        SSwitch _ _ cases defBody ->
           concatMap (constantCondInStmts mkDiag . (.scBody)) cases <> maybe [] (constantCondInStmts mkDiag) defBody
-        SBreakIf cond -> checkCond mkDiag "break if" cond
+        SBreakIf _ cond -> checkCond mkDiag "break if" cond
         _ -> []
 
     checkCond mkDiag label cond =
       either
         (const [])
-        (const [mkDiag ("constant condition in " <> label)])
+        (const [mkDiag (exprPos cond) ("constant condition in " <> label)])
         (evalConstBoolExpr ctx constIndex fnIndex structIndex cond)
 
 collectDuplicateCaseDiagnostics :: DiagnosticConfig -> ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ModuleAst -> [Diagnostic]
@@ -1320,7 +1340,7 @@ collectDuplicateCaseDiagnostics diagConfig ctx constIndex fnIndex structIndex as
     Nothing -> []
     Just DiagOff -> []
     Just sev ->
-      let mkDiag val = Diagnostic sev "duplicate_case" ("duplicate switch case selector: " <> val) Nothing Nothing
+      let mkDiag val pos = Diagnostic sev "duplicate_case" ("duplicate switch case selector: " <> val) (Just pos.spLine) (Just pos.spCol)
       in concatMap (duplicateInStmts mkDiag) (map (.fnBody) ast.modFunctions)
           <> concatMap (duplicateInStmts mkDiag . (.epBody)) ast.modEntries
   where
@@ -1328,41 +1348,40 @@ collectDuplicateCaseDiagnostics diagConfig ctx constIndex fnIndex structIndex as
 
     duplicateInStmt mkDiag stmt =
       case stmt of
-        SIf _ thenBody elseBody ->
+        SIf _ _ thenBody elseBody ->
           duplicateInStmts mkDiag thenBody <> maybe [] (duplicateInStmts mkDiag) elseBody
-        SWhile _ body -> duplicateInStmts mkDiag body
-        SLoop body continuing ->
+        SWhile _ _ body -> duplicateInStmts mkDiag body
+        SLoop _ body continuing ->
           duplicateInStmts mkDiag body <> maybe [] (duplicateInStmts mkDiag) continuing
-        SFor initStmt _ contStmt body ->
+        SFor _ initStmt _ contStmt body ->
           maybe [] (duplicateInStmt mkDiag) initStmt
             <> maybe [] (duplicateInStmt mkDiag) contStmt
             <> duplicateInStmts mkDiag body
-        SSwitch _ cases defBody ->
+        SSwitch _ _ cases defBody ->
           let selectors = concatMap (.scSelectors) cases
-              values = mapMaybe (constSelectorValue ctx constIndex fnIndex structIndex) selectors
-              keys = map renderKey values
-              dupes = duplicateValues keys
-              diags = map mkDiag dupes
+              values = mapMaybe (constSelectorValueWithPos ctx constIndex fnIndex structIndex) selectors
+              dupes = duplicateValuesWithPos values
+              diags = map (uncurry mkDiag) dupes
               nested = concatMap (duplicateInStmts mkDiag . (.scBody)) cases <> maybe [] (duplicateInStmts mkDiag) defBody
           in diags <> nested
         _ -> []
 
-    constSelectorValue ctx' constIndex' fnIndex' structIndex' expr =
+    constSelectorValueWithPos ctx' constIndex' fnIndex' structIndex' expr =
       either
         (const Nothing)
-        (\(ConstInt scalar val) -> Just (scalar, val))
+        (\(ConstInt scalar val) -> Just (renderKey (scalar, val), exprPos expr))
         (evalConstIntExpr ctx' constIndex' fnIndex' structIndex' expr)
 
-    duplicateValues vals =
+    duplicateValuesWithPos vals =
       let (dups, _) =
             foldl'
-              (\(acc, seen) v ->
-                 if Set.member v seen
-                   then (Set.insert v acc, seen)
-                   else (acc, Set.insert v seen))
-              (Set.empty, Set.empty)
+              (\(acc, seen) (key, pos) ->
+                 if Set.member key seen
+                   then (acc <> [(key, pos)], seen)
+                   else (acc, Set.insert key seen))
+              ([], Set.empty)
               vals
-      in Set.toList dups
+      in dups
 
     renderKey (scalar, val) =
       show val <> case scalar of
@@ -1376,25 +1395,25 @@ collectUsesInStmts = concatMap collectUsesInStmt
 collectUsesInStmt :: Stmt -> [Text]
 collectUsesInStmt stmt =
   case stmt of
-    SLet _ _ expr -> collectUsesInExpr expr
-    SVar _ _ mExpr -> maybe [] collectUsesInExpr mExpr
-    SAssign lv expr -> collectUsesInLValue lv <> collectUsesInExpr expr
-    SAssignOp lv _ expr -> collectUsesInLValue lv <> collectUsesInExpr expr
-    SInc lv -> collectUsesInLValue lv
-    SDec lv -> collectUsesInLValue lv
-    SExpr expr -> collectUsesInExpr expr
-    SIf cond t e -> collectUsesInExpr cond <> collectUsesInStmts t <> maybe [] collectUsesInStmts e
-    SWhile cond body -> collectUsesInExpr cond <> collectUsesInStmts body
-    SLoop body cont -> collectUsesInStmts body <> maybe [] collectUsesInStmts cont
-    SFor initStmt condExpr contStmt body ->
+    SLet _ _ _ expr -> collectUsesInExpr expr
+    SVar _ _ _ mExpr -> maybe [] collectUsesInExpr mExpr
+    SAssign _ lv expr -> collectUsesInLValue lv <> collectUsesInExpr expr
+    SAssignOp _ lv _ expr -> collectUsesInLValue lv <> collectUsesInExpr expr
+    SInc _ lv -> collectUsesInLValue lv
+    SDec _ lv -> collectUsesInLValue lv
+    SExpr _ expr -> collectUsesInExpr expr
+    SIf _ cond t e -> collectUsesInExpr cond <> collectUsesInStmts t <> maybe [] collectUsesInStmts e
+    SWhile _ cond body -> collectUsesInExpr cond <> collectUsesInStmts body
+    SLoop _ body cont -> collectUsesInStmts body <> maybe [] collectUsesInStmts cont
+    SFor _ initStmt condExpr contStmt body ->
       maybe [] collectUsesInStmt initStmt
         <> maybe [] collectUsesInExpr condExpr
         <> maybe [] collectUsesInStmt contStmt
         <> collectUsesInStmts body
-    SSwitch expr cases defBody ->
+    SSwitch _ expr cases defBody ->
       collectUsesInExpr expr <> concatMap collectUsesInCase cases <> maybe [] collectUsesInStmts defBody
-    SBreakIf expr -> collectUsesInExpr expr
-    SReturn mexpr -> maybe [] collectUsesInExpr mexpr
+    SBreakIf _ expr -> collectUsesInExpr expr
+    SReturn _ mexpr -> maybe [] collectUsesInExpr mexpr
     _ -> []
 
 collectUsesInCase :: SwitchCase -> [Text]
@@ -1404,24 +1423,24 @@ collectUsesInCase sc =
 collectUsesInExpr :: Expr -> [Text]
 collectUsesInExpr expr =
   case expr of
-    EVar name -> [name]
-    EInt _ -> []
-    EFloat _ -> []
-    EBool _ -> []
-    EBinary _ a b -> collectUsesInExpr a <> collectUsesInExpr b
-    EUnary _ a -> collectUsesInExpr a
-    ECall _ args -> concatMap collectUsesInExpr args
-    EBitcast _ arg -> collectUsesInExpr arg
-    EField base _ -> collectUsesInExpr base
-    EIndex base idx -> collectUsesInExpr base <> collectUsesInExpr idx
+    EVar _ name -> [name]
+    EInt _ _ -> []
+    EFloat _ _ -> []
+    EBool _ _ -> []
+    EBinary _ _ a b -> collectUsesInExpr a <> collectUsesInExpr b
+    EUnary _ _ a -> collectUsesInExpr a
+    ECall _ _ args -> concatMap collectUsesInExpr args
+    EBitcast _ _ arg -> collectUsesInExpr arg
+    EField _ base _ -> collectUsesInExpr base
+    EIndex _ base idx -> collectUsesInExpr base <> collectUsesInExpr idx
 
 collectUsesInLValue :: LValue -> [Text]
 collectUsesInLValue lv =
   case lv of
-    LVVar name -> [name]
-    LVField base _ -> collectUsesInLValue base
-    LVIndex base idx -> collectUsesInLValue base <> collectUsesInExpr idx
-    LVDeref expr -> collectUsesInExpr expr
+    LVVar _ name -> [name]
+    LVField _ base _ -> collectUsesInLValue base
+    LVIndex _ base idx -> collectUsesInLValue base <> collectUsesInExpr idx
+    LVDeref _ expr -> collectUsesInExpr expr
 
 validateStruct :: ModuleContext -> Scope -> StructDecl -> Either CompileError ()
 validateStruct ctx scope decl =
@@ -1488,7 +1507,8 @@ validateFunction ctx constIndex fnIndex structIndex skipConstEval scope fn = do
   mapM_ (validateType ctx scope . (.paramType)) fn.fnParams
   mapM_ (validateType ctx scope) (maybeToList fn.fnReturnType)
   let paramNames = map (.paramName) fn.fnParams
-  ensureNoDuplicates "function parameters" paramNames
+  let paramNamesWithPos = map (\p -> (p.paramName, p.paramPos)) fn.fnParams
+  ensureNoDuplicatesAt "function parameters" paramNamesWithPos
   let scope1 = scopeWithParams scope paramNames
   validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 fn.fnBody
 
@@ -1497,7 +1517,8 @@ validateEntryPoint ctx constIndex fnIndex structIndex skipConstEval scope entry 
   mapM_ (validateType ctx scope . (.paramType)) entry.epParams
   mapM_ (validateType ctx scope) (maybeToList entry.epReturnType)
   let paramNames = map (.paramName) entry.epParams
-  ensureNoDuplicates "entry point parameters" paramNames
+  let paramNamesWithPos = map (\p -> (p.paramName, p.paramPos)) entry.epParams
+  ensureNoDuplicatesAt "entry point parameters" paramNamesWithPos
   let scope1 = scopeWithParams scope paramNames
   validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 entry.epBody
 
@@ -1511,55 +1532,56 @@ validateStmtList ctx constIndex fnIndex structIndex skipConstEval = go
 
 validateStmt :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> Stmt -> Either CompileError Scope
 validateStmt ctx constIndex fnIndex structIndex skipConstEval scope stmt =
-  case stmt of
-    SLet name mType expr -> do
-      mapM_ (validateType ctx scope) mType
-      validateExpr ctx scope expr
-      scopeAdd scope name
-    SVar name mType mExpr -> do
-      mapM_ (validateType ctx scope) mType
-      mapM_ (validateExpr ctx scope) mExpr
-      scopeAdd scope name
-    SAssign lv expr -> validateLValue ctx scope lv >> validateExpr ctx scope expr >> Right scope
-    SAssignOp lv _ expr -> validateLValue ctx scope lv >> validateExpr ctx scope expr >> Right scope
-    SInc lv -> validateLValue ctx scope lv >> Right scope
-    SDec lv -> validateLValue ctx scope lv >> Right scope
-    SExpr expr -> validateExpr ctx scope expr >> Right scope
-    SIf cond thenBody elseBody -> do
-      validateExpr ctx scope cond
-      validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope) thenBody
-      mapM_ (validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope)) elseBody
-      Right scope
-    SWhile cond body -> do
-      validateExpr ctx scope cond
-      validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope) body
-      Right scope
-    SLoop body continuing -> do
-      validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope) body
-      mapM_ (validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope)) continuing
-      Right scope
-    SFor initStmt condExpr contStmt body -> do
-      scope1 <- case initStmt of
-        Nothing -> Right scope
-        Just s -> validateStmt ctx constIndex fnIndex structIndex skipConstEval scope s
-      mapM_ (validateExpr ctx scope1) condExpr
-      mapM_ (validateStmt ctx constIndex fnIndex structIndex skipConstEval scope1) contStmt
-      validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope1) body
-      Right scope
-    SSwitch expr cases defBody -> do
-      validateExpr ctx scope expr
-      mapM_ (validateSwitchCase ctx constIndex fnIndex structIndex skipConstEval scope) cases
-      mapM_ (validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope)) defBody
-      Right scope
-    SBreak -> Right scope
-    SBreakIf cond -> validateExpr ctx scope cond >> Right scope
-    SContinue -> Right scope
-    SDiscard -> Right scope
-    SFallthrough ->
-      if scope.scAllowFallthrough
-        then Right scope
-        else Left (CompileError "fallthrough is only allowed in switch cases" Nothing Nothing)
-    SReturn mexpr -> mapM_ (validateExpr ctx scope) mexpr >> Right scope
+  withPos (stmtPos stmt) $
+    case stmt of
+      SLet pos name mType expr -> do
+        mapM_ (validateType ctx scope) mType
+        validateExpr ctx scope expr
+        scopeAddAt pos scope name
+      SVar pos name mType mExpr -> do
+        mapM_ (validateType ctx scope) mType
+        mapM_ (validateExpr ctx scope) mExpr
+        scopeAddAt pos scope name
+      SAssign _ lv expr -> validateLValue ctx scope lv >> validateExpr ctx scope expr >> Right scope
+      SAssignOp _ lv _ expr -> validateLValue ctx scope lv >> validateExpr ctx scope expr >> Right scope
+      SInc _ lv -> validateLValue ctx scope lv >> Right scope
+      SDec _ lv -> validateLValue ctx scope lv >> Right scope
+      SExpr _ expr -> validateExpr ctx scope expr >> Right scope
+      SIf _ cond thenBody elseBody -> do
+        validateExpr ctx scope cond
+        validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope) thenBody
+        mapM_ (validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope)) elseBody
+        Right scope
+      SWhile _ cond body -> do
+        validateExpr ctx scope cond
+        validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope) body
+        Right scope
+      SLoop _ body continuing -> do
+        validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope) body
+        mapM_ (validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope)) continuing
+        Right scope
+      SFor _ initStmt condExpr contStmt body -> do
+        scope1 <- case initStmt of
+          Nothing -> Right scope
+          Just s -> validateStmt ctx constIndex fnIndex structIndex skipConstEval scope s
+        mapM_ (validateExpr ctx scope1) condExpr
+        mapM_ (validateStmt ctx constIndex fnIndex structIndex skipConstEval scope1) contStmt
+        validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope1) body
+        Right scope
+      SSwitch _ expr cases defBody -> do
+        validateExpr ctx scope expr
+        mapM_ (validateSwitchCase ctx constIndex fnIndex structIndex skipConstEval scope) cases
+        mapM_ (validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope)) defBody
+        Right scope
+      SBreak _ -> Right scope
+      SBreakIf _ cond -> validateExpr ctx scope cond >> Right scope
+      SContinue _ -> Right scope
+      SDiscard _ -> Right scope
+      SFallthrough _ ->
+        if scope.scAllowFallthrough
+          then Right scope
+          else Left (CompileError "fallthrough is only allowed in switch cases" Nothing Nothing)
+      SReturn _ mexpr -> mapM_ (validateExpr ctx scope) mexpr >> Right scope
 
 validateSwitchCase :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> SwitchCase -> Either CompileError ()
 validateSwitchCase ctx constIndex fnIndex structIndex skipConstEval scope sc = do
@@ -1578,25 +1600,25 @@ analyzeFallthroughPlacement body =
           lastStmt = last body
           nestedFallthrough = any stmtHasFallthrough initStmts
       in case lastStmt of
-          SFallthrough ->
+          SFallthrough pos ->
             if nestedFallthrough
-              then Left (CompileError "fallthrough must be the last statement in a switch case" Nothing Nothing)
+              then Left (errorAtPos pos "fallthrough must be the last statement in a switch case")
               else Right (True, initStmts)
           _ ->
             if nestedFallthrough || stmtHasFallthrough lastStmt
-              then Left (CompileError "fallthrough must be the last statement in a switch case" Nothing Nothing)
+              then Left (errorAtPos (stmtPos lastStmt) "fallthrough must be the last statement in a switch case")
               else Right (False, body)
 
 stmtHasFallthrough :: Stmt -> Bool
 stmtHasFallthrough stmt =
   case stmt of
-    SFallthrough -> True
-    SIf _ thenBody elseBody ->
+    SFallthrough _ -> True
+    SIf _ _ thenBody elseBody ->
       any stmtHasFallthrough thenBody || maybe False (any stmtHasFallthrough) elseBody
-    SWhile _ body -> any stmtHasFallthrough body
-    SLoop body continuing ->
+    SWhile _ _ body -> any stmtHasFallthrough body
+    SLoop _ body continuing ->
       any stmtHasFallthrough body || maybe False (any stmtHasFallthrough) continuing
-    SFor initStmt _ condStmt body ->
+    SFor _ initStmt _ condStmt body ->
       maybe False stmtHasFallthrough initStmt
         || maybe False stmtHasFallthrough condStmt
         || any stmtHasFallthrough body
@@ -1879,11 +1901,11 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
   where
     go seen fnSeen ex =
       case ex of
-        EUnary OpAddr inner -> evalConstAddressOf seen fnSeen inner
-        EUnary OpDeref inner -> do
+        EUnary _ OpAddr inner -> evalConstAddressOf seen fnSeen inner
+        EUnary _ OpDeref inner -> do
           ptr <- go seen fnSeen inner
           derefConstPointer seen fnSeen ptr
-        EVar name ->
+        EVar _ name ->
           case Map.lookup name env of
             Just envBinding -> Right envBinding.cbValue
             Nothing -> do
@@ -1899,14 +1921,14 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
                   case mTy of
                     Nothing -> Right val
                     Just ty -> coerceConstValueToType ctx structIndex ty val
-        EField base field -> do
+        EField _ base field -> do
           baseVal <- go seen fnSeen base
           evalConstFieldAccess baseVal field
-        EIndex base idxExpr -> do
+        EIndex _ base idxExpr -> do
           baseVal <- go seen fnSeen base
           idxVal <- evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen idxExpr
           evalConstIndexAccess baseVal idxVal
-        ECall name args ->
+        ECall _ name args ->
           case parseVectorCtorName name of
             Just (n, targetScalar) -> evalConstVectorCtor n targetScalar seen fnSeen args
             Nothing ->
@@ -2074,7 +2096,7 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
         Nothing -> Left (CompileError "address-of requires an lvalue" Nothing Nothing)
         Just lv ->
           case lv of
-            LVDeref ptrExpr -> do
+            LVDeref _ ptrExpr -> do
               ptr <- go seen fnSeen ptrExpr
               case ptr of
                 CVPointer _ _ -> Right ptr
@@ -2092,13 +2114,13 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
 
     freezeConstLValue seen fnSeen lv =
       case lv of
-        LVVar name -> Right (LVVar name)
-        LVField base field -> LVField <$> freezeConstLValue seen fnSeen base <*> pure field
-        LVIndex base idxExpr -> do
+        LVVar pos name -> Right (LVVar pos name)
+        LVField pos base field -> LVField pos <$> freezeConstLValue seen fnSeen base <*> pure field
+        LVIndex pos base idxExpr -> do
           base' <- freezeConstLValue seen fnSeen base
           ConstInt _ idxVal <- evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen idxExpr
-          Right (LVIndex base' (EInt idxVal))
-        LVDeref _ ->
+          Right (LVIndex pos base' (EInt pos idxVal))
+        LVDeref _ _ ->
           Left (CompileError "address-of requires an lvalue" Nothing Nothing)
 
 evalConstFunctionValueWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> FunctionDecl -> Either CompileError ConstValue
@@ -2162,86 +2184,88 @@ evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns = go
         _ -> Right (envNext, ctrl, fuelNext)
 
 evalConstStmt :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Int -> Stmt -> Either CompileError (ConstEnv, ConstControl, Int)
-evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stmt = do
-  fuel' <- consumeConstFuel fuel
-  case stmt of
-    SLet name mType expr -> do
-      val0 <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
-      val <- case mType of
-        Nothing -> Right val0
-        Just ty -> coerceConstValueToType ctx structIndex ty val0
-      Right (Map.insert name (ConstBinding val False) env, CCNone, fuel')
-    SVar name mType mExpr -> do
-      val0 <- case mExpr of
-        Just expr -> evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
-        Nothing ->
-          case mType of
-            Nothing -> Left (CompileError "var declaration requires a type or initializer" Nothing Nothing)
-            Just ty -> defaultConstValue ctx structIndex ty
-      val <- case mType of
-        Nothing -> Right val0
-        Just ty -> coerceConstValueToType ctx structIndex ty val0
-      Right (Map.insert name (ConstBinding val True) env, CCNone, fuel')
-    SAssign lv expr -> do
-      oldVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv
-      newVal <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
-      let targetTy = constValueType oldVal
-      newVal' <- coerceConstValueToType ctx structIndex targetTy newVal
-      env' <- evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal'
-      Right (env', CCNone, fuel')
-    SAssignOp lv op expr -> do
-      oldVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv
-      rhsVal <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
-      let targetTy = constValueType oldVal
-      rhsVal' <- coerceConstValueToType ctx structIndex targetTy rhsVal
-      newVal <- evalConstAssignOp op oldVal rhsVal'
-      env' <- evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal
-      Right (env', CCNone, fuel')
-    SInc lv -> do
-      oldVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv
-      one <- constScalarOne oldVal
-      newVal <- evalConstAssignOp OpAdd oldVal one
-      env' <- evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal
-      Right (env', CCNone, fuel')
-    SDec lv -> do
-      oldVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv
-      one <- constScalarOne oldVal
-      newVal <- evalConstAssignOp OpSub oldVal one
-      env' <- evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal
-      Right (env', CCNone, fuel')
-    SExpr expr -> do
-      _ <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
-      Right (env, CCNone, fuel')
-    SSwitch expr cases defBody -> do
-      cases' <- expandSwitchCases cases defBody
-      ConstInt _ selector <- evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
-      matchCase selector cases' defBody fuel'
-    SIf cond thenBody elseBody -> do
-      ok <- evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns cond
-      if ok
-        then do
-          (env', ctrl, fuel'') <- evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel' thenBody
-          Right (env', ctrl, fuel'')
-        else
-          case elseBody of
-            Nothing -> Right (env, CCNone, fuel')
-            Just body -> do
-              (env', ctrl, fuel'') <- evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel' body
-              Right (env', ctrl, fuel'')
-    SWhile cond body -> evalConstWhile cond body fuel'
-    SLoop body continuing -> evalConstLoop body continuing fuel'
-    SFor initStmt condExpr contStmt body -> evalConstFor initStmt condExpr contStmt body fuel'
-    SBreak -> Right (env, CCBreak, fuel')
-    SBreakIf cond -> do
-      ok <- evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns cond
-      Right (env, if ok then CCBreak else CCNone, fuel')
-    SContinue -> Right (env, CCContinue, fuel')
-    SReturn (Just expr) -> do
-      val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
-      Right (env, CCReturn val, fuel')
-    SReturn Nothing ->
-      Left (CompileError "const function return requires a value" Nothing Nothing)
-    _ -> Left (CompileError "const function bodies may only contain let/var, if, switch, loops, assignments, expr, and return statements" Nothing Nothing)
+evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stmt =
+  withPos (stmtPos stmt) $ do
+    fuel' <- consumeConstFuel fuel
+    case stmt of
+      SLet _ name mType expr -> do
+        val0 <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
+        val <- case mType of
+          Nothing -> Right val0
+          Just ty -> coerceConstValueToType ctx structIndex ty val0
+        Right (Map.insert name (ConstBinding val False) env, CCNone, fuel')
+      SVar _ name mType mExpr -> do
+        val0 <- case mExpr of
+          Just expr -> evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
+          Nothing ->
+            case mType of
+              Nothing -> Left (CompileError "var declaration requires a type or initializer" Nothing Nothing)
+              Just ty -> defaultConstValue ctx structIndex ty
+        val <- case mType of
+          Nothing -> Right val0
+          Just ty -> coerceConstValueToType ctx structIndex ty val0
+        Right (Map.insert name (ConstBinding val True) env, CCNone, fuel')
+      SAssign _ lv expr -> do
+        oldVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv
+        newVal <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
+        let targetTy = constValueType oldVal
+        newVal' <- coerceConstValueToType ctx structIndex targetTy newVal
+        env' <- evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal'
+        Right (env', CCNone, fuel')
+      SAssignOp _ lv op expr -> do
+        oldVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv
+        rhsVal <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
+        let targetTy = constValueType oldVal
+        rhsVal' <- coerceConstValueToType ctx structIndex targetTy rhsVal
+        newVal <- evalConstAssignOp op oldVal rhsVal'
+        env' <- evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal
+        Right (env', CCNone, fuel')
+      SInc _ lv -> do
+        oldVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv
+        one <- constScalarOne oldVal
+        newVal <- evalConstAssignOp OpAdd oldVal one
+        env' <- evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal
+        Right (env', CCNone, fuel')
+      SDec _ lv -> do
+        oldVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv
+        one <- constScalarOne oldVal
+        newVal <- evalConstAssignOp OpSub oldVal one
+        env' <- evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal
+        Right (env', CCNone, fuel')
+      SExpr _ expr -> do
+        _ <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
+        Right (env, CCNone, fuel')
+      SSwitch _ expr cases defBody -> do
+        cases' <- expandSwitchCases cases defBody
+        ConstInt _ selector <- evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
+        matchCase selector cases' defBody fuel'
+      SIf _ cond thenBody elseBody -> do
+        ok <- evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns cond
+        if ok
+          then do
+            (env', ctrl, fuel'') <- evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel' thenBody
+            Right (env', ctrl, fuel'')
+          else
+            case elseBody of
+              Nothing -> Right (env, CCNone, fuel')
+              Just body -> do
+                (env', ctrl, fuel'') <- evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel' body
+                Right (env', ctrl, fuel'')
+      SWhile _ cond body -> evalConstWhile cond body fuel'
+      SLoop _ body continuing -> evalConstLoop body continuing fuel'
+      SFor _ initStmt condExpr contStmt body -> evalConstFor initStmt condExpr contStmt body fuel'
+      SBreak _ -> Right (env, CCBreak, fuel')
+      SBreakIf _ cond -> do
+        ok <- evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns cond
+        Right (env, if ok then CCBreak else CCNone, fuel')
+      SContinue _ -> Right (env, CCContinue, fuel')
+      SReturn _ (Just expr) -> do
+        val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
+        Right (env, CCReturn val, fuel')
+      SReturn _ Nothing ->
+        Left (CompileError "const function return requires a value" Nothing Nothing)
+      _ ->
+        Left (CompileError "const function bodies may only contain let/var, if, switch, loops, assignments, expr, and return statements" Nothing Nothing)
   where
     matchCase _ [] defBody fuel'' =
       case defBody of
@@ -2330,18 +2354,18 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
 evalConstLValueGet :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> LValue -> Either CompileError ConstValue
 evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv =
   case lv of
-    LVVar name ->
+    LVVar _ name ->
       case Map.lookup name env of
         Just envBinding -> Right envBinding.cbValue
         Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
-    LVField base field -> do
+    LVField _ base field -> do
       baseVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns base
       evalConstFieldAccess baseVal field
-    LVIndex base idxExpr -> do
+    LVIndex _ base idxExpr -> do
       baseVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns base
       idxVal <- evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns idxExpr
       evalConstIndexAccess baseVal idxVal
-    LVDeref expr -> do
+    LVDeref _ expr -> do
       ptr <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
       case ptr of
         CVPointer _ ptrLv -> evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns ptrLv
@@ -2350,23 +2374,23 @@ evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv 
 evalConstLValueSet :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> LValue -> ConstValue -> Either CompileError ConstEnv
 evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal =
   case lv of
-    LVVar name ->
+    LVVar _ name ->
         case Map.lookup name env of
           Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
           Just envBinding ->
             if envBinding.cbMutable
               then Right (Map.insert name envBinding { cbValue = newVal } env)
               else Left (CompileError "cannot assign to immutable let binding" Nothing Nothing)
-    LVField base field -> do
+    LVField _ base field -> do
       baseVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns base
       updated <- updateFieldValue baseVal field newVal
       evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns base updated
-    LVIndex base idxExpr -> do
+    LVIndex _ base idxExpr -> do
       baseVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns base
       idxVal <- evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns idxExpr
       updated <- updateIndexValue baseVal idxVal newVal
       evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns base updated
-    LVDeref expr -> do
+    LVDeref _ expr -> do
       ptr <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
       case ptr of
         CVPointer _ ptrLv -> evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns ptrLv newVal
@@ -2541,7 +2565,7 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
   where
     go seen fnSeen ex =
       case ex of
-        EInt n -> do
+        EInt _ n -> do
           (scalar, val) <- selectIntLiteralScalar n
           case scalar of
             I32 -> do
@@ -2551,7 +2575,7 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
               checkU32 val
               Right (ConstInt U32 val)
             _ -> Left (CompileError "integer literal must be i32 or u32" Nothing Nothing)
-        EUnary OpNeg inner -> do
+        EUnary _ OpNeg inner -> do
           ConstInt scalar val <- go seen fnSeen inner
           case scalar of
             I32 -> do
@@ -2560,12 +2584,12 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
               Right (ConstInt I32 v)
             U32 -> Left (CompileError "unary minus is not supported for u32 in const expressions" Nothing Nothing)
             _ -> Left (CompileError "unary minus expects integer constants" Nothing Nothing)
-        EUnary OpDeref inner -> do
-          val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen (EUnary OpDeref inner)
+        EUnary _ OpDeref _ -> do
+          val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToInt val
-        EFloat _ ->
+        EFloat _ _ ->
           Left (CompileError "const int expression references a float literal" Nothing Nothing)
-        ECall "u32" [arg] ->
+        ECall _ "u32" [arg] ->
           case go seen fnSeen arg of
             Right (ConstInt _ n) -> do
               checkU32 n
@@ -2575,7 +2599,7 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
               let n = truncate v :: Integer
               checkU32 n
               Right (ConstInt U32 n)
-        ECall "i32" [arg] ->
+        ECall _ "i32" [arg] ->
           case go seen fnSeen arg of
             Right (ConstInt _ n) -> do
               checkI32 n
@@ -2585,13 +2609,13 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
               let n = truncate v :: Integer
               checkI32 n
               Right (ConstInt I32 n)
-        EBitcast _ _ ->
+        EBitcast _ _ _ ->
           Left (CompileError "bitcast is not allowed in const integer expressions" Nothing Nothing)
-        ECall name args
+        ECall _ name args
           | not (isBuiltinName name) -> do
               val <- evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seen fnSeen name args
               constValueToInt val
-        EBinary op a b -> do
+        EBinary _ op a b -> do
           ConstInt sa va <- go seen fnSeen a
           ConstInt sb vb <- go seen fnSeen b
           (scalar, x, y) <- coercePair sa va sb vb
@@ -2607,7 +2631,7 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
             OpShl -> applyShift scalar x y True
             OpShr -> applyShift scalar x y False
             _ -> Left (CompileError "unsupported const integer operation" Nothing Nothing)
-        EVar name ->
+        EVar _ name ->
           case Map.lookup name env of
             Just envBinding ->
               case envBinding.cbValue of
@@ -2629,10 +2653,10 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
                     Nothing -> Right val
                     Just ty -> coerceConstValueToType ctx structIndex ty val
                   constValueToInt val'
-        EField _ _ -> do
+        EField _ _ _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToInt val
-        EIndex _ _ -> do
+        EIndex _ _ _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToInt val
         _ -> Left (CompileError "switch case selector must be a constant integer expression" Nothing Nothing)
@@ -2717,59 +2741,59 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env = go
   where
     go seen fnSeen ex =
       case ex of
-        EFloat f -> Right (ConstFloat F32 (realToFrac f))
-        EInt n -> do
+        EFloat _ f -> Right (ConstFloat F32 (realToFrac f))
+        EInt _ n -> do
           (_, val) <- selectIntLiteralScalar n
           Right (ConstFloat F32 (fromIntegral val))
-        EUnary OpNeg inner -> do
+        EUnary _ OpNeg inner -> do
           cf <- go seen fnSeen inner
           Right (applyFloatOp cf.cfScalar negate cf.cfValue)
-        EUnary OpDeref inner -> do
-          val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen (EUnary OpDeref inner)
+        EUnary _ OpDeref _ -> do
+          val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToFloat val
-        ECall "f32" [arg] -> do
+        ECall _ "f32" [arg] -> do
           cf <- evalFloatArg seen fnSeen arg
           Right (convertConstFloatTo F32 cf)
-        ECall "f16" [arg] -> do
+        ECall _ "f16" [arg] -> do
           cf <- evalFloatArg seen fnSeen arg
           Right (convertConstFloatTo F16 cf)
-        ECall "abs" [arg] -> do
+        ECall _ "abs" [arg] -> do
           cf <- evalFloatArg seen fnSeen arg
           Right (applyFloatOp cf.cfScalar abs cf.cfValue)
-        ECall "min" [a, b] -> do
+        ECall _ "min" [a, b] -> do
           cfA <- evalFloatArg seen fnSeen a
           cfB <- evalFloatArg seen fnSeen b
           let (scalar, x, y) = coerceFloatPair cfA cfB
           Right (applyFloatOp scalar id (min x y))
-        ECall "max" [a, b] -> do
+        ECall _ "max" [a, b] -> do
           cfA <- evalFloatArg seen fnSeen a
           cfB <- evalFloatArg seen fnSeen b
           let (scalar, x, y) = coerceFloatPair cfA cfB
           Right (applyFloatOp scalar id (max x y))
-        ECall "clamp" [xExpr, loExpr, hiExpr] -> do
+        ECall _ "clamp" [xExpr, loExpr, hiExpr] -> do
           cfX <- evalFloatArg seen fnSeen xExpr
           cfLo <- evalFloatArg seen fnSeen loExpr
           cfHi <- evalFloatArg seen fnSeen hiExpr
           let (scalar1, x, lo) = coerceFloatPair cfX cfLo
           let ConstFloat _ hi = convertConstFloatTo scalar1 cfHi
           Right (applyFloatOp scalar1 id (min (max x lo) hi))
-        ECall "mix" [aExpr, bExpr, tExpr] -> do
+        ECall _ "mix" [aExpr, bExpr, tExpr] -> do
           cfA <- evalFloatArg seen fnSeen aExpr
           cfB <- evalFloatArg seen fnSeen bExpr
           cfT <- evalFloatArg seen fnSeen tExpr
           let (scalar1, a, b) = coerceFloatPair cfA cfB
           let ConstFloat _ t = convertConstFloatTo scalar1 cfT
           Right (applyFloatOp scalar1 id (a * (1.0 - t) + b * t))
-        ECall "select" [aExpr, bExpr, condExpr] -> do
+        ECall _ "select" [aExpr, bExpr, condExpr] -> do
           cond <- evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen condExpr
           cfA <- evalFloatArg seen fnSeen aExpr
           cfB <- evalFloatArg seen fnSeen bExpr
           Right (if cond then cfB else cfA)
-        ECall name args
+        ECall _ name args
           | not (isBuiltinName name) -> do
               val <- evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seen fnSeen name args
               constValueToFloat val
-        EBinary op a b -> do
+        EBinary _ op a b -> do
           cfA <- evalFloatArg seen fnSeen a
           cfB <- evalFloatArg seen fnSeen b
           let (scalar, x, y) = coerceFloatPair cfA cfB
@@ -2782,7 +2806,7 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env = go
                 then Left (CompileError "division by zero in constant expression" Nothing Nothing)
                 else Right (applyFloatOp scalar id (x / y))
             _ -> Left (CompileError "unsupported const float operation" Nothing Nothing)
-        EVar name ->
+        EVar _ name ->
           case Map.lookup name env of
             Just envBinding ->
               case envBinding.cbValue of
@@ -2804,10 +2828,10 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env = go
                     Nothing -> Right val
                     Just ty -> coerceConstValueToType ctx structIndex ty val
                   constValueToFloat val'
-        EField _ _ -> do
+        EField _ _ _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToFloat val
-        EIndex _ _ -> do
+        EIndex _ _ _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToFloat val
         _ -> Left (CompileError "const float expression requires a constant float expression" Nothing Nothing)
@@ -2835,29 +2859,29 @@ evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env = go
   where
     go seen fnSeen ex =
       case ex of
-        EBool b -> Right b
-        EUnary OpNot a -> not <$> go seen fnSeen a
-        EUnary OpDeref inner -> do
-          val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen (EUnary OpDeref inner)
+        EBool _ b -> Right b
+        EUnary _ OpNot a -> not <$> go seen fnSeen a
+        EUnary _ OpDeref _ -> do
+          val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToBool val
-        EBinary OpAnd a b -> (&&) <$> go seen fnSeen a <*> go seen fnSeen b
-        EBinary OpOr a b -> (||) <$> go seen fnSeen a <*> go seen fnSeen b
-        EBinary OpEq a b -> evalEq seen fnSeen a b
-        EBinary OpNe a b -> not <$> evalEq seen fnSeen a b
-        EBinary OpLt a b -> evalCmp seen fnSeen (<) (<) a b
-        EBinary OpLe a b -> evalCmp seen fnSeen (<=) (<=) a b
-        EBinary OpGt a b -> evalCmp seen fnSeen (>) (>) a b
-        EBinary OpGe a b -> evalCmp seen fnSeen (>=) (>=) a b
-        ECall "select" [aExpr, bExpr, condExpr] -> do
+        EBinary _ OpAnd a b -> (&&) <$> go seen fnSeen a <*> go seen fnSeen b
+        EBinary _ OpOr a b -> (||) <$> go seen fnSeen a <*> go seen fnSeen b
+        EBinary _ OpEq a b -> evalEq seen fnSeen a b
+        EBinary _ OpNe a b -> not <$> evalEq seen fnSeen a b
+        EBinary _ OpLt a b -> evalCmp seen fnSeen (<) (<) a b
+        EBinary _ OpLe a b -> evalCmp seen fnSeen (<=) (<=) a b
+        EBinary _ OpGt a b -> evalCmp seen fnSeen (>) (>) a b
+        EBinary _ OpGe a b -> evalCmp seen fnSeen (>=) (>=) a b
+        ECall _ "select" [aExpr, bExpr, condExpr] -> do
           cond <- go seen fnSeen condExpr
           if cond then go seen fnSeen bExpr else go seen fnSeen aExpr
-        EBitcast _ _ ->
+        EBitcast _ _ _ ->
           Left (CompileError "bitcast is not allowed in const boolean expressions" Nothing Nothing)
-        ECall name args
+        ECall _ name args
           | not (isBuiltinName name) -> do
               val <- evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seen fnSeen name args
               constValueToBool val
-        EVar name ->
+        EVar _ name ->
           case Map.lookup name env of
             Just envBinding ->
               case envBinding.cbValue of
@@ -2879,10 +2903,10 @@ evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env = go
                     Nothing -> Right val
                     Just ty -> coerceConstValueToType ctx structIndex ty val
                   constValueToBool val'
-        EField _ _ -> do
+        EField _ _ _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToBool val
-        EIndex _ _ -> do
+        EIndex _ _ _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToBool val
         _ -> Left (CompileError "const_assert requires a constant boolean expression" Nothing Nothing)
@@ -3004,30 +3028,32 @@ resolveFunctionRef ctx name =
 
 validateLValue :: ModuleContext -> Scope -> LValue -> Either CompileError ()
 validateLValue ctx scope lv =
-  case lv of
-    LVVar name -> validateName ctx scope name
-    LVField base _ -> validateLValue ctx scope base
-    LVIndex base idx -> validateLValue ctx scope base >> validateExpr ctx scope idx
-    LVDeref expr -> validateExpr ctx scope expr
+  withPos (lvaluePos lv) $
+    case lv of
+      LVVar _ name -> validateName ctx scope name
+      LVField _ base _ -> validateLValue ctx scope base
+      LVIndex _ base idx -> validateLValue ctx scope base >> validateExpr ctx scope idx
+      LVDeref _ expr -> validateExpr ctx scope expr
 
 validateExpr :: ModuleContext -> Scope -> Expr -> Either CompileError ()
 validateExpr ctx scope expr =
-  case expr of
-    EVar name -> validateName ctx scope name
-    EInt _ -> Right ()
-    EFloat _ -> Right ()
-    EBool _ -> Right ()
-    EBinary _ a b -> validateExpr ctx scope a >> validateExpr ctx scope b
-    EUnary OpAddr a ->
-      case exprToLValue a of
-        Nothing -> Left (CompileError "address-of requires an addressable expression" Nothing Nothing)
-        Just _ -> validateExpr ctx scope a
-    EUnary OpDeref a -> validateExpr ctx scope a
-    EUnary _ a -> validateExpr ctx scope a
-    ECall name args -> validateName ctx scope name >> mapM_ (validateExpr ctx scope) args
-    EBitcast ty arg -> validateType ctx scope ty >> validateExpr ctx scope arg
-    EField base _ -> validateExpr ctx scope base
-    EIndex base idx -> validateExpr ctx scope base >> validateExpr ctx scope idx
+  withPos (exprPos expr) $
+    case expr of
+      EVar _ name -> validateName ctx scope name
+      EInt _ _ -> Right ()
+      EFloat _ _ -> Right ()
+      EBool _ _ -> Right ()
+      EBinary _ _ a b -> validateExpr ctx scope a >> validateExpr ctx scope b
+      EUnary _ OpAddr a ->
+        case exprToLValue a of
+          Nothing -> Left (CompileError "address-of requires an addressable expression" Nothing Nothing)
+          Just _ -> validateExpr ctx scope a
+      EUnary _ OpDeref a -> validateExpr ctx scope a
+      EUnary _ _ a -> validateExpr ctx scope a
+      ECall _ name args -> validateName ctx scope name >> mapM_ (validateExpr ctx scope) args
+      EBitcast _ ty arg -> validateType ctx scope ty >> validateExpr ctx scope arg
+      EField _ base _ -> validateExpr ctx scope base
+      EIndex _ base idx -> validateExpr ctx scope base >> validateExpr ctx scope idx
 
 validateType :: ModuleContext -> Scope -> Type -> Either CompileError ()
 validateType ctx scope ty =
@@ -3125,6 +3151,10 @@ scopeWithParams scope names =
   let (table', ids) = internNames scope.scNameTable names
   in scope { scNameTable = table', scScopes = [IntSet.fromList ids] }
 
+scopeAddAt :: SrcPos -> Scope -> Text -> Either CompileError Scope
+scopeAddAt pos scope name =
+  withPos pos (scopeAdd scope name)
+
 ensureNoDuplicates :: Text -> [Text] -> Either CompileError ()
 ensureNoDuplicates label names =
   let (dups, _) = foldl' collect ([], Set.empty) names
@@ -3136,6 +3166,16 @@ ensureNoDuplicates label names =
       if Set.member name seen
         then (name : acc, seen)
         else (acc, Set.insert name seen)
+
+ensureNoDuplicatesAt :: Text -> [(Text, SrcPos)] -> Either CompileError ()
+ensureNoDuplicatesAt label names =
+  go Set.empty names
+  where
+    go _ [] = Right ()
+    go seen ((name, pos):rest) =
+      if Set.member name seen
+        then Left (errorAtPos pos ("duplicate " <> textToString label <> ": " <> T.unpack name))
+        else go (Set.insert name seen) rest
 
 isBuiltinName :: Text -> Bool
 isBuiltinName name =
@@ -3415,36 +3455,36 @@ rewriteFieldDecl ctx field =
 rewriteStmtNames :: ModuleContext -> Stmt -> Stmt
 rewriteStmtNames ctx stmt =
   case stmt of
-    SLet name mType expr -> SLet name mType (rewriteExprNames ctx expr)
-    SVar name mType mExpr -> SVar name mType (fmap (rewriteExprNames ctx) mExpr)
-    SAssign lv expr -> SAssign (rewriteLValueNames ctx lv) (rewriteExprNames ctx expr)
-    SAssignOp lv op expr -> SAssignOp (rewriteLValueNames ctx lv) op (rewriteExprNames ctx expr)
-    SInc lv -> SInc (rewriteLValueNames ctx lv)
-    SDec lv -> SDec (rewriteLValueNames ctx lv)
-    SExpr expr -> SExpr (rewriteExprNames ctx expr)
-    SIf cond thenBody elseBody ->
-      SIf (rewriteExprNames ctx cond)
+    SLet pos name mType expr -> SLet pos name mType (rewriteExprNames ctx expr)
+    SVar pos name mType mExpr -> SVar pos name mType (fmap (rewriteExprNames ctx) mExpr)
+    SAssign pos lv expr -> SAssign pos (rewriteLValueNames ctx lv) (rewriteExprNames ctx expr)
+    SAssignOp pos lv op expr -> SAssignOp pos (rewriteLValueNames ctx lv) op (rewriteExprNames ctx expr)
+    SInc pos lv -> SInc pos (rewriteLValueNames ctx lv)
+    SDec pos lv -> SDec pos (rewriteLValueNames ctx lv)
+    SExpr pos expr -> SExpr pos (rewriteExprNames ctx expr)
+    SIf pos cond thenBody elseBody ->
+      SIf pos (rewriteExprNames ctx cond)
           (map (rewriteStmtNames ctx) thenBody)
           (fmap (map (rewriteStmtNames ctx)) elseBody)
-    SWhile cond body ->
-      SWhile (rewriteExprNames ctx cond) (map (rewriteStmtNames ctx) body)
-    SLoop body continuing ->
-      SLoop (map (rewriteStmtNames ctx) body) (fmap (map (rewriteStmtNames ctx)) continuing)
-    SFor initStmt condExpr contStmt body ->
-      SFor (fmap (rewriteStmtNames ctx) initStmt)
+    SWhile pos cond body ->
+      SWhile pos (rewriteExprNames ctx cond) (map (rewriteStmtNames ctx) body)
+    SLoop pos body continuing ->
+      SLoop pos (map (rewriteStmtNames ctx) body) (fmap (map (rewriteStmtNames ctx)) continuing)
+    SFor pos initStmt condExpr contStmt body ->
+      SFor pos (fmap (rewriteStmtNames ctx) initStmt)
            (fmap (rewriteExprNames ctx) condExpr)
            (fmap (rewriteStmtNames ctx) contStmt)
            (map (rewriteStmtNames ctx) body)
-    SSwitch expr cases defBody ->
-      SSwitch (rewriteExprNames ctx expr)
+    SSwitch pos expr cases defBody ->
+      SSwitch pos (rewriteExprNames ctx expr)
         (map rewriteCase cases)
         (fmap (map (rewriteStmtNames ctx)) defBody)
-    SBreak -> SBreak
-    SBreakIf cond -> SBreakIf (rewriteExprNames ctx cond)
-    SContinue -> SContinue
-    SDiscard -> SDiscard
-    SFallthrough -> SFallthrough
-    SReturn expr -> SReturn (fmap (rewriteExprNames ctx) expr)
+    SBreak pos -> SBreak pos
+    SBreakIf pos cond -> SBreakIf pos (rewriteExprNames ctx cond)
+    SContinue pos -> SContinue pos
+    SDiscard pos -> SDiscard pos
+    SFallthrough pos -> SFallthrough pos
+    SReturn pos expr -> SReturn pos (fmap (rewriteExprNames ctx) expr)
   where
     rewriteCase sc =
       sc { scSelectors = map (rewriteExprNames ctx) sc.scSelectors
@@ -3454,24 +3494,24 @@ rewriteStmtNames ctx stmt =
 rewriteLValueNames :: ModuleContext -> LValue -> LValue
 rewriteLValueNames ctx lv =
   case lv of
-    LVVar name -> LVVar (rewriteIdent ctx name)
-    LVField base field -> LVField (rewriteLValueNames ctx base) field
-    LVIndex base idx -> LVIndex (rewriteLValueNames ctx base) (rewriteExprNames ctx idx)
-    LVDeref expr -> LVDeref (rewriteExprNames ctx expr)
+    LVVar pos name -> LVVar pos (rewriteIdent ctx name)
+    LVField pos base field -> LVField pos (rewriteLValueNames ctx base) field
+    LVIndex pos base idx -> LVIndex pos (rewriteLValueNames ctx base) (rewriteExprNames ctx idx)
+    LVDeref pos expr -> LVDeref pos (rewriteExprNames ctx expr)
 
 rewriteExprNames :: ModuleContext -> Expr -> Expr
 rewriteExprNames ctx expr =
   case expr of
-    EVar name -> EVar (rewriteIdent ctx name)
-    EInt _ -> expr
-    EFloat _ -> expr
-    EBool _ -> expr
-    EBinary op a b -> EBinary op (rewriteExprNames ctx a) (rewriteExprNames ctx b)
-    EUnary op a -> EUnary op (rewriteExprNames ctx a)
-    ECall name args -> ECall (rewriteIdent ctx name) (map (rewriteExprNames ctx) args)
-    EBitcast ty arg -> EBitcast (rewriteType ctx ty) (rewriteExprNames ctx arg)
-    EField base field -> EField (rewriteExprNames ctx base) field
-    EIndex base idx -> EIndex (rewriteExprNames ctx base) (rewriteExprNames ctx idx)
+    EVar pos name -> EVar pos (rewriteIdent ctx name)
+    EInt {} -> expr
+    EFloat {} -> expr
+    EBool {} -> expr
+    EBinary pos op a b -> EBinary pos op (rewriteExprNames ctx a) (rewriteExprNames ctx b)
+    EUnary pos op a -> EUnary pos op (rewriteExprNames ctx a)
+    ECall pos name args -> ECall pos (rewriteIdent ctx name) (map (rewriteExprNames ctx) args)
+    EBitcast pos ty arg -> EBitcast pos (rewriteType ctx ty) (rewriteExprNames ctx arg)
+    EField pos base field -> EField pos (rewriteExprNames ctx base) field
+    EIndex pos base idx -> EIndex pos (rewriteExprNames ctx base) (rewriteExprNames ctx idx)
 
 splitQName :: Text -> [Text]
 splitQName name =

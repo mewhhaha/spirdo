@@ -31,6 +31,12 @@ parseModuleWith features src = do
 
 type FeatureSet = Set.Set Text
 
+posOf :: [Token] -> SrcPos
+posOf toks =
+  case toks of
+    (Token _ pos : _) -> pos
+    [] -> SrcPos 1 1
+
 lexWesl :: Text -> Either CompileError [Token]
 lexWesl = go (SrcPos 1 1)
   where
@@ -906,10 +912,11 @@ parseParams feats toks =
     parseParam rest = do
       (attrs, rest1) <- parseAttributes rest
       (keep, attrs') <- applyIf attrs feats rest1
+      let pos = posOf rest1
       (name, rest2) <- parseIdent rest1
       rest3 <- expectSymbol ":" rest2
       (ty, rest4) <- parseType rest3
-      let param = Param name ty attrs'
+      let param = Param pos name ty attrs'
       pure (if keep then Just param else Nothing, rest4)
 
 parseReturnType :: [Token] -> Either CompileError ([Token], Maybe Type, Maybe Word32, Maybe Text)
@@ -943,15 +950,16 @@ parseStatements feats acc toks =
 
 parseStmt :: FeatureSet -> [Token] -> Either CompileError (Stmt, [Token])
 parseStmt feats toks =
-  case toks of
+  let pos = posOf toks
+  in case toks of
     (Token (TkSymbol "++") _ : rest) -> do
       (lv, rest1) <- parseLValue rest
       rest2 <- expectSymbol ";" rest1
-      Right (SInc lv, rest2)
+      Right (SInc pos lv, rest2)
     (Token (TkSymbol "--") _ : rest) -> do
       (lv, rest1) <- parseLValue rest
       rest2 <- expectSymbol ";" rest1
-      Right (SDec lv, rest2)
+      Right (SDec pos lv, rest2)
     (Token (TkIdent "if") _ : rest) -> do
       rest1 <- expectSymbol "(" rest
       (cond, rest2) <- parseExpr rest1
@@ -960,23 +968,23 @@ parseStmt feats toks =
       case rest4 of
         (Token (TkIdent "else") _ : more) -> do
           (elseBody, rest5) <- parseBody feats more
-          Right (SIf cond thenBody (Just elseBody), rest5)
-        _ -> Right (SIf cond thenBody Nothing, rest4)
+          Right (SIf pos cond thenBody (Just elseBody), rest5)
+        _ -> Right (SIf pos cond thenBody Nothing, rest4)
     (Token (TkIdent "switch") _ : rest) -> do
       rest1 <- expectSymbol "(" rest
       (expr, rest2) <- parseExpr rest1
       rest3 <- expectSymbol ")" rest2
       (cases, defBody, rest4) <- parseSwitchBody feats rest3
-      Right (SSwitch expr cases defBody, rest4)
+      Right (SSwitch pos expr cases defBody, rest4)
     (Token (TkIdent "loop") _ : rest) -> do
       (body, continuing, rest1) <- parseLoopBody feats rest
-      Right (SLoop body continuing, rest1)
+      Right (SLoop pos body continuing, rest1)
     (Token (TkIdent "while") _ : rest) -> do
       rest1 <- expectSymbol "(" rest
       (cond, rest2) <- parseExpr rest1
       rest3 <- expectSymbol ")" rest2
       (body, rest4) <- parseBody feats rest3
-      Right (SWhile cond body, rest4)
+      Right (SWhile pos cond body, rest4)
     (Token (TkIdent "for") _ : rest) -> do
       rest1 <- expectSymbol "(" rest
       (initStmt, rest2) <- parseForClause rest1
@@ -986,7 +994,7 @@ parseStmt feats toks =
       (contStmt, rest6) <- parseForClause rest5
       rest7 <- expectSymbol ")" rest6
       (body, rest8) <- parseBody feats rest7
-      Right (SFor initStmt condExpr contStmt body, rest8)
+      Right (SFor pos initStmt condExpr contStmt body, rest8)
     (Token (TkIdent "break") _ : rest) ->
       case rest of
         (Token (TkIdent "if") _ : more) -> do
@@ -994,26 +1002,26 @@ parseStmt feats toks =
           (cond, rest2) <- parseExpr rest1
           rest3 <- expectSymbol ")" rest2
           rest4 <- expectSymbol ";" rest3
-          Right (SBreakIf cond, rest4)
+          Right (SBreakIf pos cond, rest4)
         _ -> do
           rest1 <- expectSymbol ";" rest
-          Right (SBreak, rest1)
+          Right (SBreak pos, rest1)
     (Token (TkIdent "continue") _ : rest) -> do
       rest1 <- expectSymbol ";" rest
-      Right (SContinue, rest1)
+      Right (SContinue pos, rest1)
     (Token (TkIdent "discard") _ : rest) -> do
       rest1 <- expectSymbol ";" rest
-      Right (SDiscard, rest1)
+      Right (SDiscard pos, rest1)
     (Token (TkIdent "fallthrough") _ : rest) -> do
       rest1 <- expectSymbol ";" rest
-      Right (SFallthrough, rest1)
+      Right (SFallthrough pos, rest1)
     (Token (TkIdent "let") _ : rest) -> do
       (name, rest1) <- parseIdent rest
       (mType, rest2) <- parseTypeAnnotationMaybe rest1
       rest3 <- expectSymbol "=" rest2
       (expr, rest4) <- parseExpr rest3
       rest5 <- expectSymbol ";" rest4
-      Right (SLet name mType expr, rest5)
+      Right (SLet pos name mType expr, rest5)
     (Token (TkIdent "var") _ : rest) -> do
       (name, rest1) <- parseIdent rest
       (mType, rest2) <- parseTypeAnnotationMaybe rest1
@@ -1021,41 +1029,41 @@ parseStmt feats toks =
         (Token (TkSymbol "=") _ : more) -> do
           (expr, rest3) <- parseExpr more
           rest4 <- expectSymbol ";" rest3
-          Right (SVar name mType (Just expr), rest4)
+          Right (SVar pos name mType (Just expr), rest4)
         (Token (TkSymbol ";") _ : more) ->
           case mType of
             Nothing -> Left (errorAt rest2 "var declaration requires a type or initializer")
-            Just _ -> Right (SVar name mType Nothing, more)
+            Just _ -> Right (SVar pos name mType Nothing, more)
         _ -> Left (errorAt rest2 "expected '=' or ';' in var declaration")
     (Token (TkIdent "return") _ : rest) ->
       case rest of
-        (Token (TkSymbol ";") _ : more) -> Right (SReturn Nothing, more)
+        (Token (TkSymbol ";") _ : more) -> Right (SReturn pos Nothing, more)
         _ -> do
           (expr, rest1) <- parseExpr rest
           rest2 <- expectSymbol ";" rest1
-          Right (SReturn (Just expr), rest2)
+          Right (SReturn pos (Just expr), rest2)
     _ -> do
       (lv, rest1) <- parseLValue toks
       case rest1 of
         (Token (TkSymbol "++") _ : restInc) -> do
           rest2 <- expectSymbol ";" restInc
-          Right (SInc lv, rest2)
+          Right (SInc pos lv, rest2)
         (Token (TkSymbol "--") _ : restDec) -> do
           rest2 <- expectSymbol ";" restDec
-          Right (SDec lv, rest2)
+          Right (SDec pos lv, rest2)
         (Token (TkSymbol "=") _ : restEq) -> do
           (expr, rest2) <- parseExpr restEq
           rest3 <- expectSymbol ";" rest2
-          Right (SAssign lv expr, rest3)
+          Right (SAssign pos lv expr, rest3)
         (Token (TkSymbol sym) _ : restEq)
           | Just op <- assignOpFromSymbol sym -> do
               (expr, rest2) <- parseExpr restEq
               rest3 <- expectSymbol ";" rest2
-              Right (SAssignOp lv op expr, rest3)
+              Right (SAssignOp pos lv op expr, rest3)
         _ -> do
           (expr, rest2) <- parseExpr toks
           rest3 <- expectSymbol ";" rest2
-          Right (SExpr expr, rest3)
+          Right (SExpr pos expr, rest3)
 
 parseTypeAnnotationMaybe :: [Token] -> Either CompileError (Maybe Type, [Token])
 parseTypeAnnotationMaybe toks =
@@ -1129,44 +1137,45 @@ parseLoopBody feats toks =
 
 parseForClause :: [Token] -> Either CompileError (Maybe Stmt, [Token])
 parseForClause toks =
-  case toks of
+  let pos = posOf toks
+  in case toks of
     (Token (TkSymbol ";") _ : _) -> Right (Nothing, toks)
     (Token (TkSymbol ")") _ : _) -> Right (Nothing, toks)
     (Token (TkSymbol "++") _ : rest) -> do
       (lv, rest1) <- parseLValue rest
-      Right (Just (SInc lv), rest1)
+      Right (Just (SInc pos lv), rest1)
     (Token (TkSymbol "--") _ : rest) -> do
       (lv, rest1) <- parseLValue rest
-      Right (Just (SDec lv), rest1)
+      Right (Just (SDec pos lv), rest1)
     (Token (TkIdent "let") _ : rest) -> do
       (name, rest1) <- parseIdent rest
       (mType, rest2) <- parseTypeAnnotationMaybe rest1
       rest3 <- expectSymbol "=" rest2
       (expr, rest4) <- parseExpr rest3
-      Right (Just (SLet name mType expr), rest4)
+      Right (Just (SLet pos name mType expr), rest4)
     (Token (TkIdent "var") _ : rest) -> do
       (name, rest1) <- parseIdent rest
       (mType, rest2) <- parseTypeAnnotationMaybe rest1
       case rest2 of
         (Token (TkSymbol "=") _ : more) -> do
           (expr, rest3) <- parseExpr more
-          Right (Just (SVar name mType (Just expr)), rest3)
+          Right (Just (SVar pos name mType (Just expr)), rest3)
         _ ->
           case mType of
             Nothing -> Left (errorAt rest2 "var declaration requires a type or initializer")
-            Just _ -> Right (Just (SVar name mType Nothing), rest2)
+            Just _ -> Right (Just (SVar pos name mType Nothing), rest2)
     _ -> do
       (lv, rest1) <- parseLValue toks
       case rest1 of
-        (Token (TkSymbol "++") _ : restInc) -> Right (Just (SInc lv), restInc)
-        (Token (TkSymbol "--") _ : restDec) -> Right (Just (SDec lv), restDec)
+        (Token (TkSymbol "++") _ : restInc) -> Right (Just (SInc pos lv), restInc)
+        (Token (TkSymbol "--") _ : restDec) -> Right (Just (SDec pos lv), restDec)
         (Token (TkSymbol "=") _ : restEq) -> do
           (expr, rest3) <- parseExpr restEq
-          Right (Just (SAssign lv expr), rest3)
+          Right (Just (SAssign pos lv expr), rest3)
         (Token (TkSymbol sym) _ : restEq)
           | Just op <- assignOpFromSymbol sym -> do
               (expr, rest3) <- parseExpr restEq
-              Right (Just (SAssignOp lv op expr), rest3)
+              Right (Just (SAssignOp pos lv op expr), rest3)
         _ -> Left (errorAt rest1 "expected assignment in for clause")
 
 parseForCond :: [Token] -> Either CompileError (Maybe Expr, [Token])
@@ -1195,22 +1204,23 @@ assignOpFromSymbol sym =
 parseLValue :: [Token] -> Either CompileError (LValue, [Token])
 parseLValue toks =
   case toks of
-    (Token (TkSymbol "*") _ : rest) -> do
+    (Token (TkSymbol "*") pos : rest) -> do
       (expr, rest1) <- parseUnaryExpr rest
-      Right (LVDeref expr, rest1)
+      Right (LVDeref pos expr, rest1)
     _ -> do
+      let pos = posOf toks
       (name, rest) <- parseFullIdent toks
-      parseLValueTail (LVVar name) rest
+      parseLValueTail (LVVar pos name) rest
 
 parseLValueTail :: LValue -> [Token] -> Either CompileError (LValue, [Token])
 parseLValueTail lv toks =
   case toks of
-    (Token (TkSymbol ".") _ : Token (TkIdent field) _ : rest) ->
-      parseLValueTail (LVField lv field) rest
-    (Token (TkSymbol "[") _ : rest) -> do
+    (Token (TkSymbol ".") pos : Token (TkIdent field) _ : rest) ->
+      parseLValueTail (LVField pos lv field) rest
+    (Token (TkSymbol "[") pos : rest) -> do
       (idx, rest1) <- parseExpr rest
       rest2 <- expectSymbol "]" rest1
-      parseLValueTail (LVIndex lv idx) rest2
+      parseLValueTail (LVIndex pos lv idx) rest2
     _ -> Right (lv, toks)
 
 parseExpr :: [Token] -> Either CompileError (Expr, [Token])
@@ -1223,9 +1233,9 @@ parseLogicalOr toks = do
   where
     parseLogicalOrTail lhs toks' =
       case toks' of
-        (Token (TkSymbol "||") _ : rest) -> do
+        (Token (TkSymbol "||") pos : rest) -> do
           (rhs, rest1) <- parseLogicalAnd rest
-          parseLogicalOrTail (EBinary OpOr lhs rhs) rest1
+          parseLogicalOrTail (EBinary pos OpOr lhs rhs) rest1
         _ -> Right (lhs, toks')
 
 parseLogicalAnd :: [Token] -> Either CompileError (Expr, [Token])
@@ -1235,9 +1245,9 @@ parseLogicalAnd toks = do
   where
     parseLogicalAndTail lhs toks' =
       case toks' of
-        (Token (TkSymbol "&&") _ : rest) -> do
+        (Token (TkSymbol "&&") pos : rest) -> do
           (rhs, rest1) <- parseBitOr rest
-          parseLogicalAndTail (EBinary OpAnd lhs rhs) rest1
+          parseLogicalAndTail (EBinary pos OpAnd lhs rhs) rest1
         _ -> Right (lhs, toks')
 
 parseBitOr :: [Token] -> Either CompileError (Expr, [Token])
@@ -1247,9 +1257,9 @@ parseBitOr toks = do
   where
     parseBitOrTail lhs toks' =
       case toks' of
-        (Token (TkSymbol "|") _ : rest) -> do
+        (Token (TkSymbol "|") pos : rest) -> do
           (rhs, rest1) <- parseBitXor rest
-          parseBitOrTail (EBinary OpBitOr lhs rhs) rest1
+          parseBitOrTail (EBinary pos OpBitOr lhs rhs) rest1
         _ -> Right (lhs, toks')
 
 parseBitXor :: [Token] -> Either CompileError (Expr, [Token])
@@ -1259,9 +1269,9 @@ parseBitXor toks = do
   where
     parseBitXorTail lhs toks' =
       case toks' of
-        (Token (TkSymbol "^") _ : rest) -> do
+        (Token (TkSymbol "^") pos : rest) -> do
           (rhs, rest1) <- parseBitAnd rest
-          parseBitXorTail (EBinary OpBitXor lhs rhs) rest1
+          parseBitXorTail (EBinary pos OpBitXor lhs rhs) rest1
         _ -> Right (lhs, toks')
 
 parseBitAnd :: [Token] -> Either CompileError (Expr, [Token])
@@ -1271,9 +1281,9 @@ parseBitAnd toks = do
   where
     parseBitAndTail lhs toks' =
       case toks' of
-        (Token (TkSymbol "&") _ : rest) -> do
+        (Token (TkSymbol "&") pos : rest) -> do
           (rhs, rest1) <- parseEquality rest
-          parseBitAndTail (EBinary OpBitAnd lhs rhs) rest1
+          parseBitAndTail (EBinary pos OpBitAnd lhs rhs) rest1
         _ -> Right (lhs, toks')
 
 parseEquality :: [Token] -> Either CompileError (Expr, [Token])
@@ -1283,12 +1293,12 @@ parseEquality toks = do
   where
     parseEqualityTail lhs toks' =
       case toks' of
-        (Token (TkSymbol "==") _ : rest) -> do
+        (Token (TkSymbol "==") pos : rest) -> do
           (rhs, rest1) <- parseRelational rest
-          parseEqualityTail (EBinary OpEq lhs rhs) rest1
-        (Token (TkSymbol "!=") _ : rest) -> do
+          parseEqualityTail (EBinary pos OpEq lhs rhs) rest1
+        (Token (TkSymbol "!=") pos : rest) -> do
           (rhs, rest1) <- parseRelational rest
-          parseEqualityTail (EBinary OpNe lhs rhs) rest1
+          parseEqualityTail (EBinary pos OpNe lhs rhs) rest1
         _ -> Right (lhs, toks')
 
 parseRelational :: [Token] -> Either CompileError (Expr, [Token])
@@ -1298,18 +1308,18 @@ parseRelational toks = do
   where
     parseRelationalTail lhs toks' =
       case toks' of
-        (Token (TkSymbol "<") _ : rest) -> do
+        (Token (TkSymbol "<") pos : rest) -> do
           (rhs, rest1) <- parseShift rest
-          parseRelationalTail (EBinary OpLt lhs rhs) rest1
-        (Token (TkSymbol "<=") _ : rest) -> do
+          parseRelationalTail (EBinary pos OpLt lhs rhs) rest1
+        (Token (TkSymbol "<=") pos : rest) -> do
           (rhs, rest1) <- parseShift rest
-          parseRelationalTail (EBinary OpLe lhs rhs) rest1
-        (Token (TkSymbol ">") _ : rest) -> do
+          parseRelationalTail (EBinary pos OpLe lhs rhs) rest1
+        (Token (TkSymbol ">") pos : rest) -> do
           (rhs, rest1) <- parseShift rest
-          parseRelationalTail (EBinary OpGt lhs rhs) rest1
-        (Token (TkSymbol ">=") _ : rest) -> do
+          parseRelationalTail (EBinary pos OpGt lhs rhs) rest1
+        (Token (TkSymbol ">=") pos : rest) -> do
           (rhs, rest1) <- parseShift rest
-          parseRelationalTail (EBinary OpGe lhs rhs) rest1
+          parseRelationalTail (EBinary pos OpGe lhs rhs) rest1
         _ -> Right (lhs, toks')
 
 parseShift :: [Token] -> Either CompileError (Expr, [Token])
@@ -1319,12 +1329,12 @@ parseShift toks = do
   where
     parseShiftTail lhs toks' =
       case toks' of
-        (Token (TkSymbol "<<") _ : rest) -> do
+        (Token (TkSymbol "<<") pos : rest) -> do
           (rhs, rest1) <- parseAddSub rest
-          parseShiftTail (EBinary OpShl lhs rhs) rest1
-        (Token (TkSymbol ">>") _ : rest) -> do
+          parseShiftTail (EBinary pos OpShl lhs rhs) rest1
+        (Token (TkSymbol ">>") pos : rest) -> do
           (rhs, rest1) <- parseAddSub rest
-          parseShiftTail (EBinary OpShr lhs rhs) rest1
+          parseShiftTail (EBinary pos OpShr lhs rhs) rest1
         _ -> Right (lhs, toks')
 
 parseAddSub :: [Token] -> Either CompileError (Expr, [Token])
@@ -1334,12 +1344,12 @@ parseAddSub toks = do
   where
     parseAddSubTail lhs toks' =
       case toks' of
-        (Token (TkSymbol "+") _ : rest) -> do
+        (Token (TkSymbol "+") pos : rest) -> do
           (rhs, rest1) <- parseMulDiv rest
-          parseAddSubTail (EBinary OpAdd lhs rhs) rest1
-        (Token (TkSymbol "-") _ : rest) -> do
+          parseAddSubTail (EBinary pos OpAdd lhs rhs) rest1
+        (Token (TkSymbol "-") pos : rest) -> do
           (rhs, rest1) <- parseMulDiv rest
-          parseAddSubTail (EBinary OpSub lhs rhs) rest1
+          parseAddSubTail (EBinary pos OpSub lhs rhs) rest1
         _ -> Right (lhs, toks')
 
 parseMulDiv :: [Token] -> Either CompileError (Expr, [Token])
@@ -1349,32 +1359,32 @@ parseMulDiv toks = do
   where
     parseMulDivTail lhs toks' =
       case toks' of
-        (Token (TkSymbol "*") _ : rest) -> do
+        (Token (TkSymbol "*") pos : rest) -> do
           (rhs, rest1) <- parseUnaryExpr rest
-          parseMulDivTail (EBinary OpMul lhs rhs) rest1
-        (Token (TkSymbol "/") _ : rest) -> do
+          parseMulDivTail (EBinary pos OpMul lhs rhs) rest1
+        (Token (TkSymbol "/") pos : rest) -> do
           (rhs, rest1) <- parseUnaryExpr rest
-          parseMulDivTail (EBinary OpDiv lhs rhs) rest1
-        (Token (TkSymbol "%") _ : rest) -> do
+          parseMulDivTail (EBinary pos OpDiv lhs rhs) rest1
+        (Token (TkSymbol "%") pos : rest) -> do
           (rhs, rest1) <- parseUnaryExpr rest
-          parseMulDivTail (EBinary OpMod lhs rhs) rest1
+          parseMulDivTail (EBinary pos OpMod lhs rhs) rest1
         _ -> Right (lhs, toks')
 
 parseUnaryExpr :: [Token] -> Either CompileError (Expr, [Token])
 parseUnaryExpr toks =
   case toks of
-    (Token (TkSymbol "-") _ : rest) -> do
+    (Token (TkSymbol "-") pos : rest) -> do
       (expr, rest1) <- parseUnaryExpr rest
-      Right (EUnary OpNeg expr, rest1)
-    (Token (TkSymbol "!") _ : rest) -> do
+      Right (EUnary pos OpNeg expr, rest1)
+    (Token (TkSymbol "!") pos : rest) -> do
       (expr, rest1) <- parseUnaryExpr rest
-      Right (EUnary OpNot expr, rest1)
-    (Token (TkSymbol "&") _ : rest) -> do
+      Right (EUnary pos OpNot expr, rest1)
+    (Token (TkSymbol "&") pos : rest) -> do
       (expr, rest1) <- parseUnaryExpr rest
-      Right (EUnary OpAddr expr, rest1)
-    (Token (TkSymbol "*") _ : rest) -> do
+      Right (EUnary pos OpAddr expr, rest1)
+    (Token (TkSymbol "*") pos : rest) -> do
       (expr, rest1) <- parseUnaryExpr rest
-      Right (EUnary OpDeref expr, rest1)
+      Right (EUnary pos OpDeref expr, rest1)
     _ -> parsePostfixExpr toks
 
 parsePostfixExpr :: [Token] -> Either CompileError (Expr, [Token])
@@ -1384,22 +1394,23 @@ parsePostfixExpr toks = do
   where
     parsePostfixTail expr toks' =
       case toks' of
-        (Token (TkSymbol ".") _ : Token (TkIdent field) _ : rest) ->
-          parsePostfixTail (EField expr field) rest
-        (Token (TkSymbol "[") _ : rest) -> do
+        (Token (TkSymbol ".") pos : Token (TkIdent field) _ : rest) ->
+          parsePostfixTail (EField pos expr field) rest
+        (Token (TkSymbol "[") pos : rest) -> do
           (idx, rest1) <- parseExpr rest
           rest2 <- expectSymbol "]" rest1
-          parsePostfixTail (EIndex expr idx) rest2
+          parsePostfixTail (EIndex pos expr idx) rest2
         _ -> Right (expr, toks')
 
 parsePrimaryExpr :: [Token] -> Either CompileError (Expr, [Token])
 parsePrimaryExpr toks =
   case toks of
-    (Token (TkInt n mSuffix) _ : rest) -> Right (intLiteralExpr n mSuffix, rest)
-    (Token (TkFloat f mSuffix) _ : rest) -> Right (floatLiteralExpr f mSuffix, rest)
-    (Token (TkIdent "true") _ : rest) -> Right (EBool True, rest)
-    (Token (TkIdent "false") _ : rest) -> Right (EBool False, rest)
+    (Token (TkInt n mSuffix) pos : rest) -> Right (intLiteralExpr pos n mSuffix, rest)
+    (Token (TkFloat f mSuffix) pos : rest) -> Right (floatLiteralExpr pos f mSuffix, rest)
+    (Token (TkIdent "true") pos : rest) -> Right (EBool pos True, rest)
+    (Token (TkIdent "false") pos : rest) -> Right (EBool pos False, rest)
     (Token (TkIdent _) _ : _) -> do
+      let pos = posOf toks
       (name, rest) <- parseFullIdent toks
       case rest of
         (Token (TkSymbol "<") _ : _)
@@ -1410,7 +1421,7 @@ parsePrimaryExpr toks =
               rest4 <- expectSymbol "(" rest3
               (args, rest5) <- parseCallArgs [] rest4
               case args of
-                [arg] -> Right (EBitcast targetTy arg, rest5)
+                [arg] -> Right (EBitcast pos targetTy arg, rest5)
                 _ -> Left (errorAt rest4 "bitcast expects one argument")
         (Token (TkSymbol "<") _ : _)
           | name `elem` ["vec2", "vec3", "vec4"] || isJust (parseMatrixName name) -> do
@@ -1426,27 +1437,27 @@ parsePrimaryExpr toks =
                   Left
                     (errorAt rest1 (if isVec then "vector element must be a scalar" else "matrix element must be a scalar"))
               let name' = name <> "<" <> scalarName scalar <> ">"
-              Right (ECall name' args, rest5)
+              Right (ECall pos name' args, rest5)
         (Token (TkSymbol "(") _ : more) -> do
           (args, rest1) <- parseCallArgs [] more
-          Right (ECall name args, rest1)
-        _ -> Right (EVar name, rest)
+          Right (ECall pos name args, rest1)
+        _ -> Right (EVar pos name, rest)
     (Token (TkSymbol "(") _ : rest) -> do
       (expr, rest1) <- parseExpr rest
       rest2 <- expectSymbol ")" rest1
       Right (expr, rest2)
     _ -> Left (errorAt toks "expected expression")
   where
-    intLiteralExpr n mSuffix =
+    intLiteralExpr pos n mSuffix =
       case mSuffix of
-        Nothing -> EInt n
-        Just IntSuffixU -> ECall "u32" [EInt n]
-        Just IntSuffixI -> ECall "i32" [EInt n]
-    floatLiteralExpr f mSuffix =
+        Nothing -> EInt pos n
+        Just IntSuffixU -> ECall pos "u32" [EInt pos n]
+        Just IntSuffixI -> ECall pos "i32" [EInt pos n]
+    floatLiteralExpr pos f mSuffix =
       case mSuffix of
-        Nothing -> EFloat f
-        Just FloatSuffixF -> ECall "f32" [EFloat f]
-        Just FloatSuffixH -> ECall "f16" [EFloat f]
+        Nothing -> EFloat pos f
+        Just FloatSuffixF -> ECall pos "f32" [EFloat pos f]
+        Just FloatSuffixH -> ECall pos "f16" [EFloat pos f]
 
 parseCallArgs :: [Expr] -> [Token] -> Either CompileError ([Expr], [Token])
 parseCallArgs acc toks =

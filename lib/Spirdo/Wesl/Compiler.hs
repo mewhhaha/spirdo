@@ -18,7 +18,7 @@ module Spirdo.Wesl.Compiler where
 import Control.Exception (SomeException, catch, evaluate)
 import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE)
+import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE, withExceptT)
 import Data.Bifunctor (first)
 import Data.Bits (xor)
 import Data.ByteString (ByteString)
@@ -41,7 +41,7 @@ import Spirdo.Wesl.Parser
 import Spirdo.Wesl.Syntax
 import Spirdo.Wesl.Typecheck
 import Spirdo.Wesl.Types
-import Spirdo.Wesl.Util (renderError)
+import Spirdo.Wesl.Util (annotateErrorWithSource, renderErrorWithSource)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (dropExtension, isRelative, normalise, takeDirectory, (<.>), (</>))
 import Text.Read (readMaybe)
@@ -89,8 +89,8 @@ compileWith :: [Option] -> Source -> Either CompileError SomeShader
 compileWith overrides src =
   let opts = applyOptions overrides defaultCompileOptions
   in case src of
-      SourceInline _name text -> do
-        result <- compileInlineResult opts False text
+      SourceInline name text -> do
+        result <- first (annotateErrorWithSource (Just name) text) (compileInlineResult opts False text)
         withCompiled opts result $ \shader -> do
           prep <- toCompileError (prepareShader shader)
           pure (SomeShader (shaderFromPrepared prep))
@@ -102,8 +102,8 @@ compileWithDiagnostics :: [Option] -> Source -> Either CompileError (SomeShader,
 compileWithDiagnostics overrides src =
   let opts = applyOptions overrides defaultCompileOptions
   in case src of
-      SourceInline _name text -> do
-        result <- compileInlineResult opts True text
+      SourceInline name text -> do
+        result <- first (annotateErrorWithSource (Just name) text) (compileInlineResult opts True text)
         withCompiled opts result $ \shader -> do
           prep <- toCompileError (prepareShader shader)
           pure (SomeShader (shaderFromPrepared prep), result.crDiagnostics)
@@ -143,7 +143,7 @@ prepareWesl = prepareWeslWith defaultCompileOptions
 -- | Compile inline WESL with explicit options (runtime).
 prepareWeslWith :: CompileOptions -> String -> Either CompileError SomePreparedShader
 prepareWeslWith opts src = do
-  result <- compileInlineResult opts False src
+  result <- first (annotateErrorWithSource (Just "<inline>") src) (compileInlineResult opts False src)
   withCompiled opts result $ \shader -> do
     prep <- toCompileError (prepareShader shader)
     pure (SomePreparedShader prep)
@@ -151,7 +151,7 @@ prepareWeslWith opts src = do
 -- | Compile inline WESL with diagnostics (runtime).
 prepareWeslWithDiagnostics :: CompileOptions -> String -> Either CompileError (SomePreparedShader, [Diagnostic])
 prepareWeslWithDiagnostics opts src = do
-  result <- compileInlineResult opts True src
+  result <- first (annotateErrorWithSource (Just "<inline>") src) (compileInlineResult opts True src)
   withCompiled opts result $ \shader -> do
     prep <- toCompileError (prepareShader shader)
     pure (SomePreparedShader prep, result.crDiagnostics)
@@ -242,23 +242,25 @@ compileFileResult opts wantDiagnostics path =
   runExceptT $ do
     filePath <- ExceptT (resolveInputPath path)
     src <- liftIO (timedPhase opts "read-file" (readFile filePath))
-    moduleAst0 <- ExceptT (timedPhase opts "parse" (evaluate (parseModuleWith opts.enabledFeatures src)))
+    let annotate :: ExceptT CompileError IO a -> ExceptT CompileError IO a
+        annotate = withExceptT (annotateErrorWithSource (Just filePath) src)
+    moduleAst0 <- annotate (ExceptT (timedPhase opts "parse" (evaluate (parseModuleWith opts.enabledFeatures src))))
     -- resolveImports performs module linking and validateModuleScopes for file-based builds.
-    linked <- ExceptT (timedPhase opts "imports" (resolveImports opts (dropExtension filePath) moduleAst0))
-    linked' <- ExceptT (timedPhase opts "type-aliases" (evaluate (resolveTypeAliases linked)))
+    linked <- annotate (ExceptT (timedPhase opts "imports" (resolveImports opts (dropExtension filePath) moduleAst0)))
+    linked' <- annotate (ExceptT (timedPhase opts "type-aliases" (evaluate (resolveTypeAliases linked))))
     let rootDir = takeDirectory filePath
         rootPath = modulePathFromFile rootDir filePath
-    linked'' <- ExceptT (timedPhase opts "infer-overrides" (evaluate (inferOverrideTypes rootPath rootDir linked')))
-    lowered0 <- ExceptT (timedPhase opts "overrides" (evaluate (lowerOverridesWith rootPath (overrideValuesText opts.overrideValues) linked'')))
-    lowered <- ExceptT (timedPhase opts "resolve-const" (evaluate (resolveConstExprs rootPath rootDir lowered0)))
+    linked'' <- annotate (ExceptT (timedPhase opts "infer-overrides" (evaluate (inferOverrideTypes rootPath rootDir linked'))))
+    lowered0 <- annotate (ExceptT (timedPhase opts "overrides" (evaluate (lowerOverridesWith rootPath (overrideValuesText opts.overrideValues) linked''))))
+    lowered <- annotate (ExceptT (timedPhase opts "resolve-const" (evaluate (resolveConstExprs rootPath rootDir lowered0))))
     diags <-
       if wantDiagnostics
-        then ExceptT (timedPhase opts "diagnostics" (evaluate (collectDiagnosticsMerged opts rootPath lowered)))
+        then annotate (ExceptT (timedPhase opts "diagnostics" (evaluate (collectDiagnosticsMerged opts rootPath lowered))))
         else do
-          _ <- ExceptT (timedPhase opts "const-asserts" (evaluate (validateConstAssertsMerged opts rootPath lowered)))
+          _ <- annotate (ExceptT (timedPhase opts "const-asserts" (evaluate (validateConstAssertsMerged opts rootPath lowered))))
           pure []
-    iface <- ExceptT (timedPhase opts "interface" (evaluate (buildInterface opts lowered)))
-    spirv <- ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts lowered iface)))
+    iface <- annotate (ExceptT (timedPhase opts "interface" (evaluate (buildInterface opts lowered))))
+    spirv <- annotate (ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts lowered iface))))
     pure CompileResult
       { crAst = lowered
       , crInterface = iface
@@ -364,7 +366,7 @@ compileInlineCached opts src = do
   where
     compileFresh =
       either
-        (fail . renderError)
+        (fail . renderErrorWithSource (Just "<inline>") src)
         (\result -> do
             let bytes = result.crSpirv
                 iface = result.crInterface

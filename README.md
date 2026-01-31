@@ -36,6 +36,12 @@ demo window.
 Set `SPIRDO_WRITE_SPV=1` to emit SPIR-V files (`fragment-*.spv`, `vertex*.spv`,
 `compute*.spv`) for inspection.
 
+## Recommended Entry Points
+Use the smallest API that fits your workflow:
+- **Minimal runtime compile**: `Spirdo.Wesl` (bundle API) for SPIR‑V + binding metadata.
+- **Typed binding submission**: `Spirdo.Wesl.Reflection` + `Spirdo.Wesl.Inputs`.
+- **Uniform packing helpers**: `Spirdo.Wesl.Uniform` (used alongside either API).
+
 ## Example Usage (Quasiquoter)
 ```hs
 {-# LANGUAGE DataKinds #-}
@@ -588,29 +594,25 @@ the library API. It uses Slop to render a full-screen quad with fragment shaders
 
 ## Example Shaders in the Demo
 Fragment variants in `exe/Main.hs` (left/right to switch):
-- Feature Mix
-- Raymarch
-- Triangle
-- Plasma
-- Grid
-- SDF Text
-- Clouds
-- Bits
-- Aurora
-- Starfield
-- Tunnel
-- Voronoi
-- Mandelbrot
-- Override Stripes / Override Rings (specialization values)
+- Gradient Bloom
+- Circle Pulse
+- Spectrum Shift
+- Sine Waves
+- Checker Warp
+- Ripple Caustics
+- Plasma Storm
+- Vignette Glow
+- Noise Flow
+- Swirl Vortex
+- Metaballs
+- Kaleidoscope
 
 Compute examples emitted when SPIR-V output is enabled:
-- `compute.spv`: storage buffer + storage texture sample
-- `compute-1.spv`: particle update on runtime array
-- `compute-2.spv`: tiled storage texture writer
+- `compute-1.spv`: storage buffer + storage texture sample
+- `compute-2.spv`: particle update on runtime array
 
 Vertex examples emitted when SPIR-V output is enabled:
-- `vertex.spv`: passthrough quad
-- `vertex-1.spv`: wave-displaced positions
+- `vertex-1.spv`: passthrough quad
 - `vertex-2.spv`: fullscreen triangle (vertex_index)
 
 ## SPIR-V Outputs
@@ -621,8 +623,15 @@ SPIRDO_WRITE_SPV=1 cabal run -f spirdo-demo
 
 When enabled, files are written to the repo root:
 - `fragment-*.spv` for each fragment variant
-- `compute*.spv` for compute examples
-- `vertex*.spv` for vertex examples
+- `compute-*.spv` for compute examples
+- `vertex-*.spv` for vertex examples
+
+## Release Checklist (v1)
+- `cabal build`
+- `cabal test`
+- `cabal build -f spirdo-demo`
+- `cabal run -f spirdo-demo` (cycle all fragment variants)
+- Verify README examples compile (bundle + reflection snippets)
 
 ## API Reference (Public)
 Public surface area:
@@ -636,6 +645,8 @@ Compilation
 - `compile` — Compile a `Source` (inline or file) to `ShaderBundle` (IO).
 - `compileWithDiagnostics` — Same, but returns diagnostics.
 - `sourceText`, `sourceFile` — Construct a `Source` without exposing constructors.
+- `renderCompileError` — Format a `CompileError` (includes source snippet when available).
+- `renderCompileErrorWithSource` — Format a `CompileError` using explicit source text.
 - `Option` constructors (`Opt*`) — sampler mode, overrides, cache, entry point, etc.
 
 Bundle accessors
@@ -653,6 +664,7 @@ Compile + quasiquote
 - `compile`, `compileWith`, `compileWithDiagnostics`
 - `compileFile`, `compileFileWith`, `compileFileWithDiagnostics`
 - `CompileOptions` + helpers (`withSamplerMode`, `withOverrides`, `withFeatures`, ...)
+- `renderCompileError`, `renderCompileErrorWithSource` — helpers for error formatting
 
 Shader accessors + reflection
 - `shaderSpirv`, `shaderInterface`, `shaderPlan`, `shaderStageCached`, `shaderVertexAttributes`

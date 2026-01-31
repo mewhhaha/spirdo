@@ -3,6 +3,8 @@ module Spirdo.Wesl
   ( -- * Compile
     compile
   , compileWithDiagnostics
+  , renderCompileError
+  , renderCompileErrorWithSource
   , Source
   , sourceText
   , sourceFile
@@ -49,6 +51,7 @@ import Spirdo.Wesl.Types
   , OverrideValue(..)
   , Source(..)
   )
+import Spirdo.Wesl.Util (renderErrorWithSource)
 import Spirdo.Wesl.Types.Interface
   ( BindingKind(..)
   , SamplerBindingMode(..)
@@ -138,6 +141,14 @@ compileWithDiagnostics opts src =
           <$> Compiler.compileWithDiagnostics opts src
     SourceFile path ->
       fmap (fmap (\(shader, diags) -> (bundleFromSomeShader shader, diags))) (Compiler.compileFileWithDiagnostics opts path)
+
+-- | Render a compile error (with any embedded source context).
+renderCompileError :: CompileError -> String
+renderCompileError (CompileError msg _ _) = msg
+
+-- | Render a compile error using explicit source text.
+renderCompileErrorWithSource :: Maybe FilePath -> String -> CompileError -> String
+renderCompileErrorWithSource = renderErrorWithSource
 
 bundleFromSomeShader :: Interface.SomeShader -> ShaderBundle
 bundleFromSomeShader (Interface.SomeShader shader) =

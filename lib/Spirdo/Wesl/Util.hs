@@ -6,6 +6,8 @@ module Spirdo.Wesl.Util
   , errorAtPos
   , withPos
   , renderError
+  , renderErrorWithSource
+  , annotateErrorWithSource
   , textToString
   , attrInt
   , attrIntMaybe
@@ -24,6 +26,10 @@ module Spirdo.Wesl.Util
   , parseTypedScalarSuffix
   , vecSize
   , selectIntLiteralScalar
+  , exprPos
+  , stmtPos
+  , lvaluePos
+  , syntheticPos
   , exprToLValue
   , ptrAccessAllowsWrite
   , ptrAccessCompatible
@@ -49,14 +55,15 @@ module Spirdo.Wesl.Util
   ) where
 
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
-import Data.Char (isDigit)
+import Data.Char (isAlphaNum, isDigit)
 import Data.Int (Int32)
-import Data.Maybe (listToMaybe)
+import Data.List (isInfixOf, isPrefixOf)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word16, Word32)
 import GHC.Float (castFloatToWord32)
-import Spirdo.Wesl.Syntax (Expr(..), LValue(..), SrcPos(..), Stage(..), Token(..), UnaryOp(..), WorkgroupSize(..))
+import Spirdo.Wesl.Syntax (Expr(..), LValue(..), SrcPos(..), Stage(..), Stmt(..), Token(..), UnaryOp(..), WorkgroupSize(..))
 import Spirdo.Wesl.Types
 
 errorAt :: [Token] -> String -> CompileError
@@ -83,6 +90,110 @@ renderError err =
         (Just l, Just c) -> " at " <> show l <> ":" <> show c
         _ -> ""
   in err.ceMessage <> loc
+
+renderErrorWithSource :: Maybe FilePath -> String -> CompileError -> String
+renderErrorWithSource name src err =
+  case (err.ceLine, err.ceColumn) of
+    (Just lineNo, Just colNo) ->
+      let locName = fromMaybe "<inline>" name
+          srcLine = sourceLine lineNo src
+          safeLine = sanitizeLine srcLine
+          gutter = show lineNo
+          gutterPad = replicate (length gutter) ' '
+          caretPad = replicate (max 0 (colNo - 1)) ' '
+      in unlines
+          [ err.ceMessage
+          , " --> " <> locName <> ":" <> show lineNo <> ":" <> show colNo
+          , gutterPad <> " |"
+          , gutter <> " | " <> safeLine
+          , gutterPad <> " | " <> caretPad <> "^"
+          ]
+    _ -> err.ceMessage
+  where
+    sourceLine n text =
+      case drop (n - 1) (lines text) of
+        (line:_) -> line
+        [] -> ""
+    sanitizeLine = map (\ch -> if ch == '\t' then ' ' else ch)
+
+annotateErrorWithSource :: Maybe FilePath -> String -> CompileError -> CompileError
+annotateErrorWithSource name src err =
+  if "\n --> " `isInfixOf` err.ceMessage
+    then err
+    else case (err.ceLine, err.ceColumn) of
+      (Just _, Just _) ->
+        err { ceMessage = renderErrorWithSource name src err }
+      _ ->
+        case guessPos name src err of
+          Just (lineNo, colNo) ->
+            let err' = err { ceLine = Just lineNo, ceColumn = Just colNo }
+            in err' { ceMessage = renderErrorWithSource name src err' }
+          Nothing ->
+            err { ceMessage = err.ceMessage <> maybe "" (" in " <>) name }
+
+guessPos :: Maybe FilePath -> String -> CompileError -> Maybe (Int, Int)
+guessPos _ src err = do
+  ident <- extractIdent err.ceMessage
+  let matches = findIdentMatches ident src
+  case matches of
+    [pos] -> Just pos
+    _ -> Nothing
+
+extractIdent :: String -> Maybe String
+extractIdent msg =
+  extractFromPrefix msg prefixes
+  where
+    prefixes =
+      [ "unknown identifier: "
+      , "unknown variable: "
+      , "unknown constant: "
+      , "unknown function: "
+      , "unknown field: "
+      , "duplicate local declaration: "
+      , "shadowing is not allowed: "
+      ]
+    extractFromPrefix text (p:ps)
+      | p `isPrefixOf` text =
+          let rest = drop (length p) text
+              ident = takeWhile isIdentChar rest
+          in if null ident then Nothing else Just ident
+      | otherwise = extractFromPrefix text ps
+    extractFromPrefix _ [] = Nothing
+    isIdentChar ch = isAlphaNum ch || ch == '_'
+
+findIdentMatches :: String -> String -> [(Int, Int)]
+findIdentMatches ident src =
+  concatMap (\(lineNo, lineText) -> matchLine lineNo lineText) (zip [1 ..] (lines src))
+  where
+    matchLine lineNo lineText =
+      [ (lineNo, col)
+      | col <- findWordPositions ident lineText
+      ]
+
+findWordPositions :: String -> String -> [Int]
+findWordPositions needle lineText =
+  [ ix + 1
+  | ix <- matchIndices 0 lineText
+  ]
+  where
+    nlen = length needle
+    isIdentChar ch = isAlphaNum ch || ch == '_'
+    matchIndices _ [] = []
+    matchIndices ix rest
+      | needle `isPrefixOf` rest && boundaryOk ix =
+          ix : matchIndices (ix + nlen) (drop nlen rest)
+      | otherwise = matchIndices (ix + 1) (drop 1 rest)
+    boundaryOk ix =
+      let beforeOk =
+            if ix <= 0
+              then True
+              else not (isIdentChar (lineText !! (ix - 1)))
+          afterIdx = ix + nlen
+          afterOk =
+            if afterIdx >= length lineText
+              then True
+              else not (isIdentChar (lineText !! afterIdx))
+      in beforeOk && afterOk
 
 textToString :: Text -> String
 textToString = T.unpack
@@ -324,11 +435,58 @@ selectIntLiteralScalar n =
 exprToLValue :: Expr -> Maybe LValue
 exprToLValue expr =
   case expr of
-    EVar name -> Just (LVVar name)
-    EField base field -> LVField <$> exprToLValue base <*> pure field
-    EIndex base idx -> LVIndex <$> exprToLValue base <*> pure idx
-    EUnary OpDeref inner -> Just (LVDeref inner)
+    EVar pos name -> Just (LVVar pos name)
+    EField pos base field -> LVField pos <$> exprToLValue base <*> pure field
+    EIndex pos base idx -> LVIndex pos <$> exprToLValue base <*> pure idx
+    EUnary pos OpDeref inner -> Just (LVDeref pos inner)
     _ -> Nothing
+
+syntheticPos :: SrcPos
+syntheticPos = SrcPos 1 1
+
+exprPos :: Expr -> SrcPos
+exprPos expr =
+  case expr of
+    EVar pos _ -> pos
+    EInt pos _ -> pos
+    EFloat pos _ -> pos
+    EBool pos _ -> pos
+    EBinary pos _ _ _ -> pos
+    EUnary pos _ _ -> pos
+    ECall pos _ _ -> pos
+    EBitcast pos _ _ -> pos
+    EField pos _ _ -> pos
+    EIndex pos _ _ -> pos
+
+lvaluePos :: LValue -> SrcPos
+lvaluePos lv =
+  case lv of
+    LVVar pos _ -> pos
+    LVField pos _ _ -> pos
+    LVIndex pos _ _ -> pos
+    LVDeref pos _ -> pos
+
+stmtPos :: Stmt -> SrcPos
+stmtPos stmt =
+  case stmt of
+    SLet pos _ _ _ -> pos
+    SVar pos _ _ _ -> pos
+    SAssign pos _ _ -> pos
+    SAssignOp pos _ _ _ -> pos
+    SInc pos _ -> pos
+    SDec pos _ -> pos
+    SExpr pos _ -> pos
+    SIf pos _ _ _ -> pos
+    SWhile pos _ _ -> pos
+    SLoop pos _ _ -> pos
+    SFor pos _ _ _ _ -> pos
+    SSwitch pos _ _ _ -> pos
+    SBreak pos -> pos
+    SBreakIf pos _ -> pos
+    SContinue pos -> pos
+    SDiscard pos -> pos
+    SFallthrough pos -> pos
+    SReturn pos _ -> pos
 
 ptrAccessAllowsWrite :: Maybe StorageAccess -> Bool
 ptrAccessAllowsWrite acc =

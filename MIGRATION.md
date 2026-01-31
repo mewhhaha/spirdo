@@ -8,6 +8,11 @@ This guide maps the old Shader‑centric public API to the new bundle‑first su
 - Uniform packing helpers live in `Spirdo.Wesl.Uniform`.
 - Inputs remain in `Spirdo.Wesl.Inputs`.
 
+## Which API should I use?
+- **Just SPIR-V + minimal metadata**: `Spirdo.Wesl` (bundle API).
+- **Typed binding submission / reflection**: `Spirdo.Wesl.Reflection` + `Spirdo.Wesl.Inputs`.
+- **Uniform packing**: `Spirdo.Wesl.Uniform` (used alongside either API).
+
 ## Runtime compilation (bundle API)
 Old (inline):
 - `compile (SourceInline "<inline>" src) :: Either CompileError SomeShader`

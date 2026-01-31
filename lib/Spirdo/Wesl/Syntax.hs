@@ -138,7 +138,8 @@ data WorkgroupSize
   deriving (Eq, Show)
 
 data Param = Param
-  { paramName :: !Text
+  { paramPos :: !SrcPos
+  , paramName :: !Text
   , paramType :: !Type
   , paramAttrs :: ![Attr]
   } deriving (Eq, Show)
@@ -162,24 +163,24 @@ data FunctionDecl = FunctionDecl
   } deriving (Eq, Show)
 
 data Stmt
-  = SLet !Text !(Maybe Type) !Expr
-  | SVar !Text !(Maybe Type) !(Maybe Expr)
-  | SAssign !LValue !Expr
-  | SAssignOp !LValue !BinOp !Expr
-  | SInc !LValue
-  | SDec !LValue
-  | SExpr !Expr
-  | SIf !Expr ![Stmt] !(Maybe [Stmt])
-  | SWhile !Expr ![Stmt]
-  | SLoop ![Stmt] !(Maybe [Stmt])
-  | SFor !(Maybe Stmt) !(Maybe Expr) !(Maybe Stmt) ![Stmt]
-  | SSwitch !Expr ![SwitchCase] !(Maybe [Stmt])
-  | SBreak
-  | SBreakIf !Expr
-  | SContinue
-  | SDiscard
-  | SFallthrough
-  | SReturn !(Maybe Expr)
+  = SLet !SrcPos !Text !(Maybe Type) !Expr
+  | SVar !SrcPos !Text !(Maybe Type) !(Maybe Expr)
+  | SAssign !SrcPos !LValue !Expr
+  | SAssignOp !SrcPos !LValue !BinOp !Expr
+  | SInc !SrcPos !LValue
+  | SDec !SrcPos !LValue
+  | SExpr !SrcPos !Expr
+  | SIf !SrcPos !Expr ![Stmt] !(Maybe [Stmt])
+  | SWhile !SrcPos !Expr ![Stmt]
+  | SLoop !SrcPos ![Stmt] !(Maybe [Stmt])
+  | SFor !SrcPos !(Maybe Stmt) !(Maybe Expr) !(Maybe Stmt) ![Stmt]
+  | SSwitch !SrcPos !Expr ![SwitchCase] !(Maybe [Stmt])
+  | SBreak !SrcPos
+  | SBreakIf !SrcPos !Expr
+  | SContinue !SrcPos
+  | SDiscard !SrcPos
+  | SFallthrough !SrcPos
+  | SReturn !SrcPos !(Maybe Expr)
   deriving (Eq, Show)
 
 data SwitchCase = SwitchCase
@@ -188,23 +189,23 @@ data SwitchCase = SwitchCase
   } deriving (Eq, Show)
 
 data LValue
-  = LVVar !Text
-  | LVField !LValue !Text
-  | LVIndex !LValue !Expr
-  | LVDeref !Expr
+  = LVVar !SrcPos !Text
+  | LVField !SrcPos !LValue !Text
+  | LVIndex !SrcPos !LValue !Expr
+  | LVDeref !SrcPos !Expr
   deriving (Eq, Show)
 
 data Expr
-  = EVar !Text
-  | EInt !Integer
-  | EFloat !Float
-  | EBool !Bool
-  | EBinary !BinOp !Expr !Expr
-  | EUnary !UnaryOp !Expr
-  | ECall !Text ![Expr]
-  | EBitcast !Type !Expr
-  | EField !Expr !Text
-  | EIndex !Expr !Expr
+  = EVar !SrcPos !Text
+  | EInt !SrcPos !Integer
+  | EFloat !SrcPos !Float
+  | EBool !SrcPos !Bool
+  | EBinary !SrcPos !BinOp !Expr !Expr
+  | EUnary !SrcPos !UnaryOp !Expr
+  | ECall !SrcPos !Text ![Expr]
+  | EBitcast !SrcPos !Type !Expr
+  | EField !SrcPos !Expr !Text
+  | EIndex !SrcPos !Expr !Expr
   deriving (Eq, Show)
 
 data BinOp
