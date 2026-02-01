@@ -1,0 +1,41 @@
+cabal-version:      3.14
+name:               spirdo-examples
+version:            0.1.0.0
+license:            MIT
+license-file:       ../LICENSE
+author:             mewhhaha
+maintainer:         kopatheonlyone@hotmail.com
+build-type:         Simple
+
+common warnings
+    ghc-options: -Wall
+
+executable spirdo-demo
+    import:           warnings
+    main-is:          Main.hs
+    other-modules:
+        Examples.Compute
+        Examples.Fragments
+        Examples.Fragments.CheckerWarp
+        Examples.Fragments.CirclePulse
+        Examples.Fragments.GradientBloom
+        Examples.Fragments.Kaleidoscope
+        Examples.Fragments.Metaballs
+        Examples.Fragments.NoiseFlow
+        Examples.Fragments.PlasmaStorm
+        Examples.Fragments.RippleCaustics
+        Examples.Fragments.SineWaves
+        Examples.Fragments.SpectrumShift
+        Examples.Fragments.SwirlVortex
+        Examples.Fragments.VignetteGlow
+        Examples.Override
+        Examples.Vertex
+    -- other-extensions:
+    build-depends:
+        base ^>=4.21.0.0,
+        bytestring,
+        slop,
+        spirdo
+
+    hs-source-dirs:   app, src
+    default-language: GHC2024

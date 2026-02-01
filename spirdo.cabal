@@ -25,11 +25,6 @@ common warnings
         OverloadedRecordDot
         OverloadedStrings
 
-flag spirdo-demo
-    description: Build the demo executable.
-    default: False
-    manual: True
-
 library
     import:           warnings
     exposed-modules:
@@ -60,38 +55,6 @@ library
         transformers,
         template-haskell
     hs-source-dirs:   lib
-    default-language: GHC2024
-
-executable spirdo
-    import:           warnings
-    main-is:          Main.hs
-    other-modules:
-        Examples.Compute
-        Examples.Fragments
-        Examples.Fragments.CheckerWarp
-        Examples.Fragments.CirclePulse
-        Examples.Fragments.GradientBloom
-        Examples.Fragments.Kaleidoscope
-        Examples.Fragments.Metaballs
-        Examples.Fragments.NoiseFlow
-        Examples.Fragments.PlasmaStorm
-        Examples.Fragments.RippleCaustics
-        Examples.Fragments.SineWaves
-        Examples.Fragments.SpectrumShift
-        Examples.Fragments.SwirlVortex
-        Examples.Fragments.VignetteGlow
-        Examples.Override
-        Examples.Vertex
-    if !flag(spirdo-demo)
-        buildable: False
-    -- other-extensions:
-    build-depends:
-        base ^>=4.21.0.0,
-        bytestring,
-        slop,
-        spirdo
-
-    hs-source-dirs:   exe
     default-language: GHC2024
 
 test-suite spirdo-tests

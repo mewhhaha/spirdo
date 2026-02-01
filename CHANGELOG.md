@@ -1,5 +1,12 @@
 # Revision history for spirdo
 
+## Unreleased
+
+* Added precise source positions for parameters, expressions, lvalues, and statements; compile errors and diagnostics now report exact line/column locations (including quasiquoter failures).
+* New helpers to render errors: `renderCompileError` and `renderCompileErrorWithSource`.
+* Demo gallery refreshed (12 fragment + 2 compute + 2 vertex shaders) and now prints the active demo name to the console; SPIR-V dumps remain gated by `SPIRDO_WRITE_SPV=1`.
+* Documentation refreshed to reflect the bundle-first API and Reflection split.
+
 ## 0.1.0.0 -- 2026-01-25
 
 * First public version.

@@ -23,10 +23,11 @@ cabal build
 cabal test
 ```
 
-Demo app (disabled by default):
+Demo app (in `examples/`):
 ```sh
-cabal build -f spirdo-demo
-cabal run -f spirdo-demo
+cd examples
+cabal build
+cabal run
 ```
 
 The demo uses the Slop SDL3 renderer (`slop` dependency) and requires SDL3 to be
@@ -34,7 +35,7 @@ installed. Use left/right arrow keys to cycle fragment shader variants in the
 demo window.
 
 Set `SPIRDO_WRITE_SPV=1` to emit SPIR-V files (`fragment-*.spv`, `vertex*.spv`,
-`compute*.spv`) for inspection.
+`compute*.spv`) for inspection (run from `examples/`).
 
 ## Recommended Entry Points
 Use the smallest API that fits your workflow:
@@ -465,7 +466,7 @@ That requires the Reflection API (`Spirdo.Wesl.Reflection`).
 
 ### SDL (Example‑only, Not in the Library)
 Spirdo stays SDL‑agnostic, but SDL integration can be very declarative. The
-demo (`exe/Main.hs`) is a Slop‑based reference; the pattern below shows a
+demo (`examples/app/Main.hs`) is a Slop‑based reference; the pattern below shows a
 direct SDL GPU wiring variant in minimal form:
 
 #### Declarative SDL wiring (minimal)
@@ -587,13 +588,13 @@ plan = shaderPlan prepared
 attrs = vertexAttributes (shaderInterface prepared)
 ```
 
-### Demo (exe only)
-The demo executable is gated behind the `spirdo-demo` flag and is not part of
+### Demo (examples only)
+The demo executable lives in `examples/` and is not part of
 the library API. It uses Slop to render a full-screen quad with fragment shaders.
 
 
 ## Example Shaders in the Demo
-Fragment variants in `exe/Main.hs` (left/right to switch):
+Fragment variants in `examples/app/Main.hs` (left/right to switch):
 - Gradient Bloom
 - Circle Pulse
 - Spectrum Shift
@@ -616,12 +617,13 @@ Vertex examples emitted when SPIR-V output is enabled:
 - `vertex-2.spv`: fullscreen triangle (vertex_index)
 
 ## SPIR-V Outputs
-SPIR-V output is opt-in. Set `SPIRDO_WRITE_SPV=1` before running the demo:
+SPIR-V output is opt-in. Set `SPIRDO_WRITE_SPV=1` before running the demo
+(from `examples/`):
 ```
-SPIRDO_WRITE_SPV=1 cabal run -f spirdo-demo
+SPIRDO_WRITE_SPV=1 cabal run
 ```
 
-When enabled, files are written to the repo root:
+When enabled, files are written to the current working directory:
 - `fragment-*.spv` for each fragment variant
 - `compute-*.spv` for compute examples
 - `vertex-*.spv` for vertex examples
@@ -629,8 +631,8 @@ When enabled, files are written to the repo root:
 ## Release Checklist (v1)
 - `cabal build`
 - `cabal test`
-- `cabal build -f spirdo-demo`
-- `cabal run -f spirdo-demo` (cycle all fragment variants)
+- `cd examples && cabal build`
+- `cd examples && cabal run` (cycle all fragment variants)
 - Verify README examples compile (bundle + reflection snippets)
 
 ## API Reference (Public)

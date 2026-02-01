@@ -142,7 +142,7 @@
   - DONE: package discovery rules respected with version strings preserved
 
 ## Demo App Notes
-- DONE: Fragment shader variants switchable with left/right arrows in `exe/Main.hs`
+- DONE: Fragment shader variants switchable with left/right arrows in `examples/app/Main.hs`
 - DONE: Variants include Feature Mix, Raymarch, Triangle, Plasma, Grid, SDF Text, Clouds, Bits, Aurora, Starfield, Tunnel, Voronoi, Mandelbrot
 - DONE: Override variants (Stripes/Rings) compiled via runtime specialization values
 - DONE: Grid shader uses bitwise + shift + modulo ops for a jitter pattern
