@@ -2744,7 +2744,7 @@ freshId st = (st.gsNextId, st { gsNextId = st.gsNextId + 1 })
 addInstr :: (GenState -> [Instr]) -> (GenState -> [Instr] -> GenState) -> Instr -> GenState -> GenState
 addInstr getter setter instr st =
   let xs = getter st
-  in setter st (xs <> [instr])
+  in setter st (instr : xs)
 
 addCapability :: Word32 -> GenState -> GenState
 addCapability cap st =
@@ -3272,7 +3272,7 @@ emitMainFunction entry env entryInits outTargets st0 = do
   let funcInstrs =
         [ Instr opFunction [voidTy, fnId, functionControlNone, fnTy]
         , Instr opLabel [labelId]
-        ] <> fs2.fsLocals <> fs2.fsInstrs <> tailInstrs
+        ] <> reverse fs2.fsLocals <> reverse fs2.fsInstrs <> tailInstrs
   let st8 = addFunctions funcInstrs st7
   let st9 = st8 { gsEntryPoint = Just fnId }
   pure st9
@@ -3359,14 +3359,14 @@ emitFunctionBody info decl st0 = do
   let st3 = addName (Instr opName (info.fiId : encodeString (textToString decl.fnName))) st2
   let (paramInstrs, paramLocals, paramStores, env, st4) = emitFunctionParams decl.fnParams info.fiParams st3
   let envWithGlobals = st4.gsGlobalVars <> env
-  let fs0 = FuncState paramLocals paramStores envWithGlobals [] False [] []
+  let fs0 = FuncState (reverse paramLocals) (reverse paramStores) envWithGlobals [] False [] []
   (st5, fs1) <- emitStmtListFn info.fiReturn st4 fs0 decl.fnBody
   fs2 <- finalizeFunctionReturn info.fiReturn fs1
   let funcInstrs =
         [ Instr opFunction [retTyId, info.fiId, functionControlNone, info.fiTypeId]
         ] <> paramInstrs <>
         [ Instr opLabel [fnLabel]
-        ] <> fs2.fsLocals <> fs2.fsInstrs <> [Instr opFunctionEnd []]
+        ] <> reverse fs2.fsLocals <> reverse fs2.fsInstrs <> [Instr opFunctionEnd []]
   let st6 = addFunctions funcInstrs st5
   pure st6
 
@@ -3474,7 +3474,7 @@ emitStmtFn retLayout st fs stmt
           case retLayout of
             Nothing ->
               case mexpr of
-                Nothing -> Right (st, fs { fsTerminated = True, fsInstrs = fs.fsInstrs <> [Instr opReturn []] })
+                Nothing -> Right (st, fs { fsTerminated = True, fsInstrs = Instr opReturn [] : fs.fsInstrs })
                 Just _ -> Left (CompileError "void function cannot return a value" Nothing Nothing)
             Just layout -> do
               expr <- case mexpr of
@@ -3490,7 +3490,7 @@ finalizeFunctionReturn retLayout fs =
   if fs.fsTerminated
     then Right fs
     else case retLayout of
-      Nothing -> Right (fs { fsInstrs = fs.fsInstrs <> [Instr opReturn []], fsTerminated = True })
+      Nothing -> Right (fs { fsInstrs = Instr opReturn [] : fs.fsInstrs, fsTerminated = True })
       Just _ -> Left (CompileError "non-void function must return a value" Nothing Nothing)
 
 emitIfFn :: Maybe TypeLayout -> Expr -> [Stmt] -> Maybe [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
@@ -3698,7 +3698,7 @@ ensureNoResources label layout =
     else Right ()
 
 addFunctions :: [Instr] -> GenState -> GenState
-addFunctions instrs st = st { gsFunctions = st.gsFunctions <> instrs }
+addFunctions instrs st = st { gsFunctions = reverse instrs <> st.gsFunctions }
 
 getExtInstSet :: GenState -> String -> (Word32, GenState)
 getExtInstSet st name =
@@ -3709,21 +3709,21 @@ getExtInstSet st name =
           instr = Instr opExtInstImport (sid : encodeString name)
           st2 = st1
             { gsExtInstIds = (name, sid) : st1.gsExtInstIds
-            , gsExtInstImports = st1.gsExtInstImports <> [instr]
+            , gsExtInstImports = instr : st1.gsExtInstImports
             }
       in (sid, st2)
 
 addFuncInstr :: Instr -> FuncState -> FuncState
-addFuncInstr instr fs = fs { fsInstrs = fs.fsInstrs <> [instr] }
+addFuncInstr instr fs = fs { fsInstrs = instr : fs.fsInstrs }
 
 addFuncLocal :: Instr -> FuncState -> FuncState
-addFuncLocal instr fs = fs { fsLocals = fs.fsLocals <> [instr] }
+addFuncLocal instr fs = fs { fsLocals = instr : fs.fsLocals }
 
 addTerminator :: Instr -> FuncState -> FuncState
-addTerminator instr fs = fs { fsInstrs = fs.fsInstrs <> [instr], fsTerminated = True }
+addTerminator instr fs = fs { fsInstrs = instr : fs.fsInstrs, fsTerminated = True }
 
 addLabel :: Word32 -> FuncState -> FuncState
-addLabel lbl fs = fs { fsInstrs = fs.fsInstrs <> [Instr opLabel [lbl]], fsTerminated = False }
+addLabel lbl fs = fs { fsInstrs = Instr opLabel [lbl] : fs.fsInstrs, fsTerminated = False }
 
 emitStatements :: EntryPoint -> [OutputTarget] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitStatements entry outTargets st fs = do
@@ -7623,16 +7623,16 @@ buildSpirvWords opts entry st =
       body =
         concat
           [ capInstrs
-          , concatMap encodeInstr (st.gsExtInstImports)
+          , concatMap encodeInstr (reverse st.gsExtInstImports)
           , encodeInstr (Instr opMemoryModel [addressingLogical, memoryModelGLSL450])
           , entryPointInstr
           , execModeInstr
-          , concatMap encodeInstr (st.gsNames)
-          , concatMap encodeInstr (st.gsDecorations)
-          , concatMap encodeInstr (st.gsTypes)
-          , concatMap encodeInstr (st.gsConstants)
-          , concatMap encodeInstr (st.gsGlobals)
-          , concatMap encodeInstr (st.gsFunctions)
+          , concatMap encodeInstr (reverse st.gsNames)
+          , concatMap encodeInstr (reverse st.gsDecorations)
+          , concatMap encodeInstr (reverse st.gsTypes)
+          , concatMap encodeInstr (reverse st.gsConstants)
+          , concatMap encodeInstr (reverse st.gsGlobals)
+          , concatMap encodeInstr (reverse st.gsFunctions)
           ]
   in header <> body
 

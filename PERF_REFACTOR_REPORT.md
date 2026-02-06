@@ -149,3 +149,42 @@ Profile-guided optimization targeted lexer prefix checks in `lexWesl`:
 ### Baseline vs this pass
 - `time per compile`: `1170406.92 ns` -> `718213.68 ns`
 - Improvement: `452193.24 ns` (`38.64%` faster)
+
+## Function IR Accumulation Pass (latest)
+Targeted the largest remaining hotspot in `Emit`: repeated list appends while building function-local SPIR-V instruction streams.
+
+### Code changes
+- `lib/Spirdo/Wesl/Emit.hs`
+  - `FuncState` instruction/local accumulation changed from append (`<> [x]`) to prepend (`x : xs`) in:
+    - `addFuncInstr`
+    - `addFuncLocal`
+    - `addTerminator`
+    - `addLabel`
+  - Function assembly now reverses `fsLocals`/`fsInstrs` exactly once at emission boundaries:
+    - `emitMainFunction`
+    - `emitFunctionBody`
+  - Return insertion paths updated to prepend in:
+    - `emitStmtFn` (void `return`)
+    - `finalizeFunctionReturn`
+  - Function-parameter seeded local/store lists are reversed once when initializing `FuncState` to preserve emitted order.
+
+### Verification
+- Command: `cabal test`
+- Result: pass (`1 of 1 test suites`)
+
+- Command: `cabal bench`
+- 5-run sample (`time per compile (ns)`):
+  - `617069.58`
+  - `595934.44`
+  - `600080.46`
+  - `592468.08`
+  - `630702.32`
+  - median: `600080.46`
+
+### Baseline vs latest (5-run median)
+- `time per compile`: `1170406.92 ns` -> `600080.46 ns`
+- Improvement: `570326.46 ns` (`48.73%` faster)
+
+### Notes on rejected follow-ups
+- A map/set lookup conversion in `Emit` (constants/struct ids/ext-inst ids/capabilities) regressed benchmark time and was reverted.
+- Reverting global section prepend/reverse strategy also did not improve end-to-end benchmark in this environment and was reverted.
