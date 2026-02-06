@@ -188,3 +188,65 @@ Targeted the largest remaining hotspot in `Emit`: repeated list appends while bu
 ### Notes on rejected follow-ups
 - A map/set lookup conversion in `Emit` (constants/struct ids/ext-inst ids/capabilities) regressed benchmark time and was reverted.
 - Reverting global section prepend/reverse strategy also did not improve end-to-end benchmark in this environment and was reverted.
+
+## Code-Reduction Follow-up (no API change)
+Kept the fast prepend/reverse model and reduced duplicated emit code.
+
+### Code changes
+- `lib/Spirdo/Wesl/Emit.hs`
+  - Added `finalizeFunctionInstrs` helper and reused it from:
+    - `emitMainFunction`
+    - `emitFunctionBody`
+  - Added `terminateWithReturn` helper and reused it from:
+    - `emitStmtFn` (void return path)
+    - `finalizeFunctionReturn`
+  - Net effect: less duplicated list assembly/termination logic with same behavior.
+
+### Verification
+- Command: `cabal test`
+- Result: pass (`1 of 1 test suites`)
+
+- Command: `cabal bench`
+- 5-run sample (`time per compile (ns)`):
+  - `594902.08`
+  - `557675.66`
+  - `562927.78`
+  - `565014.96`
+  - `544638.26`
+  - median: `562927.78`
+
+## Statement Logic De-dup Pass (less code, same behavior)
+Reduced duplicated assignment/update statement code shared by entry and function emit paths.
+
+### Code changes
+- `lib/Spirdo/Wesl/Emit.hs`
+  - Extracted shared helpers:
+    - `withNonAtomicPtr`
+    - `emitAssignStmt`
+    - `emitAssignOpStmt`
+    - `emitIncDecStmt`
+  - Reused these from both:
+    - `emitStmt`
+    - `emitStmtFn`
+  - Removed duplicated load helper body:
+    - `emitLoadVar = emitLoadFromPtr`
+  - Added `INLINE` pragmas on tiny shared helpers to keep overhead low.
+  - Net diff in `Emit.hs` for this branch state: fewer lines overall (`-102/+94` with other current edits).
+
+### Verification
+- Command: `cabal test`
+- Result: pass (`1 of 1 test suites`)
+
+- Command: `cabal bench`
+- 10-run sample (`time per compile (ns)`):
+  - `628290.22`
+  - `542343.6`
+  - `545570.16`
+  - `559510.42`
+  - `554940.28`
+  - `542803.82`
+  - `540741.22`
+  - `575096.64`
+  - `534601.9`
+  - `548340.16`
+  - median (10-run): `546955.16`

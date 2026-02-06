@@ -3269,10 +3269,12 @@ emitMainFunction entry env entryInits outTargets st0 = do
         if fs2.fsTerminated
           then [Instr opFunctionEnd []]
           else [Instr opReturn [], Instr opFunctionEnd []]
-  let funcInstrs =
+  let funcInstrs = finalizeFunctionInstrs
         [ Instr opFunction [voidTy, fnId, functionControlNone, fnTy]
         , Instr opLabel [labelId]
-        ] <> reverse fs2.fsLocals <> reverse fs2.fsInstrs <> tailInstrs
+        ]
+        fs2
+        tailInstrs
   let st8 = addFunctions funcInstrs st7
   let st9 = st8 { gsEntryPoint = Just fnId }
   pure st9
@@ -3302,11 +3304,7 @@ emitEntryFieldValues st fs fields = go st fs fields []
       go st1 fs1 rest (val:acc)
 
 emitLoadVar :: GenState -> FuncState -> VarInfo -> Either CompileError (GenState, FuncState, Value)
-emitLoadVar st fs info = do
-  let (tyId, st1) = emitTypeFromLayout st info.viType
-  let (resId, st2) = freshId st1
-  let fs1 = addFuncInstr (Instr opLoad [tyId, resId, info.viPtrId]) fs
-  pure (st2, fs1, Value info.viType resId)
+emitLoadVar = emitLoadFromPtr
 
 registerFunctions :: StructLayoutCache -> [FunctionDecl] -> GenState -> Either CompileError GenState
 registerFunctions layoutCache decls st0 = foldM registerOne st0 decls
@@ -3362,11 +3360,10 @@ emitFunctionBody info decl st0 = do
   let fs0 = FuncState (reverse paramLocals) (reverse paramStores) envWithGlobals [] False [] []
   (st5, fs1) <- emitStmtListFn info.fiReturn st4 fs0 decl.fnBody
   fs2 <- finalizeFunctionReturn info.fiReturn fs1
-  let funcInstrs =
-        [ Instr opFunction [retTyId, info.fiId, functionControlNone, info.fiTypeId]
-        ] <> paramInstrs <>
-        [ Instr opLabel [fnLabel]
-        ] <> reverse fs2.fsLocals <> reverse fs2.fsInstrs <> [Instr opFunctionEnd []]
+  let funcInstrs = finalizeFunctionInstrs
+        ([Instr opFunction [retTyId, info.fiId, functionControlNone, info.fiTypeId]] <> paramInstrs <> [Instr opLabel [fnLabel]])
+        fs2
+        [Instr opFunctionEnd []]
   let st6 = addFunctions funcInstrs st5
   pure st6
 
@@ -3401,50 +3398,10 @@ emitStmtFn retLayout st fs stmt
       case stmt of
         SLet _ name mType expr -> emitLet name mType expr st fs
         SVar _ name mType mExpr -> emitVar name mType mExpr st fs
-        SAssign _ lv expr -> do
-          (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case ptrInfo.viType of
-            TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
-            _ -> pure ()
-          (st2, fs2, val) <- emitExpr st1 fs1 expr
-          (st3, fs3, val') <- coerceValueToLayout (ptrInfo.viType) val st2 fs2
-          ensureWritable ptrInfo
-          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, val'.valId]) fs3
-          Right (st3, fs4)
-        SAssignOp _ lv op expr -> do
-          (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case ptrInfo.viType of
-            TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
-            _ -> pure ()
-          ensureWritable ptrInfo
-          (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
-          (st3, fs3, rhsVal) <- emitExpr st2 fs2 expr
-          (st4, fs4, rhsVal') <- coerceValueToLayout (ptrInfo.viType) rhsVal st3 fs3
-          (st5, fs5, resVal) <- emitBinary op (ptrInfo.viType) (lhsVal.valId) (rhsVal'.valId) st4 fs4
-          let fs6 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs5
-          Right (st5, fs6)
-        SInc _ lv -> do
-          (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case ptrInfo.viType of
-            TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
-            _ -> pure ()
-          ensureWritable ptrInfo
-          (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
-          (oneId, st3) <- emitConstOne (ptrInfo.viType) st2
-          (st4, fs3, resVal) <- emitBinary OpAdd (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
-          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
-          Right (st4, fs4)
-        SDec _ lv -> do
-          (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case ptrInfo.viType of
-            TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
-            _ -> pure ()
-          ensureWritable ptrInfo
-          (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
-          (oneId, st3) <- emitConstOne (ptrInfo.viType) st2
-          (st4, fs3, resVal) <- emitBinary OpSub (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
-          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
-          Right (st4, fs4)
+        SAssign _ lv expr -> emitAssignStmt lv expr st fs
+        SAssignOp _ lv op expr -> emitAssignOpStmt lv op expr st fs
+        SInc _ lv -> emitIncDecStmt OpAdd lv st fs
+        SDec _ lv -> emitIncDecStmt OpSub lv st fs
         SExpr _ expr -> emitExprStmt st fs expr
         SIf _ cond thenBody elseBody ->
           emitIfFn retLayout cond thenBody elseBody st fs
@@ -3474,7 +3431,7 @@ emitStmtFn retLayout st fs stmt
           case retLayout of
             Nothing ->
               case mexpr of
-                Nothing -> Right (st, fs { fsTerminated = True, fsInstrs = Instr opReturn [] : fs.fsInstrs })
+                Nothing -> Right (st, terminateWithReturn fs)
                 Just _ -> Left (CompileError "void function cannot return a value" Nothing Nothing)
             Just layout -> do
               expr <- case mexpr of
@@ -3490,7 +3447,7 @@ finalizeFunctionReturn retLayout fs =
   if fs.fsTerminated
     then Right fs
     else case retLayout of
-      Nothing -> Right (fs { fsInstrs = Instr opReturn [] : fs.fsInstrs, fsTerminated = True })
+      Nothing -> Right (terminateWithReturn fs)
       Just _ -> Left (CompileError "non-void function must return a value" Nothing Nothing)
 
 emitIfFn :: Maybe TypeLayout -> Expr -> [Stmt] -> Maybe [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
@@ -3725,6 +3682,13 @@ addTerminator instr fs = fs { fsInstrs = instr : fs.fsInstrs, fsTerminated = Tru
 addLabel :: Word32 -> FuncState -> FuncState
 addLabel lbl fs = fs { fsInstrs = Instr opLabel [lbl] : fs.fsInstrs, fsTerminated = False }
 
+terminateWithReturn :: FuncState -> FuncState
+terminateWithReturn fs = fs { fsInstrs = Instr opReturn [] : fs.fsInstrs, fsTerminated = True }
+
+finalizeFunctionInstrs :: [Instr] -> FuncState -> [Instr] -> [Instr]
+finalizeFunctionInstrs prefix fs suffix =
+  prefix <> reverse fs.fsLocals <> reverse fs.fsInstrs <> suffix
+
 emitStatements :: EntryPoint -> [OutputTarget] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
 emitStatements entry outTargets st fs = do
   (st1, fs1) <- emitStmtList entry outTargets st fs (entry.epBody)
@@ -3780,50 +3744,10 @@ emitStmt entry outTargets st fs stmt
       case stmt of
         SLet _ name mType expr -> emitLet name mType expr st fs
         SVar _ name mType mExpr -> emitVar name mType mExpr st fs
-        SAssign _ lv expr -> do
-          (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case ptrInfo.viType of
-            TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
-            _ -> pure ()
-          (st2, fs2, val) <- emitExpr st1 fs1 expr
-          (st3, fs3, val') <- coerceValueToLayout (ptrInfo.viType) val st2 fs2
-          ensureWritable ptrInfo
-          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, val'.valId]) fs3
-          Right (st3, fs4)
-        SAssignOp _ lv op expr -> do
-          (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case ptrInfo.viType of
-            TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
-            _ -> pure ()
-          ensureWritable ptrInfo
-          (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
-          (st3, fs3, rhsVal) <- emitExpr st2 fs2 expr
-          (st4, fs4, rhsVal') <- coerceValueToLayout (ptrInfo.viType) rhsVal st3 fs3
-          (st5, fs5, resVal) <- emitBinary op (ptrInfo.viType) (lhsVal.valId) (rhsVal'.valId) st4 fs4
-          let fs6 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs5
-          Right (st5, fs6)
-        SInc _ lv -> do
-          (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case ptrInfo.viType of
-            TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
-            _ -> pure ()
-          ensureWritable ptrInfo
-          (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
-          (oneId, st3) <- emitConstOne (ptrInfo.viType) st2
-          (st4, fs3, resVal) <- emitBinary OpAdd (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
-          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
-          Right (st4, fs4)
-        SDec _ lv -> do
-          (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
-          case ptrInfo.viType of
-            TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
-            _ -> pure ()
-          ensureWritable ptrInfo
-          (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
-          (oneId, st3) <- emitConstOne (ptrInfo.viType) st2
-          (st4, fs3, resVal) <- emitBinary OpSub (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
-          let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
-          Right (st4, fs4)
+        SAssign _ lv expr -> emitAssignStmt lv expr st fs
+        SAssignOp _ lv op expr -> emitAssignOpStmt lv op expr st fs
+        SInc _ lv -> emitIncDecStmt OpAdd lv st fs
+        SDec _ lv -> emitIncDecStmt OpSub lv st fs
         SExpr _ expr -> emitExprStmt st fs expr
         SIf _ cond thenBody elseBody ->
           emitIf entry outTargets cond thenBody elseBody st fs
@@ -3874,6 +3798,47 @@ emitStmt entry outTargets st fs stmt
               let fs3 = addTerminator (Instr opReturn []) fs2
               Right (st2, fs3)
 
+withNonAtomicPtr :: GenState -> FuncState -> LValue -> (GenState -> FuncState -> VarInfo -> Either CompileError (GenState, FuncState)) -> Either CompileError (GenState, FuncState)
+withNonAtomicPtr st fs lv k = do
+  (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
+  case ptrInfo.viType of
+    TLAtomic _ -> Left (CompileError "use atomicStore for atomic values" Nothing Nothing)
+    _ -> k st1 fs1 ptrInfo
+{-# INLINE withNonAtomicPtr #-}
+
+emitAssignStmt :: LValue -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
+emitAssignStmt lv expr st fs =
+  withNonAtomicPtr st fs lv $ \st1 fs1 ptrInfo -> do
+    (st2, fs2, val) <- emitExpr st1 fs1 expr
+    (st3, fs3, val') <- coerceValueToLayout (ptrInfo.viType) val st2 fs2
+    ensureWritable ptrInfo
+    let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, val'.valId]) fs3
+    Right (st3, fs4)
+{-# INLINE emitAssignStmt #-}
+
+emitAssignOpStmt :: LValue -> BinOp -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
+emitAssignOpStmt lv op expr st fs =
+  withNonAtomicPtr st fs lv $ \st1 fs1 ptrInfo -> do
+    ensureWritable ptrInfo
+    (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
+    (st3, fs3, rhsVal) <- emitExpr st2 fs2 expr
+    (st4, fs4, rhsVal') <- coerceValueToLayout (ptrInfo.viType) rhsVal st3 fs3
+    (st5, fs5, resVal) <- emitBinary op (ptrInfo.viType) (lhsVal.valId) (rhsVal'.valId) st4 fs4
+    let fs6 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs5
+    Right (st5, fs6)
+{-# INLINE emitAssignOpStmt #-}
+
+emitIncDecStmt :: BinOp -> LValue -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
+emitIncDecStmt op lv st fs =
+  withNonAtomicPtr st fs lv $ \st1 fs1 ptrInfo -> do
+    ensureWritable ptrInfo
+    (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
+    (oneId, st3) <- emitConstOne (ptrInfo.viType) st2
+    (st4, fs3, resVal) <- emitBinary op (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
+    let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
+    Right (st4, fs4)
+{-# INLINE emitIncDecStmt #-}
+
 emitExprStmt :: GenState -> FuncState -> Expr -> Either CompileError (GenState, FuncState)
 emitExprStmt st fs expr =
   case expr of
@@ -3899,6 +3864,7 @@ emitLoadFromPtr st fs info = do
   let (resId, st2) = freshId st1
   let fs1 = addFuncInstr (Instr opLoad [tyId, resId, info.viPtrId]) fs
   Right (st2, fs1, Value (info.viType) resId)
+{-# INLINE emitLoadFromPtr #-}
 
 emitConstOne :: TypeLayout -> GenState -> Either CompileError (Word32, GenState)
 emitConstOne layout st =
