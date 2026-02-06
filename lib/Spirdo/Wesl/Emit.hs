@@ -769,7 +769,10 @@ emitModuleOverrides ctx constIndex fnIndex structIndex specMode layoutCache stru
             Right (addDecoration (Instr opDecorate [val.valId, decorationSpecId, specId]) st2)
           else Right st2
       let st4 = addName (Instr opName (val.valId : encodeString (textToString decl.odName))) st3
-      let st5 = st4 { gsConstValues = (decl.odName, val) : st4.gsConstValues }
+      let st5 = st4
+            { gsConstValues = (decl.odName, val) : st4.gsConstValues
+            , gsConstValuesByName = Map.insert decl.odName val st4.gsConstValuesByName
+            }
       Right st5
 
     fallbackLiteral layout expr st = do
@@ -856,11 +859,14 @@ emitModuleConstants decls st0 = foldM emitOne st0 decls
                 Just ty -> do
                   layout <- resolveTypeLayoutInState st1 ty
                   coerceConstValueToLayout layout val st1
-            let st3 = st2 { gsConstValues = (decl.cdName, val') : st2.gsConstValues }
+            let st3 = st2
+                  { gsConstValues = (decl.cdName, val') : st2.gsConstValues
+                  , gsConstValuesByName = Map.insert decl.cdName val' st2.gsConstValuesByName
+                  }
             pure st3
         )
         (const (Left (CompileError ("duplicate constant: " <> textToString decl.cdName) Nothing Nothing)))
-        (lookup decl.cdName st.gsConstValues)
+        (Map.lookup decl.cdName st.gsConstValuesByName)
 
 emitConstExpr :: GenState -> Expr -> Either CompileError (GenState, Value)
 emitConstExpr st expr =
@@ -929,7 +935,7 @@ emitConstExpr st expr =
             _ -> emitIntBin op s1 s2 st2 v1 v2
         _ -> Left (CompileError "constant operation expects scalar values" Nothing Nothing)
     EVar _ name ->
-      case lookup name (st.gsConstValues) of
+      case Map.lookup name st.gsConstValuesByName of
         Just val -> Right (st, val)
         Nothing -> Left (CompileError ("unknown constant: " <> textToString name) Nothing Nothing)
     ECall _ name args ->
@@ -1376,7 +1382,7 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
                         Just layout -> emitSpecConstStructCtor ctx constIndex fnIndex structIndex name layout args st0
                         Nothing -> Left (CompileError ("unsupported spec constant constructor: " <> textToString name) Nothing Nothing)
         EVar _ name ->
-          case lookup name (st0.gsConstValues) of
+          case Map.lookup name st0.gsConstValuesByName of
             Just val -> Right (st0, val)
             Nothing -> Left (CompileError "const reference requires fallback" Nothing Nothing)
         _ -> Left (CompileError "unsupported spec constant expression" Nothing Nothing)
@@ -1936,6 +1942,7 @@ encodeInstrBuilder (Instr opcode ops) =
   let wc = 1 + length ops
       first = (fromIntegral wc `shiftL` 16) .|. fromIntegral opcode
   in BB.word32LE first <> foldMap BB.word32LE ops
+{-# INLINE encodeInstrBuilder #-}
 
 -- Minimal subset of opcodes and enums
 
@@ -2683,7 +2690,7 @@ data GenState = GenState
   , gsStructLayouts :: [(Text, TypeLayout)]
   , gsStructIds :: [(Text, Word32)]
   , gsBlockStructs :: [Text]
-  , gsTypeCache :: [(TypeKey, Word32)]
+  , gsTypeCache :: Map.Map TypeKey Word32
   , gsConstCache :: Map.Map ConstKey Word32
   , gsConstKeyById :: Map.Map Word32 ConstKey
   , gsSpecConstLiteralIds :: Set.Set Word32
@@ -2694,6 +2701,7 @@ data GenState = GenState
   , gsFunctionsByName :: Map.Map Text [FunctionInfo]
   , gsEntryStage :: Stage
   , gsConstValues :: [(Text, Value)]
+  , gsConstValuesByName :: Map.Map Text Value
   , gsConstComposites :: Map.Map Word32 (TypeLayout, [Word32])
   , gsCapabilities :: [Word32]
   , gsNames :: [Instr]
@@ -2716,7 +2724,7 @@ emptyGenState samplerMode stage structLayouts blockStructs samplerLayouts =
       , gsStructLayouts = structLayouts
       , gsStructIds = ids
       , gsBlockStructs = blockStructs
-      , gsTypeCache = []
+      , gsTypeCache = Map.empty
       , gsConstCache = Map.empty
       , gsConstKeyById = Map.empty
       , gsSpecConstLiteralIds = Set.empty
@@ -2727,6 +2735,7 @@ emptyGenState samplerMode stage structLayouts blockStructs samplerLayouts =
       , gsFunctionsByName = Map.empty
       , gsEntryStage = stage
       , gsConstValues = []
+      , gsConstValuesByName = Map.empty
       , gsConstComposites = Map.empty
       , gsCapabilities = []
       , gsNames = []
@@ -2746,6 +2755,10 @@ assignStructIds start layouts =
   let go next acc [] = (reverse acc, next)
       go next acc ((name, _):rest) = go (next + 1) ((name, next):acc) rest
   in go start [] layouts
+
+mapFromAssocFirstWins :: Ord k => [(k, v)] -> Map.Map k v
+mapFromAssocFirstWins = foldr (uncurry Map.insert) Map.empty
+{-# INLINE mapFromAssocFirstWins #-}
 
 freshId :: GenState -> (Word32, GenState)
 freshId st = (st.gsNextId, st { gsNextId = st.gsNextId + 1 })
@@ -2883,7 +2896,9 @@ data FuncState = FuncState
   { fsLocals :: ![Instr]
   , fsInstrs :: ![Instr]
   , fsVars :: ![(Text, VarInfo)]
+  , fsVarsByName :: !(Map.Map Text VarInfo)
   , fsValues :: ![(Text, Value)]
+  , fsValuesByName :: !(Map.Map Text Value)
   , fsTerminated :: !Bool
   , fsLoopStack :: ![(Word32, Word32)]
   , fsBreakStack :: ![Word32]
@@ -3271,7 +3286,7 @@ emitMainFunction entry env entryInits outTargets st0 = do
   let (fnId, st3) = freshId st2
   let (labelId, st4) = freshId st3
   let st5 = addName (Instr opName (fnId : encodeString (textToString entry.epName))) st4
-  let fs0 = FuncState [] [] env [] False [] []
+  let fs0 = FuncState [] [] env (mapFromAssocFirstWins env) [] Map.empty False [] []
   (st6, fs1) <- emitEntryParamInits entryInits st5 fs0
   (st7, fs2) <- emitStatements entry outTargets st6 fs1
   let tailInstrs =
@@ -3301,7 +3316,10 @@ emitEntryParamInits inits st fs = foldM emitOne (st, fs) inits
       let fs3 = addFuncLocal (Instr opVariable [ptrTy, varId, storageClassFunction]) fs2
       let fs4 = addFuncInstr (Instr opStore [varId, resId]) fs3
       let info = VarInfo (initParam.epiLayout) varId storageClassFunction ReadOnly
-      let fs5 = fs4 { fsVars = (initParam.epiName, info) : fs4.fsVars }
+      let fs5 = fs4
+            { fsVars = (initParam.epiName, info) : fs4.fsVars
+            , fsVarsByName = Map.insert initParam.epiName info fs4.fsVarsByName
+            }
       pure (st5, fs5)
 
 emitEntryFieldValues :: GenState -> FuncState -> [EntryFieldInit] -> Either CompileError (GenState, FuncState, [Value])
@@ -3369,7 +3387,7 @@ emitFunctionBody info decl st0 = do
   let st3 = addName (Instr opName (info.fiId : encodeString (textToString decl.fnName))) st2
   let (paramInstrs, paramLocals, paramStores, env, st4) = emitFunctionParams decl.fnParams info.fiParams st3
   let envWithGlobals = st4.gsGlobalVars <> env
-  let fs0 = FuncState (reverse paramLocals) (reverse paramStores) envWithGlobals [] False [] []
+  let fs0 = FuncState (reverse paramLocals) (reverse paramStores) envWithGlobals (mapFromAssocFirstWins envWithGlobals) [] Map.empty False [] []
   (st5, fs1) <- emitStmtListFn info.fiReturn st4 fs0 decl.fnBody
   fs2 <- finalizeFunctionReturn info.fiReturn fs1
   let funcInstrs = finalizeFunctionInstrs
@@ -3985,7 +4003,10 @@ emitLet name mType expr st fs = do
       coerceValueToLayout layout val0 st1 fs1
   case val.valType of
     TLPointer {} ->
-      let fs3 = fs2 { fsValues = (name, val) : fs2.fsValues }
+      let fs3 = fs2
+            { fsValues = (name, val) : fs2.fsValues
+            , fsValuesByName = Map.insert name val fs2.fsValuesByName
+            }
       in Right (st2, fs3)
     _ -> emitLocalValue name val st2 fs2
 
@@ -4017,7 +4038,10 @@ emitLocalValue name val st fs = do
   let fs1 = addFuncLocal (Instr opVariable [ptrTy, varId, storageClassFunction]) fs
   let fs2 = addFuncInstr (Instr opStore [varId, val.valId]) fs1
   let info = VarInfo (val.valType) varId storageClassFunction ReadWrite
-  let fs3 = fs2 { fsVars = (name, info) : fs2.fsVars }
+  let fs3 = fs2
+        { fsVars = (name, info) : fs2.fsVars
+        , fsVarsByName = Map.insert name info fs2.fsVarsByName
+        }
   Right (st3, fs3)
 
 emitIf :: EntryPoint -> [OutputTarget] -> Expr -> [Stmt] -> Maybe [Stmt] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
@@ -4246,10 +4270,10 @@ emitExpr st fs expr =
       let layout = TLScalar Bool a sz
       Right (st1, fs, Value layout cid)
     EVar _ name ->
-      case lookup name (fs.fsValues) of
+      case Map.lookup name fs.fsValuesByName of
         Just val -> Right (st, fs, val)
         Nothing ->
-          case lookup name (st.gsConstValues) of
+          case Map.lookup name st.gsConstValuesByName of
             Just val -> Right (st, fs, val)
             Nothing ->
               case Map.lookup name (st.gsSamplerLayouts) of
@@ -7364,10 +7388,10 @@ emitLValuePtr :: GenState -> FuncState -> LValue -> Either CompileError (GenStat
 emitLValuePtr st fs lv =
   case lv of
     LVVar _ name ->
-      case lookup name (fs.fsVars) of
+      case Map.lookup name fs.fsVarsByName of
         Just v -> Right (st, fs, v)
         Nothing ->
-          case lookup name (fs.fsValues) of
+          case Map.lookup name fs.fsValuesByName of
             Just _ -> Left (CompileError "cannot take the address of an immutable let binding" Nothing Nothing)
             Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
     LVField _ base field -> do
@@ -7743,7 +7767,7 @@ emitSampledImageType imageId st =
 emitArrayType :: Word32 -> Word32 -> Word32 -> GenState -> (Word32, GenState)
 emitArrayType elemId lenVal stride st =
   let key = TKArray elemId (Just lenVal) stride
-  in case lookup key (st.gsTypeCache) of
+  in case Map.lookup key (st.gsTypeCache) of
        Just tid -> (tid, st)
        Nothing ->
          let (lenId, st1) = emitTypeConstU32 st lenVal
@@ -7756,7 +7780,7 @@ emitRuntimeArrayType :: Word32 -> Word32 -> GenState -> (Word32, GenState)
 emitRuntimeArrayType elemId stride st =
   let key = TKArray elemId Nothing stride
       instr = Instr opTypeRuntimeArray [elemId]
-  in case lookup key (st.gsTypeCache) of
+  in case Map.lookup key (st.gsTypeCache) of
        Just tid -> (tid, st)
        Nothing ->
          let (tyId, st1) = emitTypeCached st key instr
@@ -8161,12 +8185,12 @@ emitConstWith addInstrFn st key build =
 
 emitTypeCached :: GenState -> TypeKey -> Instr -> (Word32, GenState)
 emitTypeCached st key instr =
-  case lookup key (st.gsTypeCache) of
+  case Map.lookup key (st.gsTypeCache) of
     Just tid -> (tid, st)
     Nothing ->
       let (tid, st1) = freshId st
           st2 = addType (addResultId tid instr) st1
-          st3 = st2 { gsTypeCache = (key, tid) : st2.gsTypeCache }
+          st3 = st2 { gsTypeCache = Map.insert key tid st2.gsTypeCache }
       in (tid, st3)
 
 addResultId :: Word32 -> Instr -> Instr
@@ -8204,7 +8228,7 @@ data TypeKey
   | TKArray Word32 (Maybe Word32) Word32
   | TKPointer Word32 Word32
   | TKFunction Word32 [Word32]
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 data ConstKey
   = ConstU32 Word32

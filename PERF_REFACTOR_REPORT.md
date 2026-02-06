@@ -292,3 +292,68 @@ Executed requested sequence with test+bench after each step.
 - `cabal test`: pass
 - Final bench sample: `559895.44`, `558192.04`, `550674.9`, `559047.62`, `584055.66`
 - Final median: `559047.62`
+
+## Profiling-Driven Pass (biggest remaining hotspot)
+Profiled current state and applied targeted refactors with test+bench after each kept change.
+
+### Initial profile snapshot
+- Command: `cabal bench --enable-profiling --benchmark-options='+RTS -p -RTS'`
+- Profile file: `spirdo-compile-bench.prof` (`Fri Feb 6 13:48 2026`)
+- Top hotspots:
+  - `lookup` (`GHC.Internal.List`): `10.4% time`
+  - `lexWesl`: `7.5% time`, `13.6% alloc`
+  - `emitFieldExpr`: `4.5% time`
+  - `emitTypeCached` path showed repeated list-cache lookups
+
+### Attempt A (rejected): `encodeInstrBuilder` single-pass variants
+- Change:
+  - replaced `length + foldMap` with one-pass operand counting/building variants.
+- Result:
+  - both variants regressed in this workload and were reverted.
+  - samples observed:
+    - variant 1 median: `627348.32`
+    - variant 2 median: `599796.94`
+    - same-session baseline median (original implementation): `590142.52`
+
+### Step B (kept): fast local/const lookup maps
+- Files:
+  - `lib/Spirdo/Wesl/Emit.hs`
+- Change:
+  - added internal maps for hot lookups while retaining list fields for behavior parity:
+    - `fsVarsByName`, `fsValuesByName`
+    - `gsConstValuesByName`
+  - switched hot-path variable/const lookup sites to `Map.lookup`.
+- Verification:
+  - `cabal test`: pass
+  - 5-run bench sample: `588962.72`, `580993.4`, `594332.1`, `585442.16`, `585524.96`
+  - median: `585524.96` (small improvement vs `590142.52` same-session baseline)
+
+### Step C (kept): `gsTypeCache` from assoc-list to `Map`
+- Files:
+  - `lib/Spirdo/Wesl/Emit.hs`
+  - `lib/Spirdo/Wesl/Types/Layout.hs`
+- Change:
+  - `gsTypeCache :: Map TypeKey Word32` (was `[(TypeKey, Word32)]`)
+  - all type-cache sites switched from list `lookup` to `Map.lookup`/`Map.insert`
+  - `TypeKey` derives `Ord`
+  - `Scalar` and `StorageFormat` derive `Ord` to support `TypeKey` ordering
+- Verification:
+  - `cabal test`: pass
+  - 10-run bench sample:
+    - `530499.94`, `536957.92`, `541279.88`, `569746.3`, `543712.08`,
+    - `529306.76`, `569650.52`, `522898.4`, `528628.16`, `542145.48`
+  - median (10-run): `539118.90`
+  - delta vs same-session baseline (`590142.52`): `-51023.62 ns` (~`8.65%` faster)
+  - delta vs prior project baseline (`559047.62`): `-19928.72 ns` (~`3.56%` faster)
+
+### Post-change profile snapshot
+- Command: `cabal bench --enable-profiling --benchmark-options='+RTS -p -RTS'`
+- Profile file: `spirdo-compile-bench.prof` (`Fri Feb 6 13:50 2026`)
+- Compile timing:
+  - before this pass profile run: `1478534.44 ns`
+  - after this pass profile run: `1298528.5 ns`
+- New top hotspots:
+  - `lexWesl`: `6.8% time`
+  - `ReadP (<|>)`: `6.8% time`
+  - `toLazyByteStringWith`: `6.8% time`
+  - `lookup` dropped out of top hotspot list

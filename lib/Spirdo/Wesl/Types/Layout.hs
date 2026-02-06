@@ -70,13 +70,13 @@ data StorageFormat
   | FormatRgb10a2Unorm
   | FormatRgb10a2Uint
   | FormatRg11b10Float
-  deriving (Eq, Show, Read)
+  deriving (Eq, Ord, Show, Read)
 
 -- Runtime interface representation
 
 -- | Runtime scalar type.
 data Scalar = I32 | U32 | F16 | F32 | Bool
-  deriving (Eq, Show, Read)
+  deriving (Eq, Ord, Show, Read)
 
 -- | Constant integer expression (subset) used in array lengths and attributes.
 data ConstExpr
