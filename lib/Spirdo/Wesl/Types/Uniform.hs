@@ -24,16 +24,18 @@ module Spirdo.Wesl.Types.Uniform
   , packUniformStorable
   ) where
 
-import Data.Bits ((.&.), shiftR)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.ByteString.Builder (Builder, byteString, toLazyByteString)
+import Data.ByteString.Builder (Builder, byteString, toLazyByteString, word16LE, word32LE)
 import qualified Data.ByteString.Lazy as BSL
+import Control.Applicative ((<|>))
+import Control.Monad (foldM)
+import Data.Bifunctor (first)
 import Data.Int (Int32)
 import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.Word (Word8, Word16, Word32)
+import Data.Word (Word16, Word32)
 import Data.Proxy (Proxy(..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (castPtr)
@@ -327,83 +329,117 @@ emitValue :: Int -> UniformPath -> Int -> TypeLayout -> UniformValue -> Int -> E
 emitValue size ctx off layout value pos =
   case (layout, value) of
     (TLScalar s _ _, UVScalar v) ->
-      emitScalar ctx s v >>= \bytes ->
-        emitSegment size off bytes pos
+      emitScalar ctx s v >>= \(chunk, chunkLen) ->
+        emitSegment size off chunkLen chunk pos
     (TLVector n s _ _, UVVector n' vals)
       | n == n' ->
-          foldMBuilder pos (zip [0 ..] vals) $ \(ix, val) curPos ->
-            emitScalar (ctxIndex ctx ix) s val >>= \bytes ->
-              emitSegment size (off + ix * scalarByteSize s) bytes curPos
+          foldMBuilderIndexed pos vals $ \ix val curPos ->
+            emitScalar (ctxIndex ctx ix) s val >>= \(chunk, chunkLen) ->
+              emitSegment size (off + ix * scalarByteSize s) chunkLen chunk curPos
       | otherwise ->
           Left (formatAt ctx ("vector length mismatch: expected " <> show n <> ", got " <> show n'))
     (TLMatrix cols rows s _ _ stride, UVMatrix c r vals)
+      | cols == c && rows == r && valCount == expectedVals ->
+          foldMBuilderIndexed pos vals $ \ix val curPos ->
+            let col = ix `div` rows
+                row = ix `mod` rows
+                base = off + col * fromIntegral stride + row * scalarByteSize s
+            in emitScalar (ctxIndex (ctxIndex ctx col) row) s val >>= \(chunk, chunkLen) ->
+                emitSegment size base chunkLen chunk curPos
       | cols == c && rows == r ->
-          let expected = cols * rows
-          in if length vals /= expected
-            then Left (formatAt ctx ("matrix value count mismatch: expected " <> show expected <> ", got " <> show (length vals)))
-            else
-              foldMBuilder pos (zip [0 ..] vals) $ \(ix, val) curPos ->
-                let col = ix `div` rows
-                    row = ix `mod` rows
-                    base = off + col * fromIntegral stride + row * scalarByteSize s
-                in emitScalar (ctxIndex (ctxIndex ctx col) row) s val >>= \bytes ->
-                    emitSegment size base bytes curPos
+          Left (formatAt ctx ("matrix value count mismatch: expected " <> show expectedVals <> ", got " <> show valCount))
       | otherwise ->
           Left (formatAt ctx ("matrix size mismatch: expected " <> show cols <> "x" <> show rows <> ", got " <> show c <> "x" <> show r))
+      where
+        expectedVals = cols * rows
+        valCount = length vals
     (TLArray mlen stride elemLayout _ _, UVArray elems) ->
       case mlen of
-        Just n | n /= length elems ->
-          Left (formatAt ctx ("array length mismatch: expected " <> show n <> ", got " <> show (length elems)))
+        Just n | n /= elemCount ->
+          Left (formatAt ctx ("array length mismatch: expected " <> show n <> ", got " <> show elemCount))
         _ ->
-          foldMBuilder pos (zip [0 ..] elems) $ \(ix, el) curPos ->
+          foldMBuilderIndexed pos elems $ \ix el curPos ->
             emitValue size (ctxIndex ctx ix) (off + ix * fromIntegral stride) elemLayout el curPos
+      where
+        elemCount = length elems
     (TLStruct structName fields _ _, UVStruct vals) ->
-      let structCtx = if null ctx then structName else ctx
-          nameCounts = Map.fromListWith (+) [(n, 1 :: Int) | (n, _) <- vals]
-          dupes = Map.keys (Map.filter (> 1) nameCounts)
-      in if not (null dupes)
-        then Left (formatAt structCtx ("duplicate struct fields: " <> intercalate ", " dupes))
-        else
-          let fieldNames = map (.flName) fields
-              fieldSet = Set.fromList fieldNames
-              extra = filter (`Set.notMember` fieldSet) (map fst vals)
-          in if not (null extra)
-            then Left (formatAt structCtx ("unexpected struct fields: " <> intercalate ", " extra))
-            else
-              let valMap = Map.fromList vals
-              in foldMBuilder pos fields $ \fld curPos -> do
-                  v <- maybe (Left (formatAt structCtx ("missing struct field: " <> fld.flName))) Right
-                    (Map.lookup fld.flName valMap)
-                  emitValue size (ctxField structCtx fld.flName) (off + fromIntegral fld.flOffset) fld.flType v curPos
+      emitStruct (if null ctx then structName else ctx) fields vals
     _ ->
       Left (formatAt ctx ("uniform value does not match layout: " <> show layout))
+  where
+    emitStruct structCtx fields vals =
+      let fieldSet = Set.fromList (map (.flName) fields)
+          (valMap, dupes, extras) = foldl' (collectField fieldSet) (Map.empty, Set.empty, Set.empty) vals
+      in case structFieldError dupes extras of
+          Just err -> Left (formatAt structCtx err)
+          Nothing ->
+            foldMBuilder pos fields $ \fld curPos -> do
+              v <- maybe (Left (formatAt structCtx ("missing struct field: " <> fld.flName))) Right
+                (Map.lookup fld.flName valMap)
+              emitValue size (ctxField structCtx fld.flName) (off + fromIntegral fld.flOffset) fld.flType v curPos
 
-emitScalar :: UniformPath -> Scalar -> ScalarValue -> Either String ByteString
+    collectField fieldSet (valMap, dupes, extras) (name, fieldVal) =
+      let dupes' =
+            if Map.member name valMap
+              then Set.insert name dupes
+              else dupes
+          extras' =
+            if Set.member name fieldSet
+              then extras
+              else Set.insert name extras
+          valMap' = Map.insert name fieldVal valMap
+      in (valMap', dupes', extras')
+
+    structFieldError dupes extras =
+      renderSet "duplicate struct fields: " dupes
+        <|> renderSet "unexpected struct fields: " extras
+
+    renderSet prefix names
+      | Set.null names = Nothing
+      | otherwise = Just (prefix <> intercalate ", " (Set.toList names))
+
+emitScalar :: UniformPath -> Scalar -> ScalarValue -> Either String (Builder, Int)
 emitScalar ctx scalar value =
-  BS.pack <$> either (Left . formatAt ctx) Right (scalarValueBytes scalar value)
+  first (formatAt ctx) (scalarValueBuilder scalar value)
 
-emitSegment :: Int -> Int -> ByteString -> Int -> Either String (Builder, Int)
-emitSegment size off bytes pos
+emitSegment :: Int -> Int -> Int -> Builder -> Int -> Either String (Builder, Int)
+emitSegment size off chunkLen chunk pos
   | off < pos = Left "uniform write overlap"
   | off > size = Left "uniform write out of bounds"
-  | off + BS.length bytes > size = Left "uniform write out of bounds"
+  | off + chunkLen > size = Left "uniform write out of bounds"
   | otherwise =
       let padding = padBytes (off - pos)
-          nextPos = off + BS.length bytes
-      in Right (padding <> byteString bytes, nextPos)
+          nextPos = off + chunkLen
+      in Right (padding <> chunk, nextPos)
 
 padBytes :: Int -> Builder
 padBytes n
   | n <= 0 = mempty
-  | otherwise = byteString (BS.replicate n 0)
+  | otherwise = go n
+  where
+    chunkSize = BS.length zeroPadChunk
+    go m
+      | m <= 0 = mempty
+      | m >= chunkSize = byteString zeroPadChunk <> go (m - chunkSize)
+      | otherwise = byteString (BS.take m zeroPadChunk)
+
+zeroPadChunk :: ByteString
+zeroPadChunk = BS.replicate 64 0
 
 foldMBuilder :: Int -> [a] -> (a -> Int -> Either String (Builder, Int)) -> Either String (Builder, Int)
-foldMBuilder start items step = go mempty start items
+foldMBuilder start items step = foldM go (mempty, start) items
   where
-    go acc pos [] = Right (acc, pos)
-    go acc pos (x:xs) = do
+    go (acc, pos) x = do
       (chunk, pos') <- step x pos
-      go (acc <> chunk) pos' xs
+      pure (acc <> chunk, pos')
+
+foldMBuilderIndexed :: Int -> [a] -> (Int -> a -> Int -> Either String (Builder, Int)) -> Either String (Builder, Int)
+foldMBuilderIndexed start items step = go mempty start 0 items
+  where
+    go acc pos _ [] = Right (acc, pos)
+    go acc pos ix (x:xs) = do
+      (chunk, pos') <- step ix x pos
+      go (acc <> chunk) pos' (ix + 1) xs
 
 formatAt :: UniformPath -> String -> String
 formatAt ctx msg =
@@ -421,31 +457,17 @@ ctxIndex ctx ix =
     then "[" <> show ix <> "]"
     else ctx <> "[" <> show ix <> "]"
 
-scalarValueBytes :: Scalar -> ScalarValue -> Either String [Word8]
-scalarValueBytes scalar value =
-  case (scalar, value) of
-    (I32, SVI32 v) -> Right (word32LE (fromIntegral v))
-    (U32, SVU32 v) -> Right (word32LE v)
-    (F32, SVF32 v) -> Right (word32LE (castFloatToWord32 v))
-    (F16, SVF16 v) -> Right (word16LE v)
-    (Bool, SVBool v) -> Right (word32LE (if v then 1 else 0))
-    _ -> Left ("scalar type mismatch: expected " <> show scalar <> ", got " <> show value)
-
 scalarByteSize :: Scalar -> Int
 scalarByteSize s = case s of
   F16 -> 2
   _ -> 4
 
-word16LE :: Word16 -> [Word8]
-word16LE w =
-  [ fromIntegral (w .&. 0xFF)
-  , fromIntegral ((w `shiftR` 8) .&. 0xFF)
-  ]
-
-word32LE :: Word32 -> [Word8]
-word32LE w =
-  [ fromIntegral (w .&. 0xFF)
-  , fromIntegral ((w `shiftR` 8) .&. 0xFF)
-  , fromIntegral ((w `shiftR` 16) .&. 0xFF)
-  , fromIntegral ((w `shiftR` 24) .&. 0xFF)
-  ]
+scalarValueBuilder :: Scalar -> ScalarValue -> Either String (Builder, Int)
+scalarValueBuilder scalar value =
+  case (scalar, value) of
+    (I32, SVI32 v) -> Right (word32LE (fromIntegral v), 4)
+    (U32, SVU32 v) -> Right (word32LE v, 4)
+    (F32, SVF32 v) -> Right (word32LE (castFloatToWord32 v), 4)
+    (F16, SVF16 v) -> Right (word16LE v, 2)
+    (Bool, SVBool v) -> Right (word32LE (if v then 1 else 0), 4)
+    _ -> Left ("scalar type mismatch: expected " <> show scalar <> ", got " <> show value)

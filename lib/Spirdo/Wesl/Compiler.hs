@@ -24,12 +24,12 @@ import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char (isSpace, ord)
-import Data.List (intercalate, isPrefixOf)
+import Data.List (isPrefixOf)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Word (Word64)
+import Data.Word (Word8, Word64)
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import Language.Haskell.TH (Exp, Q)
@@ -276,29 +276,39 @@ defaultCacheDir = "dist-newstyle" </> ".wesl-cache"
 
 weslCacheKey :: CompileOptions -> String -> String
 weslCacheKey opts src =
-  let keySrc =
-        intercalate
-          "\n"
-          [ weslCacheVersion
-          , "v=" <> show (opts.spirvVersion)
-          , "features=" <> show (opts.enabledFeatures)
-          , "overrides=" <> show opts.overrideValues
-          , "spec=" <> show opts.overrideSpecMode
-          , "samplerMode=" <> show opts.samplerBindingMode
-          , "entry=" <> show opts.entryPointName
-          , src
-          ]
-      bytes = BS.pack (map (fromIntegral . ord) keySrc)
-      hash = fnv1a64 bytes
+  let keyLines =
+        [ weslCacheVersion
+        , "v=" <> show (opts.spirvVersion)
+        , "features=" <> show (opts.enabledFeatures)
+        , "overrides=" <> show opts.overrideValues
+        , "spec=" <> show opts.overrideSpecMode
+        , "samplerMode=" <> show opts.samplerBindingMode
+        , "entry=" <> show opts.entryPointName
+        , src
+        ]
+      hash = foldl' updateLine fnv1a64Offset (zip [0 :: Int ..] keyLines)
       hex = showHex hash ""
   in replicate (16 - length hex) '0' <> hex
 
+updateLine :: Word64 -> (Int, String) -> Word64
+updateLine acc (ix, line) =
+  let acc' =
+        if ix == 0
+          then acc
+          else fnv1a64Step acc (fromIntegral (ord '\n'))
+  in foldl' (\a ch -> fnv1a64Step a (fromIntegral (ord ch))) acc' line
+
+fnv1a64Offset :: Word64
+fnv1a64Offset = 14695981039346656037
+
+fnv1a64Prime :: Word64
+fnv1a64Prime = 1099511628211
+
+fnv1a64Step :: Word64 -> Word8 -> Word64
+fnv1a64Step acc byte = (acc `xor` fromIntegral byte) * fnv1a64Prime
+
 fnv1a64 :: ByteString -> Word64
-fnv1a64 = BS.foldl' step offset
-  where
-    offset = 14695981039346656037
-    prime = 1099511628211
-    step acc byte = (acc `xor` fromIntegral byte) * prime
+fnv1a64 = BS.foldl' fnv1a64Step fnv1a64Offset
 
 weslCachePaths :: CompileOptions -> String -> (FilePath, FilePath)
 weslCachePaths opts src =

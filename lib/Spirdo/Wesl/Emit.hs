@@ -28,10 +28,11 @@ import Data.Maybe (fromMaybe, isJust, isNothing)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Word (Word8, Word16, Word32)
+import Data.Word (Word16, Word32)
 import GHC.Float (castFloatToWord32, castWord32ToFloat)
 import Language.Haskell.TH (Exp, Q)
 import qualified Language.Haskell.TH as TH
+import Spirdo.Wesl.Emit.Encoding (encodeString, spirvToBytes)
 import Spirdo.Wesl.Syntax
 import Spirdo.Wesl.Typecheck
 import Spirdo.Wesl.Types
@@ -1080,17 +1081,21 @@ emitConstValueToLayout layout val st =
         Just v -> Right v
         Nothing -> Left (CompileError ("missing field: " <> fld.flName) Nothing Nothing)
 
-    emitConstValues elemLayout vals st0 = foldM go (st0, []) vals
+    emitConstValues elemLayout vals st0 = do
+      (st1, revVals) <- foldM go (st0, []) vals
+      Right (st1, reverse revVals)
       where
         go (stAcc, acc) v = do
           (st', val') <- emitConstValueToLayout elemLayout v stAcc
-          Right (st', acc <> [val'])
+          Right (st', val' : acc)
 
-    emitConstValuesFromFields fieldLayouts vals st0 = foldM go (st0, []) (zip fieldLayouts vals)
+    emitConstValuesFromFields fieldLayouts vals st0 = do
+      (st1, revVals) <- foldM go (st0, []) (zip fieldLayouts vals)
+      Right (st1, reverse revVals)
       where
         go (stAcc, acc) (fld, v) = do
           (st', val') <- emitConstValueToLayout fld.flType v stAcc
-          Right (st', acc <> [val'])
+          Right (st', val' : acc)
 
 emitSpecConstValueToLayout :: TypeLayout -> ConstValue -> GenState -> Either CompileError (GenState, Value)
 emitSpecConstValueToLayout layout val st =
@@ -1150,17 +1155,21 @@ emitSpecConstValueToLayout layout val st =
         Just v -> Right v
         Nothing -> Left (CompileError ("missing field: " <> fld.flName) Nothing Nothing)
 
-    emitConstValues elemLayout vals st0 = foldM go (st0, []) vals
+    emitConstValues elemLayout vals st0 = do
+      (st1, revVals) <- foldM go (st0, []) vals
+      Right (st1, reverse revVals)
       where
         go (stAcc, acc) v = do
           (st', val') <- emitConstValueToLayout elemLayout v stAcc
-          Right (st', acc <> [val'])
+          Right (st', val' : acc)
 
-    emitConstValuesFromFields fieldLayouts vals st0 = foldM go (st0, []) (zip fieldLayouts vals)
+    emitConstValuesFromFields fieldLayouts vals st0 = do
+      (st1, revVals) <- foldM go (st0, []) (zip fieldLayouts vals)
+      Right (st1, reverse revVals)
       where
         go (stAcc, acc) (fld, v) = do
           (st', val') <- emitConstValueToLayout fld.flType v stAcc
-          Right (st', acc <> [val'])
+          Right (st', val' : acc)
 
 constValueLayout :: GenState -> ConstValue -> Either CompileError TypeLayout
 constValueLayout st val =
@@ -1230,18 +1239,7 @@ emitSpecConstOp layout opcode operands st = do
   Right (st3, Value layout resId)
 
 isSpecConstantLiteral :: Word32 -> GenState -> Bool
-isSpecConstantLiteral cid st = any matches (st.gsConstants)
-  where
-    matches (Instr op ops)
-      | op == opSpecConstantTrue || op == opSpecConstantFalse =
-          case ops of
-            (_ty:rid:_) -> rid == cid
-            _ -> False
-      | op == opSpecConstant || op == opSpecConstantComposite =
-          case ops of
-            (_ty:rid:_) -> rid == cid
-            _ -> False
-      | otherwise = False
+isSpecConstantLiteral cid st = Set.member cid st.gsSpecConstLiteralIds
 
 emitSpecConstScalarConvert :: Scalar -> Scalar -> Value -> GenState -> Either CompileError (GenState, Value)
 emitSpecConstScalarConvert fromScalar toScalarTy val st = do
@@ -1872,10 +1870,7 @@ emitConstScalarCtor scalar args st =
     _ -> Left (CompileError "scalar constant cast requires a single argument" Nothing Nothing)
 
 lookupConstKeyById :: GenState -> Word32 -> Maybe ConstKey
-lookupConstKeyById st cid =
-  case [key | (key, cid') <- st.gsConstCache, cid' == cid] of
-    (k:_) -> Just k
-    [] -> Nothing
+lookupConstKeyById st cid = Map.lookup cid st.gsConstKeyById
 
 emitConstFromKey :: GenState -> ConstKey -> (Word32, GenState)
 emitConstFromKey st key =
@@ -2682,7 +2677,9 @@ data GenState = GenState
   , gsStructIds :: [(Text, Word32)]
   , gsBlockStructs :: [Text]
   , gsTypeCache :: [(TypeKey, Word32)]
-  , gsConstCache :: [(ConstKey, Word32)]
+  , gsConstCache :: Map.Map ConstKey Word32
+  , gsConstKeyById :: Map.Map Word32 ConstKey
+  , gsSpecConstLiteralIds :: Set.Set Word32
   , gsExtInstIds :: [(String, Word32)]
   , gsExtInstImports :: [Instr]
   , gsGlobalVars :: [(Text, VarInfo)]
@@ -2712,7 +2709,9 @@ emptyGenState samplerMode stage structLayouts blockStructs samplerLayouts =
       , gsStructIds = ids
       , gsBlockStructs = blockStructs
       , gsTypeCache = []
-      , gsConstCache = []
+      , gsConstCache = Map.empty
+      , gsConstKeyById = Map.empty
+      , gsSpecConstLiteralIds = Set.empty
       , gsExtInstIds = []
       , gsExtInstImports = []
       , gsGlobalVars = []
@@ -2763,7 +2762,23 @@ addType :: Instr -> GenState -> GenState
 addType = addInstr (.gsTypes) (\st v -> st { gsTypes = v })
 
 addConst :: Instr -> GenState -> GenState
-addConst = addInstr (.gsConstants) (\st v -> st { gsConstants = v })
+addConst instr st =
+  let st1 = addInstr (.gsConstants) (\st' v -> st' { gsConstants = v }) instr st
+  in case specConstLiteralResultId instr of
+      Nothing -> st1
+      Just rid -> st1 { gsSpecConstLiteralIds = Set.insert rid st1.gsSpecConstLiteralIds }
+
+specConstLiteralResultId :: Instr -> Maybe Word32
+specConstLiteralResultId (Instr op ops)
+  | op == opSpecConstantTrue || op == opSpecConstantFalse =
+      case ops of
+        (_ty:rid:_) -> Just rid
+        _ -> Nothing
+  | op == opSpecConstant || op == opSpecConstantComposite =
+      case ops of
+        (_ty:rid:_) -> Just rid
+        _ -> Nothing
+  | otherwise = Nothing
 
 addGlobal :: Instr -> GenState -> GenState
 addGlobal = addInstr (.gsGlobals) (\st v -> st { gsGlobals = v })
@@ -5563,22 +5578,29 @@ emitArrayLengthLValue lv st fs =
 emitFunctionCallByName :: Text -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Maybe Value)
 emitFunctionCallByName name args st fs = do
   (st1, fs1, vals) <- emitExprList st fs args
-  let candidates = [fi | fi <- st.gsFunctionTable, fi.fiName == name, length (fi.fiParams) == length vals]
+  let argCount = length vals
+  let candidates = [fi | fi <- st.gsFunctionTable, fi.fiName == name, length (fi.fiParams) == argCount]
   let exactMatches = filter (\fi -> and (zipWith (==) (fi.fiParams) (map (.valType) vals))) candidates
   let coercibleMatches =
         filter
           (\fi -> and (zipWith (argCoercible st1) vals (fi.fiParams)))
           candidates
-  case exactMatches of
-    [fi] -> emitFunctionCall fi vals st1 fs1
-    [] ->
-      case coercibleMatches of
-        [fi] -> do
+  case uniqueMatch exactMatches of
+    Left err -> Left err
+    Right (Just fi) -> emitFunctionCall fi vals st1 fs1
+    Right Nothing ->
+      case uniqueMatch coercibleMatches of
+        Left err -> Left err
+        Right (Just fi) -> do
           (st2, fs2, vals') <- coerceArgsToLayouts vals (fi.fiParams) st1 fs1
           emitFunctionCall fi vals' st2 fs2
-        [] -> Left (CompileError ("unsupported call: " <> textToString name) Nothing Nothing)
+        Right Nothing -> Left (CompileError ("unsupported call: " <> textToString name) Nothing Nothing)
+  where
+    uniqueMatch matches =
+      case matches of
+        [] -> Right Nothing
+        [fi] -> Right (Just fi)
         _ -> Left (CompileError ("ambiguous overload for " <> textToString name) Nothing Nothing)
-    _ -> Left (CompileError ("ambiguous overload for " <> textToString name) Nothing Nothing)
 
 argCoercible :: GenState -> Value -> TypeLayout -> Bool
 argCoercible st actual expected =
@@ -5595,7 +5617,8 @@ argCoercible st actual expected =
 emitFunctionCall :: FunctionInfo -> [Value] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Maybe Value)
 emitFunctionCall fnInfo vals st fs = do
   let expected = length (fnInfo.fiParams)
-  when (length vals /= expected) $
+      got = length vals
+  when (got /= expected) $
     Left (CompileError "function arity mismatch" Nothing Nothing)
   zipWithM_ (\val ty -> ensureTypeMatch (val.valType) ty) vals (fnInfo.fiParams)
   let (retTyId, st1) = case fnInfo.fiReturn of
@@ -8138,13 +8161,16 @@ emitConst = emitConstWith addConst
 
 emitConstWith :: (Instr -> GenState -> GenState) -> GenState -> ConstKey -> (Word32 -> GenState -> (Instr, GenState)) -> (Word32, GenState)
 emitConstWith addInstrFn st key build =
-  case lookup key (st.gsConstCache) of
+  case Map.lookup key (st.gsConstCache) of
     Just cid -> (cid, st)
     Nothing ->
       let (id', st1) = freshId st
           (instr, st2) = build id' st1
           st3 = addInstrFn instr st2
-          st4 = st3 { gsConstCache = (key, id') : st3.gsConstCache }
+          st4 = st3
+            { gsConstCache = Map.insert key id' st3.gsConstCache
+            , gsConstKeyById = Map.insert id' key st3.gsConstKeyById
+            }
       in (id', st4)
 
 emitTypeCached :: GenState -> TypeKey -> Instr -> (Word32, GenState)
@@ -8200,32 +8226,7 @@ data ConstKey
   | ConstF32 Word32
   | ConstF16 Word16
   | ConstBool Bool
-  deriving (Eq, Show)
-
-spirvToBytes :: [Word32] -> ByteString
-spirvToBytes words32 = BS.pack (concatMap wordToBytes words32)
-
-wordToBytes :: Word32 -> [Word8]
-wordToBytes w =
-  [ fromIntegral (w .&. 0xFF)
-  , fromIntegral ((w `shiftR` 8) .&. 0xFF)
-  , fromIntegral ((w `shiftR` 16) .&. 0xFF)
-  , fromIntegral ((w `shiftR` 24) .&. 0xFF)
-  ]
-
-encodeString :: String -> [Word32]
-encodeString str =
-  let bytes = map (fromIntegral . fromEnum) (str <> "\0")
-      chunks = chunk4 bytes
-  in map packWord chunks
-
-chunk4 :: [Word32] -> [[Word32]]
-chunk4 [] = []
-chunk4 xs = take 4 (xs <> repeat 0) : chunk4 (drop 4 xs)
-
-packWord :: [Word32] -> Word32
-packWord [a, b, c, d] = a .|. (b `shiftL` 8) .|. (c `shiftL` 16) .|. (d `shiftL` 24)
-packWord _ = 0
+  deriving (Eq, Ord, Show)
 
 bytesToExp :: ByteString -> Q Exp
 bytesToExp bytes = do

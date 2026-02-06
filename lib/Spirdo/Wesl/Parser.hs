@@ -46,15 +46,8 @@ lexWesl = go (SrcPos 1 1)
       case T.uncons src of
         Nothing -> pure []
         Just (c, cs)
-          | c == ' ' || c == '\t' -> go (advance pos c) cs
-          | c == '\n' -> go (advance pos c) cs
-          | c == '\r' -> go (advance pos c) cs
-          | c == '/' && prefix "//" src ->
-              let (_, rest, pos') = consumeLine (advance (advance pos '/') '/') (T.drop 2 src)
-              in go pos' rest
-          | c == '/' && prefix "/*" src ->
-              (\(rest, pos') -> go pos' rest)
-                =<< consumeBlockComment (advance (advance pos '/') '*') (T.drop 2 src)
+          | c == ' ' || c == '\t' || c == '\n' || c == '\r' ->
+              go (advance pos c) cs
           | isAlpha c || c == '_' ->
               let (ident, rest, pos') = consumeIdent pos src
               in (Token (TkIdent ident) pos :) <$> go pos' rest
@@ -64,50 +57,89 @@ lexWesl = go (SrcPos 1 1)
           | c == '"' ->
               (\(str, rest, pos') -> (Token (TkString str) pos :) <$> go pos' rest)
                 =<< consumeString pos cs
-          | prefix "::" src -> token2 "::" pos c src
-          | prefix "==" src -> token2 "==" pos c src
-          | prefix "!=" src -> token2 "!=" pos c src
-          | prefix "<=" src -> token2 "<=" pos c src
-          | prefix ">=" src -> token2 ">=" pos c src
-          | prefix "&&" src -> token2 "&&" pos c src
-          | prefix "||" src -> token2 "||" pos c src
-          | prefix "<<=" src -> token3 "<<=" pos c src
-          | prefix ">>=" src -> token3 ">>=" pos c src
-          | prefix "<<" src -> token2 "<<" pos c src
-          | prefix ">>" src -> token2 ">>" pos c src
-          | prefix "++" src -> token2 "++" pos c src
-          | prefix "--" src -> token2 "--" pos c src
-          | prefix "+=" src -> token2 "+=" pos c src
-          | prefix "-=" src -> token2 "-=" pos c src
-          | prefix "*=" src -> token2 "*=" pos c src
-          | prefix "/=" src -> token2 "/=" pos c src
-          | prefix "%=" src -> token2 "%=" pos c src
-          | prefix "&=" src -> token2 "&=" pos c src
-          | prefix "|=" src -> token2 "|=" pos c src
-          | prefix "^=" src -> token2 "^=" pos c src
-          | c `elem` symbolChars ->
-              let sym = T.singleton c
-              in (Token (TkSymbol sym) pos :) <$> go (advance pos c) cs
           | otherwise ->
-              Left (CompileError ("unexpected character: " <> [c]) (Just pos.spLine) (Just pos.spCol))
+              case T.uncons cs of
+                Nothing ->
+                  if isSymbolChar c
+                    then emit1 pos c cs
+                    else Left (CompileError ("unexpected character: " <> [c]) (Just pos.spLine) (Just pos.spCol))
+                Just (c2, rest2) ->
+                  case c of
+                    '/' | c2 == '/' ->
+                      let (_, rest, pos') = consumeLine (advance (advance pos '/') '/') rest2
+                      in go pos' rest
+                    '/' | c2 == '*' ->
+                      (\(rest, pos') -> go pos' rest)
+                        =<< consumeBlockComment (advance (advance pos '/') '*') rest2
+                    ':' | c2 == ':' -> emit2 pos "::" c c2 rest2
+                    '=' | c2 == '=' -> emit2 pos "==" c c2 rest2
+                    '!' | c2 == '=' -> emit2 pos "!=" c c2 rest2
+                    '<' | c2 == '=' -> emit2 pos "<=" c c2 rest2
+                    '>' | c2 == '=' -> emit2 pos ">=" c c2 rest2
+                    '&' | c2 == '&' -> emit2 pos "&&" c c2 rest2
+                    '|' | c2 == '|' -> emit2 pos "||" c c2 rest2
+                    '<' | c2 == '<' ->
+                      case T.uncons rest2 of
+                        Just (c3, rest3) | c3 == '=' -> emit3 pos "<<=" c c2 c3 rest3
+                        _ -> emit2 pos "<<" c c2 rest2
+                    '>' | c2 == '>' ->
+                      case T.uncons rest2 of
+                        Just (c3, rest3) | c3 == '=' -> emit3 pos ">>=" c c2 c3 rest3
+                        _ -> emit2 pos ">>" c c2 rest2
+                    '+' | c2 == '+' -> emit2 pos "++" c c2 rest2
+                    '-' | c2 == '-' -> emit2 pos "--" c c2 rest2
+                    '+' | c2 == '=' -> emit2 pos "+=" c c2 rest2
+                    '-' | c2 == '=' -> emit2 pos "-=" c c2 rest2
+                    '*' | c2 == '=' -> emit2 pos "*=" c c2 rest2
+                    '/' | c2 == '=' -> emit2 pos "/=" c c2 rest2
+                    '%' | c2 == '=' -> emit2 pos "%=" c c2 rest2
+                    '&' | c2 == '=' -> emit2 pos "&=" c c2 rest2
+                    '|' | c2 == '=' -> emit2 pos "|=" c c2 rest2
+                    '^' | c2 == '=' -> emit2 pos "^=" c c2 rest2
+                    _ ->
+                      if isSymbolChar c
+                        then emit1 pos c cs
+                        else Left (CompileError ("unexpected character: " <> [c]) (Just pos.spLine) (Just pos.spCol))
 
-    symbolChars :: String
-    symbolChars = "@:{}();,<>=[]+-*/.%!&|^"
+    isSymbolChar ch =
+      case ch of
+        '@' -> True
+        ':' -> True
+        '{' -> True
+        '}' -> True
+        '(' -> True
+        ')' -> True
+        ';' -> True
+        ',' -> True
+        '<' -> True
+        '>' -> True
+        '=' -> True
+        '[' -> True
+        ']' -> True
+        '+' -> True
+        '-' -> True
+        '*' -> True
+        '/' -> True
+        '.' -> True
+        '%' -> True
+        '!' -> True
+        '&' -> True
+        '|' -> True
+        '^' -> True
+        _ -> False
 
-    prefix s xs = s `T.isPrefixOf` xs
+    emit1 p ch rest =
+      let sym = T.singleton ch
+      in (Token (TkSymbol sym) p :) <$> go (advance p ch) rest
+
     advance2 p a = advance (advance p a)
     advance3 p a b = advance (advance2 p a b)
 
-    token2 sym p ch s =
-      let c2 = T.index s 1
-          rest = T.drop 2 s
-      in (Token (TkSymbol sym) p :) <$> go (advance2 p ch c2) rest
+    emit2 p sym c1 c2 rest =
+      (Token (TkSymbol sym) p :) <$> go (advance2 p c1 c2) rest
 
-    token3 sym p ch s =
-      let c2 = T.index s 1
-          c3 = T.index s 2
-          rest = T.drop 3 s
-      in (Token (TkSymbol sym) p :) <$> go (advance3 p ch c2 c3) rest
+    emit3 p sym c1 c2 c3 rest =
+      (Token (TkSymbol sym) p :) <$> go (advance3 p c1 c2 c3) rest
 
     consumeLine p rest =
       let (line, rest') = T.break (== '\n') rest
@@ -585,17 +617,12 @@ parseTTPrimary toks =
 applyIf :: [Attr] -> FeatureSet -> [Token] -> Either CompileError (Bool, [Attr])
 applyIf attrs feats _toks = do
   (ifExprs, attrs') <- stripIfAttr attrs
-  case ifExprs of
-    [] -> Right (True, attrs')
-    _ ->
-      let combined = foldl1 TTAnd ifExprs
-      in Right (evalTTExpr feats combined, attrs')
+  Right (null ifExprs || all (evalTTExpr feats) ifExprs, attrs')
 
 stripIfAttr :: [Attr] -> Either CompileError ([TTExpr], [Attr])
 stripIfAttr attrs =
-  case partition isIf attrs of
-    ([], others) -> Right ([], others)
-    (ifs, others) -> Right ([expr | AttrIf expr <- ifs], others)
+  let (ifs, others) = partition isIf attrs
+  in Right ([expr | AttrIf expr <- ifs], others)
   where
     isIf attr =
       case attr of
@@ -682,7 +709,9 @@ parseImportClause toks =
 parseImportCollection :: [Token] -> Either CompileError ([ImportItem], [Token])
 parseImportCollection toks =
   case toks of
-    (Token (TkSymbol "{") _ : rest) -> parseImportItems [] rest
+    (Token (TkSymbol "{") _ : rest) -> do
+      (revItems, rest1) <- parseImportItems [] rest
+      Right (reverse revItems, rest1)
     _ -> Left (errorAt toks "expected import collection")
   where
     parseImportItems acc rest =
@@ -690,7 +719,7 @@ parseImportCollection toks =
         (Token (TkSymbol "}") _ : more) -> Right (acc, more)
         _ -> do
           (items, rest1) <- parseImportPathOrItem rest
-          let acc' = acc <> items
+          let acc' = reverse items <> acc
           case rest1 of
             (Token (TkSymbol ",") _ : more) -> parseImportItems acc' more
             (Token (TkSymbol "}") _ : more) -> Right (acc', more)
@@ -899,15 +928,10 @@ parseParams feats toks =
   where
     parseParamList acc rest = do
       (mParam, rest1) <- parseParam rest
+      let acc' = maybe acc (: acc) mParam
       case rest1 of
-        (Token (TkSymbol ",") _ : more) ->
-          case mParam of
-            Just param -> parseParamList (param:acc) more
-            Nothing -> parseParamList acc more
-        _ ->
-          case mParam of
-            Just param -> Right (reverse (param:acc), rest1)
-            Nothing -> Right (reverse acc, rest1)
+        (Token (TkSymbol ",") _ : more) -> parseParamList acc' more
+        _ -> Right (reverse acc', rest1)
 
     parseParam rest = do
       (attrs, rest1) <- parseAttributes rest
@@ -943,7 +967,7 @@ parseStatements feats acc toks =
     (Token (TkSymbol "}") _ : more) -> Right (reverse acc, more)
     _ -> do
       (attrs, rest1) <- parseAttributes toks
-      (keep, attrs') <- applyIf attrs feats rest1
+      (keep, _attrs') <- applyIf attrs feats rest1
       (stmt, rest) <- parseStmt feats rest1
       let acc' = if keep then stmt : acc else acc
       parseStatements feats acc' rest

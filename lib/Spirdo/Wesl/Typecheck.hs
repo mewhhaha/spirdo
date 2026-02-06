@@ -18,6 +18,7 @@ import Data.Either (partitionEithers)
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.IntSet as IntSet
 import qualified Data.Map.Strict as Map
+import qualified Data.Sequence as Seq
 import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe, maybeToList)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -32,19 +33,13 @@ import System.FilePath (dropExtension, makeRelative, splitDirectories, takeDirec
 
 validateEntry :: EntryPoint -> Either CompileError ()
 validateEntry entry =
-  case entry.epStage of
-    StageCompute ->
-      case entry.epWorkgroupSize of
-        Nothing -> Left (CompileError "@workgroup_size is required for @compute" Nothing Nothing)
-        Just _ -> pure ()
-    StageVertex ->
-      case entry.epWorkgroupSize of
-        Nothing -> pure ()
-        Just _ -> Left (CompileError "@workgroup_size is not allowed for @vertex" Nothing Nothing)
-    StageFragment ->
-      case entry.epWorkgroupSize of
-        Nothing -> pure ()
-        Just _ -> Left (CompileError "@workgroup_size is not allowed for @fragment" Nothing Nothing)
+  case (entry.epStage, entry.epWorkgroupSize) of
+    (StageCompute, Nothing) -> Left (CompileError "@workgroup_size is required for @compute" Nothing Nothing)
+    (StageCompute, Just _) -> pure ()
+    (StageVertex, Nothing) -> pure ()
+    (StageVertex, Just _) -> Left (CompileError "@workgroup_size is not allowed for @vertex" Nothing Nothing)
+    (StageFragment, Nothing) -> pure ()
+    (StageFragment, Just _) -> Left (CompileError "@workgroup_size is not allowed for @fragment" Nothing Nothing)
 
 -- Import resolution (subset: module imports + qualified names)
 
@@ -74,17 +69,19 @@ resolveImports opts rootFile rootAst = runExceptT $ do
     liftEither = either throwE pure
 
 loadModuleGraph :: CompileOptions -> FilePath -> FilePath -> ModuleAst -> IO (Either CompileError [ModuleNode])
-loadModuleGraph opts rootDir rootFile rootAst = runExceptT (go Map.empty [(rootFile, rootAst)])
+loadModuleGraph opts rootDir rootFile rootAst = runExceptT (go Map.empty (Seq.singleton (rootFile, rootAst)))
   where
-    go acc [] = pure (Map.elems acc)
-    go acc ((filePath, ast):queue) = do
-      let pathSegs = modulePathFromFile rootDir filePath
-      imports <- ExceptT (resolveImportItems opts rootDir filePath ast)
-      liftEither (validateImportAliases imports)
-      let node = ModuleNode filePath pathSegs ast imports
-      let acc' = Map.insert filePath node acc
-      targets <- loadImportTargets opts acc' imports
-      go acc' (queue <> targets)
+    go acc queue =
+      case Seq.viewl queue of
+        Seq.EmptyL -> pure (Map.elems acc)
+        (filePath, ast) Seq.:< queueRest -> do
+          let pathSegs = modulePathFromFile rootDir filePath
+          imports <- ExceptT (resolveImportItems opts rootDir filePath ast)
+          liftEither (validateImportAliases imports)
+          let node = ModuleNode filePath pathSegs ast imports
+          let acc' = Map.insert filePath node acc
+          targets <- loadImportTargets opts acc' imports
+          go acc' (queueRest <> Seq.fromList targets)
 
     loadImportTargets opts' acc' imports = do
       let moduleFiles = Map.keys (Map.fromList [(imp.irModuleFile, ()) | imp <- imports])
@@ -115,13 +112,11 @@ validateImportAliases imports =
         Left (CompileError ("duplicate imports: " <> T.unpack (T.intercalate ", " dupTargets)) Nothing Nothing)
   where
     aliasFor imp =
-      case imp.irItem of
-        Nothing ->
-          let alias = fromMaybe (last imp.irModulePath) imp.irAlias
-          in if T.null alias then Nothing else Just alias
-        Just item ->
-          let alias = fromMaybe item imp.irAlias
-          in if T.null alias then Nothing else Just alias
+      let alias =
+            case imp.irItem of
+              Nothing -> fromMaybe (last imp.irModulePath) imp.irAlias
+              Just item -> fromMaybe item imp.irAlias
+      in nonEmptyText alias
 
     importTarget imp =
       let modName = T.intercalate "::" imp.irModulePath
@@ -134,101 +129,109 @@ validateImportAliases imports =
         then (name : acc, seen)
         else (acc, Set.insert name seen)
 
+    nonEmptyText txt
+      | T.null txt = Nothing
+      | otherwise = Just txt
+
 resolveImportItems :: CompileOptions -> FilePath -> FilePath -> ModuleAst -> IO (Either CompileError [ImportResolved])
 resolveImportItems opts rootDir moduleFile ast = runExceptT $ do
   let items = [(decl, item) | decl <- ast.modImports, item <- decl.idItems]
-  mapM (ExceptT . resolveOne opts rootDir moduleFile) items
+  mapM (ExceptT . resolveOne) items
   where
-    resolveOne opts' rootDir' moduleFile' (decl, item) =
-      resolveImportItem opts' rootDir' moduleFile' decl item
+    resolveOne (decl, item) = resolveImportItem opts rootDir moduleFile decl item
 
 loadModuleFromFile :: CompileOptions -> FilePath -> IO (Either CompileError ModuleAst)
 loadModuleFromFile opts path = do
-  let candidateWesl = path <.> "wesl"
-  let candidateWgsl = path <.> "wgsl"
-  weslExists <- doesFileExist candidateWesl
-  if weslExists
-    then parseModule candidateWesl
-    else do
-      wgslExists <- doesFileExist candidateWgsl
-      if wgslExists
-        then parseModule candidateWgsl
-        else pure (Right emptyModuleAst)
+  sourceFile <- pickFirstExisting [path <.> "wesl", path <.> "wgsl"]
+  maybe (pure (Right emptyModuleAst)) parseModule sourceFile
   where
     parseModule file = do
       src <- readFile file
       pure (parseModuleWith opts.enabledFeatures src)
 
+pickFirstExisting :: [FilePath] -> IO (Maybe FilePath)
+pickFirstExisting files =
+  case files of
+    [] -> pure Nothing
+    (file:rest) -> do
+      exists <- doesFileExist file
+      if exists
+        then pure (Just file)
+        else pickFirstExisting rest
+
 resolveImportItem :: CompileOptions -> FilePath -> FilePath -> ImportDecl -> ImportItem -> IO (Either CompileError ImportResolved)
 resolveImportItem opts rootDir moduleFile decl item = runExceptT $ do
   let baseDir = importBaseDir rootDir moduleFile decl.idRelative
   let segs = item.iiPath
-  let fullBase = foldl (</>) baseDir (map T.unpack segs)
+  let fullBase = appendPathSegments baseDir segs
   fullMod <- liftIO (findModuleFile fullBase)
   case fullMod of
-    Just moduleBase -> do
-      ambiguous <- liftIO (ambiguousImport opts baseDir segs)
+    Just moduleBase -> resolveAsModule baseDir segs moduleBase
+    Nothing -> resolveAsItem baseDir segs
+  where
+    resolveAsModule baseDir' segs' moduleBase = do
+      ambiguous <- liftIO (ambiguousImport opts baseDir' segs')
       when ambiguous $
-        throwE (CompileError ("ambiguous import: " <> T.unpack (T.intercalate "::" segs) <> " refers to both a module and an item") Nothing Nothing)
+        throwE (CompileError ("ambiguous import: " <> renderPath segs' <> " refers to both a module and an item") Nothing Nothing)
       pure (ImportResolved (modulePathFromFile rootDir moduleBase) moduleBase Nothing item.iiAlias)
-    Nothing ->
-      case segs of
-        [] -> throwE (CompileError "import path is empty" Nothing Nothing)
-        [_] -> throwE (CompileError ("import module not found: " <> T.unpack (T.intercalate "::" segs)) Nothing Nothing)
-        _ -> do
-          let modSegs = init segs
-          let itemName = last segs
-          let moduleBasePath = foldl (</>) baseDir (map T.unpack modSegs)
+
+    resolveAsItem baseDir' segs' =
+      case splitImportTarget segs' of
+        Nothing -> throwE (importNotFound segs')
+        Just (modSegs, itemName) -> do
+          let moduleBasePath = appendPathSegments baseDir' modSegs
           moduleBase <- liftIO (findModuleFile moduleBasePath)
           case moduleBase of
             Just mb ->
               pure (ImportResolved (modulePathFromFile rootDir mb) mb (Just itemName) item.iiAlias)
             Nothing ->
-              throwE (CompileError ("import module not found: " <> T.unpack (T.intercalate "::" modSegs)) Nothing Nothing)
-  where
+              throwE (importNotFound modSegs)
+
     ambiguousImport opts' baseDir' segs' =
-      case segs' of
-        [] -> pure False
-        [_] -> pure False
-        _ -> do
-          let modSegs = init segs'
-          let itemName = last segs'
-          let moduleBasePath = foldl (</>) baseDir' (map T.unpack modSegs)
+      case splitImportTarget segs' of
+        Nothing -> pure False
+        Just (modSegs, itemName) -> do
+          let moduleBasePath = appendPathSegments baseDir' modSegs
           moduleBaseItem <- findModuleFile moduleBasePath
-          case moduleBaseItem of
-            Nothing -> pure False
-            Just mb -> moduleHasItem opts' mb itemName
+          maybe (pure False) (\mb -> moduleHasItem opts' mb itemName) moduleBaseItem
+
+    importNotFound segs' =
+      case segs' of
+        [] -> CompileError "import path is empty" Nothing Nothing
+        _ -> CompileError ("import module not found: " <> renderPath segs') Nothing Nothing
 
 moduleHasItem :: CompileOptions -> FilePath -> Text -> IO Bool
 moduleHasItem opts moduleBase itemName = do
   astResult <- loadModuleFromFile opts moduleBase
-  pure $
-    either
-      (const False)
-      (\ast ->
-        itemName `elem` map (.sdName) ast.modStructs
-          || itemName `elem` map (.bdName) ast.modBindings
-          || itemName `elem` map (.gvName) ast.modGlobals
-          || itemName `elem` map (.cdName) ast.modConsts
-          || itemName `elem` map (.odName) ast.modOverrides
-          || itemName `elem` map (.adName) ast.modAliases
-          || itemName `elem` map (.fnName) ast.modFunctions
-          || itemName `elem` map (.epName) ast.modEntries
-      )
-      astResult
+  pure (either (const False) (Set.member itemName . moduleItemNames) astResult)
+  where
+    moduleItemNames ast =
+      Set.fromList $
+        map (.sdName) ast.modStructs
+          <> map (.bdName) ast.modBindings
+          <> map (.gvName) ast.modGlobals
+          <> map (.cdName) ast.modConsts
+          <> map (.odName) ast.modOverrides
+          <> map (.adName) ast.modAliases
+          <> map (.fnName) ast.modFunctions
+          <> map (.epName) ast.modEntries
 
 findModuleFile :: FilePath -> IO (Maybe FilePath)
 findModuleFile base = do
-  let weslPath = base <.> "wesl"
-  let wgslPath = base <.> "wgsl"
-  weslExists <- doesFileExist weslPath
-  if weslExists
-    then pure (Just base)
-    else do
-      wgslExists <- doesFileExist wgslPath
-      if wgslExists
-        then pure (Just base)
-        else pure Nothing
+  sourceFile <- pickFirstExisting [base <.> "wesl", base <.> "wgsl"]
+  pure (base <$ sourceFile)
+
+appendPathSegments :: FilePath -> [Text] -> FilePath
+appendPathSegments base segs = foldl (</>) base (map T.unpack segs)
+
+splitImportTarget :: [Text] -> Maybe ([Text], Text)
+splitImportTarget segs =
+  case reverse segs of
+    itemName : revModSegs@(_ : _) -> Just (reverse revModSegs, itemName)
+    _ -> Nothing
+
+renderPath :: [Text] -> String
+renderPath = T.unpack . T.intercalate "::"
 
 modulePathFromFile :: FilePath -> FilePath -> [Text]
 modulePathFromFile rootDir filePath =
@@ -262,24 +265,24 @@ linkModules opts rootFile rootDir nodes = do
   validateModuleScopes opts True rootPath rootDir constIndex fnIndex structIndex overrideIndex nodes
   let contexts = Map.fromList [(n.mnFile, buildModuleContext rootPath rootDir n) | n <- nodes]
   let qualified = map (qualifyModule rootPath contexts) nodes
-  let merged = foldl' mergeModule emptyModuleAst qualified
+  let merged = foldr mergeModule emptyModuleAst qualified
   let rootEntries = concat [q.mnAst.modEntries | q <- qualified, q.mnFile == rootFile]
   Right merged { modEntries = rootEntries }
 
-mergeModule :: ModuleAst -> ModuleNode -> ModuleAst
-mergeModule acc node =
+mergeModule :: ModuleNode -> ModuleAst -> ModuleAst
+mergeModule node acc =
   let ast = node.mnAst
   in acc
-      { modDirectives = acc.modDirectives <> ast.modDirectives
-      , modAliases = acc.modAliases <> ast.modAliases
-      , modStructs = acc.modStructs <> ast.modStructs
-      , modBindings = acc.modBindings <> ast.modBindings
-      , modGlobals = acc.modGlobals <> ast.modGlobals
-      , modConsts = acc.modConsts <> ast.modConsts
-      , modOverrides = acc.modOverrides <> ast.modOverrides
-      , modConstAsserts = acc.modConstAsserts <> ast.modConstAsserts
-      , modFunctions = acc.modFunctions <> ast.modFunctions
-      , modEntries = acc.modEntries <> ast.modEntries
+      { modDirectives = ast.modDirectives <> acc.modDirectives
+      , modAliases = ast.modAliases <> acc.modAliases
+      , modStructs = ast.modStructs <> acc.modStructs
+      , modBindings = ast.modBindings <> acc.modBindings
+      , modGlobals = ast.modGlobals <> acc.modGlobals
+      , modConsts = ast.modConsts <> acc.modConsts
+      , modOverrides = ast.modOverrides <> acc.modOverrides
+      , modConstAsserts = ast.modConstAsserts <> acc.modConstAsserts
+      , modFunctions = ast.modFunctions <> acc.modFunctions
+      , modEntries = ast.modEntries <> acc.modEntries
       }
 
 data ModuleContext = ModuleContext

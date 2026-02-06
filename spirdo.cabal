@@ -43,6 +43,7 @@ library
         Spirdo.Wesl.Parser
         Spirdo.Wesl.Typecheck
         Spirdo.Wesl.Emit
+        Spirdo.Wesl.Emit.Encoding
     -- other-extensions:
     build-depends:
         base ^>=4.21.0.0,
