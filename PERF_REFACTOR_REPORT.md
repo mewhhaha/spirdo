@@ -250,3 +250,45 @@ Reduced duplicated assignment/update statement code shared by entry and function
   - `534601.9`
   - `548340.16`
   - median (10-run): `546955.16`
+
+## Next Optimizations (1/2/3/4 request)
+Executed requested sequence with test+bench after each step.
+
+### Step 1: stream SPIR-V output directly to `Builder`
+- Change:
+  - `emitSpirv` now calls `buildSpirvBytes` directly (no intermediate `[Word32]` result at top level).
+  - added `encodeInstrBuilder` and `buildSpirvBytes` in `lib/Spirdo/Wesl/Emit.hs`.
+- Verification:
+  - `cabal test`: pass
+  - bench sample: `611506.0`, `616433.96`, `620497.74`, `621575.72`, `610370.02`
+  - median: `616433.96` (regression)
+
+### Step 2: `encodeString` single-pass packing
+- Change:
+  - replaced chunking (`take/drop/repeat/chunk4`) with a single-pass accumulator in `lib/Spirdo/Wesl/Emit/Encoding.hs`.
+- Verification:
+  - `cabal test`: pass
+  - bench sample: `580157.78`, `570869.46`, `569351.66`, `567695.08`, `571037.86`
+  - median: `570869.46` (improved vs step 1)
+
+### Step 3: function lookup index
+- Change:
+  - added `gsFunctionsByName :: Map Text [FunctionInfo]` in `GenState`.
+  - switched hot function lookup/call sites from full-list scans to name-index lookups:
+    - duplicate overload check in `registerFunctions`
+    - `findFunctionInfo`
+    - function-call path in `emitExprStmt` and `emitFunctionCallByName`
+- Verification:
+  - `cabal test`: pass
+  - bench sample: `589723.06`, `564636.84`, `542542.22`, `560023.68`, `553667.34`
+  - median: `560023.68`
+
+### Step 4: lexer follow-up
+- Attempted a fast column-advance shortcut in lexer numeric/ident scanning.
+- Result: regressed benchmark in this workload and was reverted.
+- Final code keeps parser behavior unchanged from pre-step-4 state.
+
+### Final state after 1/2/3 (4 reverted)
+- `cabal test`: pass
+- Final bench sample: `559895.44`, `558192.04`, `550674.9`, `559047.62`, `584055.66`
+- Final median: `559047.62`

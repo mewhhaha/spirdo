@@ -17,6 +17,8 @@ module Spirdo.Wesl.Emit where
 import Control.Monad (foldM, unless, zipWithM_, when)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, xor)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Builder as BB
+import qualified Data.ByteString.Lazy as BSL
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Internal as BSI
@@ -32,7 +34,7 @@ import Data.Word (Word16, Word32)
 import GHC.Float (castFloatToWord32, castWord32ToFloat)
 import Language.Haskell.TH (Exp, Q)
 import qualified Language.Haskell.TH as TH
-import Spirdo.Wesl.Emit.Encoding (encodeString, spirvToBytes)
+import Spirdo.Wesl.Emit.Encoding (encodeString)
 import Spirdo.Wesl.Syntax
 import Spirdo.Wesl.Typecheck
 import Spirdo.Wesl.Types
@@ -737,8 +739,7 @@ emitSpirv opts modAst iface = do
   state5 <- registerFunctions structLayoutsMap (modAst.modFunctions) state4
   state6 <- emitFunctionBodies structLayoutsMap (modAst.modFunctions) state5
   state7 <- emitMainFunction entry envGlobals entryInits outTargets state6
-  let spirvWords = buildSpirvWords opts entry state7
-  pure (spirvToBytes spirvWords)
+  pure (buildSpirvBytes opts entry state7)
 
 emitModuleOverrides :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideSpecMode -> StructLayoutCache -> [(Text, StructDecl)] -> [OverrideDecl] -> GenState -> Either CompileError GenState
 emitModuleOverrides ctx constIndex fnIndex structIndex specMode layoutCache structEnv decls st0 =
@@ -1930,6 +1931,12 @@ encodeInstr (Instr opcode ops) =
       first = (fromIntegral wc `shiftL` 16) .|. fromIntegral opcode
   in first : ops
 
+encodeInstrBuilder :: Instr -> BB.Builder
+encodeInstrBuilder (Instr opcode ops) =
+  let wc = 1 + length ops
+      first = (fromIntegral wc `shiftL` 16) .|. fromIntegral opcode
+  in BB.word32LE first <> foldMap BB.word32LE ops
+
 -- Minimal subset of opcodes and enums
 
 opCapability :: Word16
@@ -2684,6 +2691,7 @@ data GenState = GenState
   , gsExtInstImports :: [Instr]
   , gsGlobalVars :: [(Text, VarInfo)]
   , gsFunctionTable :: [FunctionInfo]
+  , gsFunctionsByName :: Map.Map Text [FunctionInfo]
   , gsEntryStage :: Stage
   , gsConstValues :: [(Text, Value)]
   , gsConstComposites :: Map.Map Word32 (TypeLayout, [Word32])
@@ -2716,6 +2724,7 @@ emptyGenState samplerMode stage structLayouts blockStructs samplerLayouts =
       , gsExtInstImports = []
       , gsGlobalVars = []
       , gsFunctionTable = []
+      , gsFunctionsByName = Map.empty
       , gsEntryStage = stage
       , gsConstValues = []
       , gsConstComposites = Map.empty
@@ -3319,7 +3328,7 @@ registerFunctions layoutCache decls st0 = foldM registerOne st0 decls
             layout <- resolveTypeLayoutWithCache layoutCache ty
             ensureNoResources "function return type" layout
             Right (Just layout)
-        let existing = [fi | fi <- st.gsFunctionTable, fi.fiName == decl.fnName]
+        let existing = Map.findWithDefault [] decl.fnName st.gsFunctionsByName
         when (any (\fi -> fi.fiParams == paramLayouts) existing) $
           Left (CompileError ("duplicate function overload: " <> textToString decl.fnName) Nothing Nothing)
         let (retTyId, st1) = case retLayout of
@@ -3330,7 +3339,10 @@ registerFunctions layoutCache decls st0 = foldM registerOne st0 decls
         let (fnTypeId, st3) = emitFunctionType st2 retTyId paramTypeIds
         let (fnId, st4) = freshId st3
         let info = FunctionInfo decl.fnName paramLayouts retLayout fnId fnTypeId
-        let st5 = st4 { gsFunctionTable = info : st4.gsFunctionTable }
+        let st5 = st4
+              { gsFunctionTable = info : st4.gsFunctionTable
+              , gsFunctionsByName = Map.insertWith (++) decl.fnName [info] st4.gsFunctionsByName
+              }
         pure st5
 
 emitFunctionBodies :: StructLayoutCache -> [FunctionDecl] -> GenState -> Either CompileError GenState
@@ -3338,13 +3350,13 @@ emitFunctionBodies layoutCache decls st0 = foldM emitOne st0 decls
   where
     emitOne st decl = do
       paramLayouts <- mapM (resolveTypeLayoutWithCache layoutCache) (map (.paramType) decl.fnParams)
-      case findFunctionInfo decl.fnName paramLayouts st.gsFunctionTable of
+      case findFunctionInfo decl.fnName paramLayouts st of
         Nothing -> Left (CompileError ("missing function info for " <> textToString decl.fnName) Nothing Nothing)
         Just info -> emitFunctionBody info decl st
 
-findFunctionInfo :: Text -> [TypeLayout] -> [FunctionInfo] -> Maybe FunctionInfo
-findFunctionInfo name paramLayouts infos =
-  case filter (\fi -> fi.fiName == name && fi.fiParams == paramLayouts) infos of
+findFunctionInfo :: Text -> [TypeLayout] -> GenState -> Maybe FunctionInfo
+findFunctionInfo name paramLayouts st =
+  case filter (\fi -> fi.fiParams == paramLayouts) (Map.findWithDefault [] name st.gsFunctionsByName) of
     (x:_) -> Just x
     [] -> Nothing
 
@@ -3847,7 +3859,7 @@ emitExprStmt st fs expr =
         "textureStore" -> emitTextureStore args st fs
         "atomicStore" -> emitAtomicStore args st fs
         _ ->
-          if any (\fi -> fi.fiName == name) (st.gsFunctionTable)
+          if Map.member name st.gsFunctionsByName
             then do
               (st1, fs1, _) <- emitFunctionCallByName name args st fs
               Right (st1, fs1)
@@ -5545,8 +5557,10 @@ emitFunctionCallByName :: Text -> [Expr] -> GenState -> FuncState -> Either Comp
 emitFunctionCallByName name args st fs = do
   (st1, fs1, vals) <- emitExprList st fs args
   let argCount = length vals
-  let candidates = [fi | fi <- st.gsFunctionTable, fi.fiName == name, length (fi.fiParams) == argCount]
-  let exactMatches = filter (\fi -> and (zipWith (==) (fi.fiParams) (map (.valType) vals))) candidates
+  let valTypes = map (.valType) vals
+  let named = Map.findWithDefault [] name st.gsFunctionsByName
+  let candidates = filter (\fi -> length (fi.fiParams) == argCount) named
+  let exactMatches = filter (\fi -> and (zipWith (==) (fi.fiParams) valTypes)) candidates
   let coercibleMatches =
         filter
           (\fi -> and (zipWith (argCoercible st1) vals (fi.fiParams)))
@@ -7551,17 +7565,20 @@ boolResultLayout n =
       let (a, sz) = vectorLayout Bool n
       in TLVector n Bool a sz
 
-buildSpirvWords :: CompileOptions -> EntryPoint -> GenState -> [Word32]
-buildSpirvWords opts entry st =
-  let header =
-        [ 0x07230203
-        , opts.spirvVersion
-        , 0
-        , st.gsNextId
-        , 0
-        ]
-      entryPointInstr = case st.gsEntryPoint of
-        Nothing -> []
+buildSpirvBytes :: CompileOptions -> EntryPoint -> GenState -> ByteString
+buildSpirvBytes opts entry st =
+  BSL.toStrict (BB.toLazyByteString (header <> body))
+  where
+    header =
+      BB.word32LE 0x07230203
+        <> BB.word32LE opts.spirvVersion
+        <> BB.word32LE 0
+        <> BB.word32LE st.gsNextId
+        <> BB.word32LE 0
+
+    entryPointInstr =
+      case st.gsEntryPoint of
+        Nothing -> mempty
         Just epId ->
           let nameWords = encodeString (textToString entry.epName)
               model = case entry.epStage of
@@ -7569,38 +7586,41 @@ buildSpirvWords opts entry st =
                 StageFragment -> executionModelFragment
                 StageVertex -> executionModelVertex
               operands = model : epId : nameWords <> st.gsInterfaceIds
-          in encodeInstr (Instr opEntryPoint operands)
-      execModeInstr = case st.gsEntryPoint of
-        Nothing -> []
+          in encodeInstrBuilder (Instr opEntryPoint operands)
+
+    execModeInstr =
+      case st.gsEntryPoint of
+        Nothing -> mempty
         Just epId ->
           case entry.epStage of
             StageCompute ->
               case entry.epWorkgroupSize of
-                Nothing -> []
+                Nothing -> mempty
                 Just (WorkgroupSizeValue (x, y, z)) ->
                   let ops = [epId, executionModeLocalSize, x, y, z]
-                  in encodeInstr (Instr opExecutionMode ops)
-                Just (WorkgroupSizeExpr _) -> []
+                  in encodeInstrBuilder (Instr opExecutionMode ops)
+                Just (WorkgroupSizeExpr _) -> mempty
             StageFragment ->
-              encodeInstr (Instr opExecutionMode [epId, executionModeOriginUpperLeft])
-            StageVertex -> []
-      capInstrs =
-        concatMap (\cap -> encodeInstr (Instr opCapability [cap])) (capabilityShader : st.gsCapabilities)
-      body =
-        concat
-          [ capInstrs
-          , concatMap encodeInstr (reverse st.gsExtInstImports)
-          , encodeInstr (Instr opMemoryModel [addressingLogical, memoryModelGLSL450])
-          , entryPointInstr
-          , execModeInstr
-          , concatMap encodeInstr (reverse st.gsNames)
-          , concatMap encodeInstr (reverse st.gsDecorations)
-          , concatMap encodeInstr (reverse st.gsTypes)
-          , concatMap encodeInstr (reverse st.gsConstants)
-          , concatMap encodeInstr (reverse st.gsGlobals)
-          , concatMap encodeInstr (reverse st.gsFunctions)
-          ]
-  in header <> body
+              encodeInstrBuilder (Instr opExecutionMode [epId, executionModeOriginUpperLeft])
+            StageVertex -> mempty
+
+    capInstrs =
+      foldMap (\cap -> encodeInstrBuilder (Instr opCapability [cap])) (capabilityShader : st.gsCapabilities)
+
+    body =
+      mconcat
+        [ capInstrs
+        , foldMap encodeInstrBuilder (reverse st.gsExtInstImports)
+        , encodeInstrBuilder (Instr opMemoryModel [addressingLogical, memoryModelGLSL450])
+        , entryPointInstr
+        , execModeInstr
+        , foldMap encodeInstrBuilder (reverse st.gsNames)
+        , foldMap encodeInstrBuilder (reverse st.gsDecorations)
+        , foldMap encodeInstrBuilder (reverse st.gsTypes)
+        , foldMap encodeInstrBuilder (reverse st.gsConstants)
+        , foldMap encodeInstrBuilder (reverse st.gsGlobals)
+        , foldMap encodeInstrBuilder (reverse st.gsFunctions)
+        ]
 
 emitVoidType :: GenState -> (Word32, GenState)
 emitVoidType st = emitTypeCached st TKVoid (Instr opTypeVoid [])
