@@ -445,3 +445,39 @@ Focused on lexing and SPIR-V serialization hot spots.
   - `lib/Spirdo/Wesl/Util.hs`
 - Result:
   - tests failed (`vec4<f32>` typed constructor not recognized); reverted.
+
+### Attempt N (rejected): manual hex prefix check in lexer
+- File:
+  - `lib/Spirdo/Wesl/Parser.hs`
+- Change:
+  - replaced `T.stripPrefix "0x"/"0X"` with manual `T.uncons` checks and a shared decimal parser path
+- Verification:
+  - `cabal test`: pass
+  - 10-run bench sample: `441417.12`, `457613.2`, `481776.04`, `455496.82`, `448846.66`, `451566.46`, `446207.1`, `454908.42`, `475732.66`, `445698.68`
+  - median (10-run): `453237.44`
+- Result:
+  - regressed median; reverted.
+
+### Attempt O (rejected): precomputed ctor tables for vec/mat names
+- File:
+  - `lib/Spirdo/Wesl/Util.hs`
+- Change:
+  - added `Map` lookups for common `vec*`/`mat*` ctor names (suffix and `<...>` forms), fallback to existing parsing for uncommon sizes
+- Verification:
+  - `cabal test`: pass
+  - 10-run bench sample: `466042.12`, `489663.34`, `487930.76`, `480282.02`, `485627.38`, `471912.28`, `478463.62`, `464638.14`, `473454.88`, `496996.08`
+  - median (10-run): `479372.82`
+- Result:
+  - regressed median; reverted.
+
+### Attempt P (rejected): batch `freshId` allocation in hot control-flow paths
+- File:
+  - `lib/Spirdo/Wesl/Emit.hs`
+- Change:
+  - added `freshIds2/3/4` and replaced sequential `freshId` calls in `emitIfFn`, `emitWhileFn`, `emitLoopFn`, `emitForFn`, `emitSwitchChainFn`, `emitMainFunction`
+- Verification:
+  - `cabal test`: pass
+  - 10-run bench sample: `458821.56`, `474577.64`, `466971.08`, `479909.4`, `454541.78`, `471567.88`, `472568.24`, `446104.26`, `448401.64`, `460213.74`
+  - median (10-run): `463592.41`
+- Result:
+  - regressed median; reverted.
