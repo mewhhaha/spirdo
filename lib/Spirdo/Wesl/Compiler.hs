@@ -15,9 +15,11 @@
 -- | Compiler pipeline and quasiquoter implementation.
 module Spirdo.Wesl.Compiler where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, catch, evaluate, throwIO, try)
+import Control.Concurrent (forkFinally)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.QSem (QSem, newQSem, signalQSem, waitQSem)
+import Control.Exception (SomeException, catch, evaluate, throwIO)
+import GHC.Conc (getNumCapabilities)
 import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE, withExceptT)
@@ -388,19 +390,23 @@ compileInlineCached opts src = do
         )
         (compileInlineResult opts False src)
 
-mapConcurrentlyIO :: (a -> IO b) -> [a] -> IO [b]
+mapConcurrentlyIO :: forall a b. (a -> IO b) -> [a] -> IO [b]
 mapConcurrentlyIO f xs = do
-  mvars <- mapM spawn xs
+  caps <- getNumCapabilities
+  sem <- newQSem (max 1 caps)
+  mvars <- mapM (spawn sem) xs
   results <- mapM takeMVar mvars
   case partitionEithers results of
     (err:_, _) -> throwIO err
     ([], vals) -> pure vals
   where
-    spawn x = do
+    spawn :: QSem -> a -> IO (MVar (Either SomeException b))
+    spawn sem x = do
       mv <- newEmptyMVar
-      _ <- forkIO $ do
-        res <- try @SomeException (f x)
+      waitQSem sem
+      _ <- forkFinally (f x) $ \res -> do
         putMVar mv res
+        signalQSem sem
       pure mv
 
 compileInlineCachedBatch :: CompileOptions -> [(String, String)] -> IO (Either String [(String, ByteString, ShaderInterface)])
@@ -421,14 +427,18 @@ compileInlineCachedBatch opts entries = do
     Just (_, err) -> pure (Left err)
     Nothing -> do
       let resultMap = Map.fromList [(i, v) | (i, Right v) <- results]
-      let ordered =
-            [ case Map.lookup ix resultMap of
-                Just v -> v
-                Nothing -> error "wesl: batch compile result missing"
+      let missing =
+            [ ix
             | ix <- [0 .. length entries - 1]
+            , Map.notMember ix resultMap
             ]
-      mapM_ writeCache ordered
-      pure (Right [(name, bytes, iface) | (name, _src, bytes, iface, _fromCache) <- ordered])
+      case missing of
+        ix:_ ->
+          pure (Left ("wesl: batch compile result missing at index " <> show ix))
+        [] -> do
+          let ordered = [resultMap Map.! ix | ix <- [0 .. length entries - 1]]
+          mapM_ writeCache ordered
+          pure (Right [(name, bytes, iface) | (name, _src, bytes, iface, _fromCache) <- ordered])
   where
     compileMiss o (ix, name, src) =
       case compileInlineResult o False src of

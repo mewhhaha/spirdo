@@ -137,6 +137,7 @@ CompileOptions helpers you’ll typically use (Reflection API):
 For faster iteration without changing the API:
 - Keep the cache on (default): `withCache True`.
 - Use `weslBatch`/`weslBatchWith` when you have many shaders in a single module.
+  Batch compilation runs in parallel; set `GHCRTS=-N` during build to use all cores.
 - Avoid diagnostics in hot loops (use `compile`/`wesl`, not the `*WithDiagnostics` variants).
 
 Set `withCacheVerbose True` to print basic timing output (cache read/write).
