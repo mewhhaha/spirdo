@@ -540,3 +540,16 @@ Focused on lexing and SPIR-V serialization hot spots.
   - post profile: `1085161.76` (profiling build)
 - Result:
   - regression on this run; reverted.
+
+### Attempt U (kept): lexer micro-allocations
+- Files:
+  - `lib/Spirdo/Wesl/Parser.hs`
+- Change:
+  - avoid `T.unpack` in hex underscore check
+  - delay `removeUnderscores` for integer digits until needed
+  - reuse single-character symbol `Text` via constants
+- Verification:
+  - `cabal bench`: time per compile `464452.44`
+  - `cabal bench --enable-profiling --benchmark-options='+RTS -p -RTS'`: `1075956.32`
+- Result:
+  - improvement vs last non-profiling run on this session.

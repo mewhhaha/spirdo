@@ -128,8 +128,35 @@ lexWesl = go (SrcPos 1 1)
         '^' -> True
         _ -> False
 
+    symbolText ch =
+      case ch of
+        '@' -> "@"
+        ':' -> ":"
+        '{' -> "{"
+        '}' -> "}"
+        '(' -> "("
+        ')' -> ")"
+        ';' -> ";"
+        ',' -> ","
+        '<' -> "<"
+        '>' -> ">"
+        '=' -> "="
+        '[' -> "["
+        ']' -> "]"
+        '+' -> "+"
+        '-' -> "-"
+        '*' -> "*"
+        '/' -> "/"
+        '.' -> "."
+        '%' -> "%"
+        '!' -> "!"
+        '&' -> "&"
+        '|' -> "|"
+        '^' -> "^"
+        _ -> T.singleton ch
+
     emit1 p ch rest =
-      let sym = T.singleton ch
+      let sym = symbolText ch
       in (Token (TkSymbol sym) p :) <$> go (advance p ch) rest
 
     advance2 p a = advance (advance p a)
@@ -169,8 +196,9 @@ lexWesl = go (SrcPos 1 1)
       case T.stripPrefix "0x" cs <|> T.stripPrefix "0X" cs of
         Just restHex ->
           let (hexRaw, rest) = T.span isHexDigitOrUnderscore restHex
-              pos' = advanceCols p (2 + T.length hexRaw)
-          in if all (== '_') (T.unpack hexRaw)
+              hexLen = T.length hexRaw
+              pos' = advanceCols p (2 + hexLen)
+          in if T.all (== '_') hexRaw
               then (TkInt 0 Nothing, restHex, p)
               else
                 let val = parseHexUnderscore hexRaw
@@ -178,37 +206,42 @@ lexWesl = go (SrcPos 1 1)
         Nothing ->
           let (intRaw, rest0) = T.span isDigitOrUnderscore cs
               intVal = parseDecUnderscore intRaw
-              intDigits = removeUnderscores intRaw
+              intRawLen = T.length intRaw
           in case T.uncons rest0 of
               Just ('.', r) ->
                 case T.uncons r of
                   Just (d, _rest1) | isDigit d ->
                     let (fracRaw, rest1) = T.span isDigitOrUnderscore r
                         fracDigits = removeUnderscores fracRaw
+                        intDigits = removeUnderscores intRaw
                         (expTxt, expRaw, rest2, okExp) = parseExponent rest1
                         numTxt = intDigits <> "." <> fracDigits <> expTxt
-                        consumedLen = T.length intRaw + 1 + T.length fracRaw + T.length expRaw
+                        consumedLen = intRawLen + 1 + T.length fracRaw + T.length expRaw
                         pos' = advanceCols p consumedLen
                     in if okExp
                         then applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest2 pos'
                         else
                           let floatTxt = intDigits <> "." <> fracDigits
-                              floatPos = advanceCols p (T.length intRaw + 1 + T.length fracRaw)
+                              floatPos = advanceCols p (intRawLen + 1 + T.length fracRaw)
                           in applySuffix (TkFloat (parseFloatText floatTxt) Nothing) rest1 floatPos
                   _ ->
                     let (expTxt, expRaw, rest1, okExp) = parseExponent rest0
-                        numTxt = intDigits <> expTxt
-                        pos' = advanceCols p (T.length intRaw + T.length expRaw)
+                        pos' = advanceCols p (intRawLen + T.length expRaw)
                     in if okExp
-                        then applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos'
-                        else applySuffix (TkInt intVal Nothing) rest0 (advanceCols p (T.length intRaw))
+                        then
+                          let intDigits = removeUnderscores intRaw
+                              numTxt = intDigits <> expTxt
+                          in applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos'
+                        else applySuffix (TkInt intVal Nothing) rest0 (advanceCols p intRawLen)
               _ ->
                 let (expTxt, expRaw, rest1, okExp) = parseExponent rest0
-                    numTxt = intDigits <> expTxt
-                    pos' = advanceCols p (T.length intRaw + T.length expRaw)
+                    pos' = advanceCols p (intRawLen + T.length expRaw)
                 in if okExp
-                    then applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos'
-                    else applySuffix (TkInt intVal Nothing) rest0 (advanceCols p (T.length intRaw))
+                    then
+                      let intDigits = removeUnderscores intRaw
+                          numTxt = intDigits <> expTxt
+                      in applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos'
+                    else applySuffix (TkInt intVal Nothing) rest0 (advanceCols p intRawLen)
       where
         isDigitOrUnderscore c = isDigit c || c == '_'
         isHexDigitOrUnderscore c = isHexDigit c || c == '_'
