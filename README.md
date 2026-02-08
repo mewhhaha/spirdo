@@ -89,7 +89,15 @@ in‑memory sources at compile time.
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 
-import Spirdo.Wesl.Reflection (Shader, SamplerBindingMode(..), Imports(..), spirv, import_, importsNil, wesl)
+import Spirdo.Wesl.Reflection
+  ( Shader
+  , SamplerBindingMode(..)
+  , Imports(..)
+  , spirv
+  , module_
+  , imports
+  , wesl
+  )
 
 somethingSrc :: String
 somethingSrc = "@const let FOO: f32 = 1.0;"
@@ -97,7 +105,7 @@ somethingSrc = "@const let FOO: f32 = 1.0;"
 shader :: Shader 'SamplerCombined iface
 shader =
   $(spirv
-      (import_ @"something" somethingSrc :> importsNil)
+      (imports <: module_ @"something" somethingSrc)
       [wesl|
         import something;
         @fragment fn main() -> @location(0) vec4<f32> { return vec4(FOO); }
@@ -710,7 +718,7 @@ Compile + quasiquote
 - `weslShader`, `weslShaderWith`
 - `weslShaderBatch`, `weslShaderBatchWith` (legacy aliases: `weslBatch*`)
 - `spirv`, `spirvWith`, `spirvNamed` (compile-time with inline imports)
-- `Import`, `Imports`, `importsNil`, `import_`, `importText`, `(:>)`
+- `Import`, `Imports`, `imports`, `importsNil`, `module_`, `moduleText`, `import_`, `importText`, `(:>)`, `(<:)`
 - `compile`, `compileWith`, `compileWithDiagnostics`
 - `compileFile`, `compileFileWith`, `compileFileWithDiagnostics`
 - `CompileOptions` + helpers (`withSamplerMode`, `withOverrides`, `withFeatures`, ...)

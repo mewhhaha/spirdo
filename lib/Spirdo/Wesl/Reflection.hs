@@ -97,9 +97,14 @@ module Spirdo.Wesl.Reflection
   , spirvNamed
   , Imports(..)
   , Import(..)
+  , Snoc
+  , imports
   , importsNil
   , import_
   , importText
+  , module_
+  , moduleText
+  , (<:)
   , normalizeModuleKey
   ) where
 

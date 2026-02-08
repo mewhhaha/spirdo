@@ -84,15 +84,15 @@ loadModuleGraphInline opts rootDir rootFile rootAst moduleMap = go Map.empty (Se
         Seq.EmptyL -> Right (Map.elems acc)
         (filePath, ast) Seq.:< queueRest -> do
           let pathSegs = modulePathFromFile rootDir filePath
-          imports <- resolveImportItemsInline opts rootDir filePath ast moduleMap
-          validateImportAliases imports
-          let node = ModuleNode filePath pathSegs ast imports
+          importItems <- resolveImportItemsInline opts rootDir filePath ast moduleMap
+          validateImportAliases importItems
+          let node = ModuleNode filePath pathSegs ast importItems
           let acc' = Map.insert filePath node acc
-          targets <- loadImportTargets acc' imports
+          targets <- loadImportTargets acc' importItems
           go acc' (queueRest <> Seq.fromList targets)
 
-    loadImportTargets acc' imports = do
-      let moduleFiles = Map.keys (Map.fromList [(imp.irModuleFile, ()) | imp <- imports])
+    loadImportTargets acc' importItems = do
+      let moduleFiles = Map.keys (Map.fromList [(imp.irModuleFile, ()) | imp <- importItems])
       targets <- sequence (map (loadOne acc') moduleFiles)
       pure (concat targets)
 
@@ -182,15 +182,15 @@ loadModuleGraph opts rootDir rootFile rootAst = runExceptT (go Map.empty (Seq.si
         Seq.EmptyL -> pure (Map.elems acc)
         (filePath, ast) Seq.:< queueRest -> do
           let pathSegs = modulePathFromFile rootDir filePath
-          imports <- ExceptT (resolveImportItems opts rootDir filePath ast)
-          liftEither (validateImportAliases imports)
-          let node = ModuleNode filePath pathSegs ast imports
+          importItems <- ExceptT (resolveImportItems opts rootDir filePath ast)
+          liftEither (validateImportAliases importItems)
+          let node = ModuleNode filePath pathSegs ast importItems
           let acc' = Map.insert filePath node acc
-          targets <- loadImportTargets opts acc' imports
+          targets <- loadImportTargets opts acc' importItems
           go acc' (queueRest <> Seq.fromList targets)
 
-    loadImportTargets opts' acc' imports = do
-      let moduleFiles = Map.keys (Map.fromList [(imp.irModuleFile, ()) | imp <- imports])
+    loadImportTargets opts' acc' importItems = do
+      let moduleFiles = Map.keys (Map.fromList [(imp.irModuleFile, ()) | imp <- importItems])
       results <- liftIO (mapM (loadOne opts' acc') moduleFiles)
       targets <- liftEither (sequence results)
       pure (concat targets)
@@ -206,10 +206,10 @@ loadModuleGraph opts rootDir rootFile rootAst = runExceptT (go Map.empty (Seq.si
     liftEither = either throwE pure
 
 validateImportAliases :: [ImportResolved] -> Either CompileError ()
-validateImportAliases imports =
-  let aliases = mapMaybe aliasFor imports
+validateImportAliases importItems =
+  let aliases = mapMaybe aliasFor importItems
       (dups, _) = foldl' collect ([], Set.empty) aliases
-      targets = map importTarget imports
+      targets = map importTarget importItems
       (dupTargets, _) = foldl' collect ([], Set.empty) targets
   in do
       unless (null dups) $

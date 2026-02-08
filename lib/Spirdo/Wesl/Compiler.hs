@@ -272,9 +272,9 @@ parseModuleMap opts modules =
         Right ast -> Right (path, ast)
 
 validateInlineImports :: FilePath -> Imports mods -> [ModuleNode] -> Either CompileError ()
-validateInlineImports rootName imports nodes = do
+validateInlineImports rootName importSet nodes = do
   let rootDir = takeDirectory rootName
-  let provided = importsNames imports
+  let provided = importsNames importSet
   let dupes = duplicates provided
   unless (null dupes) $
     Left (CompileError ("duplicate import modules: " <> showListComma dupes) Nothing Nothing)
@@ -314,13 +314,13 @@ validateInlineImports rootName imports nodes = do
     formatImportDelta label xs = " (" <> label <> ": " <> showListComma (sort xs) <> ")"
 
 compileInlineResultWithImports :: CompileOptions -> Bool -> FilePath -> Imports mods -> String -> Either CompileError CompileResult
-compileInlineResultWithImports opts wantDiagnostics rootName imports src = do
+compileInlineResultWithImports opts wantDiagnostics rootName importSet src = do
   let rootDir = takeDirectory rootName
   moduleAst0 <- parseModuleWith opts.enabledFeatures src
-  let importMap = normalizeImportsForRoot rootDir (importsMap imports)
+  let importMap = normalizeImportsForRoot rootDir (importsMap importSet)
   astMap <- parseModuleMap opts importMap
   (nodes, linked) <- resolveImportsInline opts rootName moduleAst0 astMap
-  validateInlineImports rootName imports nodes
+  validateInlineImports rootName importSet nodes
   linked' <- resolveTypeAliases linked
   let rootPath = modulePathFromFile rootDir rootName
   linked'' <- inferOverrideTypes rootPath rootDir linked'
@@ -516,12 +516,12 @@ spirvWith opts = spirvNamed opts "<inline>"
 
 -- | Compile inline WESL with imports and an explicit root name (compile-time).
 spirvNamed :: CompileOptions -> FilePath -> Imports mods -> String -> Q Exp
-spirvNamed opts rootName imports src = do
+spirvNamed opts rootName importSet src = do
   result <-
     either
       (fail . renderErrorWithSource (Just rootName) src)
       pure
-      (compileInlineResultWithImports opts False rootName imports src)
+      (compileInlineResultWithImports opts False rootName importSet src)
   preparedExpWith opts result.crSpirv result.crInterface result.crSource
 
 mapConcurrentlyIO :: forall a b. (a -> IO b) -> [a] -> IO [b]

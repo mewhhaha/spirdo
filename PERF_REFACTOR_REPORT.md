@@ -512,3 +512,14 @@ Focused on lexing and SPIR-V serialization hot spots.
   - `cabal bench`: time per compile `465183.42`
 - Result:
   - Improved vs prior run; still slightly above best median (~459k).
+
+### Attempt S (kept): avoid `imports` shadowing
+- Files:
+  - `lib/Spirdo/Wesl/Typecheck.hs`
+- Change:
+  - Renamed local `imports` bindings to `importItems` to avoid shadowing the new `imports` helper.
+- Verification:
+  - `cabal test`: pass
+  - `cabal bench`: time per compile `454429.36`
+- Result:
+  - Slight improvement vs prior run.

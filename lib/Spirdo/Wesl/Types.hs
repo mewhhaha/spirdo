@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 
 -- | Public type surface (re-exports of interface, layout, uniform packing).
@@ -22,9 +23,14 @@ module Spirdo.Wesl.Types
   , Option(..)
   , Imports(..)
   , Import(..)
+  , Snoc
+  , imports
   , importsNil
   , import_
   , importText
+  , module_
+  , moduleText
+  , (<:)
   , importsMap
   , importsNames
   , normalizeModuleKey
@@ -152,9 +158,17 @@ data Import (name :: Symbol) = Import
   , importSource :: !Text
   } deriving (Eq, Show, Read)
 
+type family Snoc (mods :: [k]) (x :: k) :: [k] where
+  Snoc '[] x = '[x]
+  Snoc (y ': ys) x = y ': Snoc ys x
+
 -- | Empty import set.
 importsNil :: Imports '[]
 importsNil = ImportsNil
+
+-- | Alias for 'importsNil' to read better in left-to-right DSLs.
+imports :: Imports '[]
+imports = ImportsNil
 
 -- | Add an import source using a type-level module name.
 import_ :: forall name. KnownSymbol name => String -> Import name
@@ -165,6 +179,23 @@ importText :: forall name. KnownSymbol name => Text -> Import name
 importText src =
   let key = normalizeModuleKey (symbolVal (Proxy @name))
   in Import key src
+
+-- | Alias for 'import_' to read like module declarations.
+module_ :: forall name. KnownSymbol name => String -> Import name
+module_ = import_
+
+-- | Alias for 'importText' to read like module declarations.
+moduleText :: forall name. KnownSymbol name => Text -> Import name
+moduleText = importText
+
+infixl 5 <:
+
+-- | Append a typed import to an import set (HList-style, left-to-right).
+(<:) :: Imports mods -> Import name -> Imports (Snoc mods name)
+imports0 <: import0 =
+  case imports0 of
+    ImportsNil -> import0 :> ImportsNil
+    imp :> rest -> imp :> (rest <: import0)
 
 -- | Normalize module keys for inline import maps.
 normalizeModuleKey :: String -> FilePath
