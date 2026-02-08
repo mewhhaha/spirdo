@@ -26,8 +26,12 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 
   let warp = vec2(sin(p.y * 3.0 + t) * 0.25, cos(p.x * 3.0 - t) * 0.25);
   let g = (p + warp) * 4.0;
-  let cx = step(0.5, fract(g.x));
-  let cy = step(0.5, fract(g.y));
+  let gx = fract(g.x);
+  let gy = fract(g.y);
+  let ax = fwidth(g.x) * 0.5;
+  let ay = fwidth(g.y) * 0.5;
+  let cx = smoothstep(0.5 - ax, 0.5 + ax, gx);
+  let cy = smoothstep(0.5 - ay, 0.5 + ay, gy);
   let checker = abs(cx - cy);
 
   let stripe = 0.5 + 0.5 * sin((p.x + p.y) * 6.0 - t * 2.0);

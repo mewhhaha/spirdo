@@ -40,9 +40,10 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   let f2 = 0.4 / (length(p - c2) + 0.05);
   let f3 = 0.35 / (length(p - c3) + 0.05);
   let field = f1 + f2 + f3;
+  let af = fwidth(field);
 
-  let blob = smoothstep(1.0, 1.6, field);
-  let rim = smoothstep(1.4, 1.6, field) - smoothstep(1.6, 1.8, field);
+  let blob = smoothstep(1.0 - af, 1.6 + af, field);
+  let rim = smoothstep(1.4 - af, 1.6 + af, field) - smoothstep(1.6 - af, 1.8 + af, field);
 
   let col = palette(field * 0.15) * (0.3 + blob * 0.9) + vec3(rim * 0.6, rim * 0.3, rim * 0.2);
   let vignette = smoothstep(1.3, 0.3, length(p));

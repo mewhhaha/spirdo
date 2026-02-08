@@ -33,11 +33,14 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   let t = params.time_res.x * 0.4;
 
   let r = length(p);
-  let angle = atan2(p.y, p.x) + r * 2.0 - t;
+  let ang = atan2(p.y, p.x);
+  let angle = ang + r * 2.0 - t;
   let swirl = sin(angle * 6.0 + r * 4.0 - t * 2.0);
   let band = smoothstep(0.2, 0.8, swirl * 0.5 + 0.5);
 
-  let col = palette(r + angle * 0.15 + t * 0.1) * (0.3 + band * 0.9);
+  let angVec = vec2(cos(ang), sin(ang));
+  let angWarp = dot(angVec, vec2(0.6, 0.8));
+  let col = palette(r + angWarp * 0.35 + t * 0.1) * (0.3 + band * 0.9);
   let vignette = smoothstep(1.2, 0.2, r);
 
   return vec4(col.x * vignette, col.y * vignette, col.z * vignette, 1.0) * params.color;

@@ -26,7 +26,8 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 
   let r = length(p);
   let ripple = sin(r * 25.0 - t * 4.0);
-  let rings = smoothstep(0.0, 1.0, 1.0 - abs(ripple));
+  let aa = max(fwidth(ripple), 0.002);
+  let rings = smoothstep(0.0, aa, 1.0 - abs(ripple));
   let caustic = pow(rings, 3.0);
 
   let base = mix(vec3(0.02, 0.05, 0.1), vec3(0.08, 0.16, 0.22), vec3(uv.y, uv.y, uv.y));
