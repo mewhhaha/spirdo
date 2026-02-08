@@ -37,6 +37,7 @@ New:
 - Bundle accessors: `shaderSpirv`, `shaderStage`, `shaderBindings`, `shaderVertexAttributes`,
   `shaderOverrides`, `shaderSamplerMode`, `shaderWorkgroupSize`
 - Full reflection: import `Spirdo.Wesl.Reflection` and keep using the old accessors.
+- New accessor: `shaderSource` returns the original source (name + text) when available.
 
 ## Quasiquoter
 - `wesl` / `weslWith` are now in `Spirdo.Wesl.Reflection`.

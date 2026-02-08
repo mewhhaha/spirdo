@@ -59,6 +59,7 @@ data CompileResult = CompileResult
   , crInterface :: !ShaderInterface
   , crSpirv :: !ByteString
   , crDiagnostics :: ![Diagnostic]
+  , crSource :: !(Maybe ShaderSource)
   }
 
 data SamplerModeProxy (mode :: SamplerBindingMode) where
@@ -74,7 +75,7 @@ withSamplerModeProxy mode k =
 compileToCompiled :: CompileOptions -> CompileResult -> SomeCompiledShader
 compileToCompiled opts result =
   withSamplerModeProxy opts.samplerBindingMode $ \(_ :: SamplerModeProxy mode) ->
-    SomeCompiledShader (CompiledShader @mode (result.crSpirv) (result.crInterface))
+    SomeCompiledShader (CompiledShader @mode (result.crSpirv) (result.crInterface) (result.crSource))
 
 withCompiled ::
   CompileOptions ->
@@ -95,7 +96,7 @@ compileWith overrides src =
   let opts = applyOptions overrides defaultCompileOptions
   in case src of
       SourceInline name text -> do
-        result <- first (annotateErrorWithSource (Just name) text) (compileInlineResult opts False text)
+        result <- first (annotateErrorWithSource (Just name) text) (compileInlineResult opts False name text)
         withCompiled opts result $ \shader -> do
           prep <- toCompileError (prepareShader shader)
           pure (SomeShader (shaderFromPrepared prep))
@@ -108,7 +109,7 @@ compileWithDiagnostics overrides src =
   let opts = applyOptions overrides defaultCompileOptions
   in case src of
       SourceInline name text -> do
-        result <- first (annotateErrorWithSource (Just name) text) (compileInlineResult opts True text)
+        result <- first (annotateErrorWithSource (Just name) text) (compileInlineResult opts True name text)
         withCompiled opts result $ \shader -> do
           prep <- toCompileError (prepareShader shader)
           pure (SomeShader (shaderFromPrepared prep), result.crDiagnostics)
@@ -148,7 +149,7 @@ prepareWesl = prepareWeslWith defaultCompileOptions
 -- | Compile inline WESL with explicit options (runtime).
 prepareWeslWith :: CompileOptions -> String -> Either CompileError SomePreparedShader
 prepareWeslWith opts src = do
-  result <- first (annotateErrorWithSource (Just "<inline>") src) (compileInlineResult opts False src)
+  result <- first (annotateErrorWithSource (Just "<inline>") src) (compileInlineResult opts False "<inline>" src)
   withCompiled opts result $ \shader -> do
     prep <- toCompileError (prepareShader shader)
     pure (SomePreparedShader prep)
@@ -156,7 +157,7 @@ prepareWeslWith opts src = do
 -- | Compile inline WESL with diagnostics (runtime).
 prepareWeslWithDiagnostics :: CompileOptions -> String -> Either CompileError (SomePreparedShader, [Diagnostic])
 prepareWeslWithDiagnostics opts src = do
-  result <- first (annotateErrorWithSource (Just "<inline>") src) (compileInlineResult opts True src)
+  result <- first (annotateErrorWithSource (Just "<inline>") src) (compileInlineResult opts True "<inline>" src)
   withCompiled opts result $ \shader -> do
     prep <- toCompileError (prepareShader shader)
     pure (SomePreparedShader prep, result.crDiagnostics)
@@ -185,8 +186,8 @@ prepareWeslFileWithDiagnostics opts path = do
       prep <- toCompileError (prepareShader shader)
       pure (SomePreparedShader prep, cr.crDiagnostics)
 
-compileInlineResult :: CompileOptions -> Bool -> String -> Either CompileError CompileResult
-compileInlineResult opts wantDiagnostics src = do
+compileInlineResult :: CompileOptions -> Bool -> FilePath -> String -> Either CompileError CompileResult
+compileInlineResult opts wantDiagnostics name src = do
   moduleAst0 <- parseModuleWith opts.enabledFeatures src
   moduleAst1 <- resolveTypeAliases moduleAst0
   moduleAst2 <- inferOverrideTypes [] "" moduleAst1
@@ -211,10 +212,11 @@ compileInlineResult opts wantDiagnostics src = do
     , crInterface = iface
     , crSpirv = spirv
     , crDiagnostics = diags
+    , crSource = Just (ShaderSource name (T.pack src))
     }
 
-compileInlineResultIO :: CompileOptions -> Bool -> String -> IO (Either CompileError CompileResult)
-compileInlineResultIO opts wantDiagnostics src = runExceptT $ do
+compileInlineResultIO :: CompileOptions -> Bool -> FilePath -> String -> IO (Either CompileError CompileResult)
+compileInlineResultIO opts wantDiagnostics name src = runExceptT $ do
   moduleAst0 <- ExceptT (timedPhase opts "parse" (evaluate (parseModuleWith opts.enabledFeatures src)))
   moduleAst1 <- ExceptT (timedPhase opts "type-aliases" (evaluate (resolveTypeAliases moduleAst0)))
   moduleAst2 <- ExceptT (timedPhase opts "infer-overrides" (evaluate (inferOverrideTypes [] "" moduleAst1)))
@@ -240,6 +242,7 @@ compileInlineResultIO opts wantDiagnostics src = runExceptT $ do
       , crInterface = iface
       , crSpirv = spirv
       , crDiagnostics = diagList
+      , crSource = Just (ShaderSource name (T.pack src))
       }
 
 compileFileResult :: CompileOptions -> Bool -> FilePath -> IO (Either CompileError CompileResult)
@@ -271,6 +274,7 @@ compileFileResult opts wantDiagnostics path =
       , crInterface = iface
       , crSpirv = spirv
       , crDiagnostics = diags
+      , crSource = Just (ShaderSource filePath (T.pack src))
       }
 
 weslCacheVersion :: String
@@ -371,13 +375,14 @@ weslWith opts =
 
 weslExpWith :: CompileOptions -> String -> Q Exp
 weslExpWith opts src = do
-  (bytes, iface) <- compileInlineCached opts src
-  preparedExpWith opts bytes iface
+  (bytes, iface, sourceInfo) <- compileInlineCached opts src
+  preparedExpWith opts bytes iface sourceInfo
 
-compileInlineCached :: CompileOptions -> String -> Q (ByteString, ShaderInterface)
+compileInlineCached :: CompileOptions -> String -> Q (ByteString, ShaderInterface, Maybe ShaderSource)
 compileInlineCached opts src = do
+  let sourceInfo = Just (ShaderSource "<inline>" (T.pack src))
   cached <- TH.runIO (timed opts "cache-read" (loadWeslCache opts src))
-  maybe compileFresh pure cached
+  maybe compileFresh (\(bytes, iface) -> pure (bytes, iface, sourceInfo)) cached
   where
     compileFresh =
       either
@@ -386,9 +391,9 @@ compileInlineCached opts src = do
             let bytes = result.crSpirv
                 iface = result.crInterface
             TH.runIO (timed opts "cache-write" (writeWeslCache opts src bytes iface))
-            pure (bytes, iface)
+            pure (bytes, iface, result.crSource)
         )
-        (compileInlineResult opts False src)
+        (compileInlineResult opts False "<inline>" src)
 
 mapConcurrentlyIO :: forall a b. (a -> IO b) -> [a] -> IO [b]
 mapConcurrentlyIO f xs = do
@@ -409,12 +414,12 @@ mapConcurrentlyIO f xs = do
         signalQSem sem
       pure mv
 
-compileInlineCachedBatch :: CompileOptions -> [(String, String)] -> IO (Either String [(String, ByteString, ShaderInterface)])
+compileInlineCachedBatch :: CompileOptions -> [(String, String)] -> IO (Either String [(String, ByteString, ShaderInterface, Maybe ShaderSource)])
 compileInlineCachedBatch opts entries = do
   let indexed = zip [0 :: Int ..] entries
   cached <- mapM (\(_, (_, src)) -> timed opts "cache-read" (loadWeslCache opts src)) indexed
   let hits =
-        [ (ix, Right (name, src, bytes, iface, True))
+        [ (ix, Right (name, src, bytes, iface, Just (ShaderSource name (T.pack src)), True))
         | ((ix, (name, src)), Just (bytes, iface)) <- zip indexed cached
         ]
   let misses =
@@ -438,25 +443,35 @@ compileInlineCachedBatch opts entries = do
         [] -> do
           let ordered = [resultMap Map.! ix | ix <- [0 .. length entries - 1]]
           mapM_ writeCache ordered
-          pure (Right [(name, bytes, iface) | (name, _src, bytes, iface, _fromCache) <- ordered])
+          pure (Right [(name, bytes, iface, sourceInfo) | (name, _src, bytes, iface, sourceInfo, _fromCache) <- ordered])
   where
     compileMiss o (ix, name, src) =
-      case compileInlineResult o False src of
-        Left err -> pure (ix, Left (renderErrorWithSource (Just "<inline>") src err))
+      case compileInlineResult o False name src of
+        Left err -> pure (ix, Left (renderErrorWithSource (Just name) src err))
         Right cr -> do
           let bytes = cr.crSpirv
               iface = cr.crInterface
           _ <- evaluate (BS.length bytes)
-          pure (ix, Right (name, src, bytes, iface, False))
+          pure (ix, Right (name, src, bytes, iface, cr.crSource, False))
 
-    writeCache (_name, src, bytes, iface, fromCache) =
+    writeCache (_name, src, bytes, iface, _sourceInfo, fromCache) =
       unless fromCache $
         timed opts "cache-write" (writeWeslCache opts src bytes iface)
 
-preparedExpWith :: CompileOptions -> ByteString -> ShaderInterface -> Q Exp
-preparedExpWith opts bytes iface = do
+preparedExpWith :: CompileOptions -> ByteString -> ShaderInterface -> Maybe ShaderSource -> Q Exp
+preparedExpWith opts bytes iface sourceInfo = do
   bytesExp <- bytesToExp bytes
   ifaceExp <- interfaceToExp iface
+  let sourceExp =
+        case sourceInfo of
+          Nothing -> TH.ConE 'Nothing
+          Just (ShaderSource name text) ->
+            TH.AppE
+              (TH.ConE 'Just)
+              ( TH.AppE
+                  (TH.AppE (TH.ConE 'ShaderSource) (TH.LitE (TH.StringL name)))
+                  (TH.AppE (TH.VarE 'T.pack) (TH.LitE (TH.StringL (T.unpack text))))
+              )
   ifaceTy <- either (fail . ("wesl: " <>)) pure (interfaceToType iface)
   let modeTy =
         case opts.samplerBindingMode of
@@ -468,7 +483,7 @@ preparedExpWith opts bytes iface = do
           ifaceTy
   let compiledExp =
         TH.SigE
-          (TH.AppE (TH.AppE (TH.ConE 'CompiledShader) bytesExp) ifaceExp)
+          (TH.AppE (TH.AppE (TH.AppE (TH.ConE 'CompiledShader) bytesExp) ifaceExp) sourceExp)
           compiledTy
   let prepExp = TH.AppE (TH.VarE 'unsafePrepareInline) compiledExp
   let shaderExp = TH.AppE (TH.VarE 'shaderFromPrepared) prepExp
@@ -486,8 +501,8 @@ weslBatchWith opts entries = do
     Left err -> fail err
     Right items -> fmap concat (mapM compileOne items)
   where
-    compileOne (nameStr, bytes, iface) = do
-      expr <- preparedExpWith opts bytes iface
+    compileOne (nameStr, bytes, iface, sourceInfo) = do
+      expr <- preparedExpWith opts bytes iface sourceInfo
       let name = TH.mkName nameStr
       pure [TH.ValD (TH.VarP name) (TH.NormalB expr) []]
 

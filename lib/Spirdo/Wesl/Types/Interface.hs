@@ -26,6 +26,7 @@ module Spirdo.Wesl.Types.Interface
   , preparedStage
   , preparedPlan
   , preparedVertexAttributes
+  , preparedSource
   , somePreparedSpirv
   , somePreparedInterface
   , stageIO
@@ -51,8 +52,10 @@ module Spirdo.Wesl.Types.Interface
   , OverrideInfo(..)
   , ShaderInterface(..)
   , specializableOverrides
+  , ShaderSource(..)
   , CompiledShader(..)
   , SomeCompiledShader(..)
+  , compiledSource
   , Shader(..)
   , SomeShader(..)
   , shaderFromPrepared
@@ -62,12 +65,14 @@ module Spirdo.Wesl.Types.Interface
   , shaderPlan
   , shaderStageCached
   , shaderVertexAttributes
+  , shaderSource
   ) where
 
 import Data.ByteString (ByteString)
 import Data.List (sortBy)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, mapMaybe)
+import Data.Text (Text)
 import Data.Word (Word32)
 import Data.Ord (comparing)
 import GHC.TypeLits (Symbol, Nat)
@@ -401,14 +406,25 @@ isStorageTextureKind kind =
 pushConstantLayout :: ShaderInterface -> Maybe TypeLayout
 pushConstantLayout iface = iface.siPushConstants
 
+-- | Original shader source text (name + text).
+data ShaderSource = ShaderSource
+  { sourceName :: !FilePath
+  , sourceText :: !Text
+  } deriving (Eq, Show, Read)
+
 -- | Compiled shader with a type-level interface description and sampler mode.
 data CompiledShader (mode :: SamplerBindingMode) (iface :: [Binding]) = CompiledShader
   { shaderSpirv :: ByteString
   , shaderInterface :: ShaderInterface
+  , shaderSource :: Maybe ShaderSource
   }
 
 -- | Existential wrapper for runtime compilation output.
 data SomeCompiledShader = forall mode iface. SomeCompiledShader (CompiledShader mode iface)
+
+-- | Original source for a compiled shader.
+compiledSource :: CompiledShader mode iface -> Maybe ShaderSource
+compiledSource (CompiledShader _ _ source) = source
 
 -- | Fully prepared shader with cached stage and binding plan.
 data Shader (mode :: SamplerBindingMode) (iface :: [Binding]) = Shader
@@ -417,6 +433,7 @@ data Shader (mode :: SamplerBindingMode) (iface :: [Binding]) = Shader
   , shaderStage :: ShaderStage
   , shaderPlan :: BindingPlan
   , shaderVertexAttributes :: Maybe [VertexAttribute]
+  , shaderSource :: Maybe ShaderSource
   }
 
 -- | Existential wrapper for shaders.
@@ -470,25 +487,33 @@ preparedPlan prep = prep.psPlan
 preparedVertexAttributes :: PreparedShader mode iface -> Maybe [VertexAttribute]
 preparedVertexAttributes prep = prep.psVertexAttributes
 
+-- | Original source for a prepared shader.
+preparedSource :: PreparedShader mode iface -> Maybe ShaderSource
+preparedSource prep = compiledSource prep.psShader
+
 -- | SPIR-V bytes for a shader.
 shaderSpirv :: Shader mode iface -> ByteString
-shaderSpirv (Shader spv _ _ _ _) = spv
+shaderSpirv (Shader spv _ _ _ _ _) = spv
 
 -- | Reflected interface for a shader.
 shaderInterface :: Shader mode iface -> ShaderInterface
-shaderInterface (Shader _ iface _ _ _) = iface
+shaderInterface (Shader _ iface _ _ _ _) = iface
 
 -- | Cached binding plan for a shader.
 shaderPlan :: Shader mode iface -> BindingPlan
-shaderPlan (Shader _ _ _ plan _) = plan
+shaderPlan (Shader _ _ _ plan _ _) = plan
 
 -- | Cached stage for a shader.
 shaderStageCached :: Shader mode iface -> ShaderStage
-shaderStageCached (Shader _ _ stage _ _) = stage
+shaderStageCached (Shader _ _ stage _ _ _) = stage
 
 -- | Cached vertex attributes for vertex shaders.
 shaderVertexAttributes :: Shader mode iface -> Maybe [VertexAttribute]
-shaderVertexAttributes (Shader _ _ _ _ attrs) = attrs
+shaderVertexAttributes (Shader _ _ _ _ attrs _) = attrs
+
+-- | Original source for a shader.
+shaderSource :: Shader mode iface -> Maybe ShaderSource
+shaderSource (Shader _ _ _ _ _ source) = source
 
 -- | Convert a prepared shader to the new shader record.
 shaderFromPrepared :: PreparedShader mode iface -> Shader mode iface
@@ -499,6 +524,7 @@ shaderFromPrepared prep =
     , shaderStage = preparedStage prep
     , shaderPlan = preparedPlan prep
     , shaderVertexAttributes = preparedVertexAttributes prep
+    , shaderSource = preparedSource prep
     }
 
 -- | Convert an existential prepared shader to a shader.

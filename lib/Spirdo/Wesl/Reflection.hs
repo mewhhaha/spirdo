@@ -14,6 +14,7 @@ module Spirdo.Wesl.Reflection
   , StageIO(..)
   , BindingPlan(..)
   , shaderStage
+  , ShaderSource(..)
   , Shader(..)
   , SomeShader(..)
   , shaderSpirv
@@ -21,6 +22,7 @@ module Spirdo.Wesl.Reflection
   , shaderPlan
   , shaderStageCached
   , shaderVertexAttributes
+  , shaderSource
   , UniformValue
   , ToUniform(..)
   , uniform

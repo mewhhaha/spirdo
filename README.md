@@ -670,7 +670,7 @@ Compile + quasiquote
 - `renderCompileError`, `renderCompileErrorWithSource` — helpers for error formatting
 
 Shader accessors + reflection
-- `shaderSpirv`, `shaderInterface`, `shaderPlan`, `shaderStageCached`, `shaderVertexAttributes`
+- `shaderSpirv`, `shaderInterface`, `shaderPlan`, `shaderStageCached`, `shaderVertexAttributes`, `shaderSource`
 - `shaderStage`, `vertexAttributes`, `pushConstantLayout`, `specializableOverrides`
 
 ### `Spirdo.Wesl.Uniform`
