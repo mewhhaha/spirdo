@@ -182,3 +182,35 @@ This keeps default builds fully validated while providing an opt-in path to stri
 - DONE: shorthand vector/matrix type names (`vec2f`, `vec3u`, `vec2h`, `mat2x2f`, etc.)
 - DONE: typed constructors with scalar splat (e.g., `vec4<f32>(1.0)` and `vec2h(1.0h)`)
 - DONE: constant expressions for array lengths and `@workgroup_size` (resolved during typecheck)
+
+## Pause Handoff (2026-02-06)
+### Current WIP (not yet fully validated)
+- Modified files:
+  - `lib/Spirdo/Wesl/Parser.hs`
+  - `lib/Spirdo/Wesl/Util.hs`
+  - `lib/Spirdo/Wesl/Emit.hs`
+  - `lib/Spirdo/Wesl/Emit/Encoding.hs`
+- Intent of current changes:
+  - parser/lexer speedups (remove `read`/`readHex` paths, faster numeric parsing)
+  - SPIR-V emission path switched to direct `[Word32] -> ByteString` via `spirvToBytes`
+
+### What I need to proceed
+1) Validate current WIP state:
+   - `cabal test`
+2) Benchmark current state (warm sample, then median):
+   - `for i in 1 2 3 4 5 6 7 8 9 10; do cabal bench 2>/dev/null | awk '/time per compile/ {print $5}'; done`
+3) Re-profile current state:
+   - `cabal bench --enable-profiling --benchmark-options='+RTS -p -RTS'`
+   - inspect `spirdo-compile-bench.prof` top hotspots
+4) Keep only improvements:
+   - if a step regresses median, revert that step before continuing
+
+### Last known baselines for comparison
+- Before latest parser+emit push (5-run): `530370.16, 564759.74, 533362.92, 512034.86, 541061.08`
+- After parser/lexer refactor (10-run sample): strong improvement (median around `470428`)
+- After SPIR-V emission refactor (10-run sample): further improvement (median around `459040`)
+
+### Acceptance criteria for next resume chunk
+- `cabal test` passes
+- bench median improves (or no worse) versus latest kept median
+- results appended to `PERF_REFACTOR_REPORT.md`

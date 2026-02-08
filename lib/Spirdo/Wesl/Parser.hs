@@ -12,13 +12,13 @@ module Spirdo.Wesl.Parser where
 
 import Control.Applicative ((<|>))
 import Control.Monad (unless, when)
-import Data.Char (isAlpha, isAlphaNum, isDigit, isHexDigit)
+import Data.Char (digitToInt, isAlpha, isAlphaNum, isDigit, isHexDigit)
 import Data.List (partition)
 import Data.Maybe (isJust)
-import Numeric (readHex)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Read as TR
 import Data.Word (Word32)
 import Spirdo.Wesl.Syntax
 import Spirdo.Wesl.Types
@@ -162,56 +162,57 @@ lexWesl = go (SrcPos 1 1)
 
     consumeIdent p cs =
       let (ident, rest) = T.span (\x -> isAlphaNum x || x == '_') cs
-          pos' = T.foldl' advance p ident
+          pos' = advanceCols p (T.length ident)
       in (ident, rest, pos')
 
     consumeNumber p cs =
       case T.stripPrefix "0x" cs <|> T.stripPrefix "0X" cs of
         Just restHex ->
           let (hexRaw, rest) = T.span isHexDigitOrUnderscore restHex
-              hexDigits = T.filter (/= '_') hexRaw
-              consumed = "0x" <> hexRaw
-              pos' = T.foldl' advance p consumed
-          in if T.null hexDigits
+              pos' = advanceCols p (2 + T.length hexRaw)
+          in if all (== '_') (T.unpack hexRaw)
               then (TkInt 0 Nothing, restHex, p)
               else
-                let val = case readHex (T.unpack hexDigits) of
-                      ((v, _):_) -> v
-                      _ -> 0
+                let val = parseHexUnderscore hexRaw
                 in applySuffix (TkInt val Nothing) rest pos'
         Nothing ->
           let (intRaw, rest0) = T.span isDigitOrUnderscore cs
-              intDigits = T.filter (/= '_') intRaw
+              intVal = parseDecUnderscore intRaw
+              intDigits = removeUnderscores intRaw
           in case T.uncons rest0 of
               Just ('.', r) ->
                 case T.uncons r of
                   Just (d, _rest1) | isDigit d ->
                     let (fracRaw, rest1) = T.span isDigitOrUnderscore r
-                        fracDigits = T.filter (/= '_') fracRaw
-                        (expTxt, rest2, okExp) = parseExponent rest1
+                        fracDigits = removeUnderscores fracRaw
+                        (expTxt, expRaw, rest2, okExp) = parseExponent rest1
                         numTxt = intDigits <> "." <> fracDigits <> expTxt
-                        consumed = intRaw <> "." <> fracRaw <> expTxt
-                        pos' = T.foldl' advance p consumed
+                        consumedLen = T.length intRaw + 1 + T.length fracRaw + T.length expRaw
+                        pos' = advanceCols p consumedLen
                     in if okExp
-                        then applySuffix (TkFloat (read (T.unpack numTxt)) Nothing) rest2 pos'
-                        else applySuffix (TkFloat (read (T.unpack (intDigits <> "." <> fracDigits))) Nothing) rest1 (T.foldl' advance p (intRaw <> "." <> fracRaw))
+                        then applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest2 pos'
+                        else
+                          let floatTxt = intDigits <> "." <> fracDigits
+                              floatPos = advanceCols p (T.length intRaw + 1 + T.length fracRaw)
+                          in applySuffix (TkFloat (parseFloatText floatTxt) Nothing) rest1 floatPos
                   _ ->
-                    let (expTxt, rest1, okExp) = parseExponent rest0
+                    let (expTxt, expRaw, rest1, okExp) = parseExponent rest0
                         numTxt = intDigits <> expTxt
-                        pos' = T.foldl' advance p (intRaw <> expTxt)
+                        pos' = advanceCols p (T.length intRaw + T.length expRaw)
                     in if okExp
-                        then applySuffix (TkFloat (read (T.unpack numTxt)) Nothing) rest1 pos'
-                        else applySuffix (TkInt (read (T.unpack intDigits)) Nothing) rest0 (T.foldl' advance p intRaw)
+                        then applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos'
+                        else applySuffix (TkInt intVal Nothing) rest0 (advanceCols p (T.length intRaw))
               _ ->
-                let (expTxt, rest1, okExp) = parseExponent rest0
+                let (expTxt, expRaw, rest1, okExp) = parseExponent rest0
                     numTxt = intDigits <> expTxt
-                    pos' = T.foldl' advance p (intRaw <> expTxt)
+                    pos' = advanceCols p (T.length intRaw + T.length expRaw)
                 in if okExp
-                    then applySuffix (TkFloat (read (T.unpack numTxt)) Nothing) rest1 pos'
-                    else applySuffix (TkInt (read (T.unpack intDigits)) Nothing) rest0 (T.foldl' advance p intRaw)
+                    then applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos'
+                    else applySuffix (TkInt intVal Nothing) rest0 (advanceCols p (T.length intRaw))
       where
         isDigitOrUnderscore c = isDigit c || c == '_'
         isHexDigitOrUnderscore c = isHexDigit c || c == '_'
+        removeUnderscores = T.filter (/= '_')
 
         applySuffix tok rest pos' =
           case T.uncons rest of
@@ -248,11 +249,29 @@ lexWesl = go (SrcPos 1 1)
                       Just (s, restSign) | s == '+' || s == '-' -> (T.singleton s, restSign)
                       _ -> ("", more)
                   (expRaw, rest2) = T.span isDigitOrUnderscore rest1
-                  expDigits = T.filter (/= '_') expRaw
+                  expDigits = removeUnderscores expRaw
+                  expHead = T.singleton e <> signTxt
               in if T.null expDigits
-                  then ("", rest, False)
-                  else (T.singleton e <> signTxt <> expDigits, rest2, True)
-            _ -> ("", rest, False)
+                  then ("", "", rest, False)
+                  else (expHead <> expDigits, expHead <> expRaw, rest2, True)
+            _ -> ("", "", rest, False)
+
+        parseDecUnderscore = T.foldl' step 0
+          where
+            step acc ch
+              | ch == '_' = acc
+              | otherwise = acc * 10 + fromIntegral (digitToInt ch)
+
+        parseHexUnderscore = T.foldl' step 0
+          where
+            step acc ch
+              | ch == '_' = acc
+              | otherwise = acc * 16 + fromIntegral (digitToInt ch)
+
+        parseFloatText txt =
+          case TR.double txt of
+            Right (v, rest) | T.null rest -> realToFrac v
+            _ -> 0
 
     consumeString p cs =
       let goStr acc pos' src' =
@@ -270,6 +289,9 @@ lexWesl = go (SrcPos 1 1)
     advance (SrcPos l c) ch
       | ch == '\n' = SrcPos (l + 1) 1
       | otherwise = SrcPos l (c + 1)
+
+    advanceCols (SrcPos l c) n = SrcPos l (c + n)
+
 
 parseModuleTokensWith :: FeatureSet -> [Token] -> Either CompileError ModuleAst
 parseModuleTokensWith feats toks =

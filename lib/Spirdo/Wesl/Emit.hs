@@ -17,8 +17,6 @@ module Spirdo.Wesl.Emit where
 import Control.Monad (foldM, unless, zipWithM_, when)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, xor)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString.Builder as BB
-import qualified Data.ByteString.Lazy as BSL
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Internal as BSI
@@ -34,7 +32,7 @@ import Data.Word (Word16, Word32)
 import GHC.Float (castFloatToWord32, castWord32ToFloat)
 import Language.Haskell.TH (Exp, Q)
 import qualified Language.Haskell.TH as TH
-import Spirdo.Wesl.Emit.Encoding (encodeString)
+import Spirdo.Wesl.Emit.Encoding (encodeString, spirvToBytes)
 import Spirdo.Wesl.Syntax
 import Spirdo.Wesl.Typecheck
 import Spirdo.Wesl.Types
@@ -1936,13 +1934,6 @@ encodeInstr (Instr opcode ops) =
   let wc = 1 + length ops
       first = (fromIntegral wc `shiftL` 16) .|. fromIntegral opcode
   in first : ops
-
-encodeInstrBuilder :: Instr -> BB.Builder
-encodeInstrBuilder (Instr opcode ops) =
-  let wc = 1 + length ops
-      first = (fromIntegral wc `shiftL` 16) .|. fromIntegral opcode
-  in BB.word32LE first <> foldMap BB.word32LE ops
-{-# INLINE encodeInstrBuilder #-}
 
 -- Minimal subset of opcodes and enums
 
@@ -7591,14 +7582,10 @@ boolResultLayout n =
 
 buildSpirvBytes :: CompileOptions -> EntryPoint -> GenState -> ByteString
 buildSpirvBytes opts entry st =
-  BSL.toStrict (BB.toLazyByteString (header <> body))
+  spirvToBytes (header <> body)
   where
     header =
-      BB.word32LE 0x07230203
-        <> BB.word32LE opts.spirvVersion
-        <> BB.word32LE 0
-        <> BB.word32LE st.gsNextId
-        <> BB.word32LE 0
+      [0x07230203, opts.spirvVersion, 0, st.gsNextId, 0]
 
     entryPointInstr =
       case st.gsEntryPoint of
@@ -7610,7 +7597,7 @@ buildSpirvBytes opts entry st =
                 StageFragment -> executionModelFragment
                 StageVertex -> executionModelVertex
               operands = model : epId : nameWords <> st.gsInterfaceIds
-          in encodeInstrBuilder (Instr opEntryPoint operands)
+          in encodeInstr (Instr opEntryPoint operands)
 
     execModeInstr =
       case st.gsEntryPoint of
@@ -7622,28 +7609,28 @@ buildSpirvBytes opts entry st =
                 Nothing -> mempty
                 Just (WorkgroupSizeValue (x, y, z)) ->
                   let ops = [epId, executionModeLocalSize, x, y, z]
-                  in encodeInstrBuilder (Instr opExecutionMode ops)
+                  in encodeInstr (Instr opExecutionMode ops)
                 Just (WorkgroupSizeExpr _) -> mempty
             StageFragment ->
-              encodeInstrBuilder (Instr opExecutionMode [epId, executionModeOriginUpperLeft])
+              encodeInstr (Instr opExecutionMode [epId, executionModeOriginUpperLeft])
             StageVertex -> mempty
 
     capInstrs =
-      foldMap (\cap -> encodeInstrBuilder (Instr opCapability [cap])) (capabilityShader : st.gsCapabilities)
+      concatMap (\cap -> encodeInstr (Instr opCapability [cap])) (capabilityShader : st.gsCapabilities)
 
     body =
       mconcat
         [ capInstrs
-        , foldMap encodeInstrBuilder (reverse st.gsExtInstImports)
-        , encodeInstrBuilder (Instr opMemoryModel [addressingLogical, memoryModelGLSL450])
+        , concatMap encodeInstr (reverse st.gsExtInstImports)
+        , encodeInstr (Instr opMemoryModel [addressingLogical, memoryModelGLSL450])
         , entryPointInstr
         , execModeInstr
-        , foldMap encodeInstrBuilder (reverse st.gsNames)
-        , foldMap encodeInstrBuilder (reverse st.gsDecorations)
-        , foldMap encodeInstrBuilder (reverse st.gsTypes)
-        , foldMap encodeInstrBuilder (reverse st.gsConstants)
-        , foldMap encodeInstrBuilder (reverse st.gsGlobals)
-        , foldMap encodeInstrBuilder (reverse st.gsFunctions)
+        , concatMap encodeInstr (reverse st.gsNames)
+        , concatMap encodeInstr (reverse st.gsDecorations)
+        , concatMap encodeInstr (reverse st.gsTypes)
+        , concatMap encodeInstr (reverse st.gsConstants)
+        , concatMap encodeInstr (reverse st.gsGlobals)
+        , concatMap encodeInstr (reverse st.gsFunctions)
         ]
 
 emitVoidType :: GenState -> (Word32, GenState)

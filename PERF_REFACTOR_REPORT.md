@@ -357,3 +357,91 @@ Profiled current state and applied targeted refactors with test+bench after each
   - `ReadP (<|>)`: `6.8% time`
   - `toLazyByteStringWith`: `6.8% time`
   - `lookup` dropped out of top hotspot list
+
+## Parser + SPIR-V Emission Pass (profiling-driven)
+Focused on lexing and SPIR-V serialization hot spots.
+
+### Step D (kept): lexer numeric parsing without `read` / `readHex`
+- Files:
+  - `lib/Spirdo/Wesl/Parser.hs`
+  - `lib/Spirdo/Wesl/Util.hs`
+- Change:
+  - replaced numeric parsing with direct folds + `Data.Text.Read.double`
+  - reduced position updates for identifier/number scanning
+  - removed `read`/`readHex` from the hot lexing path
+- Verification:
+  - `cabal test`: pass
+  - 10-run bench sample: `665181.92`, `590151.38`, `618713.4`, `446265.46`, `527735.56`, `462773.36`, `478082.68`, `462086.96`, `457953.58`, `457448.18`
+  - median (10-run): `470428`
+
+### Step E (kept): SPIR-V output assembled as `[Word32]` + `spirvToBytes`
+- Files:
+  - `lib/Spirdo/Wesl/Emit.hs`
+- Change:
+  - removed `Builder` assembly in `buildSpirvBytes`
+  - emit `[Word32]` stream with `encodeInstr`, then `spirvToBytes`
+- Verification:
+  - `cabal test`: pass
+  - 10-run bench sample: `454379.62`, `455758.62`, `450110.64`, `450192.44`, `453696.02`, `462321.78`, `491629.38`, `496939.36`, `467825.34`, `467240.54`
+  - median (10-run): `459040`
+
+### Step F (kept): `spirvToBytes` direct strict encoding
+- Files:
+  - `lib/Spirdo/Wesl/Emit/Encoding.hs`
+- Change:
+  - replaced `Builder`-based encoding with `unsafeCreate` + little-endian writes
+- Verification:
+  - `cabal test`: pass
+  - 10-run bench sample: `449698.04`, `442022.74`, `446689.1`, `438299.22`, `466971.68`, `443124.18`, `444150.76`, `442578.6`, `442620.02`, `434428.34`
+  - median (10-run): `442872`
+  - note: this is the current best median after Step E + Step F combined
+
+### Attempt G (rejected): faster `parseTypedScalarSuffix` + `consumeLine`
+- Files:
+  - `lib/Spirdo/Wesl/Util.hs`
+  - `lib/Spirdo/Wesl/Parser.hs`
+- Result:
+  - regressed median; reverted to prior behavior.
+  - sample (10-run) with change: `439998.62`, `470882.98`, `452326.94`, `454542.12`, `455954.3`, `450170.96`, `446388.38`, `439068.24`, `458920.3`, `446844.18`
+  - median: `451249`
+
+### Attempt H (rejected): `freshId` INLINE
+- File:
+  - `lib/Spirdo/Wesl/Emit.hs`
+- Result:
+  - 10-run sample: `443196.76`, `450005.48`, `447035.12`, `456653.42`, `441844.76`, `450916.08`, `454856.26`, `482680.38`, `448424.1`, `450850.1`
+  - median: `450428`
+
+### Attempt I (rejected): guard `parseTypedScalarSuffix` at parseType call site
+- File:
+  - `lib/Spirdo/Wesl/Parser.hs`
+- Result:
+  - 10-run sample: `496909.26`, `464149.74`, `452002.24`, `451233.86`, `455188.62`, `449249.88`, `448233.3`, `469945.7`, `450790.86`, `451211.26`
+  - median: `451618`
+
+### Attempt J (rejected): prefilter `parseVectorCtorName`/`parseMatrixCtorName` by prefix
+- File:
+  - `lib/Spirdo/Wesl/Util.hs`
+- Result:
+  - 10-run sample: `440036.14`, `441909.34`, `466979.3`, `456608.2`, `442550.32`, `452093.44`, `440993.72`, `465643.32`, `446418.68`, `478245.22`
+  - median: `449256`
+
+### Attempt K (rejected): whitespace chunk skipping in lexer
+- File:
+  - `lib/Spirdo/Wesl/Parser.hs`
+- Result:
+  - 10-run sample: `446599.04`, `470129.64`, `448442.22`, `451615.8`, `457102.16`, `457186.76`, `447093.84`, `439598.7`, `450443.62`, `449977.4`
+  - median: `450211`
+
+### Attempt L (rejected): direct SPIR-V emission into ByteString buffer
+- File:
+  - `lib/Spirdo/Wesl/Emit.hs`
+- Result:
+  - 10-run sample: `446727.1`, `453967.04`, `471108.3`, `456816.6`, `474287.08`, `452225.24`, `442329.54`, `441713.34`, `458310.62`, `452821.24`
+  - median: `453394`
+
+### Attempt M (rejected): drop `<...>` handling in `parseTypedScalarSuffix`
+- File:
+  - `lib/Spirdo/Wesl/Util.hs`
+- Result:
+  - tests failed (`vec4<f32>` typed constructor not recognized); reverted.

@@ -3,14 +3,27 @@ module Spirdo.Wesl.Emit.Encoding
   , encodeString
   ) where
 
-import Data.Bits ((.&.), (.|.), shiftL)
+import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString.Builder as BB
-import qualified Data.ByteString.Lazy as BSL
-import Data.Word (Word32)
+import qualified Data.ByteString.Internal as BSI
+import Data.Word (Word32, Word8)
+import Foreign.Storable (pokeByteOff)
 
 spirvToBytes :: [Word32] -> ByteString
-spirvToBytes words32 = BSL.toStrict (BB.toLazyByteString (foldMap BB.word32LE words32))
+spirvToBytes words32 =
+  BSI.unsafeCreate (length words32 * 4) $ \ptr -> go ptr 0 words32
+  where
+    go _ _ [] = pure ()
+    go ptr off (w:ws) = do
+      pokeWord32LE ptr off w
+      go ptr (off + 4) ws
+
+    pokeWord32LE ptr off w = do
+      pokeByteOff ptr off (fromIntegral (w .&. 0xFF) :: Word8)
+      pokeByteOff ptr (off + 1) (fromIntegral ((w `shiftR` 8) .&. 0xFF) :: Word8)
+      pokeByteOff ptr (off + 2) (fromIntegral ((w `shiftR` 16) .&. 0xFF) :: Word8)
+      pokeByteOff ptr (off + 3) (fromIntegral ((w `shiftR` 24) .&. 0xFF) :: Word8)
+{-# INLINE spirvToBytes #-}
 
 encodeString :: String -> [Word32]
 encodeString = go 0 0

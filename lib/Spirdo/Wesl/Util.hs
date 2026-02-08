@@ -55,7 +55,7 @@ module Spirdo.Wesl.Util
   ) where
 
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
-import Data.Char (isAlphaNum, isDigit)
+import Data.Char (digitToInt, isAlphaNum, isDigit)
 import Data.Int (Int32)
 import Data.List (isInfixOf, isPrefixOf)
 import Data.Maybe (fromMaybe, listToMaybe)
@@ -402,22 +402,39 @@ parseScalarSuffixChar ch =
 
 parseMatrixName :: Text -> Maybe (Int, Int)
 parseMatrixName name =
-  case T.unpack name of
+  case name of
     "mat2" -> Just (2, 2)
     "mat3" -> Just (3, 3)
     "mat4" -> Just (4, 4)
     _ ->
-      case T.unpack name of
-        'm':'a':'t':rest ->
-          let (a, rest1) = span isDigit rest
-          in case rest1 of
-               ('x':rest2) ->
-                 let (b, rest3) = span isDigit rest2
-                 in if null a || null b || not (null rest3)
-                      then Nothing
-                      else Just (read a, read b)
+      case T.stripPrefix "mat" name of
+        Nothing -> Nothing
+        Just rest ->
+          let (colsTxt, afterCols) = T.span isDigit rest
+          in case T.uncons afterCols of
+               Just ('x', rowsPart) ->
+                 let (rowsTxt, extra) = T.span isDigit rowsPart
+                 in do
+                      guardNonEmpty colsTxt
+                      guardNonEmpty rowsTxt
+                      if T.null extra
+                        then do
+                          cols <- parseDecTxt colsTxt
+                          rows <- parseDecTxt rowsTxt
+                          pure (cols, rows)
+                        else Nothing
                _ -> Nothing
-        _ -> Nothing
+  where
+    guardNonEmpty txt =
+      if T.null txt then Nothing else Just ()
+
+    parseDecTxt = T.foldl' step (Just 0)
+      where
+        step Nothing _ = Nothing
+        step (Just acc) ch =
+          if isDigit ch
+            then Just (acc * 10 + digitToInt ch)
+            else Nothing
 
 selectIntLiteralScalar :: Integer -> Either CompileError (Scalar, Integer)
 selectIntLiteralScalar n =
