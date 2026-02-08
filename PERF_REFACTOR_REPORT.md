@@ -523,3 +523,20 @@ Focused on lexing and SPIR-V serialization hot spots.
   - `cabal bench`: time per compile `454429.36`
 - Result:
   - Slight improvement vs prior run.
+
+### Attempt T (reverted): low-risk allocation trims
+- Files:
+  - `lib/Spirdo/Wesl/Emit.hs`
+  - `lib/Spirdo/Wesl/Compiler.hs`
+  - `lib/Spirdo/Wesl/Typecheck.hs`
+- Change:
+  - replaced `zip [0..]` member loops with indexed folds
+  - removed tuple allocation in `weslCacheKey` hashing
+  - de-duped import targets via `Set` fold
+- Verification:
+  - pre bench: `484895.6`
+  - post bench: `506064.42`
+  - pre profile: `1047202.02` (profiling build)
+  - post profile: `1085161.76` (profiling build)
+- Result:
+  - regression on this run; reverted.

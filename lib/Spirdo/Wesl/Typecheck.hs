@@ -152,9 +152,10 @@ resolveImportItemInline opts rootDir moduleFile moduleMap decl item = do
 
 findModuleInline :: Map.Map FilePath ModuleAst -> FilePath -> Maybe FilePath
 findModuleInline moduleMap base =
-  case Map.lookup base moduleMap of
-    Just _ -> Just base
-    Nothing -> Nothing
+  let key = normalizeModuleKey base
+  in case Map.lookup key moduleMap of
+      Just _ -> Just key
+      Nothing -> Nothing
 
 moduleHasItemInline :: Map.Map FilePath ModuleAst -> FilePath -> Text -> Bool
 moduleHasItemInline moduleMap moduleBase itemName =

@@ -4,6 +4,7 @@
 module Examples.Fragments
   ( fragmentGradientBloomShader
   , fragmentCirclePulseShader
+  , fragmentInlineImportsShader
   , fragmentSpectrumShiftShader
   , fragmentSineWavesShader
   , fragmentCheckerWarpShader
@@ -19,6 +20,7 @@ module Examples.Fragments
 import Examples.Fragments.CheckerWarp (fragmentCheckerWarpShader)
 import Examples.Fragments.CirclePulse (fragmentCirclePulseShader)
 import Examples.Fragments.GradientBloom (fragmentGradientBloomShader)
+import Examples.Fragments.InlineImports (fragmentInlineImportsShader)
 import Examples.Fragments.Kaleidoscope (fragmentKaleidoscopeShader)
 import Examples.Fragments.Metaballs (fragmentMetaballsShader)
 import Examples.Fragments.NoiseFlow (fragmentNoiseFlowShader)

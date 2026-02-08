@@ -33,6 +33,8 @@ cabal run
 The demo uses the Slop SDL3 renderer (`slop` dependency) and requires SDL3 to be
 installed. Use left/right arrow keys to cycle fragment shader variants in the
 demo window.
+The demo includes an Inline Imports variant built with `spirv` to show
+compile-time module linking.
 
 Set `SPIRDO_WRITE_SPV=1` to emit SPIR-V files (`fragment-*.spv`, `vertex*.spv`,
 `compute*.spv`) for inspection (run from `examples/`).
@@ -107,13 +109,14 @@ shader =
   $(spirv
       (imports <: module_ @"something" somethingSrc)
       [wesl|
-        import something;
+        import something::FOO;
         @fragment fn main() -> @location(0) vec4<f32> { return vec4(FOO); }
       |]
    )
 ```
 Note: the import list must match the modules used by the source (extra or
 missing entries are errors).
+Chain `(<:)` to add more inline modules.
 
 ## Example Usage (Runtime Compile)
 ```hs

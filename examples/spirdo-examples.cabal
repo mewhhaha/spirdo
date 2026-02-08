@@ -19,6 +19,7 @@ executable spirdo-demo
         Examples.Fragments.CheckerWarp
         Examples.Fragments.CirclePulse
         Examples.Fragments.GradientBloom
+        Examples.Fragments.InlineImports
         Examples.Fragments.Kaleidoscope
         Examples.Fragments.Metaballs
         Examples.Fragments.NoiseFlow
