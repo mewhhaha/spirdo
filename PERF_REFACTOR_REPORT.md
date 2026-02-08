@@ -499,3 +499,16 @@ Focused on lexing and SPIR-V serialization hot spots.
   - `cabal bench`: time per compile `485205.54`
 - Result:
   - Slight regression vs best median (~459k), but within recent single-run noise.
+
+### Attempt R (kept): HList-style inline imports
+- Files:
+  - `lib/Spirdo/Wesl/Types.hs`
+  - `lib/Spirdo/Wesl/Reflection.hs`
+  - `README.md`
+- Change:
+  - Switched `Imports` to a GADT with `:>` constructor and `Import` specs for HList-style composition.
+- Verification:
+  - `cabal test`: pass
+  - `cabal bench`: time per compile `465183.42`
+- Result:
+  - Improved vs prior run; still slightly above best median (~459k).

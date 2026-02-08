@@ -1,4 +1,6 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeOperators #-}
 
 -- | Public type surface (re-exports of interface, layout, uniform packing).
 module Spirdo.Wesl.Types
@@ -19,6 +21,7 @@ module Spirdo.Wesl.Types
   , CachePolicy(..)
   , Option(..)
   , Imports(..)
+  , Import(..)
   , importsNil
   , import_
   , importText
@@ -139,24 +142,29 @@ data Source
   deriving (Eq, Show, Read)
 
 -- | Inline import sources keyed by module name.
-data Imports (mods :: [Symbol]) = Imports
-  { importsMap :: !(Map.Map FilePath Text)
-  , importsNames :: ![FilePath]
+data Imports (mods :: [Symbol]) where
+  ImportsNil :: Imports '[]
+  (:>) :: Import name -> Imports mods -> Imports (name ': mods)
+
+-- | A single inline import source.
+data Import (name :: Symbol) = Import
+  { importKey :: !FilePath
+  , importSource :: !Text
   } deriving (Eq, Show, Read)
 
 -- | Empty import set.
 importsNil :: Imports '[]
-importsNil = Imports Map.empty []
+importsNil = ImportsNil
 
 -- | Add an import source using a type-level module name.
-import_ :: forall name mods. KnownSymbol name => String -> Imports mods -> Imports (name ': mods)
+import_ :: forall name. KnownSymbol name => String -> Import name
 import_ src = importText @name (T.pack src)
 
 -- | Add an import source using a type-level module name and 'Text'.
-importText :: forall name mods. KnownSymbol name => Text -> Imports mods -> Imports (name ': mods)
-importText src (Imports mp names) =
+importText :: forall name. KnownSymbol name => Text -> Import name
+importText src =
   let key = normalizeModuleKey (symbolVal (Proxy @name))
-  in Imports (Map.insert key src mp) (key : names)
+  in Import key src
 
 -- | Normalize module keys for inline import maps.
 normalizeModuleKey :: String -> FilePath
@@ -177,11 +185,20 @@ normalizeModuleKey raw =
 
 -- | Access the import source map.
 importsMap :: Imports mods -> Map.Map FilePath Text
-importsMap = (.importsMap)
+importsMap = go Map.empty
+  where
+    go :: Map.Map FilePath Text -> Imports mods' -> Map.Map FilePath Text
+    go acc ImportsNil = acc
+    go acc (Import key src :> rest) =
+      go (Map.insert key src acc) rest
 
 -- | Access import names in insertion order.
 importsNames :: Imports mods -> [FilePath]
-importsNames = reverse . (.importsNames)
+importsNames = go
+  where
+    go :: Imports mods' -> [FilePath]
+    go ImportsNil = []
+    go (Import key _ :> rest) = key : go rest
 
 -- | Cache configuration for the compile pipeline.
 data CachePolicy

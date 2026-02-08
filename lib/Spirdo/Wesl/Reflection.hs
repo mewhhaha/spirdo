@@ -96,6 +96,7 @@ module Spirdo.Wesl.Reflection
   , spirvWith
   , spirvNamed
   , Imports(..)
+  , Import(..)
   , importsNil
   , import_
   , importText
