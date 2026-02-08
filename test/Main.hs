@@ -24,7 +24,6 @@ import System.Process (readProcessWithExitCode)
 import Test.QuickCheck (Gen, arbitrary, generate)
 
 import Spirdo.Wesl.Reflection
-import Spirdo.Wesl.Uniform
 import Spirdo.Wesl.Inputs
   ( SamplerHandle(..)
   , TextureHandle(..)
