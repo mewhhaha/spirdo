@@ -15,7 +15,9 @@
 -- | Compiler pipeline and quasiquoter implementation.
 module Spirdo.Wesl.Compiler where
 
-import Control.Exception (SomeException, catch, evaluate)
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (SomeException, catch, evaluate, throwIO, try)
 import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE, withExceptT)
@@ -24,6 +26,7 @@ import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char (isSpace, ord)
+import Data.Either (partitionEithers)
 import Data.List (isPrefixOf)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -385,6 +388,61 @@ compileInlineCached opts src = do
         )
         (compileInlineResult opts False src)
 
+mapConcurrentlyIO :: (a -> IO b) -> [a] -> IO [b]
+mapConcurrentlyIO f xs = do
+  mvars <- mapM spawn xs
+  results <- mapM takeMVar mvars
+  case partitionEithers results of
+    (err:_, _) -> throwIO err
+    ([], vals) -> pure vals
+  where
+    spawn x = do
+      mv <- newEmptyMVar
+      _ <- forkIO $ do
+        res <- try @SomeException (f x)
+        putMVar mv res
+      pure mv
+
+compileInlineCachedBatch :: CompileOptions -> [(String, String)] -> IO (Either String [(String, ByteString, ShaderInterface)])
+compileInlineCachedBatch opts entries = do
+  let indexed = zip [0 :: Int ..] entries
+  cached <- mapM (\(_, (_, src)) -> timed opts "cache-read" (loadWeslCache opts src)) indexed
+  let hits =
+        [ (ix, Right (name, src, bytes, iface, True))
+        | ((ix, (name, src)), Just (bytes, iface)) <- zip indexed cached
+        ]
+  let misses =
+        [ (ix, name, src)
+        | ((ix, (name, src)), Nothing) <- zip indexed cached
+        ]
+  missResults <- mapConcurrentlyIO (compileMiss opts) misses
+  let results = hits ++ missResults
+  case Map.lookupMin (Map.fromList [(ix, err) | (ix, Left err) <- results]) of
+    Just (_, err) -> pure (Left err)
+    Nothing -> do
+      let resultMap = Map.fromList [(i, v) | (i, Right v) <- results]
+      let ordered =
+            [ case Map.lookup ix resultMap of
+                Just v -> v
+                Nothing -> error "wesl: batch compile result missing"
+            | ix <- [0 .. length entries - 1]
+            ]
+      mapM_ writeCache ordered
+      pure (Right [(name, bytes, iface) | (name, _src, bytes, iface, _fromCache) <- ordered])
+  where
+    compileMiss o (ix, name, src) =
+      case compileInlineResult o False src of
+        Left err -> pure (ix, Left (renderErrorWithSource (Just "<inline>") src err))
+        Right cr -> do
+          let bytes = cr.crSpirv
+              iface = cr.crInterface
+          _ <- evaluate (BS.length bytes)
+          pure (ix, Right (name, src, bytes, iface, False))
+
+    writeCache (_name, src, bytes, iface, fromCache) =
+      unless fromCache $
+        timed opts "cache-write" (writeWeslCache opts src bytes iface)
+
 preparedExpWith :: CompileOptions -> ByteString -> ShaderInterface -> Q Exp
 preparedExpWith opts bytes iface = do
   bytesExp <- bytesToExp bytes
@@ -412,10 +470,13 @@ weslBatch = weslBatchWith defaultCompileOptions
 
 -- | Compile multiple inline WESL shaders with explicit options.
 weslBatchWith :: CompileOptions -> [(String, String)] -> Q [TH.Dec]
-weslBatchWith opts entries = fmap concat (mapM compileOne entries)
+weslBatchWith opts entries = do
+  compiled <- TH.runIO (compileInlineCachedBatch opts entries)
+  case compiled of
+    Left err -> fail err
+    Right items -> fmap concat (mapM compileOne items)
   where
-    compileOne (nameStr, src) = do
-      (bytes, iface) <- compileInlineCached opts src
+    compileOne (nameStr, bytes, iface) = do
       expr <- preparedExpWith opts bytes iface
       let name = TH.mkName nameStr
       pure [TH.ValD (TH.VarP name) (TH.NormalB expr) []]
