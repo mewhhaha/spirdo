@@ -4,10 +4,10 @@
 -- | Example fragment shader: Checker Warp.
 module Examples.Fragments.CheckerWarp (fragmentCheckerWarpShader) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 fragmentCheckerWarpShader =
-      [wesl|
+      [weslShader|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;

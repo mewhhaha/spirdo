@@ -4,10 +4,10 @@
 -- | Example fragment shader: Metaballs.
 module Examples.Fragments.Metaballs (fragmentMetaballsShader) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 fragmentMetaballsShader =
-      [wesl|
+      [weslShader|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;

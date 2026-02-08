@@ -4,10 +4,10 @@
 -- | Example fragment shader: Noise Flow.
 module Examples.Fragments.NoiseFlow (fragmentNoiseFlowShader) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 fragmentNoiseFlowShader =
-      [wesl|
+      [weslShader|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;

@@ -68,6 +68,112 @@ resolveImports opts rootFile rootAst = runExceptT $ do
   where
     liftEither = either throwE pure
 
+-- | Resolve imports for inline modules using an in-memory module map.
+resolveImportsInline :: CompileOptions -> FilePath -> ModuleAst -> Map.Map FilePath ModuleAst -> Either CompileError ([ModuleNode], ModuleAst)
+resolveImportsInline opts rootFile rootAst moduleMap = do
+  let rootDir = takeDirectory rootFile
+  graph <- loadModuleGraphInline opts rootDir rootFile rootAst moduleMap
+  linked <- linkModules opts rootFile rootDir graph
+  pure (graph, linked)
+
+loadModuleGraphInline :: CompileOptions -> FilePath -> FilePath -> ModuleAst -> Map.Map FilePath ModuleAst -> Either CompileError [ModuleNode]
+loadModuleGraphInline opts rootDir rootFile rootAst moduleMap = go Map.empty (Seq.singleton (rootFile, rootAst))
+  where
+    go acc queue =
+      case Seq.viewl queue of
+        Seq.EmptyL -> Right (Map.elems acc)
+        (filePath, ast) Seq.:< queueRest -> do
+          let pathSegs = modulePathFromFile rootDir filePath
+          imports <- resolveImportItemsInline opts rootDir filePath ast moduleMap
+          validateImportAliases imports
+          let node = ModuleNode filePath pathSegs ast imports
+          let acc' = Map.insert filePath node acc
+          targets <- loadImportTargets acc' imports
+          go acc' (queueRest <> Seq.fromList targets)
+
+    loadImportTargets acc' imports = do
+      let moduleFiles = Map.keys (Map.fromList [(imp.irModuleFile, ()) | imp <- imports])
+      targets <- sequence (map (loadOne acc') moduleFiles)
+      pure (concat targets)
+
+    loadOne acc' moduleFile =
+      if Map.member moduleFile acc'
+        then Right []
+        else case Map.lookup moduleFile moduleMap of
+          Nothing ->
+            Left (CompileError ("import module not found: " <> moduleFile) Nothing Nothing)
+          Just ast' ->
+            Right [(moduleFile, ast')]
+
+resolveImportItemsInline :: CompileOptions -> FilePath -> FilePath -> ModuleAst -> Map.Map FilePath ModuleAst -> Either CompileError [ImportResolved]
+resolveImportItemsInline opts rootDir moduleFile ast moduleMap =
+  let items = [(decl, item) | decl <- ast.modImports, item <- decl.idItems]
+  in mapM (uncurry (resolveImportItemInline opts rootDir moduleFile moduleMap)) items
+
+resolveImportItemInline :: CompileOptions -> FilePath -> FilePath -> Map.Map FilePath ModuleAst -> ImportDecl -> ImportItem -> Either CompileError ImportResolved
+resolveImportItemInline opts rootDir moduleFile moduleMap decl item = do
+  let baseDir = importBaseDir rootDir moduleFile decl.idRelative
+  let segs = item.iiPath
+  let fullBase = appendPathSegments baseDir segs
+  let fullMod = findModuleInline moduleMap fullBase
+  case fullMod of
+    Just moduleBase -> resolveAsModule baseDir segs moduleBase
+    Nothing -> resolveAsItem baseDir segs
+  where
+    resolveAsModule baseDir' segs' moduleBase = do
+      let ambiguous = ambiguousImport opts baseDir' segs'
+      when ambiguous $
+        Left (CompileError ("ambiguous import: " <> renderPath segs' <> " refers to both a module and an item") Nothing Nothing)
+      pure (ImportResolved (modulePathFromFile rootDir moduleBase) moduleBase Nothing item.iiAlias)
+
+    resolveAsItem baseDir' segs' =
+      case splitImportTarget segs' of
+        Nothing -> Left (importNotFound segs')
+        Just (modSegs, itemName) -> do
+          let moduleBasePath = appendPathSegments baseDir' modSegs
+          case findModuleInline moduleMap moduleBasePath of
+            Just mb ->
+              Right (ImportResolved (modulePathFromFile rootDir mb) mb (Just itemName) item.iiAlias)
+            Nothing ->
+              Left (importNotFound modSegs)
+
+    ambiguousImport _opts baseDir' segs' =
+      case splitImportTarget segs' of
+        Nothing -> False
+        Just (modSegs, itemName) ->
+          case findModuleInline moduleMap (appendPathSegments baseDir' modSegs) of
+            Nothing -> False
+            Just mb -> moduleHasItemInline moduleMap mb itemName
+
+    importNotFound segs' =
+      case segs' of
+        [] -> CompileError "import path is empty" Nothing Nothing
+        _ -> CompileError ("import module not found: " <> renderPath segs') Nothing Nothing
+
+findModuleInline :: Map.Map FilePath ModuleAst -> FilePath -> Maybe FilePath
+findModuleInline moduleMap base =
+  case Map.lookup base moduleMap of
+    Just _ -> Just base
+    Nothing -> Nothing
+
+moduleHasItemInline :: Map.Map FilePath ModuleAst -> FilePath -> Text -> Bool
+moduleHasItemInline moduleMap moduleBase itemName =
+  case Map.lookup moduleBase moduleMap of
+    Nothing -> False
+    Just ast ->
+      Set.member itemName (moduleItemNames ast)
+  where
+    moduleItemNames ast =
+      Set.fromList $
+        map (.sdName) ast.modStructs
+          <> map (.bdName) ast.modBindings
+          <> map (.gvName) ast.modGlobals
+          <> map (.cdName) ast.modConsts
+          <> map (.odName) ast.modOverrides
+          <> map (.adName) ast.modAliases
+          <> map (.fnName) ast.modFunctions
+          <> map (.epName) ast.modEntries
+
 loadModuleGraph :: CompileOptions -> FilePath -> FilePath -> ModuleAst -> IO (Either CompileError [ModuleNode])
 loadModuleGraph opts rootDir rootFile rootAst = runExceptT (go Map.empty (Seq.singleton (rootFile, rootAst)))
   where

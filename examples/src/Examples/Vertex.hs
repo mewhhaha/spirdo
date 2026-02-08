@@ -7,10 +7,10 @@ module Examples.Vertex
   , vertexFullscreenShader
   ) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 vertexShader =
-      [wesl|
+      [weslShader|
 struct VsOut {
 @builtin(position) position: vec4<f32>;
 @location(0) uv: vec2<f32>;
@@ -23,7 +23,7 @@ return VsOut(pos, in_uv);
 }
 |]
 vertexFullscreenShader =
-      [wesl|
+      [weslShader|
 struct VsOut {
 @builtin(position) position: vec4<f32>;
 @location(0) uv: vec2<f32>;

@@ -4,10 +4,10 @@
 -- | Example fragment shader: Gradient Bloom.
 module Examples.Fragments.GradientBloom (fragmentGradientBloomShader) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 fragmentGradientBloomShader =
-      [wesl|
+      [weslShader|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;

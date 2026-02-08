@@ -4,10 +4,10 @@
 -- | Example fragment shader: Spectrum Shift.
 module Examples.Fragments.SpectrumShift (fragmentSpectrumShiftShader) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 fragmentSpectrumShiftShader =
-      [wesl|
+      [weslShader|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;

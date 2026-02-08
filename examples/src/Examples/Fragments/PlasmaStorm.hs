@@ -4,10 +4,10 @@
 -- | Example fragment shader: Plasma Storm.
 module Examples.Fragments.PlasmaStorm (fragmentPlasmaStormShader) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 fragmentPlasmaStormShader =
-      [wesl|
+      [weslShader|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;

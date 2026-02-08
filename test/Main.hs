@@ -926,7 +926,7 @@ orderingShader :: Shader 'SamplerCombined
   '[ 'Binding "b" 'BUniform 0 1 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
    , 'Binding "a" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
    ]
-orderingShader = [wesl|
+orderingShader = [weslShader|
 struct Params { v: vec4<f32>; };
 
 @group(0) @binding(1) var<uniform> b: Params;
@@ -1381,7 +1381,7 @@ combinedInputShader :: Shader 'SamplerCombined
    , 'Binding "tex" 'BTexture2D 0 1 ('TTexture2D 'SF32)
    ]
 combinedInputShader =
-  [wesl|
+  [weslShader|
 struct Params { v: vec4<f32>; };
 
 @group(0) @binding(0) var<uniform> params: Params;

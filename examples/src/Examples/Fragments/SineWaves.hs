@@ -4,10 +4,10 @@
 -- | Example fragment shader: Sine Waves.
 module Examples.Fragments.SineWaves (fragmentSineWavesShader) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 fragmentSineWavesShader =
-      [wesl|
+      [weslShader|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;

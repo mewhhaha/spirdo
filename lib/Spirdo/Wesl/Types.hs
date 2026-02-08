@@ -18,6 +18,13 @@ module Spirdo.Wesl.Types
   , Source(..)
   , CachePolicy(..)
   , Option(..)
+  , Imports(..)
+  , importsNil
+  , import_
+  , importText
+  , importsMap
+  , importsNames
+  , normalizeModuleKey
   , defaultCompileOptions
   , defaultOptions
   , applyOptions
@@ -36,8 +43,13 @@ module Spirdo.Wesl.Types
   ) where
 
 import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Word (Word32)
 import Data.List (nub)
+import qualified Data.Map.Strict as Map
+import Data.Proxy (Proxy(..))
+import GHC.TypeLits (KnownSymbol, Symbol, symbolVal)
+import System.FilePath (dropExtension, normalise, takeExtension)
 
 import Spirdo.Wesl.Types.Interface
 import Spirdo.Wesl.Types.Layout
@@ -125,6 +137,51 @@ data Source
       }
   | SourceFile FilePath
   deriving (Eq, Show, Read)
+
+-- | Inline import sources keyed by module name.
+data Imports (mods :: [Symbol]) = Imports
+  { importsMap :: !(Map.Map FilePath Text)
+  , importsNames :: ![FilePath]
+  } deriving (Eq, Show, Read)
+
+-- | Empty import set.
+importsNil :: Imports '[]
+importsNil = Imports Map.empty []
+
+-- | Add an import source using a type-level module name.
+import_ :: forall name mods. KnownSymbol name => String -> Imports mods -> Imports (name ': mods)
+import_ src = importText @name (T.pack src)
+
+-- | Add an import source using a type-level module name and 'Text'.
+importText :: forall name mods. KnownSymbol name => Text -> Imports mods -> Imports (name ': mods)
+importText src (Imports mp names) =
+  let key = normalizeModuleKey (symbolVal (Proxy @name))
+  in Imports (Map.insert key src mp) (key : names)
+
+-- | Normalize module keys for inline import maps.
+normalizeModuleKey :: String -> FilePath
+normalizeModuleKey raw =
+  let replaced = replaceColons raw
+      normalized = normalise replaced
+  in stripWeslExt normalized
+  where
+    replaceColons [] = []
+    replaceColons (':' : ':' : rest) = '/' : replaceColons rest
+    replaceColons (c : rest) = c : replaceColons rest
+
+    stripWeslExt path =
+      case takeExtension path of
+        ".wesl" -> dropExtension path
+        ".wgsl" -> dropExtension path
+        _ -> path
+
+-- | Access the import source map.
+importsMap :: Imports mods -> Map.Map FilePath Text
+importsMap = (.importsMap)
+
+-- | Access import names in insertion order.
+importsNames :: Imports mods -> [FilePath]
+importsNames = reverse . (.importsNames)
 
 -- | Cache configuration for the compile pipeline.
 data CachePolicy

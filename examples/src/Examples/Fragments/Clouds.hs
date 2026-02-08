@@ -4,10 +4,10 @@
 -- | Example fragment shader: Volumetric Clouds (Horizon-inspired).
 module Examples.Fragments.Clouds (fragmentCloudShader) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 fragmentCloudShader =
-      [wesl|
+      [weslShader|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;

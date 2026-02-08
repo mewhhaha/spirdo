@@ -481,3 +481,21 @@ Focused on lexing and SPIR-V serialization hot spots.
   - median (10-run): `463592.41`
 - Result:
   - regressed median; reverted.
+
+### Attempt Q (kept): raw `wesl` + inline import linking API
+- Files:
+  - `lib/Spirdo/Wesl/Compiler.hs`
+  - `lib/Spirdo/Wesl/Typecheck.hs`
+  - `lib/Spirdo/Wesl/Types.hs`
+  - `lib/Spirdo/Wesl/Types/Interface.hs`
+  - `lib/Spirdo/Wesl/Reflection.hs`
+  - `README.md`, `MIGRATION.md`
+  - examples + tests
+- Change:
+  - `wesl` now returns raw source; `weslShader` keeps compile-time shader output.
+  - Added `Imports` and `spirv` for compile-time import linking.
+- Verification:
+  - `cabal test`: pass
+  - `cabal bench`: time per compile `485205.54`
+- Result:
+  - Slight regression vs best median (~459k), but within recent single-run noise.

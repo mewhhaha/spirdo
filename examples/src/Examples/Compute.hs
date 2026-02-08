@@ -7,10 +7,10 @@ module Examples.Compute
   , computeParticlesShader
   ) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 computeShader =
-      [wesl|
+      [weslShader|
 struct Params {
 scale: f32;
 color: vec4<f32>;
@@ -93,7 +93,7 @@ let _sum = s0 + s1.x + col.y;
 }
 |]
 computeParticlesShader =
-      [wesl|
+      [weslShader|
 struct Params {
 time: f32;
 dt: f32;

@@ -40,7 +40,9 @@ New:
 - New accessor: `shaderSource` returns the original source (name + text) when available.
 
 ## Quasiquoter
-- `wesl` / `weslWith` are now in `Spirdo.Wesl.Reflection`.
+- `wesl` / `weslWith` are now in `Spirdo.Wesl.Reflection` and return raw source (`String`).
+- `weslShader` / `weslShaderWith` replace the old compile-time shader quasiquoter.
+- `spirv` / `spirvWith` / `spirvNamed` allow compile-time linking with inline imports.
 
 ## Options
 - `Option` constructors (`Opt*`) are unchanged and work with `Spirdo.Wesl.compile`.

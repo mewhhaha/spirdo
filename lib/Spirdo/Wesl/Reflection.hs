@@ -86,8 +86,20 @@ module Spirdo.Wesl.Reflection
   , compileFileWithDiagnostics
   , wesl
   , weslWith
+  , weslShader
+  , weslShaderWith
+  , weslShaderBatch
+  , weslShaderBatchWith
   , weslBatch
   , weslBatchWith
+  , spirv
+  , spirvWith
+  , spirvNamed
+  , Imports(..)
+  , importsNil
+  , import_
+  , importText
+  , normalizeModuleKey
   ) where
 
 import Spirdo.Wesl.Compiler

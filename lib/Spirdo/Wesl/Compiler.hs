@@ -29,11 +29,12 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char (isSpace, ord)
 import Data.Either (partitionEithers)
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Set as Set
 import Data.Word (Word8, Word64)
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -48,7 +49,7 @@ import Spirdo.Wesl.Typecheck
 import Spirdo.Wesl.Types
 import Spirdo.Wesl.Util (annotateErrorWithSource, renderErrorWithSource)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.FilePath (dropExtension, isRelative, normalise, takeDirectory, (<.>), (</>))
+import System.FilePath (dropExtension, isRelative, makeRelative, normalise, splitDirectories, takeDirectory, (<.>), (</>))
 import Text.Read (readMaybe)
 
 overrideValuesText :: [(String, OverrideValue)] -> [(Text, OverrideValue)]
@@ -202,7 +203,7 @@ compileInlineResult opts wantDiagnostics name src = do
   let overrideIndex = buildOverrideIndex [node]
   validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node]
   iface <- buildInterface opts moduleAst
-  spirv <- emitSpirv opts moduleAst iface
+  spirvBytes <- emitSpirv opts moduleAst iface
   diags <-
     if wantDiagnostics
       then collectDiagnosticsMerged opts [] moduleAst
@@ -210,7 +211,7 @@ compileInlineResult opts wantDiagnostics name src = do
   pure CompileResult
     { crAst = moduleAst
     , crInterface = iface
-    , crSpirv = spirv
+    , crSpirv = spirvBytes
     , crDiagnostics = diags
     , crSource = Just (ShaderSource name (T.pack src))
     }
@@ -231,7 +232,7 @@ compileInlineResultIO opts wantDiagnostics name src = runExceptT $ do
   let overrideIndex = buildOverrideIndex [node]
   _ <- ExceptT (timedPhase opts "validate" (evaluate (validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node])))
   iface <- ExceptT (timedPhase opts "interface" (evaluate (buildInterface opts moduleAst)))
-  spirv <- ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts moduleAst iface)))
+  spirvBytes <- ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts moduleAst iface)))
   diagList <-
     if wantDiagnostics
       then ExceptT (timedPhase opts "diagnostics" (evaluate (collectDiagnosticsMerged opts [] moduleAst)))
@@ -240,10 +241,106 @@ compileInlineResultIO opts wantDiagnostics name src = runExceptT $ do
     CompileResult
       { crAst = moduleAst
       , crInterface = iface
-      , crSpirv = spirv
+      , crSpirv = spirvBytes
       , crDiagnostics = diagList
       , crSource = Just (ShaderSource name (T.pack src))
       }
+
+normalizeImportsForRoot :: FilePath -> Map.Map FilePath Text -> Map.Map FilePath Text
+normalizeImportsForRoot rootDir imports0 =
+  if null rootDir || rootDir == "."
+    then imports0
+    else foldl' add imports0 (Map.toList imports0)
+  where
+    add acc (key, src)
+      | isRelative key && not (isUnder rootDir key) =
+          Map.insertWith (\_ old -> old) (rootDir </> key) src acc
+      | otherwise = acc
+
+    isUnder base path =
+      let baseSegs = splitDirectories (normalise base)
+          pathSegs = splitDirectories (normalise path)
+      in baseSegs `isPrefixOf` pathSegs
+
+parseModuleMap :: CompileOptions -> Map.Map FilePath Text -> Either CompileError (Map.Map FilePath ModuleAst)
+parseModuleMap opts modules =
+  fmap Map.fromList (mapM parseOne (Map.toList modules))
+  where
+    parseOne (path, src) =
+      case parseModuleWith opts.enabledFeatures (T.unpack src) of
+        Left err -> Left (annotateErrorWithSource (Just path) (T.unpack src) err)
+        Right ast -> Right (path, ast)
+
+validateInlineImports :: FilePath -> Imports mods -> [ModuleNode] -> Either CompileError ()
+validateInlineImports rootName imports nodes = do
+  let rootDir = takeDirectory rootName
+  let provided = importsNames imports
+  let dupes = duplicates provided
+  unless (null dupes) $
+    Left (CompileError ("duplicate import modules: " <> showListComma dupes) Nothing Nothing)
+  let usedFiles =
+        [ node.mnFile
+        | node <- nodes
+        , normalise node.mnFile /= normalise rootName
+        ]
+  let used =
+        map
+          (normalizeModuleKey . makeRelative rootDir)
+          usedFiles
+  let providedSet = Set.fromList (map normalizeModuleKey provided)
+  let usedSet = Set.fromList (map normalizeModuleKey used)
+  let missing = Set.toList (Set.difference usedSet providedSet)
+  let extra = Set.toList (Set.difference providedSet usedSet)
+  case (missing, extra) of
+    ([], []) -> Right ()
+    _ ->
+      Left
+        ( CompileError
+            ( "inline import mismatch"
+                <> formatImportDelta "missing" missing
+                <> formatImportDelta "extra" extra
+            )
+            Nothing
+            Nothing
+        )
+  where
+    duplicates xs =
+      let groups = Map.fromListWith (+) [(x, (1 :: Int)) | x <- xs]
+      in [x | (x, n) <- Map.toList groups, n > 1]
+
+    showListComma xs = T.unpack (T.intercalate ", " (map T.pack xs))
+
+    formatImportDelta _ [] = ""
+    formatImportDelta label xs = " (" <> label <> ": " <> showListComma (sort xs) <> ")"
+
+compileInlineResultWithImports :: CompileOptions -> Bool -> FilePath -> Imports mods -> String -> Either CompileError CompileResult
+compileInlineResultWithImports opts wantDiagnostics rootName imports src = do
+  let rootDir = takeDirectory rootName
+  moduleAst0 <- parseModuleWith opts.enabledFeatures src
+  let importMap = normalizeImportsForRoot rootDir (importsMap imports)
+  astMap <- parseModuleMap opts importMap
+  (nodes, linked) <- resolveImportsInline opts rootName moduleAst0 astMap
+  validateInlineImports rootName imports nodes
+  linked' <- resolveTypeAliases linked
+  let rootPath = modulePathFromFile rootDir rootName
+  linked'' <- inferOverrideTypes rootPath rootDir linked'
+  lowered0 <- lowerOverridesWith rootPath (overrideValuesText opts.overrideValues) linked''
+  lowered <- resolveConstExprs rootPath rootDir lowered0
+  diags <-
+    if wantDiagnostics
+      then collectDiagnosticsMerged opts rootPath lowered
+      else do
+        _ <- validateConstAssertsMerged opts rootPath lowered
+        pure []
+  iface <- buildInterface opts lowered
+  spirvBytes <- emitSpirv opts lowered iface
+  pure CompileResult
+    { crAst = lowered
+    , crInterface = iface
+    , crSpirv = spirvBytes
+    , crDiagnostics = diags
+    , crSource = Just (ShaderSource rootName (T.pack src))
+    }
 
 compileFileResult :: CompileOptions -> Bool -> FilePath -> IO (Either CompileError CompileResult)
 compileFileResult opts wantDiagnostics path =
@@ -268,11 +365,11 @@ compileFileResult opts wantDiagnostics path =
           _ <- annotate (ExceptT (timedPhase opts "const-asserts" (evaluate (validateConstAssertsMerged opts rootPath lowered))))
           pure []
     iface <- annotate (ExceptT (timedPhase opts "interface" (evaluate (buildInterface opts lowered))))
-    spirv <- annotate (ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts lowered iface))))
+    spirvBytes <- annotate (ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts lowered iface))))
     pure CompileResult
       { crAst = lowered
       , crInterface = iface
-      , crSpirv = spirv
+      , crSpirv = spirvBytes
       , crDiagnostics = diags
       , crSource = Just (ShaderSource filePath (T.pack src))
       }
@@ -359,22 +456,36 @@ writeWeslCache opts src bytes iface =
 
 -- Quasiquoter
 
--- | Quasiquoter for inline WESL (compile-time).
+-- | Quasiquoter for raw inline WESL source.
 wesl :: QuasiQuoter
 wesl = weslWith defaultCompileOptions
 
--- | Quasiquoter with explicit compile options.
+-- | Quasiquoter for raw WESL source (options ignored).
 weslWith :: CompileOptions -> QuasiQuoter
-weslWith opts =
+weslWith _ =
   QuasiQuoter
-    { quoteExp = weslExpWith opts
+    { quoteExp = \src -> pure (TH.LitE (TH.StringL src))
     , quotePat = const (fail "wesl: pattern context not supported")
     , quoteType = const (fail "wesl: type context not supported")
     , quoteDec = const (fail "wesl: declaration context not supported")
     }
 
-weslExpWith :: CompileOptions -> String -> Q Exp
-weslExpWith opts src = do
+-- | Quasiquoter for inline WESL compiled to a shader (compile-time).
+weslShader :: QuasiQuoter
+weslShader = weslShaderWith defaultCompileOptions
+
+-- | Quasiquoter for compiled WESL with explicit compile options.
+weslShaderWith :: CompileOptions -> QuasiQuoter
+weslShaderWith opts =
+  QuasiQuoter
+    { quoteExp = weslShaderExpWith opts
+    , quotePat = const (fail "weslShader: pattern context not supported")
+    , quoteType = const (fail "weslShader: type context not supported")
+    , quoteDec = const (fail "weslShader: declaration context not supported")
+    }
+
+weslShaderExpWith :: CompileOptions -> String -> Q Exp
+weslShaderExpWith opts src = do
   (bytes, iface, sourceInfo) <- compileInlineCached opts src
   preparedExpWith opts bytes iface sourceInfo
 
@@ -394,6 +505,24 @@ compileInlineCached opts src = do
             pure (bytes, iface, result.crSource)
         )
         (compileInlineResult opts False "<inline>" src)
+
+-- | Compile inline WESL with an in-memory import map (compile-time).
+spirv :: Imports mods -> String -> Q Exp
+spirv = spirvWith defaultCompileOptions
+
+-- | Compile inline WESL with imports and explicit compile options (compile-time).
+spirvWith :: CompileOptions -> Imports mods -> String -> Q Exp
+spirvWith opts = spirvNamed opts "<inline>"
+
+-- | Compile inline WESL with imports and an explicit root name (compile-time).
+spirvNamed :: CompileOptions -> FilePath -> Imports mods -> String -> Q Exp
+spirvNamed opts rootName imports src = do
+  result <-
+    either
+      (fail . renderErrorWithSource (Just rootName) src)
+      pure
+      (compileInlineResultWithImports opts False rootName imports src)
+  preparedExpWith opts result.crSpirv result.crInterface result.crSource
 
 mapConcurrentlyIO :: forall a b. (a -> IO b) -> [a] -> IO [b]
 mapConcurrentlyIO f xs = do
@@ -490,12 +619,12 @@ preparedExpWith opts bytes iface sourceInfo = do
   pure (TH.SigE shaderExp (TH.AppT (TH.AppT (TH.ConT ''Shader) modeTy) ifaceTy))
 
 -- | Compile multiple inline WESL shaders in a single splice.
-weslBatch :: [(String, String)] -> Q [TH.Dec]
-weslBatch = weslBatchWith defaultCompileOptions
+weslShaderBatch :: [(String, String)] -> Q [TH.Dec]
+weslShaderBatch = weslShaderBatchWith defaultCompileOptions
 
 -- | Compile multiple inline WESL shaders with explicit options.
-weslBatchWith :: CompileOptions -> [(String, String)] -> Q [TH.Dec]
-weslBatchWith opts entries = do
+weslShaderBatchWith :: CompileOptions -> [(String, String)] -> Q [TH.Dec]
+weslShaderBatchWith opts entries = do
   compiled <- TH.runIO (compileInlineCachedBatch opts entries)
   case compiled of
     Left err -> fail err
@@ -505,6 +634,14 @@ weslBatchWith opts entries = do
       expr <- preparedExpWith opts bytes iface sourceInfo
       let name = TH.mkName nameStr
       pure [TH.ValD (TH.VarP name) (TH.NormalB expr) []]
+
+-- | Legacy aliases for shader batch compilation.
+weslBatch :: [(String, String)] -> Q [TH.Dec]
+weslBatch = weslShaderBatch
+
+-- | Legacy alias for shader batch compilation.
+weslBatchWith :: CompileOptions -> [(String, String)] -> Q [TH.Dec]
+weslBatchWith = weslShaderBatchWith
 
 timed :: CompileOptions -> String -> IO a -> IO a
 timed opts label action =

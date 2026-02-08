@@ -4,10 +4,10 @@
 -- | Example fragment shader: Vignette Glow.
 module Examples.Fragments.VignetteGlow (fragmentVignetteGlowShader) where
 
-import Spirdo.Wesl.Reflection (wesl)
+import Spirdo.Wesl.Reflection (weslShader)
 
 fragmentVignetteGlowShader =
-      [wesl|
+      [weslShader|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;
