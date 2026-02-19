@@ -1285,7 +1285,8 @@ typedCtorShader =
     , "  let sh = vec2h(1.0h);"
     , "  let m = mat2x2<f32>(1.0, 0.0, 0.0, 1.0);"
     , "  let m2 = mat2x2<f32>(1.0);"
-    , "  let _ = m[0][0] + m2[1][1] + sf.x + f32(si.x) + f32(su.x) + f32(sh.x);"
+    , "  let arr = array<vec2<f32>, 2>(vec2<f32>(0.25, 0.5), vec2<f32>(0.75, 1.0));"
+    , "  let _ = m[0][0] + m2[1][1] + sf.x + f32(si.x) + f32(su.x) + f32(sh.x) + arr[1].y;"
     , "  return vec4(d.x, d.y, d.z, a.w);"
     , "}"
     ]

@@ -1503,6 +1503,18 @@ parsePrimaryExpr toks =
                 [arg] -> Right (EBitcast pos targetTy arg, rest5)
                 _ -> Left (errorAt rest4 "bitcast expects one argument")
         (Token (TkSymbol "<") _ : _)
+          | name == "array" -> do
+              rest1 <- expectSymbol "<" rest
+              (_, rest2) <- parseType rest1
+              rest3 <- case rest2 of
+                (Token (TkSymbol ",") _ : restLen) -> do
+                  (_, restLen1) <- parseConstExpr [">"] restLen
+                  expectSymbol ">" restLen1
+                _ -> Left (errorAt rest2 "array constructor requires a fixed size")
+              rest4 <- expectSymbol "(" rest3
+              (args, rest5) <- parseCallArgs [] rest4
+              Right (ECall pos "array" args, rest5)
+        (Token (TkSymbol "<") _ : _)
           | name `elem` ["vec2", "vec3", "vec4"] || isJust (parseMatrixName name) -> do
               let isVec = name `elem` ["vec2", "vec3", "vec4"]
               rest1 <- expectSymbol "<" rest
