@@ -134,7 +134,7 @@ data Type
   | TyStorageTexture3D StorageFormat StorageAccess
   | TyAtomic Scalar
   | TyPtr Text (Maybe StorageAccess) Type
-  deriving (Eq, Show)
+  deriving (Eq, Show, Read)
 
 -- Layout metadata
 

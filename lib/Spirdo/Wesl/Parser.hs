@@ -1505,15 +1505,17 @@ parsePrimaryExpr toks =
         (Token (TkSymbol "<") _ : _)
           | name == "array" -> do
               rest1 <- expectSymbol "<" rest
-              (_, rest2) <- parseType rest1
+              (elemTy, rest2) <- parseType rest1
               rest3 <- case rest2 of
                 (Token (TkSymbol ",") _ : restLen) -> do
-                  (_, restLen1) <- parseConstExpr [">"] restLen
-                  expectSymbol ">" restLen1
+                  (lenExpr, restLen1) <- parseConstExpr [">"] restLen
+                  restLen2 <- expectSymbol ">" restLen1
+                  Right (ArrayLenExpr lenExpr, restLen2)
                 _ -> Left (errorAt rest2 "array constructor requires a fixed size")
-              rest4 <- expectSymbol "(" rest3
-              (args, rest5) <- parseCallArgs [] rest4
-              Right (ECall pos "array" args, rest5)
+              let (arrLen, rest4) = rest3
+              rest5 <- expectSymbol "(" rest4
+              (args, rest6) <- parseCallArgs [] rest5
+              Right (ECall pos (renderArrayCtorName elemTy arrLen) args, rest6)
         (Token (TkSymbol "<") _ : _)
           | name `elem` ["vec2", "vec3", "vec4"] || isJust (parseMatrixName name) -> do
               let isVec = name `elem` ["vec2", "vec3", "vec4"]

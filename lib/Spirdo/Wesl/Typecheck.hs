@@ -842,6 +842,7 @@ resolveConstExprs rootPath rootDir ast = do
   globals <- mapM (resolveGlobal ctx constIndex fnIndex structIndex) ast.modGlobals
   consts <- mapM (resolveConst ctx constIndex fnIndex structIndex) ast.modConsts
   overrides <- mapM (resolveOverride ctx constIndex fnIndex structIndex) ast.modOverrides
+  constAsserts <- mapM (resolveConstAssertExpr ctx constIndex fnIndex structIndex) ast.modConstAsserts
   functions <- mapM (resolveFunction ctx constIndex fnIndex structIndex) ast.modFunctions
   entries <- mapM (resolveEntry ctx constIndex fnIndex structIndex) ast.modEntries
   Right ast
@@ -851,6 +852,7 @@ resolveConstExprs rootPath rootDir ast = do
     , modGlobals = globals
     , modConsts = consts
     , modOverrides = overrides
+    , modConstAsserts = constAsserts
     , modFunctions = functions
     , modEntries = entries
     }
@@ -896,15 +898,21 @@ resolveConstExprs rootPath rootDir ast = do
 
     resolveGlobal ctx constIndex fnIndex structIndex decl = do
       ty <- resolveType ctx constIndex fnIndex structIndex decl.gvType
-      Right decl { gvType = ty }
+      initExpr <- mapM (resolveExpr ctx constIndex fnIndex structIndex) decl.gvInit
+      Right decl { gvType = ty, gvInit = initExpr }
 
     resolveConst ctx constIndex fnIndex structIndex decl = do
       ty <- mapM (resolveType ctx constIndex fnIndex structIndex) decl.cdType
-      Right decl { cdType = ty }
+      expr <- resolveExpr ctx constIndex fnIndex structIndex decl.cdExpr
+      Right decl { cdType = ty, cdExpr = expr }
 
     resolveOverride ctx constIndex fnIndex structIndex decl = do
       ty <- mapM (resolveType ctx constIndex fnIndex structIndex) decl.odType
-      Right decl { odType = ty }
+      expr <- mapM (resolveExpr ctx constIndex fnIndex structIndex) decl.odExpr
+      Right decl { odType = ty, odExpr = expr }
+
+    resolveConstAssertExpr ctx constIndex fnIndex structIndex (ConstAssert pos expr) =
+      ConstAssert pos <$> resolveExpr ctx constIndex fnIndex structIndex expr
 
     resolveParam ctx constIndex fnIndex structIndex param = do
       ty <- resolveType ctx constIndex fnIndex structIndex param.paramType
@@ -914,13 +922,126 @@ resolveConstExprs rootPath rootDir ast = do
     resolveFunction ctx constIndex fnIndex structIndex fn = do
       params <- mapM (resolveParam ctx constIndex fnIndex structIndex) fn.fnParams
       retTy <- mapM (resolveType ctx constIndex fnIndex structIndex) fn.fnReturnType
-      Right fn { fnParams = params, fnReturnType = retTy }
+      body <- mapM (resolveStmt ctx constIndex fnIndex structIndex) fn.fnBody
+      Right fn { fnParams = params, fnReturnType = retTy, fnBody = body }
 
     resolveEntry ctx constIndex fnIndex structIndex entry = do
       params <- mapM (resolveParam ctx constIndex fnIndex structIndex) entry.epParams
       retTy <- mapM (resolveType ctx constIndex fnIndex structIndex) entry.epReturnType
       wg <- resolveWorkgroup ctx constIndex fnIndex structIndex entry.epStage entry.epWorkgroupSize
-      Right entry { epParams = params, epReturnType = retTy, epWorkgroupSize = wg }
+      body <- mapM (resolveStmt ctx constIndex fnIndex structIndex) entry.epBody
+      Right entry { epParams = params, epReturnType = retTy, epWorkgroupSize = wg, epBody = body }
+
+    resolveExpr ctx constIndex fnIndex structIndex expr =
+      case expr of
+        EVar {} -> Right expr
+        EInt {} -> Right expr
+        EFloat {} -> Right expr
+        EBool {} -> Right expr
+        EBinary pos op a b ->
+          EBinary pos op
+            <$> resolveExpr ctx constIndex fnIndex structIndex a
+            <*> resolveExpr ctx constIndex fnIndex structIndex b
+        EUnary pos op a ->
+          EUnary pos op <$> resolveExpr ctx constIndex fnIndex structIndex a
+        ECall pos name args -> do
+          args' <- mapM (resolveExpr ctx constIndex fnIndex structIndex) args
+          case parseArrayCtorName name of
+            Just (elemTy, len) -> do
+              elemTy' <- resolveType ctx constIndex fnIndex structIndex (rewriteType ctx elemTy)
+              len' <- resolveArrayLen ctx constIndex fnIndex structIndex len
+              Right (ECall pos (renderArrayCtorName elemTy' len') args')
+            Nothing ->
+              Right (ECall pos name args')
+        EBitcast pos ty arg -> do
+          ty' <- resolveType ctx constIndex fnIndex structIndex ty
+          arg' <- resolveExpr ctx constIndex fnIndex structIndex arg
+          Right (EBitcast pos ty' arg')
+        EField pos base field ->
+          EField pos
+            <$> resolveExpr ctx constIndex fnIndex structIndex base
+            <*> pure field
+        EIndex pos base idx ->
+          EIndex pos
+            <$> resolveExpr ctx constIndex fnIndex structIndex base
+            <*> resolveExpr ctx constIndex fnIndex structIndex idx
+
+    resolveLValue ctx constIndex fnIndex structIndex lv =
+      case lv of
+        LVVar {} -> Right lv
+        LVField pos base field ->
+          LVField pos
+            <$> resolveLValue ctx constIndex fnIndex structIndex base
+            <*> pure field
+        LVIndex pos base idx ->
+          LVIndex pos
+            <$> resolveLValue ctx constIndex fnIndex structIndex base
+            <*> resolveExpr ctx constIndex fnIndex structIndex idx
+        LVDeref pos expr ->
+          LVDeref pos <$> resolveExpr ctx constIndex fnIndex structIndex expr
+
+    resolveSwitchCase ctx constIndex fnIndex structIndex sc = do
+      selectors <- mapM (resolveExpr ctx constIndex fnIndex structIndex) sc.scSelectors
+      body <- mapM (resolveStmt ctx constIndex fnIndex structIndex) sc.scBody
+      Right sc { scSelectors = selectors, scBody = body }
+
+    resolveStmt ctx constIndex fnIndex structIndex stmt =
+      case stmt of
+        SLet pos name mType expr -> do
+          mType' <- mapM (resolveType ctx constIndex fnIndex structIndex) mType
+          expr' <- resolveExpr ctx constIndex fnIndex structIndex expr
+          Right (SLet pos name mType' expr')
+        SVar pos name mType mExpr -> do
+          mType' <- mapM (resolveType ctx constIndex fnIndex structIndex) mType
+          mExpr' <- mapM (resolveExpr ctx constIndex fnIndex structIndex) mExpr
+          Right (SVar pos name mType' mExpr')
+        SAssign pos lv expr ->
+          SAssign pos
+            <$> resolveLValue ctx constIndex fnIndex structIndex lv
+            <*> resolveExpr ctx constIndex fnIndex structIndex expr
+        SAssignOp pos lv op expr ->
+          SAssignOp pos
+            <$> resolveLValue ctx constIndex fnIndex structIndex lv
+            <*> pure op
+            <*> resolveExpr ctx constIndex fnIndex structIndex expr
+        SInc pos lv ->
+          SInc pos <$> resolveLValue ctx constIndex fnIndex structIndex lv
+        SDec pos lv ->
+          SDec pos <$> resolveLValue ctx constIndex fnIndex structIndex lv
+        SExpr pos expr ->
+          SExpr pos <$> resolveExpr ctx constIndex fnIndex structIndex expr
+        SIf pos cond thenBody elseBody -> do
+          cond' <- resolveExpr ctx constIndex fnIndex structIndex cond
+          thenBody' <- mapM (resolveStmt ctx constIndex fnIndex structIndex) thenBody
+          elseBody' <- mapM (mapM (resolveStmt ctx constIndex fnIndex structIndex)) elseBody
+          Right (SIf pos cond' thenBody' elseBody')
+        SWhile pos cond body -> do
+          cond' <- resolveExpr ctx constIndex fnIndex structIndex cond
+          body' <- mapM (resolveStmt ctx constIndex fnIndex structIndex) body
+          Right (SWhile pos cond' body')
+        SLoop pos body continuing -> do
+          body' <- mapM (resolveStmt ctx constIndex fnIndex structIndex) body
+          cont' <- mapM (mapM (resolveStmt ctx constIndex fnIndex structIndex)) continuing
+          Right (SLoop pos body' cont')
+        SFor pos initStmt condExpr contStmt body -> do
+          initStmt' <- mapM (resolveStmt ctx constIndex fnIndex structIndex) initStmt
+          condExpr' <- mapM (resolveExpr ctx constIndex fnIndex structIndex) condExpr
+          contStmt' <- mapM (resolveStmt ctx constIndex fnIndex structIndex) contStmt
+          body' <- mapM (resolveStmt ctx constIndex fnIndex structIndex) body
+          Right (SFor pos initStmt' condExpr' contStmt' body')
+        SSwitch pos expr cases defBody -> do
+          expr' <- resolveExpr ctx constIndex fnIndex structIndex expr
+          cases' <- mapM (resolveSwitchCase ctx constIndex fnIndex structIndex) cases
+          defBody' <- mapM (mapM (resolveStmt ctx constIndex fnIndex structIndex)) defBody
+          Right (SSwitch pos expr' cases' defBody')
+        SBreak _ -> Right stmt
+        SBreakIf pos cond ->
+          SBreakIf pos <$> resolveExpr ctx constIndex fnIndex structIndex cond
+        SContinue _ -> Right stmt
+        SDiscard _ -> Right stmt
+        SFallthrough _ -> Right stmt
+        SReturn pos mexpr ->
+          SReturn pos <$> mapM (resolveExpr ctx constIndex fnIndex structIndex) mexpr
 
     resolveAttrs ctx constIndex fnIndex structIndex attrs =
       mapM (resolveAttr ctx constIndex fnIndex structIndex) attrs
@@ -2042,20 +2163,24 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
           case parseVectorCtorName name of
             Just (n, targetScalar) -> evalConstVectorCtor n targetScalar seen fnSeen args
             Nothing ->
-              case name of
-                "array" -> evalConstArrayCtor seen fnSeen args
-                _ ->
-                  case parseMatrixCtorName name of
-                    Just (cols, rows, targetScalar) ->
-                      evalConstMatrixCtor cols rows targetScalar seen fnSeen args
-                    Nothing ->
-                      if isBuiltinName name
-                        then evalConstScalarValue seen fnSeen ex
-                        else
-                          case resolveStructDecl ctx structIndex name of
-                            Right decl -> evalConstStructCtor decl.sdName decl.sdFields seen fnSeen args
-                            Left _ ->
-                              evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seen fnSeen name args
+              case parseArrayCtorName name of
+                Just (elemTy, arrLen) ->
+                  evalConstTypedArrayCtor elemTy arrLen seen fnSeen args
+                Nothing ->
+                  case name of
+                    "array" -> evalConstArrayCtor seen fnSeen args
+                    _ ->
+                      case parseMatrixCtorName name of
+                        Just (cols, rows, targetScalar) ->
+                          evalConstMatrixCtor cols rows targetScalar seen fnSeen args
+                        Nothing ->
+                          if isBuiltinName name
+                            then evalConstScalarValue seen fnSeen ex
+                            else
+                              case resolveStructDecl ctx structIndex name of
+                                Right decl -> evalConstStructCtor decl.sdName decl.sdFields seen fnSeen args
+                                Left _ ->
+                                  evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seen fnSeen name args
         _ -> evalConstScalarValue seen fnSeen ex
 
     evalConstScalarValue seen fnSeen ex =
@@ -2072,28 +2197,34 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
     firstError errI _ = errI
 
     evalConstVectorCtor n targetScalar seen fnSeen args = do
-      when (null args) $
-        Left (CompileError "vector constructor needs arguments" Nothing Nothing)
-      vals <- mapM (go seen fnSeen) args
-      let singleScalar =
-            case vals of
-              [v] -> isScalarConst v
-              _ -> False
-      flattened <- fmap concat (mapM flattenArg vals)
-      case flattened of
-        [] -> Left (CompileError "vector constructor needs arguments" Nothing Nothing)
-        (firstVal : _) -> do
-          scalar <- case targetScalar of
-            Just s -> Right s
-            Nothing -> constScalarType firstVal
-          coerced <- mapM (coerceConstScalarValue scalar) flattened
-          let filled =
-                case (singleScalar, coerced) of
-                  (True, [v]) -> replicate n v
-                  _ -> coerced
-          when (length filled /= n) $
-            Left (CompileError "vector constructor arity mismatch" Nothing Nothing)
-          Right (CVVector n scalar filled)
+      if null args
+        then
+          case targetScalar of
+            Nothing -> Left (CompileError "vector constructor needs arguments" Nothing Nothing)
+            Just scalar ->
+              let zero = constZeroScalar scalar
+              in Right (CVVector n scalar (replicate n zero))
+        else do
+          vals <- mapM (go seen fnSeen) args
+          let singleScalar =
+                case vals of
+                  [v] -> isScalarConst v
+                  _ -> False
+          flattened <- fmap concat (mapM flattenArg vals)
+          case flattened of
+            [] -> Left (CompileError "vector constructor needs arguments" Nothing Nothing)
+            (firstVal : _) -> do
+              scalar <- case targetScalar of
+                Just s -> Right s
+                Nothing -> constScalarType firstVal
+              coerced <- mapM (coerceConstScalarValue scalar) flattened
+              let filled =
+                    case (singleScalar, coerced) of
+                      (True, [v]) -> replicate n v
+                      _ -> coerced
+              when (length filled /= n) $
+                Left (CompileError "vector constructor arity mismatch" Nothing Nothing)
+              Right (CVVector n scalar filled)
       where
         isScalarConst v =
           case v of
@@ -2101,6 +2232,13 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
             CVFloat _ -> True
             CVBool _ -> True
             _ -> False
+        constZeroScalar s =
+          case s of
+            I32 -> CVInt (ConstInt I32 0)
+            U32 -> CVInt (ConstInt U32 0)
+            F32 -> CVFloat (ConstFloat F32 0)
+            F16 -> CVFloat (ConstFloat F16 0)
+            Bool -> CVBool False
         flattenArg v =
           case v of
             CVInt _ -> Right [v]
@@ -2110,35 +2248,42 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
             _ -> Left (CompileError "vector constructor arguments must be scalars or vectors" Nothing Nothing)
 
     evalConstMatrixCtor cols rows targetScalar seen fnSeen args = do
-      when (null args) $
-        Left (CompileError "matrix constructor needs arguments" Nothing Nothing)
-      vals <- mapM (go seen fnSeen) args
-      let scalarCount = cols * rows
-      case vals of
-        [v] | isScalarConst v -> do
-          scalar <- case targetScalar of
-            Just s -> Right s
-            Nothing -> constScalarType v
-          v' <- coerceConstScalarValue scalar v
-          let zero = constZeroScalar scalar
-          let colsVals =
-                [ CVVector rows scalar [if rowIx == colIx then v' else zero | rowIx <- [0 .. rows - 1]]
-                | colIx <- [0 .. cols - 1]
-                ]
-          Right (CVMatrix cols rows scalar colsVals)
-        _ -> do
-          flattened <- fmap concat (mapM (flattenMatrixArg rows) vals)
-          case flattened of
-            [] -> Left (CompileError "matrix constructor needs arguments" Nothing Nothing)
-            (firstVal:_) -> do
+      if null args
+        then
+          case targetScalar of
+            Nothing -> Left (CompileError "matrix constructor needs arguments" Nothing Nothing)
+            Just scalar ->
+              let zero = constZeroScalar scalar
+                  colsVals = replicate cols (CVVector rows scalar (replicate rows zero))
+              in Right (CVMatrix cols rows scalar colsVals)
+        else do
+          vals <- mapM (go seen fnSeen) args
+          let scalarCount = cols * rows
+          case vals of
+            [v] | isScalarConst v -> do
               scalar <- case targetScalar of
                 Just s -> Right s
-                Nothing -> constScalarType firstVal
-              scalars <- mapM (coerceConstScalarValue scalar) flattened
-              when (length scalars /= scalarCount) $
-                Left (CompileError "matrix constructor expects column vectors or a full scalar list" Nothing Nothing)
-              let colsVals = map (CVVector rows scalar) (chunk rows scalars)
+                Nothing -> constScalarType v
+              v' <- coerceConstScalarValue scalar v
+              let zero = constZeroScalar scalar
+              let colsVals =
+                    [ CVVector rows scalar [if rowIx == colIx then v' else zero | rowIx <- [0 .. rows - 1]]
+                    | colIx <- [0 .. cols - 1]
+                    ]
               Right (CVMatrix cols rows scalar colsVals)
+            _ -> do
+              flattened <- fmap concat (mapM (flattenMatrixArg rows) vals)
+              case flattened of
+                [] -> Left (CompileError "matrix constructor needs arguments" Nothing Nothing)
+                (firstVal:_) -> do
+                  scalar <- case targetScalar of
+                    Just s -> Right s
+                    Nothing -> constScalarType firstVal
+                  scalars <- mapM (coerceConstScalarValue scalar) flattened
+                  when (length scalars /= scalarCount) $
+                    Left (CompileError "matrix constructor expects column vectors or a full scalar list" Nothing Nothing)
+                  let colsVals = map (CVVector rows scalar) (chunk rows scalars)
+                  Right (CVMatrix cols rows scalar colsVals)
       where
         isScalarConst v =
           case v of
@@ -2194,12 +2339,44 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
             then Right ()
             else Left (CompileError "array constructor argument type mismatch" Nothing Nothing)
 
+    evalConstTypedArrayCtor elemTy len seen fnSeen args = do
+      fixedLen <- resolveArrayLength len
+      case args of
+        [] -> do
+          zero <- defaultConstValue ctx structIndex elemTy
+          Right (CVArray elemTy (replicate fixedLen zero))
+        _ -> do
+          when (length args /= fixedLen) $
+            Left (CompileError "array constructor arity mismatch" Nothing Nothing)
+          vals <- mapM (go seen fnSeen) args
+          coerced <- mapM (coerceConstValueToType ctx structIndex elemTy) vals
+          Right (CVArray elemTy coerced)
+      where
+        resolveArrayLength arrLen =
+          case arrLen of
+            ArrayLenFixed n -> Right n
+            ArrayLenExpr expr -> do
+              ConstInt _ v <- evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen (constExprToExpr expr)
+              when (v <= 0) $
+                Left (CompileError "array length must be positive" Nothing Nothing)
+              when (v > fromIntegral (maxBound :: Int)) $
+                Left (CompileError "array length is too large" Nothing Nothing)
+              Right (fromIntegral v)
+            ArrayLenRuntime ->
+              Left (CompileError "array constructor requires a fixed size" Nothing Nothing)
+
     evalConstStructCtor name fields seen fnSeen args = do
-      when (length args /= length fields) $
-        Left (CompileError ("struct constructor arity mismatch for " <> textToString name) Nothing Nothing)
-      vals <- mapM (go seen fnSeen) args
-      let pairs = zip (map (.fdName) fields) vals
-      Right (CVStruct name pairs)
+      case args of
+        [] -> do
+          vals <- mapM (\f -> defaultConstValue ctx structIndex f.fdType) fields
+          let pairs = zip (map (.fdName) fields) vals
+          Right (CVStruct name pairs)
+        _ -> do
+          when (length args /= length fields) $
+            Left (CompileError ("struct constructor arity mismatch for " <> textToString name) Nothing Nothing)
+          vals <- mapM (go seen fnSeen) args
+          let pairs = zip (map (.fdName) fields) vals
+          Right (CVStruct name pairs)
 
     evalConstAddressOf seen fnSeen inner =
       case exprToLValue inner of
@@ -2709,6 +2886,8 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
               let n = truncate v :: Integer
               checkU32 n
               Right (ConstInt U32 n)
+        ECall _ "u32" [] ->
+          Right (ConstInt U32 0)
         ECall _ "i32" [arg] ->
           case go seen fnSeen arg of
             Right (ConstInt _ n) -> do
@@ -2719,6 +2898,8 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
               let n = truncate v :: Integer
               checkI32 n
               Right (ConstInt I32 n)
+        ECall _ "i32" [] ->
+          Right (ConstInt I32 0)
         EBitcast _ _ _ ->
           Left (CompileError "bitcast is not allowed in const integer expressions" Nothing Nothing)
         ECall _ name args
@@ -2864,9 +3045,13 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env = go
         ECall _ "f32" [arg] -> do
           cf <- evalFloatArg seen fnSeen arg
           Right (convertConstFloatTo F32 cf)
+        ECall _ "f32" [] ->
+          Right (ConstFloat F32 0.0)
         ECall _ "f16" [arg] -> do
           cf <- evalFloatArg seen fnSeen arg
           Right (convertConstFloatTo F16 cf)
+        ECall _ "f16" [] ->
+          Right (ConstFloat F16 0.0)
         ECall _ "abs" [arg] -> do
           cf <- evalFloatArg seen fnSeen arg
           Right (applyFloatOp cf.cfScalar abs cf.cfValue)
@@ -3292,6 +3477,7 @@ isBuiltinName name =
   name `Set.member` builtinNames
     || isJust (parseVectorCtorName name)
     || isJust (parseMatrixCtorName name)
+    || isJust (parseArrayCtorName name)
 
 builtinNames :: Set.Set Text
 builtinNames =

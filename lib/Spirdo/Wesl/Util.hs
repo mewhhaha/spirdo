@@ -23,6 +23,8 @@ module Spirdo.Wesl.Util
   , parseMatrixName
   , parseMatrixCtorName
   , parseVectorCtorName
+  , parseArrayCtorName
+  , renderArrayCtorName
   , parseTypedScalarSuffix
   , vecSize
   , selectIntLiteralScalar
@@ -55,7 +57,7 @@ module Spirdo.Wesl.Util
   ) where
 
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
-import Data.Char (digitToInt, isAlphaNum, isDigit)
+import Data.Char (chr, digitToInt, isAlphaNum, isDigit, isHexDigit, ord)
 import Data.Int (Int32)
 import Data.List (isInfixOf, isPrefixOf)
 import Data.Maybe (fromMaybe, listToMaybe)
@@ -65,6 +67,7 @@ import Data.Word (Word16, Word32)
 import GHC.Float (castFloatToWord32)
 import Spirdo.Wesl.Syntax (Expr(..), LValue(..), SrcPos(..), Stage(..), Stmt(..), Token(..), UnaryOp(..), WorkgroupSize(..))
 import Spirdo.Wesl.Types
+import Text.Read (readMaybe)
 
 errorAt :: [Token] -> String -> CompileError
 errorAt toks msg =
@@ -374,6 +377,67 @@ parseMatrixCtorName name =
   case parseTypedScalarSuffix name of
     Just (base, scalar) -> (\(c, r) -> (c, r, Just scalar)) <$> parseMatrixName base
     Nothing -> (\(c, r) -> (c, r, Nothing)) <$> parseMatrixName name
+
+arrayCtorPrefix :: Text
+arrayCtorPrefix = "__wesl_array_ctor$"
+
+renderArrayCtorName :: Type -> ArrayLen -> Text
+renderArrayCtorName elemTy len =
+  arrayCtorPrefix <> hexEncode (show elemTy) <> "$" <> hexEncode (show len)
+
+parseArrayCtorName :: Text -> Maybe (Type, ArrayLen)
+parseArrayCtorName name = do
+  body <- T.stripPrefix arrayCtorPrefix name
+  let (tyTxt, rest) = T.breakOn "$" body
+  guardNonEmpty tyTxt
+  guardNonEmpty rest
+  let lenTxt = T.drop 1 rest
+  guardNonEmpty lenTxt
+  tySrc <- hexDecode tyTxt
+  lenSrc <- hexDecode lenTxt
+  ty <- readMaybe tySrc
+  len <- readMaybe lenSrc
+  pure (ty, len)
+  where
+    guardNonEmpty txt =
+      if T.null txt then Nothing else Just ()
+
+hexEncode :: String -> Text
+hexEncode = T.pack . concatMap encodeChar
+  where
+    encodeChar ch =
+      let v = ord ch
+          d3 = (v `div` 4096) `mod` 16
+          d2 = (v `div` 256) `mod` 16
+          d1 = (v `div` 16) `mod` 16
+          d0 = v `mod` 16
+      in [toHex d3, toHex d2, toHex d1, toHex d0]
+    toHex n
+      | n >= 0 && n <= 9 = toEnum (fromEnum '0' + n)
+      | n >= 10 && n <= 15 = toEnum (fromEnum 'a' + (n - 10))
+      | otherwise = '0'
+
+hexDecode :: Text -> Maybe String
+hexDecode txt =
+  let chars = T.unpack txt
+  in if length chars `mod` 4 /= 0
+      then Nothing
+      else go chars
+  where
+    go [] = Just []
+    go (a:b:c:d:rest) = do
+      d3 <- fromHex a
+      d2 <- fromHex b
+      d1 <- fromHex c
+      d0 <- fromHex d
+      let v = d3 * 4096 + d2 * 256 + d1 * 16 + d0
+      cs <- go rest
+      pure (chr v : cs)
+    go _ = Nothing
+
+    fromHex ch
+      | isHexDigit ch = Just (digitToInt ch)
+      | otherwise = Nothing
 
 parseTypedScalarSuffix :: Text -> Maybe (Text, Scalar)
 parseTypedScalarSuffix name =
