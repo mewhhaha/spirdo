@@ -1740,6 +1740,7 @@ validateConstAssert ctx constIndex fnIndex structIndex diagConfig (ConstAssert p
 validateFunction :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> FunctionDecl -> Either CompileError ()
 validateFunction ctx constIndex fnIndex structIndex skipConstEval scope fn = do
   mapM_ (validateType ctx scope . (.paramType)) fn.fnParams
+  mapM_ validateFunctionParamType fn.fnParams
   mapM_ (validateType ctx scope) (maybeToList fn.fnReturnType)
   let paramNames = map (.paramName) fn.fnParams
   let paramNamesWithPos = map (\p -> (p.paramName, p.paramPos)) fn.fnParams
@@ -1750,12 +1751,31 @@ validateFunction ctx constIndex fnIndex structIndex skipConstEval scope fn = do
 validateEntryPoint :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> EntryPoint -> Either CompileError ()
 validateEntryPoint ctx constIndex fnIndex structIndex skipConstEval scope entry = do
   mapM_ (validateType ctx scope . (.paramType)) entry.epParams
+  mapM_ validateEntryParamType entry.epParams
   mapM_ (validateType ctx scope) (maybeToList entry.epReturnType)
   let paramNames = map (.paramName) entry.epParams
   let paramNamesWithPos = map (\p -> (p.paramName, p.paramPos)) entry.epParams
   ensureNoDuplicatesAt "entry point parameters" paramNamesWithPos
   let scope1 = scopeWithParams scope paramNames
   validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 entry.epBody
+
+validateFunctionParamType :: Param -> Either CompileError ()
+validateFunctionParamType param =
+  case param.paramType of
+    TyPtr addr _ _ ->
+      if addr `elem` ["function", "private"]
+        then Right ()
+        else withPos param.paramPos $
+          Left (CompileError "function pointer parameters must use ptr<function,...> or ptr<private,...>" Nothing Nothing)
+    _ -> Right ()
+
+validateEntryParamType :: Param -> Either CompileError ()
+validateEntryParamType param =
+  case param.paramType of
+    TyPtr {} ->
+      withPos param.paramPos $
+        Left (CompileError "entry point parameters cannot be pointers" Nothing Nothing)
+    _ -> Right ()
 
 validateStmtList :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> [Stmt] -> Either CompileError ()
 validateStmtList ctx constIndex fnIndex structIndex skipConstEval = go

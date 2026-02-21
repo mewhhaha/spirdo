@@ -200,6 +200,8 @@ main = do
   checkLocationIoTypeRule
   checkF16RequiresEnable
   checkStorageWriteAccessRejected
+  checkPointerParamAddressSpaceRules
+  checkEntryPointerParamRejected
   checkSamplerInterface
   checkCombinedSamplerInterface
   checkSamplerValueCombinedError
@@ -312,6 +314,9 @@ checkNagaOracleParity mNaga =
             , ("naga-parity:f16-enable", defaultOpts, nagaF16Enable, True)
             , ("naga-parity:interpolate-int-linear", defaultOpts, nagaInterpolateIntLinear, False)
             , ("naga-parity:interpolate-float-linear", defaultOpts, nagaInterpolateFloatLinear, True)
+            , ("naga-parity:pointer-param-workgroup", defaultOpts, pointerParamWorkgroupShader, False)
+            , ("naga-parity:pointer-param-storage", defaultOpts, pointerParamStorageShader, False)
+            , ("naga-parity:entry-pointer-param", defaultOpts, nagaEntryPointerParam, False)
             ]
       forM_ cases $ \(label, opts, src, expectedOk) -> do
         spirdoOk <- case compileInline opts src of
@@ -439,6 +444,30 @@ checkStorageWriteAccessRejected =
         fail ("storage-write-access-rejected: unexpected error: " <> msg)
     Right _ ->
       fail "storage-write-access-rejected: expected failure for var<storage, write> buffer"
+
+checkPointerParamAddressSpaceRules :: IO ()
+checkPointerParamAddressSpaceRules = do
+  case compileInline defaultOpts pointerParamWorkgroupShader of
+    Left (CompileError msg _ _) ->
+      unless ("function pointer parameters must use ptr<function,...> or ptr<private,...>" `isInfixOf` msg) $
+        fail ("pointer-param-workgroup: unexpected error: " <> msg)
+    Right _ ->
+      fail "pointer-param-workgroup: expected failure for ptr<workgroup,...> function parameter"
+  case compileInline defaultOpts pointerParamStorageShader of
+    Left (CompileError msg _ _) ->
+      unless ("function pointer parameters must use ptr<function,...> or ptr<private,...>" `isInfixOf` msg) $
+        fail ("pointer-param-storage: unexpected error: " <> msg)
+    Right _ ->
+      fail "pointer-param-storage: expected failure for ptr<storage,...> function parameter"
+
+checkEntryPointerParamRejected :: IO ()
+checkEntryPointerParamRejected =
+  case compileInline defaultOpts nagaEntryPointerParam of
+    Left (CompileError msg _ _) ->
+      unless ("entry point parameters cannot be pointers" `isInfixOf` msg) $
+        fail ("entry-pointer-param: unexpected error: " <> msg)
+    Right _ ->
+      fail "entry-pointer-param: expected failure for pointer entry parameter"
 
 checkPackUniformLayout :: IO ()
 checkPackUniformLayout =
@@ -1771,6 +1800,46 @@ nagaInterpolateFloatLinear =
     , "fn main(@builtin(vertex_index) i: u32) -> Out {"
     , "  let x = f32(i & 1u);"
     , "  return Out(vec4<f32>(0.0, 0.0, 0.0, 1.0), vec2<f32>(x, 0.0));"
+    , "}"
+    ]
+
+nagaEntryPointerParam :: String
+nagaEntryPointerParam =
+  unlines
+    [ "@compute @workgroup_size(1)"
+    , "fn main(p: ptr<function, i32>) {"
+    , "}"
+    ]
+
+pointerParamWorkgroupShader :: String
+pointerParamWorkgroupShader =
+  unlines
+    [ "var<workgroup> g: i32;"
+    , "fn bump(p: ptr<workgroup, i32>) -> i32 {"
+    , "  *p = *p + 1;"
+    , "  return *p;"
+    , "}"
+    , "@compute @workgroup_size(1)"
+    , "fn main() {"
+    , "  let y = bump(&g);"
+    , "  if (y == 0) { }"
+    , "}"
+    ]
+
+pointerParamStorageShader :: String
+pointerParamStorageShader =
+  unlines
+    [ "struct Data { v: u32, }"
+    , "@group(0) @binding(0)"
+    , "var<storage, read_write> data: Data;"
+    , "fn bump(p: ptr<storage, u32, read_write>) -> u32 {"
+    , "  *p = *p + 1u;"
+    , "  return *p;"
+    , "}"
+    , "@compute @workgroup_size(1)"
+    , "fn main() {"
+    , "  let y = bump(&data.v);"
+    , "  if (y == 0u) { }"
     , "}"
     ]
 

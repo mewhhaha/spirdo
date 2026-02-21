@@ -165,6 +165,7 @@ and `Spirdo.Wesl.Inputs`. Internal modules are not part of the supported surface
 - `@invariant` is only accepted on `@builtin(position)` for vertex outputs and fragment inputs.
 - `@interpolate(linear|perspective, ...)` is only accepted on floating-point scalar/vector IO.
 - Storage buffer access modes support `read` and `read_write`; `var<storage, write>` buffers are rejected.
+- Function pointer parameters are limited to `ptr<function,...>` and `ptr<private,...>`; entry-point parameters cannot be pointers.
 
 ### Compile-Time Cache & Timings
 `weslShader` quasiquotes (from `Spirdo.Wesl.Reflection`) use an on-disk cache under
