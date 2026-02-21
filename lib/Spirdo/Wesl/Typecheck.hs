@@ -13,6 +13,7 @@ module Spirdo.Wesl.Typecheck where
 import Control.Monad (foldM, zipWithM, unless, when, replicateM)
 import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE)
 import Control.Monad.IO.Class (liftIO)
+import Data.Bifunctor (first)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, xor)
 import Data.Either (partitionEithers)
 import Data.Int (Int32)
@@ -261,7 +262,7 @@ loadModuleFromFile opts path = do
   where
     parseModule file = do
       src <- readFile file
-      pure (parseModuleWith opts.enabledFeatures src)
+      pure (first (annotateErrorWithSource (Just file) src) (parseModuleWith opts.enabledFeatures src))
 
 pickFirstExisting :: [FilePath] -> IO (Maybe FilePath)
 pickFirstExisting files =
@@ -3733,6 +3734,7 @@ qualifyModule rootPath ctxs node =
       rewriteField = rewriteFieldDecl ctx
       rewriteStmt = rewriteStmtNames ctx
       rewriteExpr = rewriteExprNames ctx
+      rewriteWorkgroup = rewriteWorkgroupSize ctx
       rewriteFn fn =
         fn
           { fnName = renameDecl fn.fnName
@@ -3780,6 +3782,7 @@ qualifyModule rootPath ctxs node =
           then
             [ e
                 { epParams = map rewriteParam e.epParams
+                , epWorkgroupSize = fmap rewriteWorkgroup e.epWorkgroupSize
                 , epReturnType = fmap rewriteTy e.epReturnType
                 , epBody = map rewriteStmt e.epBody
                 }
@@ -3839,7 +3842,7 @@ rewriteType :: ModuleContext -> Type -> Type
 rewriteType ctx ty =
   case ty of
     TyStructRef name -> TyStructRef (rewriteIdent ctx name)
-    TyArray elemTy n -> TyArray (rewriteType ctx elemTy) n
+    TyArray elemTy n -> TyArray (rewriteType ctx elemTy) (rewriteArrayLen ctx n)
     TyVector n s -> TyVector n s
     TyMatrix c r s -> TyMatrix c r s
     TyTexture1D s -> TyTexture1D s
@@ -3867,17 +3870,23 @@ rewriteType ctx ty =
 
 rewriteParamType :: ModuleContext -> Param -> Param
 rewriteParamType ctx param =
-  param { paramType = rewriteType ctx param.paramType }
+  param
+    { paramType = rewriteType ctx param.paramType
+    , paramAttrs = map (rewriteAttr ctx) param.paramAttrs
+    }
 
 rewriteFieldDecl :: ModuleContext -> FieldDecl -> FieldDecl
 rewriteFieldDecl ctx field =
-  field { fdType = rewriteType ctx field.fdType }
+  field
+    { fdType = rewriteType ctx field.fdType
+    , fdAttrs = map (rewriteAttr ctx) field.fdAttrs
+    }
 
 rewriteStmtNames :: ModuleContext -> Stmt -> Stmt
 rewriteStmtNames ctx stmt =
   case stmt of
-    SLet pos name mType expr -> SLet pos name mType (rewriteExprNames ctx expr)
-    SVar pos name mType mExpr -> SVar pos name mType (fmap (rewriteExprNames ctx) mExpr)
+    SLet pos name mType expr -> SLet pos name (fmap (rewriteType ctx) mType) (rewriteExprNames ctx expr)
+    SVar pos name mType mExpr -> SVar pos name (fmap (rewriteType ctx) mType) (fmap (rewriteExprNames ctx) mExpr)
     SAssign pos lv expr -> SAssign pos (rewriteLValueNames ctx lv) (rewriteExprNames ctx expr)
     SAssignOp pos lv op expr -> SAssignOp pos (rewriteLValueNames ctx lv) op (rewriteExprNames ctx expr)
     SInc pos lv -> SInc pos (rewriteLValueNames ctx lv)
@@ -3933,6 +3942,39 @@ rewriteExprNames ctx expr =
     EBitcast pos ty arg -> EBitcast pos (rewriteType ctx ty) (rewriteExprNames ctx arg)
     EField pos base field -> EField pos (rewriteExprNames ctx base) field
     EIndex pos base idx -> EIndex pos (rewriteExprNames ctx base) (rewriteExprNames ctx idx)
+
+rewriteWorkgroupSize :: ModuleContext -> WorkgroupSize -> WorkgroupSize
+rewriteWorkgroupSize ctx workgroup =
+  case workgroup of
+    WorkgroupSizeExpr exprs -> WorkgroupSizeExpr (map (rewriteConstExpr ctx) exprs)
+    WorkgroupSizeValue v -> WorkgroupSizeValue v
+
+rewriteArrayLen :: ModuleContext -> ArrayLen -> ArrayLen
+rewriteArrayLen ctx arrLen =
+  case arrLen of
+    ArrayLenRuntime -> ArrayLenRuntime
+    ArrayLenFixed n -> ArrayLenFixed n
+    ArrayLenExpr expr -> ArrayLenExpr (rewriteConstExpr ctx expr)
+
+rewriteAttr :: ModuleContext -> Attr -> Attr
+rewriteAttr ctx attr =
+  case attr of
+    Attr name args -> Attr name (map rewriteArg args)
+    AttrIf cond -> AttrIf cond
+  where
+    rewriteArg arg =
+      case arg of
+        AttrExpr expr -> AttrExpr (rewriteConstExpr ctx expr)
+        _ -> arg
+
+rewriteConstExpr :: ModuleContext -> ConstExpr -> ConstExpr
+rewriteConstExpr ctx expr =
+  case expr of
+    CEInt {} -> expr
+    CEIdent name -> CEIdent (rewriteIdent ctx name)
+    CEUnaryNeg inner -> CEUnaryNeg (rewriteConstExpr ctx inner)
+    CEBinary op a b -> CEBinary op (rewriteConstExpr ctx a) (rewriteConstExpr ctx b)
+    CECall name args -> CECall (rewriteIdent ctx name) (map (rewriteConstExpr ctx) args)
 
 splitQName :: Text -> [Text]
 splitQName name =

@@ -171,6 +171,8 @@ and `Spirdo.Wesl.Inputs`. Internal modules are not part of the supported surface
 - `@interpolate(linear|perspective, ...)` is only accepted on floating-point scalar/vector IO.
 - Storage buffer access modes support `read` and `read_write`; `var<storage, write>` buffers are rejected.
 - Function pointer parameters are limited to `ptr<function,...>` and `ptr<private,...>`; entry-point parameters cannot be pointers.
+- Module-scope constants accept both `let` and `const` declaration keywords.
+- Qualified imported constants can be used in const-expression positions (for example array lengths and `@workgroup_size(...)`).
 - `@workgroup_size(...)` does not support runtime specialization via `override` values.
 - In statement/switch/loop bodies, only `@if(...)` attributes are accepted.
 

@@ -18,7 +18,7 @@ module Spirdo.Wesl.Compiler where
 import Control.Concurrent (forkFinally)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.QSem (QSem, newQSem, signalQSem, waitQSem)
-import Control.Exception (SomeException, catch, evaluate, throwIO)
+import Control.Exception (IOException, SomeException, catch, evaluate, throwIO, try)
 import GHC.Conc (getNumCapabilities)
 import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
@@ -29,7 +29,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char (isSpace, ord)
 import Data.Either (isLeft, partitionEithers)
-import Data.List (isPrefixOf, sort)
+import Data.List (isInfixOf, isPrefixOf, sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
@@ -346,12 +346,28 @@ compileFileResult :: CompileOptions -> Bool -> FilePath -> IO (Either CompileErr
 compileFileResult opts wantDiagnostics path =
   runExceptT $ do
     filePath <- ExceptT (resolveInputPath path)
-    src <- liftIO (timedPhase opts "read-file" (readFile filePath))
+    src <- do
+      readResult <- liftIO (try (timedPhase opts "read-file" (readFile filePath)) :: IO (Either IOException String))
+      case readResult of
+        Left ioErr ->
+          throwE
+            ( CompileError
+                ("failed to read file: " <> filePath <> " (" <> show ioErr <> ")")
+                Nothing
+                Nothing
+            )
+        Right text -> pure text
     let annotate :: ExceptT CompileError IO a -> ExceptT CompileError IO a
-        annotate = withExceptT (annotateErrorWithSource (Just filePath) src)
+        annotate = withExceptT annotateErr
+        annotateErr err
+          | " --> " `isInfixOf` err.ceMessage = err
+          | otherwise =
+              case (err.ceLine, err.ceColumn) of
+                (Just _, Just _) -> annotateErrorWithSource (Just filePath) src err
+                _ -> err
     moduleAst0 <- annotate (ExceptT (timedPhase opts "parse" (evaluate (parseModuleWith opts.enabledFeatures src))))
     -- resolveImports performs module linking and validateModuleScopes for file-based builds.
-    linked <- annotate (ExceptT (timedPhase opts "imports" (resolveImports opts (dropExtension filePath) moduleAst0)))
+    linked <- ExceptT (timedPhase opts "imports" (resolveImports opts (dropExtension filePath) moduleAst0))
     linked' <- annotate (ExceptT (timedPhase opts "type-aliases" (evaluate (resolveTypeAliases linked))))
     let rootDir = takeDirectory filePath
         rootPath = modulePathFromFile rootDir filePath

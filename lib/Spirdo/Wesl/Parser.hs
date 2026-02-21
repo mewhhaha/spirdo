@@ -392,7 +392,7 @@ parseModuleTokensWith feats toks =
                     (globalDecl, rest2) <- parseGlobalVar attrs' rest1
                     let accGlobals' = if keep then globalDecl : accGlobals else accGlobals
                     loop accDirectives accImports accAliases accStructs accBindings accGlobals' accConsts accOverrides accAsserts accFns accEntries True True rest2
-              (Token (TkIdent "let") _ : _) -> do
+              (Token (TkIdent kw) _ : _) | kw == "let" || kw == "const" -> do
                 (constDecl, rest2) <- parseConstDecl attrs' rest1
                 let accConsts' = if keep then constDecl : accConsts else accConsts
                 loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts' accOverrides accAsserts accFns accEntries True True rest2
@@ -611,10 +611,13 @@ parseConstExpr stop toks = parseConstBitOr toks
       case ts of
         (Token (TkInt n mSuffix) _ : rest) ->
           Right (constIntExpr n mSuffix, rest)
-        (Token (TkIdent name) _ : Token (TkSymbol "(") _ : more) -> do
-          (args, rest1) <- parseConstCallArgs [] more
-          Right (CECall name args, rest1)
-        (Token (TkIdent name) _ : rest) -> Right (CEIdent name, rest)
+        (Token (TkIdent _) _ : _) -> do
+          (name, rest) <- parseFullIdent ts
+          case rest of
+            (Token (TkSymbol "(") _ : more) -> do
+              (args, rest1) <- parseConstCallArgs [] more
+              Right (CECall name args, rest1)
+            _ -> Right (CEIdent name, rest)
         (Token (TkSymbol "(") _ : more) -> do
           (expr, rest1) <- parseConstExpr [")"] more
           rest2 <- expectSymbol ")" rest1
@@ -877,7 +880,7 @@ parseConstDecl attrs toks = do
       (expr, rest4) <- parseExpr rest3
       rest5 <- expectSymbol ";" rest4
       Right (ConstDecl name mType expr, rest5)
-    _ -> Left (errorAt toks "expected let declaration")
+    _ -> Left (errorAt toks "expected let/const declaration")
 
 parseAliasDecl :: [Token] -> Either CompileError (AliasDecl, [Token])
 parseAliasDecl toks =

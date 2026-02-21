@@ -537,10 +537,14 @@ parseMatrixName name =
                         then do
                           cols <- parseDecTxt colsTxt
                           rows <- parseDecTxt rowsTxt
-                          pure (cols, rows)
+                          if validMatrixDim cols && validMatrixDim rows
+                            then pure (cols, rows)
+                            else Nothing
                         else Nothing
                _ -> Nothing
   where
+    validMatrixDim n = n >= 2 && n <= 4
+
     guardNonEmpty txt =
       if T.null txt then Nothing else Just ()
 

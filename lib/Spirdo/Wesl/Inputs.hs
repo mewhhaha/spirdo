@@ -46,7 +46,7 @@ module Spirdo.Wesl.Inputs
   , orderedUniforms
   ) where
 
-import Control.Monad (foldM, when)
+import Control.Monad (foldM, unless, when)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import Data.List (intercalate, sortOn)
@@ -380,6 +380,9 @@ inputsFrom iface (InputsBuilder items) =
   in do
       (inputs, _) <- foldM (applyItem iface.siSamplerMode bmap) (initInputs, Set.empty) items
       let normalized = normalizeInputs inputs
+      let missingBindings = missingBindingNames iface normalized
+      unless (null missingBindings) $
+        Left (InputsError ("missing required bindings: " <> intercalate ", " missingBindings) Nothing)
       case iface.siSamplerMode of
         SamplerCombined ->
           let missing = [t.textureName | t <- normalized.siTextures, isNothing t.textureSampler]
@@ -507,3 +510,19 @@ itemName item =
     InputSampledTexture name _ _ -> name
     InputStorageBuffer name _ -> name
     InputStorageTexture name _ -> name
+
+missingBindingNames :: ShaderInterface -> ShaderInputs iface -> [String]
+missingBindingNames iface inputs =
+  let provided =
+        Set.fromList
+          ( map (.uiName) inputs.siUniforms
+              <> map (.samplerName) inputs.siSamplers
+              <> map (.textureName) inputs.siTextures
+              <> map (.storageBufferName) inputs.siStorageBuffers
+              <> map (.storageTextureName) inputs.siStorageTextures
+          )
+  in
+    [ info.biName
+    | info <- iface.siBindings
+    , not (Set.member info.biName provided)
+    ]

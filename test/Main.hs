@@ -188,6 +188,7 @@ main = do
   checkImportItemCompile spirvVal
   checkImportAliasCompile spirvVal
   checkImportStructZeroCtorCompile spirvVal
+  checkImportQualifiedConstCompile spirvVal
   checkCtsFixtures spirvVal
   checkSwitchConstValidation
   checkConstAssertValidation
@@ -196,6 +197,8 @@ main = do
   checkNonIfStatementAttrsRejected
   checkNonIfSwitchCaseAttrsRejected
   checkNonIfLoopAttrsRejected
+  checkModuleConstDecl
+  checkInvalidMatrixDimensionsRejected
   checkNegativeI32Range
   checkComputeRequiresWorkgroupSize
   checkSuperImportContainment
@@ -229,10 +232,13 @@ main = do
   checkFragmentReturnBindingRequired
   checkNonEntryParamIoAttrsRejected
   checkNegativeLocationRejected
+  checkLocationTooManyArgsRejected
+  checkStageAttrWithArgsRejected
   checkDuplicateLocationAttrRejected
   checkDuplicateBuiltinAttrRejected
   checkDuplicateGroupBindingAttrsRejected
   checkDuplicateStageAttrsRejected
+  checkNonEntryFunctionAttrAccepted
   checkSamplerInterface
   checkCombinedSamplerInterface
   checkSamplerValueCombinedError
@@ -245,6 +251,7 @@ main = do
   checkInputOrdering
   checkInputsCombinedMissingSampler
   checkInputsCombinedOk
+  checkInputsMissingBindingsRejected
   checkInputsSeparateModeRejectsSampledTexture
   checkInputsDuplicateBuilder
   checkQuickCheck
@@ -525,52 +532,92 @@ checkFragmentReturnBindingRequired =
 checkNonEntryParamIoAttrsRejected :: IO ()
 checkNonEntryParamIoAttrsRejected =
   case compileInline defaultOpts nagaNonEntryParamIoAttrs of
-    Left _ -> pure ()
+    Left (CompileError msg _ _) ->
+      unless ("parameter attributes are only allowed on entry points" `isInfixOf` msg) $
+        fail ("non-entry-param-io-attrs: unexpected error: " <> msg)
     Right _ ->
       fail "non-entry-param-io-attrs: expected failure for @location on non-entry function parameter"
 
 checkNegativeLocationRejected :: IO ()
 checkNegativeLocationRejected =
   case compileInline defaultOpts nagaNegativeLocation of
-    Left _ -> pure ()
+    Left (CompileError msg _ _) ->
+      unless ("@location must be a non-negative 32-bit integer" `isInfixOf` msg) $
+        fail ("negative-location: unexpected error: " <> msg)
     Right _ ->
       fail "negative-location: expected failure for @location(-1)"
+
+checkLocationTooManyArgsRejected :: IO ()
+checkLocationTooManyArgsRejected =
+  case compileInline defaultOpts nagaLocationTooManyArgs of
+    Left (CompileError msg _ _) ->
+      unless ("@location expects exactly one integer argument" `isInfixOf` msg) $
+        fail ("location-too-many-args: unexpected error: " <> msg)
+    Right _ ->
+      fail "location-too-many-args: expected failure for @location with two args"
+
+checkStageAttrWithArgsRejected :: IO ()
+checkStageAttrWithArgsRejected =
+  case compileInline defaultOpts nagaStageAttrWithArgs of
+    Left (CompileError msg _ _) ->
+      unless ("invalid entry point attributes" `isInfixOf` msg) $
+        fail ("stage-attr-with-args: unexpected error: " <> msg)
+    Right _ ->
+      fail "stage-attr-with-args: expected failure for stage attribute with args"
 
 checkDuplicateLocationAttrRejected :: IO ()
 checkDuplicateLocationAttrRejected =
   case compileInline defaultOpts nagaDuplicateLocationReturn of
-    Left _ -> pure ()
+    Left (CompileError msg _ _) ->
+      unless ("duplicate @location attributes" `isInfixOf` msg) $
+        fail ("duplicate-location-return: unexpected error: " <> msg)
     Right _ ->
       fail "duplicate-location-return: expected failure for duplicate @location return attributes"
 
 checkDuplicateBuiltinAttrRejected :: IO ()
 checkDuplicateBuiltinAttrRejected =
   case compileInline defaultOpts nagaDuplicateBuiltinReturn of
-    Left _ -> pure ()
+    Left (CompileError msg _ _) ->
+      unless ("duplicate @builtin attributes" `isInfixOf` msg) $
+        fail ("duplicate-builtin-return: unexpected error: " <> msg)
     Right _ ->
       fail "duplicate-builtin-return: expected failure for duplicate @builtin return attributes"
 
 checkDuplicateGroupBindingAttrsRejected :: IO ()
 checkDuplicateGroupBindingAttrsRejected = do
   case compileInline defaultOpts nagaDuplicateGroupAttr of
-    Left _ -> pure ()
+    Left (CompileError msg _ _) ->
+      unless ("duplicate @group attributes" `isInfixOf` msg) $
+        fail ("duplicate-group-attr: unexpected error: " <> msg)
     Right _ ->
       fail "duplicate-group-attr: expected failure for duplicate @group attributes"
   case compileInline defaultOpts nagaDuplicateBindingAttr of
-    Left _ -> pure ()
+    Left (CompileError msg _ _) ->
+      unless ("duplicate @binding attributes" `isInfixOf` msg) $
+        fail ("duplicate-binding-attr: unexpected error: " <> msg)
     Right _ ->
       fail "duplicate-binding-attr: expected failure for duplicate @binding attributes"
 
 checkDuplicateStageAttrsRejected :: IO ()
 checkDuplicateStageAttrsRejected = do
   case compileInline defaultOpts nagaDuplicateFragmentStageAttr of
-    Left _ -> pure ()
+    Left (CompileError msg _ _) ->
+      unless ("invalid entry point attributes" `isInfixOf` msg) $
+        fail ("duplicate-fragment-stage-attr: unexpected error: " <> msg)
     Right _ ->
       fail "duplicate-fragment-stage-attr: expected failure for duplicate @fragment attributes"
   case compileInline defaultOpts nagaDuplicateWorkgroupSizeAttr of
-    Left _ -> pure ()
+    Left (CompileError msg _ _) ->
+      unless ("invalid entry point attributes" `isInfixOf` msg) $
+        fail ("duplicate-workgroup-size-attr: unexpected error: " <> msg)
     Right _ ->
       fail "duplicate-workgroup-size-attr: expected failure for duplicate @workgroup_size attributes"
+
+checkNonEntryFunctionAttrAccepted :: IO ()
+checkNonEntryFunctionAttrAccepted =
+  case compileBytes defaultOpts nagaNonEntryFunctionAttr of
+    Left err -> fail ("non-entry-fn-attr: " <> show err)
+    Right _ -> pure ()
 
 checkPackUniformLayout :: IO ()
 checkPackUniformLayout =
@@ -771,6 +818,15 @@ checkInputsCombinedOk =
           <> Inputs.sampledTexture @"tex" (TextureHandle 9) (SamplerHandle 3)) of
     Left err -> fail ("inputs-combined-ok: " <> err.ieMessage)
     Right _ -> pure ()
+
+checkInputsMissingBindingsRejected :: IO ()
+checkInputsMissingBindingsRejected =
+  case inputsFor orderingShader mempty of
+    Left err ->
+      unless ("missing required bindings:" `isInfixOf` err.ieMessage) $
+        fail ("inputs-missing-bindings: unexpected error: " <> err.ieMessage)
+    Right _ ->
+      fail "inputs-missing-bindings: expected missing required bindings error"
 
 checkInputsSeparateModeRejectsSampledTexture :: IO ()
 checkInputsSeparateModeRejectsSampledTexture =
@@ -1341,6 +1397,18 @@ checkNonIfLoopAttrsRejected =
     Left _ -> pure ()
     Right _ -> fail "loop-attrs: expected failure for non-@if loop attributes"
 
+checkModuleConstDecl :: IO ()
+checkModuleConstDecl =
+  case compileBytes defaultOpts moduleConstDeclShader of
+    Left err -> fail ("module-const-decl: " <> show err)
+    Right _ -> pure ()
+
+checkInvalidMatrixDimensionsRejected :: IO ()
+checkInvalidMatrixDimensionsRejected =
+  case compileInline defaultOpts invalidMatrixDimensionsShader of
+    Left _ -> pure ()
+    Right _ -> fail "invalid-matrix-dimensions: expected failure for mat5x5"
+
 checkNegativeI32Range :: IO ()
 checkNegativeI32Range =
   case compileBytes defaultOpts negativeI32RangeShader of
@@ -1434,6 +1502,14 @@ checkImportStructZeroCtorCompile spirvVal = do
     Left err -> fail ("import-struct-zero-ctor: " <> show err)
     Right (SomeShader shader) -> assertSpirv spirvVal "import-struct-zero-ctor" (shaderSpirv shader)
 
+checkImportQualifiedConstCompile :: Maybe FilePath -> IO ()
+checkImportQualifiedConstCompile spirvVal = do
+  let path = "test" </> "fixtures" </> "import_const_main.wesl"
+  result <- compileFile path
+  case result of
+    Left err -> fail ("import-qualified-const: " <> show err)
+    Right (SomeShader shader) -> assertSpirv spirvVal "import-qualified-const" (shaderSpirv shader)
+
 checkCtsFixtures :: Maybe FilePath -> IO ()
 checkCtsFixtures spirvVal = do
   positive <- collectCtsFixtures ("test" </> "cts" </> "positive")
@@ -1449,7 +1525,8 @@ checkCtsFixtures spirvVal = do
     case result of
       Left err ->
         case expectedCtsNegativeMessage path of
-          Nothing -> pure ()
+          Nothing ->
+            fail ("cts-negative: missing expected error mapping for fixture " <> path)
           Just needle ->
             unless (needle `isInfixOf` err.ceMessage) $
               fail
@@ -1722,6 +1799,26 @@ workgroupOverrideShader =
     [ "override scale: i32 = 1;"
     , "@compute @workgroup_size(scale)"
     , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {}"
+    ]
+
+moduleConstDeclShader :: String
+moduleConstDeclShader =
+  unlines
+    [ "const SCALE: i32 = 1;"
+    , "@compute @workgroup_size(1)"
+    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
+    , "  let _ = SCALE + i32(gid.x);"
+    , "}"
+    ]
+
+invalidMatrixDimensionsShader :: String
+invalidMatrixDimensionsShader =
+  unlines
+    [ "@fragment"
+    , "fn main() -> @location(0) vec4<f32> {"
+    , "  let m = mat5x5<f32>(1.0);"
+    , "  return vec4<f32>(m[0][0]);"
+    , "}"
     ]
 
 computeShader :: String
