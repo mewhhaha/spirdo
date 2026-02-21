@@ -309,6 +309,7 @@ entryAttributesMaybe attrs =
          case stages of
            [("compute", _)] ->
              case workgroups of
+               [] -> Just (StageCompute, Nothing)
                [args] -> Just (StageCompute, Just (WorkgroupSizeExpr (map attrArgToConstExpr args)))
                _ -> Nothing
            [("fragment", _)] ->

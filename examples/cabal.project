@@ -4,4 +4,4 @@ packages: .
 source-repository-package
   type: git
   location: https://github.com/mewhhaha/slop
-  tag: main
+  tag: ff550dfeec4513f82d73642b150556c59090307e

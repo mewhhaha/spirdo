@@ -171,6 +171,8 @@ and `Spirdo.Wesl.Inputs`. Internal modules are not part of the supported surface
 - `@interpolate(linear|perspective, ...)` is only accepted on floating-point scalar/vector IO.
 - Storage buffer access modes support `read` and `read_write`; `var<storage, write>` buffers are rejected.
 - Function pointer parameters are limited to `ptr<function,...>` and `ptr<private,...>`; entry-point parameters cannot be pointers.
+- `@workgroup_size(...)` does not support runtime specialization via `override` values.
+- In statement/switch/loop bodies, only `@if(...)` attributes are accepted.
 
 ### Compile-Time Cache & Timings
 `weslShader` quasiquotes (from `Spirdo.Wesl.Reflection`) use an on-disk cache under
@@ -187,8 +189,10 @@ let opts =
 
 Runtime compilation via `Spirdo.Wesl.compile` uses `[Option]`:
 ```hs
-let opts = [OptSamplerMode SamplerSeparate, OptCache (CacheInDir "dist-newstyle/.wesl-cache")]
+let opts = [OptSamplerMode SamplerSeparate]
 ```
+Note: on-disk cache controls (`OptCache`, `OptCacheVerbose`, `withCache*`) currently apply to
+compile-time/quasiquoter flows. Runtime `compile`/`compileFile` paths do not use the disk cache.
 
 Combined samplers are the default. If your backend expects **separate** sampler
 and texture bindings (e.g. explicit texture+sampler slots), set
@@ -671,6 +675,7 @@ the library API. It uses Slop to render a full-screen quad with fragment shaders
 Fragment variants in `examples/app/Main.hs` (left/right to switch):
 - Gradient Bloom
 - Circle Pulse
+- Inline Imports
 - Spectrum Shift
 - Sine Waves
 - Checker Warp

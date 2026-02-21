@@ -7,21 +7,24 @@
 -- | Executable entry point.
 module Main (main) where
 
-import Control.Monad (forM_, unless, when, replicateM)
+import Control.Monad (forM_, unless, replicateM, when)
 import Data.Bits ((.|.), shiftL)
 import qualified Data.ByteString as BS
+import Data.Char (toLower)
 import Data.List (find, isInfixOf, isPrefixOf)
+import Data.Foldable (toList)
 import Data.Maybe (isJust, isNothing)
 import Data.Proxy (Proxy(..))
 import Data.Word (Word16, Word32, Word64)
 import GHC.Float (castFloatToWord32)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable, getTemporaryDirectory, listDirectory, removeFile)
 import System.Environment (lookupEnv)
-import System.FilePath ((</>), takeExtension)
+import System.FilePath ((</>), takeExtension, takeFileName)
 import System.Exit (ExitCode(..))
 import System.IO (hClose, openBinaryTempFile)
 import System.Process (readProcessWithExitCode)
 import Test.QuickCheck (Gen, arbitrary, generate)
+import Unsafe.Coerce (unsafeCoerce)
 
 import Spirdo.Wesl.Reflection
 import Spirdo.Wesl.Inputs
@@ -113,6 +116,11 @@ defaultOpts = [OptEnableFeature "f16"]
 separateOpts :: [Option]
 separateOpts = [OptSamplerMode SamplerSeparate]
 
+isTruthy :: String -> Bool
+isTruthy raw =
+  let lower = map toLower raw
+  in lower == "1" || lower == "true" || lower == "yes" || lower == "on"
+
 inlineSource :: String -> Source
 inlineSource = SourceInline "<inline>"
 
@@ -133,6 +141,12 @@ main :: IO ()
 main = do
   spirvVal <- findExecutable "spirv-val"
   nagaExe <- findExecutable "naga"
+  requireValidators <- fmap isTruthy <$> lookupEnv "SPIRDO_REQUIRE_VALIDATORS"
+  when (requireValidators == Just True) $ do
+    when (isNothing spirvVal) $
+      fail "SPIRDO_REQUIRE_VALIDATORS=1 but spirv-val was not found in PATH"
+    when (isNothing nagaExe) $
+      fail "SPIRDO_REQUIRE_VALIDATORS=1 but naga was not found in PATH"
   let tests =
         [ ("compute-atomics", computeShader)
         , ("compute-barriers", barrierShader)
@@ -173,12 +187,22 @@ main = do
   checkImportCompile spirvVal
   checkImportItemCompile spirvVal
   checkImportAliasCompile spirvVal
+  checkImportStructZeroCtorCompile spirvVal
   checkCtsFixtures spirvVal
   checkSwitchConstValidation
   checkConstAssertValidation
+  checkMalformedHexLiteral
+  checkStructFieldSeparators
+  checkNonIfStatementAttrsRejected
+  checkNonIfSwitchCaseAttrsRejected
+  checkNonIfLoopAttrsRejected
+  checkNegativeI32Range
+  checkComputeRequiresWorkgroupSize
+  checkSuperImportContainment
   checkOverrideSpecialization spirvVal
   checkOverrideDefault spirvVal
   checkOverrideMissing
+  checkWorkgroupSizeOverrideReject
   checkOverrideDependency spirvVal
   checkOverrideParityMode
   checkDiagnosticOverride
@@ -221,6 +245,7 @@ main = do
   checkInputOrdering
   checkInputsCombinedMissingSampler
   checkInputsCombinedOk
+  checkInputsSeparateModeRejectsSampledTexture
   checkInputsDuplicateBuilder
   checkQuickCheck
   checkDuplicateBindings
@@ -710,6 +735,10 @@ checkBindingPlan =
       let group0 = filter (\b -> b.biGroup == 0) plan.bpBindings
       unless (length group0 == 2) $
         fail "binding-plan: expected 2 bindings in group 0"
+      let byGroupValues = concat (toList plan.bpByGroup)
+      let byGroupBindings = map (.biBinding) byGroupValues
+      unless (byGroupBindings == [0, 1]) $
+        fail ("binding-plan: expected grouped bindings [0,1], got " <> show byGroupBindings)
       unless (length plan.bpSamplers == 1) $
         fail "binding-plan: expected 1 sampler binding"
       unless (length plan.bpTextures == 1) $
@@ -742,6 +771,27 @@ checkInputsCombinedOk =
           <> Inputs.sampledTexture @"tex" (TextureHandle 9) (SamplerHandle 3)) of
     Left err -> fail ("inputs-combined-ok: " <> err.ieMessage)
     Right _ -> pure ()
+
+checkInputsSeparateModeRejectsSampledTexture :: IO ()
+checkInputsSeparateModeRejectsSampledTexture =
+  case compileInline separateOpts samplerShader of
+    Left err -> fail ("inputs-separate-sampledtexture: " <> show err)
+    Right (SomeShader someShader) ->
+      let shader :: Shader
+            'SamplerSeparate
+            '[ 'Binding "tex" 'BTexture2D 0 0 ('TTexture2D 'SF32)
+             , 'Binding "samp" 'BSampler 0 1 'TSampler
+             ]
+          shader = unsafeCoerce someShader
+      in case inputsFor
+            shader
+            (Inputs.sampledTexture @"tex" (TextureHandle 9) (SamplerHandle 3)) of
+          Left err ->
+            unless
+              ("sampledTexture is not supported in SamplerSeparate mode" `isInfixOf` err.ieMessage)
+              (fail ("inputs-separate-sampledtexture: unexpected error: " <> err.ieMessage))
+          Right _ ->
+            fail "inputs-separate-sampledtexture: expected sampledTexture rejection in SamplerSeparate mode"
 
 checkInputsDuplicateBuilder :: IO ()
 checkInputsDuplicateBuilder =
@@ -1226,7 +1276,7 @@ duplicateBindingShader =
 
 checkGoldenSpirv :: IO ()
 checkGoldenSpirv = do
-  update <- isJust <$> lookupEnv "SPIRDO_UPDATE_GOLDEN"
+  update <- fmap (maybe False isTruthy) (lookupEnv "SPIRDO_UPDATE_GOLDEN")
   let dir = "test" </> "golden"
   let fixtures =
         [ ("compute-basic", goldenComputeShader)
@@ -1261,6 +1311,97 @@ checkIfTranslation = do
     Left _ -> pure ()
     Right _ -> fail "if-translation: expected failure without FOO feature"
 
+checkMalformedHexLiteral :: IO ()
+checkMalformedHexLiteral = do
+  case compileInline defaultOpts malformedHexLiteralShader of
+    Left _ -> pure ()
+    Right _ -> fail "malformed-hex-literal: expected parse failure for 0x/0x__"
+
+checkStructFieldSeparators :: IO ()
+checkStructFieldSeparators =
+  case compileInline defaultOpts badStructFieldShader of
+    Left _ -> pure ()
+    Right _ -> fail "struct-field-separator: expected failure for adjacent fields without delimiter"
+
+checkNonIfStatementAttrsRejected :: IO ()
+checkNonIfStatementAttrsRejected =
+  case compileInline defaultOpts nonIfStatementAttrShader of
+    Left _ -> pure ()
+    Right _ -> fail "statement-attrs: expected failure for non-@if statement attributes"
+
+checkNonIfSwitchCaseAttrsRejected :: IO ()
+checkNonIfSwitchCaseAttrsRejected =
+  case compileInline defaultOpts nonIfSwitchCaseAttrShader of
+    Left _ -> pure ()
+    Right _ -> fail "switch-case-attrs: expected failure for non-@if switch-case attributes"
+
+checkNonIfLoopAttrsRejected :: IO ()
+checkNonIfLoopAttrsRejected =
+  case compileInline defaultOpts nonIfLoopAttrShader of
+    Left _ -> pure ()
+    Right _ -> fail "loop-attrs: expected failure for non-@if loop attributes"
+
+checkNegativeI32Range :: IO ()
+checkNegativeI32Range =
+  case compileBytes defaultOpts negativeI32RangeShader of
+    Left err -> fail ("negative-i32-range: " <> show err)
+    Right _ -> pure ()
+
+checkComputeRequiresWorkgroupSize :: IO ()
+checkComputeRequiresWorkgroupSize =
+  case compileInline defaultOpts computeWithoutWorkgroupSizeShader of
+    Left err ->
+      unless ("@workgroup_size is required for @compute" `isInfixOf` err.ceMessage) $
+        fail ("compute-workgroup-size-missing: unexpected error: " <> show err)
+    Right _ -> fail "compute-workgroup-size-missing: expected failure for @compute without @workgroup_size"
+
+checkSuperImportContainment :: IO ()
+checkSuperImportContainment = do
+  tmp <- getTemporaryDirectory
+  let rootDir = tmp </> "spirdo-super-containment"
+      libFile = rootDir </> "lib.wesl"
+      rootFile = rootDir </> "main.wesl"
+      validSource =
+        unlines
+          [ "import super::lib;"
+          , "@fragment"
+          , "fn main() -> @location(0) vec4<f32> {"
+          , "  return vec4(0.0);"
+          , "}"
+          ]
+      invalidSource =
+        unlines
+          [ "import super::super::lib;"
+          , "@fragment"
+          , "fn main() -> @location(0) vec4<f32> {"
+          , "  return vec4(0.0);"
+          , "}"
+          ]
+      libSource = "fn lib() -> f32 { return 1.0; }"
+
+  createDirectoryIfMissing True rootDir
+  writeFile libFile libSource
+  writeFile rootFile validSource
+  resultOk <- compileFile rootFile
+  case resultOk of
+    Left err -> fail ("super-containment: valid single super import failed: " <> show err)
+    Right _ -> pure ()
+  writeFile rootFile invalidSource
+  resultBad <- compileFile rootFile
+  case resultBad of
+    Left err ->
+      unless ("import path escapes package root" `isInfixOf` err.ceMessage) $
+        fail ("super-containment: expected path escape message, got: " <> show err)
+    Right _ -> fail "super-containment: expected rejected super import path that escapes root"
+
+checkWorkgroupSizeOverrideReject :: IO ()
+checkWorkgroupSizeOverrideReject =
+  case compileInline defaultOpts workgroupOverrideShader of
+    Left err ->
+      unless ("runtime specialization" `isInfixOf` err.ceMessage) $
+        fail ("workgroup-size-overrides: unexpected error: " <> show err)
+    Right _ -> fail "workgroup-size-overrides: expected failure for override-dependent workgroup_size"
+
 checkImportCompile :: Maybe FilePath -> IO ()
 checkImportCompile spirvVal = do
   let path = "test" </> "fixtures" </> "main.wesl"
@@ -1285,6 +1426,14 @@ checkImportAliasCompile spirvVal = do
     Left err -> fail ("import-alias: " <> show err)
     Right (SomeShader shader) -> assertSpirv spirvVal "import-alias" (shaderSpirv shader)
 
+checkImportStructZeroCtorCompile :: Maybe FilePath -> IO ()
+checkImportStructZeroCtorCompile spirvVal = do
+  let path = "test" </> "fixtures" </> "import_struct_main.wesl"
+  result <- compileFile path
+  case result of
+    Left err -> fail ("import-struct-zero-ctor: " <> show err)
+    Right (SomeShader shader) -> assertSpirv spirvVal "import-struct-zero-ctor" (shaderSpirv shader)
+
 checkCtsFixtures :: Maybe FilePath -> IO ()
 checkCtsFixtures spirvVal = do
   positive <- collectCtsFixtures ("test" </> "cts" </> "positive")
@@ -1298,7 +1447,19 @@ checkCtsFixtures spirvVal = do
   forM_ negative $ \path -> do
     result <- compileFile path
     case result of
-      Left _ -> pure ()
+      Left err ->
+        case expectedCtsNegativeMessage path of
+          Nothing -> pure ()
+          Just needle ->
+            unless (needle `isInfixOf` err.ceMessage) $
+              fail
+                ( "cts-negative: unexpected error for "
+                    <> path
+                    <> "\nexpected to contain: "
+                    <> show needle
+                    <> "\nactual: "
+                    <> show err
+                )
       Right _ -> fail ("cts-negative: expected failure for " <> path)
 
 collectCtsFixtures :: FilePath -> IO [FilePath]
@@ -1310,6 +1471,20 @@ collectCtsFixtures dir = do
       entries <- listDirectory dir
       let exts = [".wesl", ".wgsl"]
       pure [dir </> e | e <- entries, takeExtension e `elem` exts, not ("_" `isPrefixOf` e)]
+
+expectedCtsNegativeMessage :: FilePath -> Maybe String
+expectedCtsNegativeMessage path =
+  case takeFileName path of
+    "import_duplicate_alias.wesl" -> Just "duplicate import aliases"
+    "import_duplicate_target.wesl" -> Just "duplicate imports:"
+    "missing_workgroup_size.wesl" -> Just "@workgroup_size is required for @compute"
+    "override_cycle.wesl" -> Just "override dependency cycle"
+    "scope_out_of_scope.wesl" -> Just "unknown identifier: inner"
+    "unknown_identifier.wesl" -> Just "unknown identifier: missing_value"
+    "const_assert_type_mismatch.wesl" -> Just "const_assert comparison requires matching types"
+    "const_assert_pointer_compare.wesl" -> Just "const int expression references a composite value"
+    "const_fn_switch_fallthrough.wesl" -> Just "non-void function must return a value"
+    _ -> Nothing
 
 checkSwitchConstValidation :: IO ()
 checkSwitchConstValidation =
@@ -1469,6 +1644,85 @@ checkDiagnosticDuplicateCase =
     Right (_, diags) ->
       unless (any (\d -> d.diagRule == "duplicate_case" && d.diagSeverity == DiagWarning) diags) $
         fail "diagnostic-duplicate-case: expected duplicate_case warning"
+
+malformedHexLiteralShader :: String
+malformedHexLiteralShader =
+  unlines
+    [ "let bad = 0x;"
+    , "let bad2 = 0x__;"
+    , "@compute @workgroup_size(1)"
+    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
+    , "  let _ = bad + bad2;"
+    , "}"
+    ]
+
+badStructFieldShader :: String
+badStructFieldShader =
+  unlines
+    [ "struct Params {"
+    , "  a: i32"
+    , "  b: i32;"
+    , "}"
+    , "@compute @workgroup_size(1)"
+    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {}"
+    ]
+
+nonIfStatementAttrShader :: String
+nonIfStatementAttrShader =
+  unlines
+    [ "@compute @workgroup_size(1)"
+    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
+    , "  @group(0) let x = i32(1);"
+    , "}"
+    ]
+
+nonIfSwitchCaseAttrShader :: String
+nonIfSwitchCaseAttrShader =
+  unlines
+    [ "@compute @workgroup_size(1)"
+    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
+    , "  switch (gid.x) {"
+    , "    @location(0) case 0: {}"
+    , "  }"
+    , "}"
+    ]
+
+nonIfLoopAttrShader :: String
+nonIfLoopAttrShader =
+  unlines
+    [ "@compute @workgroup_size(1)"
+    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
+    , "  loop {"
+    , "    @id(0) break;"
+    , "  }"
+    , "}"
+    ]
+
+negativeI32RangeShader :: String
+negativeI32RangeShader =
+  unlines
+    [ "@compute @workgroup_size(1)"
+    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
+    , "  let _: i32 = -2147483648;"
+    , "}"
+    ]
+
+computeWithoutWorkgroupSizeShader :: String
+computeWithoutWorkgroupSizeShader =
+  unlines
+    [ "@compute"
+    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
+    , "  let _ = gid;"
+    , "}"
+    ]
+
+workgroupOverrideShader :: String
+workgroupOverrideShader =
+  unlines
+    [ "override scale: i32 = 1;"
+    , "@compute @workgroup_size(scale)"
+    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {}"
+    ]
 
 computeShader :: String
 computeShader =

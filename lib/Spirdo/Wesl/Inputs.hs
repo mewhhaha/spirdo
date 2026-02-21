@@ -378,7 +378,7 @@ inputsFrom iface (InputsBuilder items) =
   let bmap = bindingMap iface
       initInputs = emptyInputs iface
   in do
-      (inputs, _) <- foldM (applyItem bmap) (initInputs, Set.empty) items
+      (inputs, _) <- foldM (applyItem iface.siSamplerMode bmap) (initInputs, Set.empty) items
       let normalized = normalizeInputs inputs
       case iface.siSamplerMode of
         SamplerCombined ->
@@ -392,17 +392,28 @@ inputsFrom iface (InputsBuilder items) =
 inputsFor :: forall mode iface. Shader mode iface -> InputsBuilder mode iface -> Either InputsError (ShaderInputs iface)
 inputsFor shader = inputsFrom (shaderInterface shader)
 
-applyItem :: BindingMap -> (ShaderInputs iface, Set.Set String) -> InputItem -> Either InputsError (ShaderInputs iface, Set.Set String)
-applyItem bmap (inputs, seen) item = do
+applyItem ::
+  SamplerBindingMode ->
+  BindingMap ->
+  (ShaderInputs iface, Set.Set String) ->
+  InputItem ->
+  Either InputsError (ShaderInputs iface, Set.Set String)
+applyItem mode bmap (inputs, seen) item = do
   let name = itemName item
   when (Set.member name seen) $
     Left (InputsError ("duplicate binding entry: " <> name) (Just name))
   info <- maybe (Left (InputsError ("binding not found in interface: " <> name) (Just name))) Right (bindingInfoForMap name bmap)
-  inputs' <- applyBinding name info item inputs
+  inputs' <- applyBinding mode name info item inputs
   pure (inputs', Set.insert name seen)
 
-applyBinding :: String -> BindingInfo -> InputItem -> ShaderInputs iface -> Either InputsError (ShaderInputs iface)
-applyBinding name info item inputs =
+applyBinding ::
+  SamplerBindingMode ->
+  String ->
+  BindingInfo ->
+  InputItem ->
+  ShaderInputs iface ->
+  Either InputsError (ShaderInputs iface)
+applyBinding mode name info item inputs =
   case (item, info.biKind) of
     (InputUniform _ val, kind)
       | isUniformKind kind -> do
@@ -443,6 +454,12 @@ applyBinding name info item inputs =
                   : inputs.siTextures
             }
     (InputSampledTexture _ handle sampHandle, kind)
+      | mode == SamplerSeparate ->
+          Left
+            ( InputsError
+                ("sampledTexture is not supported in SamplerSeparate mode: " <> name)
+                (Just name)
+            )
       | isTextureKind kind ->
           Right inputs
             { siTextures =

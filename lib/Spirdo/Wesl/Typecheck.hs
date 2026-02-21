@@ -15,6 +15,7 @@ import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, xor)
 import Data.Either (partitionEithers)
+import Data.Int (Int32)
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.IntSet as IntSet
 import qualified Data.Map.Strict as Map
@@ -29,7 +30,7 @@ import Spirdo.Wesl.Syntax
 import Spirdo.Wesl.Types
 import Spirdo.Wesl.Util
 import System.Directory (doesFileExist)
-import System.FilePath (dropExtension, makeRelative, splitDirectories, takeDirectory, (<.>), (</>))
+import System.FilePath (dropExtension, isRelative, makeRelative, normalise, splitDirectories, takeDirectory, (<.>), (</>))
 
 validateEntry :: EntryPoint -> Either CompileError ()
 validateEntry entry =
@@ -59,6 +60,12 @@ data ImportResolved = ImportResolved
 
 emptyModuleAst :: ModuleAst
 emptyModuleAst = ModuleAst [] [] [] [] [] [] [] [] [] [] []
+
+minI32 :: Integer
+minI32 = fromIntegral (minBound :: Int32)
+
+maxI32 :: Integer
+maxI32 = fromIntegral (maxBound :: Int32)
 
 resolveImports :: CompileOptions -> FilePath -> ModuleAst -> IO (Either CompileError ModuleAst)
 resolveImports opts rootFile rootAst = runExceptT $ do
@@ -112,7 +119,7 @@ resolveImportItemsInline opts rootDir moduleFile ast moduleMap =
 
 resolveImportItemInline :: CompileOptions -> FilePath -> FilePath -> Map.Map FilePath ModuleAst -> ImportDecl -> ImportItem -> Either CompileError ImportResolved
 resolveImportItemInline opts rootDir moduleFile moduleMap decl item = do
-  let baseDir = importBaseDir rootDir moduleFile decl.idRelative
+  baseDir <- importBaseDir rootDir moduleFile decl.idRelative
   let segs = item.iiPath
   let fullBase = appendPathSegments baseDir segs
   let fullMod = findModuleInline moduleMap fullBase
@@ -268,7 +275,7 @@ pickFirstExisting files =
 
 resolveImportItem :: CompileOptions -> FilePath -> FilePath -> ImportDecl -> ImportItem -> IO (Either CompileError ImportResolved)
 resolveImportItem opts rootDir moduleFile decl item = runExceptT $ do
-  let baseDir = importBaseDir rootDir moduleFile decl.idRelative
+  baseDir <- ExceptT (pure (importBaseDir rootDir moduleFile decl.idRelative))
   let segs = item.iiPath
   let fullBase = appendPathSegments baseDir segs
   fullMod <- liftIO (findModuleFile fullBase)
@@ -345,12 +352,21 @@ modulePathFromFile rootDir filePath =
   let rel = dropExtension (makeRelative rootDir filePath)
   in map T.pack (filter (not . null) (splitDirectories rel))
 
-importBaseDir :: FilePath -> FilePath -> Maybe ImportRelative -> FilePath
+importBaseDir :: FilePath -> FilePath -> Maybe ImportRelative -> Either CompileError FilePath
 importBaseDir rootDir moduleFile rel =
   case rel of
-    Nothing -> rootDir
-    Just ImportPackage -> rootDir
-    Just (ImportSuper n) -> superModuleFile moduleFile n
+    Nothing -> ensureInRoot rootDir rootDir
+    Just ImportPackage -> ensureInRoot rootDir rootDir
+    Just (ImportSuper n) -> ensureInRoot rootDir (superModuleFile (normalise moduleFile) n)
+
+ensureInRoot :: FilePath -> FilePath -> Either CompileError FilePath
+ensureInRoot rootDir path =
+  let rel = makeRelative (normalise rootDir) (normalise path)
+  in if isRelative rel && not (isEscaping rel)
+      then Right (normalise path)
+      else Left (CompileError "import path escapes package root" Nothing Nothing)
+  where
+    isEscaping relPath = any (== "..") (splitDirectories relPath)
 
 superModuleFile :: FilePath -> Int -> FilePath
 superModuleFile filePath n =
@@ -399,6 +415,7 @@ data ModuleContext = ModuleContext
   , mcLocals :: Set.Set Text
   , mcConstNames :: Set.Set Text
   , mcFunctionNames :: Set.Set Text
+  , mcOverrideNames :: Set.Set Text
   , mcRootPath :: [Text]
   }
 
@@ -464,8 +481,9 @@ buildModuleContext rootPath _rootDir node =
           )
       constNames = Set.fromList (map (.cdName) ast.modConsts <> map (.odName) ast.modOverrides)
       functionNames = Set.fromList (map (.fnName) ast.modFunctions)
+      overrideNames = Set.fromList (map (.odName) ast.modOverrides)
       (moduleAliases, itemAliases) = buildAliasMaps node.mnImports
-  in ModuleContext node.mnPath moduleAliases itemAliases localNames constNames functionNames rootPath
+  in ModuleContext node.mnPath moduleAliases itemAliases localNames constNames functionNames overrideNames rootPath
 
 data ConstIndex = ConstIndex
   { ciPathTable :: !NameTable
@@ -1083,6 +1101,8 @@ resolveConstExprs rootPath rootDir ast = do
         (StageCompute, Nothing) ->
           Left (CompileError "@workgroup_size is required for @compute" Nothing Nothing)
         (StageCompute, Just (WorkgroupSizeExpr exprs)) -> do
+          when (any (containsOverrideInWorkgroupExpr ctx) exprs) $
+            Left (CompileError "@workgroup_size does not support runtime specialization via overrides" Nothing Nothing)
           when (null exprs || length exprs > 3) $
             Left (CompileError "@workgroup_size expects 1, 2, or 3 values" Nothing Nothing)
           vals <- mapM (evalConstIntExpr ctx constIndex fnIndex structIndex . constExprToExpr) exprs
@@ -1106,6 +1126,13 @@ resolveConstExprs rootPath rootDir ast = do
           Left (CompileError "@workgroup_size is not allowed for @vertex" Nothing Nothing)
         (StageFragment, Just _) ->
           Left (CompileError "@workgroup_size is not allowed for @fragment" Nothing Nothing)
+    containsOverrideInWorkgroupExpr ctx expr =
+      case expr of
+        CEInt _ -> False
+        CEIdent name -> Set.member name ctx.mcOverrideNames
+        CEUnaryNeg inner -> containsOverrideInWorkgroupExpr ctx inner
+        CEBinary _ lhs rhs -> containsOverrideInWorkgroupExpr ctx lhs || containsOverrideInWorkgroupExpr ctx rhs
+        CECall _ args -> any (containsOverrideInWorkgroupExpr ctx) args
 
 constExprToExpr :: ConstExpr -> Expr
 constExprToExpr expr =
@@ -1994,7 +2021,7 @@ coerceConstScalarValue target val =
         CVInt ci -> CVInt <$> coerceConstIntToScalar I32 ci
         CVFloat (ConstFloat _ v) -> do
           let n = truncate v :: Integer
-          when (n < 0 || n > 0x7FFFFFFF) $
+          when (n < minI32 || n > maxI32) $
             Left (CompileError "constant i32 is out of range" Nothing Nothing)
           Right (CVInt (ConstInt I32 n))
         _ -> Left (CompileError "expected integer constant" Nothing Nothing)
@@ -2098,9 +2125,7 @@ defaultConstValue ctx structIndex ty =
     TyArray _ (ArrayLenExpr _) ->
       Left (CompileError "array constants require a fixed length" Nothing Nothing)
     TyStructRef name -> do
-      decl <- case lookupStructIndex structIndex [] name of
-        Nothing -> Left (CompileError ("unknown struct: " <> T.unpack name) Nothing Nothing)
-        Just d -> Right d
+      decl <- resolveStructDecl ctx structIndex name
       fields <- mapM (\f -> (f.fdName,) <$> defaultConstValue ctx structIndex f.fdType) decl.sdFields
       Right (CVStruct name fields)
     TySampler -> Left (CompileError "sampler types are not supported for local variables" Nothing Nothing)
@@ -2844,7 +2869,7 @@ evalConstAssignOp op lhs rhs =
         Left (CompileError "constant u32 is out of range" Nothing Nothing)
 
     checkI32 n =
-      when (n < 0 || n > 0x7FFFFFFF) $
+      when (n < minI32 || n > maxI32) $
         Left (CompileError "constant i32 is out of range" Nothing Nothing)
 
 evalConstFieldAccess :: ConstValue -> Text -> Either CompileError ConstValue
@@ -2905,7 +2930,10 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
               let v = negate val
               checkI32 v
               Right (ConstInt I32 v)
-            U32 -> Left (CompileError "unary minus is not supported for u32 in const expressions" Nothing Nothing)
+            U32 ->
+              if val == maxI32 + 1
+                then Right (ConstInt I32 minI32)
+                else Left (CompileError "unary minus is not supported for u32 in const expressions" Nothing Nothing)
             _ -> Left (CompileError "unary minus expects integer constants" Nothing Nothing)
         EUnary _ OpDeref _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
@@ -2993,7 +3021,7 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
         Left (CompileError "switch case selector is out of range for u32" Nothing Nothing)
 
     checkI32 n =
-      when (n < 0 || n > 0x7FFFFFFF) $
+      when (n < minI32 || n > maxI32) $
         Left (CompileError "switch case selector is out of range for i32" Nothing Nothing)
 
     coercePair sa va sb vb =
@@ -3001,11 +3029,11 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
         (I32, I32) -> Right (I32, va, vb)
         (U32, U32) -> Right (U32, va, vb)
         (I32, U32) ->
-          if vb <= 0x7FFFFFFF
+          if vb <= maxI32
             then Right (I32, va, vb)
             else Left (CompileError "constant u32 is out of range for i32 operation" Nothing Nothing)
         (U32, I32) ->
-          if va <= 0x7FFFFFFF
+          if va <= maxI32
             then Right (I32, va, vb)
             else Left (CompileError "constant u32 is out of range for i32 operation" Nothing Nothing)
         _ -> Left (CompileError "unsupported const integer types" Nothing Nothing)
@@ -3305,7 +3333,7 @@ coerceConstIntToScalar target (ConstInt scalar val) =
     (I32, I32) -> Right (ConstInt I32 val)
     (U32, U32) -> Right (ConstInt U32 val)
     (I32, U32) ->
-      if val <= 0x7FFFFFFF
+      if val <= maxI32
         then Right (ConstInt I32 val)
         else Left (CompileError "constant u32 is out of range for i32" Nothing Nothing)
     (U32, I32) ->

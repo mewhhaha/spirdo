@@ -14,6 +14,10 @@ extra-doc-files:    CHANGELOG.md
                    , MIGRATION.md
 extra-source-files:
     bench/fixtures/feature.wesl
+    test/fixtures/*.wesl
+    test/cts/positive/*.wesl
+    test/cts/negative/*.wesl
+    test/golden/*.golden
 
 common warnings
     ghc-options: -Wall
@@ -70,6 +74,7 @@ test-suite spirdo-tests
         filepath,
         process,
         QuickCheck,
+        template-haskell,
         spirdo
     default-language: GHC2024
 

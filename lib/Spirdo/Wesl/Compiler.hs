@@ -28,7 +28,7 @@ import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char (isSpace, ord)
-import Data.Either (partitionEithers)
+import Data.Either (isLeft, partitionEithers)
 import Data.List (isPrefixOf, sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -493,7 +493,14 @@ compileInlineCached :: CompileOptions -> String -> Q (ByteString, ShaderInterfac
 compileInlineCached opts src = do
   let sourceInfo = Just (ShaderSource "<inline>" (T.pack src))
   cached <- TH.runIO (timed opts "cache-read" (loadWeslCache opts src))
-  maybe compileFresh (\(bytes, iface) -> pure (bytes, iface, sourceInfo)) cached
+  maybe
+    compileFresh
+    ( \entry@(_, iface) ->
+        case validateCachedShader opts src entry of
+          Right _ -> pure (fst entry, iface, sourceInfo)
+          Left _ -> compileFresh
+    )
+    cached
   where
     compileFresh =
       either
@@ -550,10 +557,14 @@ compileInlineCachedBatch opts entries = do
   let hits =
         [ (ix, Right (name, src, bytes, iface, Just (ShaderSource name (T.pack src)), True))
         | ((ix, (name, src)), Just (bytes, iface)) <- zip indexed cached
+        , Right _ <- [validateCachedShader opts src (bytes, iface)]
         ]
   let misses =
         [ (ix, name, src)
-        | ((ix, (name, src)), Nothing) <- zip indexed cached
+        | ((ix, (name, src)), maybeEntry) <- zip indexed cached
+        , case maybeEntry of
+            Nothing -> True
+            Just entry -> isLeft (validateCachedShader opts src entry)
         ]
   missResults <- mapConcurrentlyIO (compileMiss opts) misses
   let results = hits ++ missResults
@@ -586,6 +597,13 @@ compileInlineCachedBatch opts entries = do
     writeCache (_name, src, bytes, iface, _sourceInfo, fromCache) =
       unless fromCache $
         timed opts "cache-write" (writeWeslCache opts src bytes iface)
+
+validateCachedShader :: CompileOptions -> String -> (ByteString, ShaderInterface) -> Either String ()
+validateCachedShader opts src (bytes, iface) =
+  withSamplerModeProxy opts.samplerBindingMode $ \(_ :: SamplerModeProxy mode) ->
+    case (prepareShader (CompiledShader bytes iface Nothing :: CompiledShader mode '[]) :: Either String (PreparedShader mode '[])) of
+      Left err -> Left ("cached shader invalid for " <> src <> ": " <> err)
+      Right _ -> Right ()
 
 preparedExpWith :: CompileOptions -> ByteString -> ShaderInterface -> Maybe ShaderSource -> Q Exp
 preparedExpWith opts bytes iface sourceInfo = do

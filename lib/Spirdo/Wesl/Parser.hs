@@ -52,8 +52,9 @@ lexWesl = go (SrcPos 1 1)
               let (ident, rest, pos') = consumeIdent pos src
               in (Token (TkIdent ident) pos :) <$> go pos' rest
           | isDigit c ->
-              let (tok, rest, pos') = consumeNumber pos src
-              in (Token tok pos :) <$> go pos' rest
+              do
+                (tok, rest, pos') <- consumeNumber pos src
+                (Token tok pos :) <$> go pos' rest
           | c == '"' ->
               (\(str, rest, pos') -> (Token (TkString str) pos :) <$> go pos' rest)
                 =<< consumeString pos cs
@@ -193,16 +194,16 @@ lexWesl = go (SrcPos 1 1)
       in (ident, rest, pos')
 
     consumeNumber p cs =
-      case T.stripPrefix "0x" cs <|> T.stripPrefix "0X" cs of
+      Right =<< case T.stripPrefix "0x" cs <|> T.stripPrefix "0X" cs of
         Just restHex ->
           let (hexRaw, rest) = T.span isHexDigitOrUnderscore restHex
               hexLen = T.length hexRaw
               pos' = advanceCols p (2 + hexLen)
           in if T.all (== '_') hexRaw
-              then (TkInt 0 Nothing, restHex, p)
+              then Left (CompileError "malformed hexadecimal literal" (Just p.spLine) (Just p.spCol))
               else
                 let val = parseHexUnderscore hexRaw
-                in applySuffix (TkInt val Nothing) rest pos'
+                in Right (applySuffix (TkInt val Nothing) rest pos')
         Nothing ->
           let (intRaw, rest0) = T.span isDigitOrUnderscore cs
               intVal = parseDecUnderscore intRaw
@@ -219,11 +220,11 @@ lexWesl = go (SrcPos 1 1)
                         consumedLen = intRawLen + 1 + T.length fracRaw + T.length expRaw
                         pos' = advanceCols p consumedLen
                     in if okExp
-                        then applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest2 pos'
+                        then Right (applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest2 pos')
                         else
                           let floatTxt = intDigits <> "." <> fracDigits
                               floatPos = advanceCols p (intRawLen + 1 + T.length fracRaw)
-                          in applySuffix (TkFloat (parseFloatText floatTxt) Nothing) rest1 floatPos
+                          in Right (applySuffix (TkFloat (parseFloatText floatTxt) Nothing) rest1 floatPos)
                   _ ->
                     let (expTxt, expRaw, rest1, okExp) = parseExponent rest0
                         pos' = advanceCols p (intRawLen + T.length expRaw)
@@ -231,8 +232,8 @@ lexWesl = go (SrcPos 1 1)
                         then
                           let intDigits = removeUnderscores intRaw
                               numTxt = intDigits <> expTxt
-                          in applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos'
-                        else applySuffix (TkInt intVal Nothing) rest0 (advanceCols p intRawLen)
+                          in Right (applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos')
+                        else Right (applySuffix (TkInt intVal Nothing) rest0 (advanceCols p intRawLen))
               _ ->
                 let (expTxt, expRaw, rest1, okExp) = parseExponent rest0
                     pos' = advanceCols p (intRawLen + T.length expRaw)
@@ -240,8 +241,8 @@ lexWesl = go (SrcPos 1 1)
                     then
                       let intDigits = removeUnderscores intRaw
                           numTxt = intDigits <> expTxt
-                      in applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos'
-                    else applySuffix (TkInt intVal Nothing) rest0 (advanceCols p intRawLen)
+                      in Right (applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos')
+                    else Right (applySuffix (TkInt intVal Nothing) rest0 (advanceCols p intRawLen))
       where
         isDigitOrUnderscore c = isDigit c || c == '_'
         isHexDigitOrUnderscore c = isHexDigit c || c == '_'
@@ -723,10 +724,11 @@ parseStructFields feats acc rest =
     (Token (TkSymbol "}") _ : more) -> Right (reverse acc, more)
     _ -> do
       (mField, rest1) <- parseStructField feats rest
-      let rest2 = case rest1 of
-            (Token (TkSymbol ",") _ : more) -> more
-            (Token (TkSymbol ";") _ : more) -> more
-            _ -> rest1
+      rest2 <- case rest1 of
+        (Token (TkSymbol ",") _ : more) -> Right more
+        (Token (TkSymbol ";") _ : more) -> Right more
+        (Token (TkSymbol "}") _ : _) -> Right rest1
+        _ -> Left (errorAt rest1 "expected ',' or ';' between struct fields")
       let acc' = case mField of
             Just field -> field : acc
             Nothing -> acc
@@ -1036,7 +1038,8 @@ parseStatements feats acc toks =
     (Token (TkSymbol "}") _ : more) -> Right (reverse acc, more)
     _ -> do
       (attrs, rest1) <- parseAttributes toks
-      (keep, _attrs') <- applyIf attrs feats rest1
+      (keep, attrs') <- applyIf attrs feats rest1
+      unless (null attrs') (Left (errorAt rest1 "only @if attributes are allowed in statements"))
       (stmt, rest) <- parseStmt feats rest1
       let acc' = if keep then stmt : acc else acc
       parseStatements feats acc' rest
@@ -1177,7 +1180,8 @@ parseSwitchBody feats toks =
         (Token (TkSymbol "}") _ : more) -> Right (reverse acc, def, more)
         _ -> do
           (attrs, rest1) <- parseAttributes rest
-          (keep, _attrs) <- applyIf attrs feats rest1
+          (keep, attrs') <- applyIf attrs feats rest1
+          unless (null attrs') (Left (errorAt rest1 "only @if attributes are allowed on switch cases"))
           case rest1 of
             (Token (TkIdent "case") _ : more) -> do
               (selectors, rest2) <- parseCaseSelectors more
@@ -1215,7 +1219,8 @@ parseLoopBody feats toks =
         (Token (TkSymbol "}") _ : more) -> Right (reverse acc, Nothing, more)
         _ -> do
           (attrs, rest1) <- parseAttributes rest
-          (keep, _attrs) <- applyIf attrs feats rest1
+          (keep, attrs') <- applyIf attrs feats rest1
+          unless (null attrs') (Left (errorAt rest1 "only @if attributes are allowed in loops"))
           case rest1 of
             (Token (TkIdent "continuing") _ : more) -> do
               (contBody, rest2) <- parseBody feats more

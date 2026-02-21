@@ -354,7 +354,7 @@ bindingPlan iface =
         sortBy
           (comparing (.biGroup) <> comparing (.biBinding) <> comparing (.biName))
           iface.siBindings
-      grouped = Map.fromListWith (<>) [(info.biGroup, [info]) | info <- sorted]
+      grouped = Map.fromListWith (flip (<>)) [(info.biGroup, [info]) | info <- sorted]
   in BindingPlan
         { bpBindings = sorted
         , bpByGroup = grouped
