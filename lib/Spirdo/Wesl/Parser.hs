@@ -413,12 +413,13 @@ parseModuleTokensWith feats toks =
                 loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides' accAsserts accFns accEntries True True rest2
               (Token (TkIdent "fn") _ : _) -> do
                 (name, params, retType, retAttrs, retLoc, retBuiltin, body, rest2) <- parseFunctionGeneric feats rest1
-                let hasStageAttr = any isStageAttr attrs'
+                let hasEntryAttr = any isEntryAttr attrs'
                 case entryAttributesMaybe attrs' of
                   Nothing ->
-                    if hasStageAttr
-                      then Left (errorAt rest1 "invalid entry point attributes")
-                      else do
+                    if null attrs' || isStandaloneWorkgroupSize attrs'
+                      then do
+                        when (any hasParamAttrs params) $
+                          Left (errorAt rest1 "parameter attributes are only allowed on entry points")
                         case retLoc of
                           Nothing -> pure ()
                           Just _ -> Left (errorAt rest1 "return location is only allowed on entry points")
@@ -430,17 +431,28 @@ parseModuleTokensWith feats toks =
                         let fnDecl = FunctionDecl name params retType body
                         let accFns' = if keep then fnDecl : accFns else accFns
                         loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns' accEntries True True rest2
+                      else
+                        if hasEntryAttr
+                          then Left (errorAt rest1 "invalid entry point attributes")
+                          else Left (errorAt rest1 "function declarations do not accept attributes other than @if")
                   Just (stage, workgroup) -> do
+                    unless (all isEntryAttr attrs') $
+                      Left (errorAt rest1 "invalid entry point attributes")
                     let entry = EntryPoint name stage workgroup params retType retAttrs retLoc retBuiltin body
                     let accEntries' = if keep then entry : accEntries else accEntries
                     loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntries' True True rest2
               _ -> Left (errorAt rest1 "expected directive, import, alias, struct, var, let, override, const_assert, or fn")
   in loop [] [] [] [] [] [] [] [] [] [] [] False False toks
   where
-    isStageAttr attr =
+    isEntryAttr attr =
       case attr of
-        Attr n _ -> n == "compute" || n == "fragment" || n == "vertex"
+        Attr n _ -> n == "compute" || n == "fragment" || n == "vertex" || n == "workgroup_size"
         AttrIf _ -> False
+    isStandaloneWorkgroupSize attrs =
+      case attrs of
+        [Attr "workgroup_size" args] -> not (null args) && length args <= 3
+        _ -> False
+    hasParamAttrs (Param _ _ _ attrs) = not (null attrs)
     isIdAttr attr =
       case attr of
         Attr n [AttrInt _] -> n == "id"

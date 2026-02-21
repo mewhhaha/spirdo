@@ -890,6 +890,7 @@ resolveConstExprs rootPath rootDir ast = do
     resolveField ctx constIndex fnIndex structIndex fld = do
       ty <- resolveType ctx constIndex fnIndex structIndex fld.fdType
       attrs <- resolveAttrs ctx constIndex fnIndex structIndex fld.fdAttrs
+      validateLocationBuiltinAttrs attrs
       Right fld { fdType = ty, fdAttrs = attrs }
 
     resolveBinding ctx constIndex fnIndex structIndex decl = do
@@ -917,6 +918,7 @@ resolveConstExprs rootPath rootDir ast = do
     resolveParam ctx constIndex fnIndex structIndex param = do
       ty <- resolveType ctx constIndex fnIndex structIndex param.paramType
       attrs <- resolveAttrs ctx constIndex fnIndex structIndex param.paramAttrs
+      validateLocationBuiltinAttrs attrs
       Right param { paramType = ty, paramAttrs = attrs }
 
     resolveFunction ctx constIndex fnIndex structIndex fn = do
@@ -929,9 +931,19 @@ resolveConstExprs rootPath rootDir ast = do
       params <- mapM (resolveParam ctx constIndex fnIndex structIndex) entry.epParams
       retTy <- mapM (resolveType ctx constIndex fnIndex structIndex) entry.epReturnType
       retAttrs <- resolveAttrs ctx constIndex fnIndex structIndex entry.epReturnAttrs
+      validateLocationBuiltinAttrs retAttrs
       wg <- resolveWorkgroup ctx constIndex fnIndex structIndex entry.epStage entry.epWorkgroupSize
       body <- mapM (resolveStmt ctx constIndex fnIndex structIndex) entry.epBody
-      Right entry { epParams = params, epReturnType = retTy, epReturnAttrs = retAttrs, epWorkgroupSize = wg, epBody = body }
+      Right
+        entry
+          { epParams = params
+          , epReturnType = retTy
+          , epReturnAttrs = retAttrs
+          , epReturnLocation = attrLocation retAttrs
+          , epReturnBuiltin = attrBuiltin retAttrs
+          , epWorkgroupSize = wg
+          , epBody = body
+          }
 
     resolveExpr ctx constIndex fnIndex structIndex expr =
       case expr of

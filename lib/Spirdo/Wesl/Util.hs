@@ -13,6 +13,7 @@ module Spirdo.Wesl.Util
   , attrIntMaybe
   , attrLocation
   , attrBuiltin
+  , validateLocationBuiltinAttrs
   , attrArgs
   , attrInts
   , paramLocation
@@ -63,6 +64,7 @@ import Data.Char (chr, digitToInt, isAlphaNum, isDigit, isHexDigit, ord)
 import Data.Int (Int32)
 import Data.List (isInfixOf, isPrefixOf)
 import Data.Maybe (fromMaybe, listToMaybe)
+import Control.Monad (when)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word16, Word32)
@@ -208,7 +210,7 @@ attrInt name attrs =
   listToMaybe [v | Attr n args <- attrs, n == name, AttrInt v <- args]
 
 attrIntMaybe :: Text -> [Attr] -> Maybe Word32
-attrIntMaybe name attrs = fmap fromIntegral (attrInt name attrs)
+attrIntMaybe name attrs = attrInt name attrs >>= integerToWord32Maybe
 
 attrLocation :: [Attr] -> Maybe Word32
 attrLocation = attrIntMaybe "location"
@@ -216,6 +218,39 @@ attrLocation = attrIntMaybe "location"
 attrBuiltin :: [Attr] -> Maybe Text
 attrBuiltin attrs =
   listToMaybe [name | Attr n args <- attrs, n == "builtin", AttrIdent name <- args]
+
+validateLocationBuiltinAttrs :: [Attr] -> Either CompileError ()
+validateLocationBuiltinAttrs attrs = do
+  validateLocation
+  validateBuiltin
+  where
+    validateLocation =
+      case [args | Attr n args <- attrs, n == "location"] of
+        [] -> Right ()
+        [args] ->
+          case args of
+            [AttrInt n]
+              | n < 0 || n > fromIntegral (maxBound :: Word32) ->
+                  Left (CompileError "@location must be a non-negative 32-bit integer" Nothing Nothing)
+              | otherwise ->
+                  Right ()
+            [_] ->
+              Left (CompileError "@location expects an integer argument" Nothing Nothing)
+            _ ->
+              Left (CompileError "@location expects exactly one integer argument" Nothing Nothing)
+        _ -> Left (CompileError "duplicate @location attributes" Nothing Nothing)
+
+    validateBuiltin =
+      case [args | Attr n args <- attrs, n == "builtin"] of
+        [] -> Right ()
+        [args] ->
+          case args of
+            [AttrIdent _] -> Right ()
+            [_] ->
+              Left (CompileError "@builtin expects an identifier argument" Nothing Nothing)
+            _ ->
+              Left (CompileError "@builtin expects exactly one identifier argument" Nothing Nothing)
+        _ -> Left (CompileError "duplicate @builtin attributes" Nothing Nothing)
 
 attrArgs :: Text -> [Attr] -> Maybe [AttrArg]
 attrArgs name attrs =
@@ -233,45 +268,59 @@ paramBuiltin :: [Attr] -> Maybe Text
 paramBuiltin = attrBuiltin
 
 bindingNumbers :: [Attr] -> Either CompileError (Word32, Word32)
-bindingNumbers attrs =
-  maybe
-    (Left (CompileError "@group and @binding are required for bindings" Nothing Nothing))
-    Right
-    ( do
-        grp <- attrInt "group" attrs
-        bind <- attrInt "binding" attrs
-        pure (fromIntegral grp, fromIntegral bind)
-    )
+bindingNumbers attrs = do
+  let groups = [args | Attr n args <- attrs, n == "group"]
+      bindings = [args | Attr n args <- attrs, n == "binding"]
+  when (null groups || null bindings) $
+    Left (CompileError "@group and @binding are required for bindings" Nothing Nothing)
+  grp <- parseNumberAttr "group" groups
+  bind <- parseNumberAttr "binding" bindings
+  pure (grp, bind)
+  where
+    parseNumberAttr name argsList =
+      case argsList of
+        [args] ->
+          case args of
+            [AttrInt n] ->
+              case integerToWord32Maybe n of
+                Just v -> Right v
+                Nothing -> Left (CompileError ("@" <> textToString name <> " must be a non-negative 32-bit integer") Nothing Nothing)
+            [_] ->
+              Left (CompileError ("@" <> textToString name <> " expects an integer argument") Nothing Nothing)
+            _ ->
+              Left (CompileError ("@" <> textToString name <> " expects exactly one integer argument") Nothing Nothing)
+        _ ->
+          Left (CompileError ("duplicate @" <> textToString name <> " attributes") Nothing Nothing)
+
+integerToWord32Maybe :: Integer -> Maybe Word32
+integerToWord32Maybe n
+  | n < 0 = Nothing
+  | n > fromIntegral (maxBound :: Word32) = Nothing
+  | otherwise = Just (fromIntegral n)
 
 entryAttributesMaybe :: [Attr] -> Maybe (Stage, Maybe WorkgroupSize)
 entryAttributesMaybe attrs =
-  let isCompute = any (hasAttr "compute") attrs
-      isFragment = any (hasAttr "fragment") attrs
-      isVertex = any (hasAttr "vertex") attrs
-      wgArgs = attrArgs "workgroup_size" attrs
-  in case (isCompute, isFragment, isVertex) of
-       (True, True, _) -> Nothing
-       (True, _, True) -> Nothing
-       (_, True, True) -> Nothing
-       (True, False, False) ->
-         case wgArgs of
-           Just args -> Just (StageCompute, Just (WorkgroupSizeExpr (map attrArgToConstExpr args)))
-           Nothing -> Nothing
-       (False, True, False) ->
-         case wgArgs of
-           Nothing -> Just (StageFragment, Nothing)
-           Just _ -> Nothing
-       (False, False, True) ->
-         case wgArgs of
-           Nothing -> Just (StageVertex, Nothing)
-           Just _ -> Nothing
-       (False, False, False) -> Nothing
+  let stages = [(name, args) | Attr name args <- attrs, name == "compute" || name == "fragment" || name == "vertex"]
+      workgroups = [args | Attr name args <- attrs, name == "workgroup_size"]
+      stageHasArgs = any (not . null . snd) stages
+  in if stageHasArgs
+       then Nothing
+       else
+         case stages of
+           [("compute", _)] ->
+             case workgroups of
+               [args] -> Just (StageCompute, Just (WorkgroupSizeExpr (map attrArgToConstExpr args)))
+               _ -> Nothing
+           [("fragment", _)] ->
+             case workgroups of
+               [] -> Just (StageFragment, Nothing)
+               _ -> Nothing
+           [("vertex", _)] ->
+             case workgroups of
+               [] -> Just (StageVertex, Nothing)
+               _ -> Nothing
+           _ -> Nothing
   where
-    hasAttr target attr =
-      case attr of
-        Attr name _ -> name == target
-        AttrIf _ -> False
-
 attrArgToConstExpr :: AttrArg -> ConstExpr
 attrArgToConstExpr arg =
   case arg of

@@ -3234,6 +3234,8 @@ emitFragmentOutput structEnv entry retLayout st0 =
             Left (CompileError "resource types are not allowed as fragment outputs" Nothing Nothing)
           when (containsAtomic layout) $
             Left (CompileError "atomic types are not allowed as fragment outputs" Nothing Nothing)
+          when (isNothing entry.epReturnBuiltin && isNothing entry.epReturnLocation) $
+            Left (CompileError "fragment entry point return must use @location or @builtin" Nothing Nothing)
           blendSrc <- parseBlendSrcAttr entry.epReturnAttrs
           when (isJust blendSrc) $
             Left (CompileError "if @blend_src is used, fragment outputs must be exactly two @location(0) fields with @blend_src(0) and @blend_src(1)" Nothing Nothing)

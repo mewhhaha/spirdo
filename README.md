@@ -162,6 +162,11 @@ and `Spirdo.Wesl.Inputs`. Internal modules are not part of the supported surface
 - If `@blend_src` is used, fragment outputs must be exactly two `@location(0)` outputs:
   one `@blend_src(0)` and one `@blend_src(1)`.
 - `@location` stage IO types must be scalar/vector `i32`, `u32`, `f16`, or `f32`.
+- Fragment entry returns must explicitly use `@location(...)` or `@builtin(...)`.
+- Entry-point IO attributes are strict: duplicate or malformed `@location`/`@builtin` are rejected.
+- Binding attributes are strict: `@group` and `@binding` must each appear exactly once with a non-negative 32-bit integer.
+- Entry-point function attributes are strict: duplicate stage attrs (for example `@fragment @fragment`) and duplicate `@workgroup_size` are rejected.
+- Non-entry functions cannot use IO attributes (`@location`/`@builtin`) on parameters.
 - `@invariant` is only accepted on `@builtin(position)` for vertex outputs and fragment inputs.
 - `@interpolate(linear|perspective, ...)` is only accepted on floating-point scalar/vector IO.
 - Storage buffer access modes support `read` and `read_write`; `var<storage, write>` buffers are rejected.

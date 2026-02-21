@@ -202,6 +202,13 @@ main = do
   checkStorageWriteAccessRejected
   checkPointerParamAddressSpaceRules
   checkEntryPointerParamRejected
+  checkFragmentReturnBindingRequired
+  checkNonEntryParamIoAttrsRejected
+  checkNegativeLocationRejected
+  checkDuplicateLocationAttrRejected
+  checkDuplicateBuiltinAttrRejected
+  checkDuplicateGroupBindingAttrsRejected
+  checkDuplicateStageAttrsRejected
   checkSamplerInterface
   checkCombinedSamplerInterface
   checkSamplerValueCombinedError
@@ -317,6 +324,18 @@ checkNagaOracleParity mNaga =
             , ("naga-parity:pointer-param-workgroup", defaultOpts, pointerParamWorkgroupShader, False)
             , ("naga-parity:pointer-param-storage", defaultOpts, pointerParamStorageShader, False)
             , ("naga-parity:entry-pointer-param", defaultOpts, nagaEntryPointerParam, False)
+            , ("naga-parity:fragment-return-no-binding", defaultOpts, nagaFragmentReturnNoBinding, False)
+            , ("naga-parity:non-entry-param-io-attrs", defaultOpts, nagaNonEntryParamIoAttrs, False)
+            , ("naga-parity:negative-location", defaultOpts, nagaNegativeLocation, False)
+            , ("naga-parity:location-too-many-args", defaultOpts, nagaLocationTooManyArgs, False)
+            , ("naga-parity:duplicate-location-return", defaultOpts, nagaDuplicateLocationReturn, False)
+            , ("naga-parity:duplicate-builtin-return", defaultOpts, nagaDuplicateBuiltinReturn, False)
+            , ("naga-parity:duplicate-group-attr", defaultOpts, nagaDuplicateGroupAttr, False)
+            , ("naga-parity:duplicate-binding-attr", defaultOpts, nagaDuplicateBindingAttr, False)
+            , ("naga-parity:duplicate-fragment-stage-attr", defaultOpts, nagaDuplicateFragmentStageAttr, False)
+            , ("naga-parity:duplicate-workgroup-size-attr", defaultOpts, nagaDuplicateWorkgroupSizeAttr, False)
+            , ("naga-parity:stage-attr-with-args", defaultOpts, nagaStageAttrWithArgs, False)
+            , ("naga-parity:non-entry-fn-attr", defaultOpts, nagaNonEntryFunctionAttr, True)
             ]
       forM_ cases $ \(label, opts, src, expectedOk) -> do
         spirdoOk <- case compileInline opts src of
@@ -468,6 +487,65 @@ checkEntryPointerParamRejected =
         fail ("entry-pointer-param: unexpected error: " <> msg)
     Right _ ->
       fail "entry-pointer-param: expected failure for pointer entry parameter"
+
+checkFragmentReturnBindingRequired :: IO ()
+checkFragmentReturnBindingRequired =
+  case compileInline defaultOpts nagaFragmentReturnNoBinding of
+    Left (CompileError msg _ _) ->
+      unless ("fragment entry point return must use @location or @builtin" `isInfixOf` msg) $
+        fail ("fragment-return-binding: unexpected error: " <> msg)
+    Right _ ->
+      fail "fragment-return-binding: expected failure for unbound fragment return"
+
+checkNonEntryParamIoAttrsRejected :: IO ()
+checkNonEntryParamIoAttrsRejected =
+  case compileInline defaultOpts nagaNonEntryParamIoAttrs of
+    Left _ -> pure ()
+    Right _ ->
+      fail "non-entry-param-io-attrs: expected failure for @location on non-entry function parameter"
+
+checkNegativeLocationRejected :: IO ()
+checkNegativeLocationRejected =
+  case compileInline defaultOpts nagaNegativeLocation of
+    Left _ -> pure ()
+    Right _ ->
+      fail "negative-location: expected failure for @location(-1)"
+
+checkDuplicateLocationAttrRejected :: IO ()
+checkDuplicateLocationAttrRejected =
+  case compileInline defaultOpts nagaDuplicateLocationReturn of
+    Left _ -> pure ()
+    Right _ ->
+      fail "duplicate-location-return: expected failure for duplicate @location return attributes"
+
+checkDuplicateBuiltinAttrRejected :: IO ()
+checkDuplicateBuiltinAttrRejected =
+  case compileInline defaultOpts nagaDuplicateBuiltinReturn of
+    Left _ -> pure ()
+    Right _ ->
+      fail "duplicate-builtin-return: expected failure for duplicate @builtin return attributes"
+
+checkDuplicateGroupBindingAttrsRejected :: IO ()
+checkDuplicateGroupBindingAttrsRejected = do
+  case compileInline defaultOpts nagaDuplicateGroupAttr of
+    Left _ -> pure ()
+    Right _ ->
+      fail "duplicate-group-attr: expected failure for duplicate @group attributes"
+  case compileInline defaultOpts nagaDuplicateBindingAttr of
+    Left _ -> pure ()
+    Right _ ->
+      fail "duplicate-binding-attr: expected failure for duplicate @binding attributes"
+
+checkDuplicateStageAttrsRejected :: IO ()
+checkDuplicateStageAttrsRejected = do
+  case compileInline defaultOpts nagaDuplicateFragmentStageAttr of
+    Left _ -> pure ()
+    Right _ ->
+      fail "duplicate-fragment-stage-attr: expected failure for duplicate @fragment attributes"
+  case compileInline defaultOpts nagaDuplicateWorkgroupSizeAttr of
+    Left _ -> pure ()
+    Right _ ->
+      fail "duplicate-workgroup-size-attr: expected failure for duplicate @workgroup_size attributes"
 
 checkPackUniformLayout :: IO ()
 checkPackUniformLayout =
@@ -1811,6 +1889,130 @@ nagaEntryPointerParam =
     , "}"
     ]
 
+nagaFragmentReturnNoBinding :: String
+nagaFragmentReturnNoBinding =
+  unlines
+    [ "@fragment"
+    , "fn main() -> vec4<f32> {"
+    , "  return vec4<f32>(1.0);"
+    , "}"
+    ]
+
+nagaNonEntryParamIoAttrs :: String
+nagaNonEntryParamIoAttrs =
+  unlines
+    [ "fn helper(@location(0) x: f32) -> f32 {"
+    , "  return x;"
+    , "}"
+    , "@fragment"
+    , "fn main() -> @location(0) vec4<f32> {"
+    , "  return vec4<f32>(helper(1.0));"
+    , "}"
+    ]
+
+nagaNegativeLocation :: String
+nagaNegativeLocation =
+  unlines
+    [ "@vertex"
+    , "fn main(@location(-1) x: vec4<f32>) -> @builtin(position) vec4<f32> {"
+    , "  return x;"
+    , "}"
+    ]
+
+nagaLocationTooManyArgs :: String
+nagaLocationTooManyArgs =
+  unlines
+    [ "@fragment"
+    , "fn main() -> @location(0, 1) vec4<f32> {"
+    , "  return vec4<f32>(1.0);"
+    , "}"
+    ]
+
+nagaDuplicateLocationReturn :: String
+nagaDuplicateLocationReturn =
+  unlines
+    [ "@fragment"
+    , "fn main() -> @location(0) @location(1) vec4<f32> {"
+    , "  return vec4<f32>(1.0);"
+    , "}"
+    ]
+
+nagaDuplicateBuiltinReturn :: String
+nagaDuplicateBuiltinReturn =
+  unlines
+    [ "@vertex"
+    , "fn main() -> @builtin(position) @builtin(position) vec4<f32> {"
+    , "  return vec4<f32>(0.0, 0.0, 0.0, 1.0);"
+    , "}"
+    ]
+
+nagaDuplicateGroupAttr :: String
+nagaDuplicateGroupAttr =
+  unlines
+    [ "struct U {"
+    , "  v: vec4<f32>,"
+    , "}"
+    , "@group(0) @group(1) @binding(0)"
+    , "var<uniform> u: U;"
+    , "@fragment"
+    , "fn main() -> @location(0) vec4<f32> {"
+    , "  return u.v;"
+    , "}"
+    ]
+
+nagaDuplicateBindingAttr :: String
+nagaDuplicateBindingAttr =
+  unlines
+    [ "struct U {"
+    , "  v: vec4<f32>,"
+    , "}"
+    , "@group(0) @binding(0) @binding(1)"
+    , "var<uniform> u: U;"
+    , "@fragment"
+    , "fn main() -> @location(0) vec4<f32> {"
+    , "  return u.v;"
+    , "}"
+    ]
+
+nagaDuplicateFragmentStageAttr :: String
+nagaDuplicateFragmentStageAttr =
+  unlines
+    [ "@fragment @fragment"
+    , "fn main() -> @location(0) vec4<f32> {"
+    , "  return vec4<f32>(1.0);"
+    , "}"
+    ]
+
+nagaDuplicateWorkgroupSizeAttr :: String
+nagaDuplicateWorkgroupSizeAttr =
+  unlines
+    [ "@compute @workgroup_size(1) @workgroup_size(2)"
+    , "fn main() {"
+    , "}"
+    ]
+
+nagaStageAttrWithArgs :: String
+nagaStageAttrWithArgs =
+  unlines
+    [ "@fragment(1)"
+    , "fn main() -> @location(0) vec4<f32> {"
+    , "  return vec4<f32>(1.0);"
+    , "}"
+    ]
+
+nagaNonEntryFunctionAttr :: String
+nagaNonEntryFunctionAttr =
+  unlines
+    [ "@workgroup_size(1)"
+    , "fn helper() -> i32 {"
+    , "  return 1;"
+    , "}"
+    , "@fragment"
+    , "fn main() -> @location(0) vec4<f32> {"
+    , "  return vec4<f32>(f32(helper()));"
+    , "}"
+    ]
+
 pointerParamWorkgroupShader :: String
 pointerParamWorkgroupShader =
   unlines
@@ -2230,7 +2432,7 @@ diagnosticUnreachableShader =
     , "  let _ = 1;"
     , "}"
     , "@fragment"
-    , "fn main() -> vec4<f32> {"
+    , "fn main() -> @location(0) vec4<f32> {"
     , "  discard;"
     , "  let _ = 0.5;"
     , "  return vec4(1.0, 0.0, 0.0, 1.0);"
