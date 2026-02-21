@@ -150,6 +150,7 @@ data EntryPoint = EntryPoint
   , epWorkgroupSize :: !(Maybe WorkgroupSize)
   , epParams :: ![Param]
   , epReturnType :: !(Maybe Type)
+  , epReturnAttrs :: ![Attr]
   , epReturnLocation :: !(Maybe Word32)
   , epReturnBuiltin :: !(Maybe Text)
   , epBody :: ![Stmt]

@@ -928,9 +928,10 @@ resolveConstExprs rootPath rootDir ast = do
     resolveEntry ctx constIndex fnIndex structIndex entry = do
       params <- mapM (resolveParam ctx constIndex fnIndex structIndex) entry.epParams
       retTy <- mapM (resolveType ctx constIndex fnIndex structIndex) entry.epReturnType
+      retAttrs <- resolveAttrs ctx constIndex fnIndex structIndex entry.epReturnAttrs
       wg <- resolveWorkgroup ctx constIndex fnIndex structIndex entry.epStage entry.epWorkgroupSize
       body <- mapM (resolveStmt ctx constIndex fnIndex structIndex) entry.epBody
-      Right entry { epParams = params, epReturnType = retTy, epWorkgroupSize = wg, epBody = body }
+      Right entry { epParams = params, epReturnType = retTy, epReturnAttrs = retAttrs, epWorkgroupSize = wg, epBody = body }
 
     resolveExpr ctx constIndex fnIndex structIndex expr =
       case expr of
@@ -1049,7 +1050,7 @@ resolveConstExprs rootPath rootDir ast = do
     resolveAttr ctx constIndex fnIndex structIndex attr =
       case attr of
         Attr name args
-          | name `elem` ["align", "size", "location"] -> do
+          | name `elem` ["align", "size", "location", "blend_src"] -> do
               args' <- mapM (resolveAttrInt ctx constIndex fnIndex structIndex) args
               Right (Attr name args')
           | otherwise -> Right attr
@@ -1141,6 +1142,7 @@ data Scope = Scope
   , scModuleAliases :: IntSet.IntSet
   , scItemAliases :: IntSet.IntSet
   , scTypeAliases :: IntSet.IntSet
+  , scEnabledFeatures :: Set.Set Text
   , scAllowShadowing :: Bool
   , scAllowFallthrough :: Bool
   }
@@ -1179,6 +1181,7 @@ validateModuleScope opts skipConstAsserts rootPath rootDir constIndex fnIndex st
   let (nt2, moduleAliasIds) = internNameSet nt1 (Map.keys ctx.mcModuleAliases)
   let (nt3, itemAliasIds) = internNameSet nt2 (Map.keys ctx.mcItemAliases)
   let (nt4, typeAliasIds) = internNameSet nt3 (map (.adName) node.mnAst.modAliases)
+  let enabledFeatures = Set.fromList [feat | DirEnable feat <- node.mnAst.modDirectives]
   let scope0 =
         Scope
           { scNameTable = nt4
@@ -1187,6 +1190,7 @@ validateModuleScope opts skipConstAsserts rootPath rootDir constIndex fnIndex st
           , scModuleAliases = moduleAliasIds
           , scItemAliases = itemAliasIds
           , scTypeAliases = typeAliasIds
+          , scEnabledFeatures = enabledFeatures
           , scAllowShadowing = allowShadowing
           , scAllowFallthrough = False
           }
@@ -3345,13 +3349,17 @@ validateExpr ctx scope expr =
           Just _ -> validateExpr ctx scope a
       EUnary _ OpDeref a -> validateExpr ctx scope a
       EUnary _ _ a -> validateExpr ctx scope a
-      ECall _ name args -> validateName ctx scope name >> mapM_ (validateExpr ctx scope) args
+      ECall _ name args -> do
+        validateName ctx scope name
+        mapM_ (validateExpr ctx scope) args
+        validateCallFeatures scope name
       EBitcast _ ty arg -> validateType ctx scope ty >> validateExpr ctx scope arg
       EField _ base _ -> validateExpr ctx scope base
       EIndex _ base idx -> validateExpr ctx scope base >> validateExpr ctx scope idx
 
 validateType :: ModuleContext -> Scope -> Type -> Either CompileError ()
 validateType ctx scope ty =
+  ensureTypeFeatures scope ty >>
   case ty of
     TyStructRef name ->
       case lookupNameId scope name of
@@ -3382,6 +3390,59 @@ validateType ctx scope ty =
     TySampler -> Right ()
     TySamplerComparison -> Right ()
     TyScalar _ -> Right ()
+
+ensureTypeFeatures :: Scope -> Type -> Either CompileError ()
+ensureTypeFeatures scope ty = do
+  when (typeUsesF16 ty && not (scopeFeatureEnabled scope "f16")) $
+    Left (CompileError "f16 usage requires `enable f16;`" Nothing Nothing)
+
+validateCallFeatures :: Scope -> Text -> Either CompileError ()
+validateCallFeatures scope name = do
+  when (callUsesF16 name && not (scopeFeatureEnabled scope "f16")) $
+    Left (CompileError "f16 usage requires `enable f16;`" Nothing Nothing)
+
+scopeFeatureEnabled :: Scope -> Text -> Bool
+scopeFeatureEnabled scope feat = Set.member feat scope.scEnabledFeatures
+
+typeUsesF16 :: Type -> Bool
+typeUsesF16 ty =
+  case ty of
+    TyScalar F16 -> True
+    TyVector _ F16 -> True
+    TyVector _ _ -> False
+    TyMatrix _ _ F16 -> True
+    TyMatrix _ _ _ -> False
+    TyArray elemTy _ -> typeUsesF16 elemTy
+    TyStructRef _ -> False
+    TyTexture1D _ -> False
+    TyTexture1DArray _ -> False
+    TyTexture2D _ -> False
+    TyTexture2DArray _ -> False
+    TyTexture3D _ -> False
+    TyTextureCube _ -> False
+    TyTextureCubeArray _ -> False
+    TyTextureMultisampled2D _ -> False
+    TyTextureDepth2D -> False
+    TyTextureDepth2DArray -> False
+    TyTextureDepthCube -> False
+    TyTextureDepthCubeArray -> False
+    TyTextureDepthMultisampled2D -> False
+    TyStorageTexture1D _ _ -> False
+    TyStorageTexture2D _ _ -> False
+    TyStorageTexture2DArray _ _ -> False
+    TyStorageTexture3D _ _ -> False
+    TyAtomic _ -> False
+    TyPtr _ _ inner -> typeUsesF16 inner
+    TySampler -> False
+    TySamplerComparison -> False
+    TyScalar _ -> False
+
+callUsesF16 :: Text -> Bool
+callUsesF16 name =
+  name == "f16"
+    || maybe False (\(_n, mScalar) -> mScalar == Just F16) (parseVectorCtorName name)
+    || maybe False (\(_c, _r, mScalar) -> mScalar == Just F16) (parseMatrixCtorName name)
+    || maybe False (\(elemTy, _len) -> typeUsesF16 elemTy) (parseArrayCtorName name)
 
 validateName :: ModuleContext -> Scope -> Text -> Either CompileError ()
 validateName _ scope name =
@@ -3579,6 +3640,9 @@ builtinNames =
     , "textureNumLevels"
     , "textureNumLayers"
     , "textureNumSamples"
+    , "workgroupBarrier"
+    , "storageBarrier"
+    , "textureBarrier"
     , "textureLoad"
     , "textureStore"
     , "dpdx"
@@ -3594,6 +3658,7 @@ builtinNames =
     , "atomicOr"
     , "atomicXor"
     , "atomicExchange"
+    , "atomicCompareExchangeWeak"
     ]
 
 qualifyModule :: [Text] -> Map.Map FilePath ModuleContext -> ModuleNode -> ModuleNode
@@ -3838,6 +3903,7 @@ builtinInputType stage name =
     (StageFragment, "position") -> Just (TyVector 4 F32)
     (StageFragment, "front_facing") -> Just (TyScalar Bool)
     (StageFragment, "sample_index") -> Just (TyScalar U32)
+    (StageFragment, "sample_mask") -> Just (TyScalar U32)
     _ -> Nothing
 
 builtinOutputType :: Stage -> Text -> Maybe Type
@@ -3845,6 +3911,7 @@ builtinOutputType stage name =
   case (stage, name) of
     (StageVertex, "position") -> Just (TyVector 4 F32)
     (StageFragment, "frag_depth") -> Just (TyScalar F32)
+    (StageFragment, "sample_mask") -> Just (TyScalar U32)
     _ -> Nothing
 
 builtinInputDecoration :: Stage -> Text -> Maybe Word32
@@ -3860,6 +3927,7 @@ builtinInputDecoration stage name =
     (StageFragment, "position") -> Just builtInFragCoord
     (StageFragment, "front_facing") -> Just builtInFrontFacing
     (StageFragment, "sample_index") -> Just builtInSampleIndex
+    (StageFragment, "sample_mask") -> Just builtInSampleMask
     _ -> Nothing
 
 builtinOutputDecoration :: Stage -> Text -> Maybe Word32
@@ -3867,4 +3935,5 @@ builtinOutputDecoration stage name =
   case (stage, name) of
     (StageVertex, "position") -> Just builtInPosition
     (StageFragment, "frag_depth") -> Just builtInFragDepth
+    (StageFragment, "sample_mask") -> Just builtInSampleMask
     _ -> Nothing

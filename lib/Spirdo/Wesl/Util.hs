@@ -13,6 +13,7 @@ module Spirdo.Wesl.Util
   , attrIntMaybe
   , attrLocation
   , attrBuiltin
+  , attrArgs
   , attrInts
   , paramLocation
   , paramBuiltin
@@ -50,6 +51,7 @@ module Spirdo.Wesl.Util
   , builtInFragCoord
   , builtInFrontFacing
   , builtInSampleIndex
+  , builtInSampleMask
   , builtInFragDepth
   , imageFormatUnknown
   , storageFormatScalar
@@ -695,6 +697,9 @@ builtInFrontFacing = 17
 
 builtInSampleIndex :: Word32
 builtInSampleIndex = 18
+
+builtInSampleMask :: Word32
+builtInSampleMask = 20
 
 builtInFragDepth :: Word32
 builtInFragDepth = 22

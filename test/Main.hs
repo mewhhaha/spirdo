@@ -108,7 +108,7 @@ instance ToUniform ParamsExtended2U
 
 
 defaultOpts :: [Option]
-defaultOpts = []
+defaultOpts = [OptEnableFeature "f16"]
 
 separateOpts :: [Option]
 separateOpts = [OptSamplerMode SamplerSeparate]
@@ -132,11 +132,16 @@ compileBytesWithDiagnostics opts src = do
 main :: IO ()
 main = do
   spirvVal <- findExecutable "spirv-val"
+  nagaExe <- findExecutable "naga"
   let tests =
         [ ("compute-atomics", computeShader)
+        , ("compute-barriers", barrierShader)
+        , ("atomic-compare-exchange", atomicCompareExchangeShader)
         , ("typed-ctors", typedCtorShader)
         , ("fragment-derivatives", fragmentShader)
+        , ("fragment-sample-mask", sampleMaskShader)
         , ("vertex-struct-io", vertexShader)
+        , ("vertex-io-attrs", vertexIoAttrShader)
         , ("storage-texture", storageTextureShader)
         , ("sampler-texture", samplerShader)
         , ("bitwise-ops", bitwiseShader)
@@ -185,6 +190,16 @@ main = do
   checkDiagnosticShadowing
   checkDiagnosticConstantCondition
   checkDiagnosticDuplicateCase
+  checkNagaOracleParity nagaExe
+  checkTextureBarrierStage
+  checkBlendSrcEnabled spirvVal
+  checkBlendSrcRequiresEnable
+  checkBlendSrcPairRules
+  checkInterpolateIntegerRule
+  checkInvariantRule
+  checkLocationIoTypeRule
+  checkF16RequiresEnable
+  checkStorageWriteAccessRejected
   checkSamplerInterface
   checkCombinedSamplerInterface
   checkSamplerValueCombinedError
@@ -273,6 +288,157 @@ checkSamplerValueCombinedError =
         fail ("sampler-combined-error: unexpected error: " <> msg)
     Right _ ->
       fail "sampler-combined-error: expected failure when say using sampler value in combined mode"
+
+checkTextureBarrierStage :: IO ()
+checkTextureBarrierStage =
+  case compileInline defaultOpts textureBarrierFragmentShader of
+    Left (CompileError msg _ _) ->
+      unless ("textureBarrier is not available in this shader stage" `isInfixOf` msg) $
+        fail ("texture-barrier-stage: unexpected error: " <> msg)
+    Right _ ->
+      fail "texture-barrier-stage: expected failure for textureBarrier in fragment stage"
+
+checkNagaOracleParity :: Maybe FilePath -> IO ()
+checkNagaOracleParity mNaga =
+  case mNaga of
+    Nothing -> pure ()
+    Just nagaExe -> do
+      let cases =
+            [ ("naga-parity:texture-barrier-fragment", defaultOpts, nagaTextureBarrierFragment, False)
+            , ("naga-parity:storage-write-buffer", defaultOpts, nagaStorageWriteBuffer, False)
+            , ("naga-parity:blend-src-enabled", defaultOpts <> [OptEnableFeature "dual_source_blending"], nagaBlendSrcEnabled, True)
+            , ("naga-parity:blend-src-no-enable", defaultOpts <> [OptEnableFeature "dual_source_blending"], nagaBlendSrcNoEnable, False)
+            , ("naga-parity:f16-no-enable", defaultOpts, nagaF16NoEnable, False)
+            , ("naga-parity:f16-enable", defaultOpts, nagaF16Enable, True)
+            , ("naga-parity:interpolate-int-linear", defaultOpts, nagaInterpolateIntLinear, False)
+            , ("naga-parity:interpolate-float-linear", defaultOpts, nagaInterpolateFloatLinear, True)
+            ]
+      forM_ cases $ \(label, opts, src, expectedOk) -> do
+        spirdoOk <- case compileInline opts src of
+          Left _ -> pure False
+          Right _ -> pure True
+        (nagaOk, nagaLog) <- runNagaCheck nagaExe label src
+        when (spirdoOk /= nagaOk) $
+          fail
+            ( label
+                <> ": spirdo/naga mismatch (spirdo="
+                <> show spirdoOk
+                <> ", naga="
+                <> show nagaOk
+                <> ")\n"
+                <> nagaLog
+            )
+        when (spirdoOk /= expectedOk) $
+          fail
+            ( label
+                <> ": unexpected result (got "
+                <> show spirdoOk
+                <> ", expected "
+                <> show expectedOk
+                <> ")"
+            )
+
+runNagaCheck :: FilePath -> String -> String -> IO (Bool, String)
+runNagaCheck nagaExe label src = do
+  tmpDir <- getTemporaryDirectory
+  let safeLabel = map sanitize label
+      srcPath = tmpDir </> (safeLabel <> ".wgsl")
+      outPath = tmpDir </> (safeLabel <> ".spv")
+  writeFile srcPath src
+  (code, out, err) <- readProcessWithExitCode nagaExe [srcPath, outPath, "--input-kind", "wgsl"] ""
+  removeIfExists srcPath
+  removeIfExists outPath
+  case code of
+    ExitSuccess -> pure (True, out <> err)
+    ExitFailure _ -> pure (False, out <> err)
+  where
+    sanitize c
+      | c == '/' || c == '\\' || c == ':' = '_'
+      | otherwise = c
+
+removeIfExists :: FilePath -> IO ()
+removeIfExists path = do
+  exists <- doesFileExist path
+  when exists (removeFile path)
+
+checkBlendSrcEnabled :: Maybe FilePath -> IO ()
+checkBlendSrcEnabled spirvVal =
+  case compileBytes [OptEnableFeature "dual_source_blending"] fragmentBlendSrcShader of
+    Left err -> fail ("blend-src-enabled: " <> show err)
+    Right bytes -> assertSpirv spirvVal "blend-src-enabled" bytes
+
+checkBlendSrcRequiresEnable :: IO ()
+checkBlendSrcRequiresEnable =
+  case compileInline [OptEnableFeature "dual_source_blending"] fragmentBlendSrcNoEnableShader of
+    Left (CompileError msg _ _) ->
+      unless ("@blend_src requires `enable dual_source_blending;`" `isInfixOf` msg) $
+        fail ("blend-src-requires-enable: unexpected error: " <> msg)
+    Right _ ->
+      fail "blend-src-requires-enable: expected failure when shader omits enable dual_source_blending"
+
+checkBlendSrcPairRules :: IO ()
+checkBlendSrcPairRules = do
+  case compileInline [OptEnableFeature "dual_source_blending"] fragmentBlendSrcOnlyOneShader of
+    Left (CompileError msg _ _) ->
+      unless ("if @blend_src is used, fragment outputs must be exactly two @location(0) fields with @blend_src(0) and @blend_src(1)" `isInfixOf` msg) $
+        fail ("blend-src-pair-rules(one): unexpected error: " <> msg)
+    Right _ ->
+      fail "blend-src-pair-rules(one): expected failure for incomplete @blend_src pair"
+  case compileInline [OptEnableFeature "dual_source_blending"] fragmentBlendSrcLocationOneShader of
+    Left (CompileError msg _ _) ->
+      unless
+        ( "@blend_src is only valid on @location(0)" `isInfixOf` msg
+            || "if @blend_src is used, fragment outputs must be exactly two @location(0) fields with @blend_src(0) and @blend_src(1)" `isInfixOf` msg
+        )
+        $
+        fail ("blend-src-pair-rules(location): unexpected error: " <> msg)
+    Right _ ->
+      fail "blend-src-pair-rules(location): expected failure for @blend_src on non-zero location"
+
+checkInterpolateIntegerRule :: IO ()
+checkInterpolateIntegerRule =
+  case compileInline defaultOpts vertexInterpolateIntegerShader of
+    Left (CompileError msg _ _) ->
+      unless ("@interpolate(perspective|linear, ...): only floating-point scalars/vectors are allowed" `isInfixOf` msg) $
+        fail ("interpolate-integer-rule: unexpected error: " <> msg)
+    Right _ ->
+      fail "interpolate-integer-rule: expected failure for non-flat interpolation on integer IO"
+
+checkInvariantRule :: IO ()
+checkInvariantRule =
+  case compileInline defaultOpts vertexInvariantLocationShader of
+    Left (CompileError msg _ _) ->
+      unless ("@invariant is only allowed on @builtin(position) vertex outputs and fragment inputs" `isInfixOf` msg) $
+        fail ("invariant-rule: unexpected error: " <> msg)
+    Right _ ->
+      fail "invariant-rule: expected failure for @invariant on @location IO"
+
+checkLocationIoTypeRule :: IO ()
+checkLocationIoTypeRule =
+  case compileInline defaultOpts vertexBoolLocationShader of
+    Left (CompileError msg _ _) ->
+      unless ("stage @location inputs/outputs must be scalar or vector i32/u32/f16/f32" `isInfixOf` msg) $
+        fail ("location-io-type-rule: unexpected error: " <> msg)
+    Right _ ->
+      fail "location-io-type-rule: expected failure for bool @location IO"
+
+checkF16RequiresEnable :: IO ()
+checkF16RequiresEnable =
+  case compileInline defaultOpts f16NoEnableShader of
+    Left (CompileError msg _ _) ->
+      unless ("f16 usage requires `enable f16;`" `isInfixOf` msg) $
+        fail ("f16-requires-enable: unexpected error: " <> msg)
+    Right _ ->
+      fail "f16-requires-enable: expected failure for f16 usage without enable directive"
+
+checkStorageWriteAccessRejected :: IO ()
+checkStorageWriteAccessRejected =
+  case compileInline defaultOpts storageWriteAccessShader of
+    Left (CompileError msg _ _) ->
+      unless ("unsupported storage access: write" `isInfixOf` msg) $
+        fail ("storage-write-access-rejected: unexpected error: " <> msg)
+    Right _ ->
+      fail "storage-write-access-rejected: expected failure for var<storage, write> buffer"
 
 checkPackUniformLayout :: IO ()
 checkPackUniformLayout =
@@ -1270,10 +1436,51 @@ computeShader =
     , "}"
     ]
 
+barrierShader :: String
+barrierShader =
+  unlines
+    [ "@compute @workgroup_size(1)"
+    , "fn main(@builtin(local_invocation_index) li: u32) {"
+    , "  if (li == 0u) {"
+    , "    workgroupBarrier();"
+    , "    storageBarrier();"
+    , "    textureBarrier();"
+    , "  }"
+    , "}"
+    ]
+
+textureBarrierFragmentShader :: String
+textureBarrierFragmentShader =
+  unlines
+    [ "@fragment"
+    , "fn main() -> @location(0) vec4<f32> {"
+    , "  textureBarrier();"
+    , "  return vec4<f32>(1.0);"
+    , "}"
+    ]
+
+atomicCompareExchangeShader :: String
+atomicCompareExchangeShader =
+  unlines
+    [ "struct Data {"
+    , "  value: atomic<u32>;"
+    , "};"
+    , "@group(0) @binding(0)"
+    , "var<storage, read_write> data: Data;"
+    , "@compute @workgroup_size(1)"
+    , "fn main() {"
+    , "  let r = atomicCompareExchangeWeak(data.value, 0u, 1u);"
+    , "  if (r.exchanged) {"
+    , "    atomicStore(data.value, r.old_value);"
+    , "  }"
+    , "}"
+    ]
+
 typedCtorShader :: String
 typedCtorShader =
   unlines
-    [ "struct Z {"
+    [ "enable f16;"
+    , "struct Z {"
     , "  a: f32;"
     , "  b: vec2<f32>;"
     , "};"
@@ -1302,6 +1509,19 @@ typedCtorShader =
     , "}"
     ]
 
+sampleMaskShader :: String
+sampleMaskShader =
+  unlines
+    [ "struct FragOut {"
+    , "  @location(0) color: vec4<f32>;"
+    , "  @builtin(sample_mask) mask: u32;"
+    , "};"
+    , "@fragment"
+    , "fn main(@builtin(sample_mask) inMask: u32) -> FragOut {"
+    , "  return FragOut(vec4<f32>(1.0, 0.0, 0.0, 1.0), inMask);"
+    , "}"
+    ]
+
 fragmentShader :: String
 fragmentShader =
   unlines
@@ -1327,6 +1547,21 @@ fragmentShader =
     , "}"
     ]
 
+vertexIoAttrShader :: String
+vertexIoAttrShader =
+  unlines
+    [ "struct VsOut {"
+    , "  @builtin(position) @invariant pos: vec4<f32>;"
+    , "  @location(0) @interpolate(flat) id: u32;"
+    , "  @location(1) @interpolate(linear, centroid) uv: vec2<f32>;"
+    , "};"
+    , "@vertex"
+    , "fn main(@builtin(vertex_index) idx: u32) -> VsOut {"
+    , "  let x = f32(idx & 1u);"
+    , "  return VsOut(vec4<f32>(x, 0.0, 0.0, 1.0), idx, vec2<f32>(x, 0.0));"
+    , "}"
+    ]
+
 vertexShader :: String
 vertexShader =
   unlines
@@ -1338,6 +1573,204 @@ vertexShader =
     , "fn main(@location(0) in_pos: vec2<f32>) -> VsOut {"
     , "  let pos = vec4(in_pos.x, in_pos.y, 0.0, 1.0);"
     , "  return VsOut(pos, in_pos);"
+    , "}"
+    ]
+
+fragmentBlendSrcShader :: String
+fragmentBlendSrcShader =
+  unlines
+    [ "enable dual_source_blending;"
+    , "struct BlendOut {"
+    , "  @location(0) @blend_src(0) c0: vec4<f32>;"
+    , "  @location(0) @blend_src(1) c1: vec4<f32>;"
+    , "};"
+    , "@fragment"
+    , "fn main() -> BlendOut {"
+    , "  return BlendOut(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0));"
+    , "}"
+    ]
+
+fragmentBlendSrcNoEnableShader :: String
+fragmentBlendSrcNoEnableShader =
+  unlines
+    [ "struct BlendOut {"
+    , "  @location(0) @blend_src(0) c0: vec4<f32>;"
+    , "  @location(0) @blend_src(1) c1: vec4<f32>;"
+    , "};"
+    , "@fragment"
+    , "fn main() -> BlendOut {"
+    , "  return BlendOut(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0));"
+    , "}"
+    ]
+
+fragmentBlendSrcOnlyOneShader :: String
+fragmentBlendSrcOnlyOneShader =
+  unlines
+    [ "enable dual_source_blending;"
+    , "struct BlendOut {"
+    , "  @location(0) @blend_src(1) c1: vec4<f32>;"
+    , "};"
+    , "@fragment"
+    , "fn main() -> BlendOut {"
+    , "  return BlendOut(vec4<f32>(0.0, 1.0, 0.0, 1.0));"
+    , "}"
+    ]
+
+fragmentBlendSrcLocationOneShader :: String
+fragmentBlendSrcLocationOneShader =
+  unlines
+    [ "enable dual_source_blending;"
+    , "struct BlendOut {"
+    , "  @location(1) @blend_src(0) c0: vec4<f32>;"
+    , "  @location(1) @blend_src(1) c1: vec4<f32>;"
+    , "};"
+    , "@fragment"
+    , "fn main() -> BlendOut {"
+    , "  return BlendOut(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0));"
+    , "}"
+    ]
+
+vertexInterpolateIntegerShader :: String
+vertexInterpolateIntegerShader =
+  unlines
+    [ "struct VsOut {"
+    , "  @builtin(position) pos: vec4<f32>;"
+    , "  @location(0) @interpolate(linear) id: u32;"
+    , "};"
+    , "@vertex"
+    , "fn main(@builtin(vertex_index) idx: u32) -> VsOut {"
+    , "  return VsOut(vec4<f32>(0.0, 0.0, 0.0, 1.0), idx);"
+    , "}"
+    ]
+
+vertexInvariantLocationShader :: String
+vertexInvariantLocationShader =
+  unlines
+    [ "struct VsOut {"
+    , "  @builtin(position) pos: vec4<f32>;"
+    , "  @location(0) @invariant uv: vec2<f32>;"
+    , "};"
+    , "@vertex"
+    , "fn main(@builtin(vertex_index) idx: u32) -> VsOut {"
+    , "  let x = f32(idx & 1u);"
+    , "  return VsOut(vec4<f32>(x, 0.0, 0.0, 1.0), vec2<f32>(x, 0.0));"
+    , "}"
+    ]
+
+vertexBoolLocationShader :: String
+vertexBoolLocationShader =
+  unlines
+    [ "struct VsOut {"
+    , "  @builtin(position) pos: vec4<f32>;"
+    , "  @location(0) b: bool;"
+    , "};"
+    , "@vertex"
+    , "fn main() -> VsOut {"
+    , "  return VsOut(vec4<f32>(0.0, 0.0, 0.0, 1.0), true);"
+    , "}"
+    ]
+
+f16NoEnableShader :: String
+f16NoEnableShader =
+  unlines
+    [ "@fragment"
+    , "fn main() -> @location(0) vec4<f16> {"
+    , "  return vec4<f16>(1.0h);"
+    , "}"
+    ]
+
+nagaTextureBarrierFragment :: String
+nagaTextureBarrierFragment =
+  unlines
+    [ "@fragment"
+    , "fn main() -> @location(0) vec4<f32> {"
+    , "  textureBarrier();"
+    , "  return vec4<f32>(1.0);"
+    , "}"
+    ]
+
+nagaStorageWriteBuffer :: String
+nagaStorageWriteBuffer =
+  unlines
+    [ "struct Data { v: u32, }"
+    , "@group(0) @binding(0)"
+    , "var<storage, write> data: Data;"
+    , "@compute @workgroup_size(1)"
+    , "fn main() {"
+    , "  data.v = 1u;"
+    , "}"
+    ]
+
+nagaBlendSrcEnabled :: String
+nagaBlendSrcEnabled =
+  unlines
+    [ "enable dual_source_blending;"
+    , "struct Out {"
+    , "  @location(0) @blend_src(0) a: vec4<f32>,"
+    , "  @location(0) @blend_src(1) b: vec4<f32>,"
+    , "}"
+    , "@fragment"
+    , "fn main() -> Out {"
+    , "  return Out(vec4<f32>(1.0), vec4<f32>(0.0));"
+    , "}"
+    ]
+
+nagaBlendSrcNoEnable :: String
+nagaBlendSrcNoEnable =
+  unlines
+    [ "struct Out {"
+    , "  @location(0) @blend_src(0) a: vec4<f32>,"
+    , "  @location(0) @blend_src(1) b: vec4<f32>,"
+    , "}"
+    , "@fragment"
+    , "fn main() -> Out {"
+    , "  return Out(vec4<f32>(1.0), vec4<f32>(0.0));"
+    , "}"
+    ]
+
+nagaF16NoEnable :: String
+nagaF16NoEnable =
+  unlines
+    [ "@fragment"
+    , "fn main() -> @location(0) vec4<f16> {"
+    , "  return vec4<f16>(1.0h);"
+    , "}"
+    ]
+
+nagaF16Enable :: String
+nagaF16Enable =
+  unlines
+    [ "enable f16;"
+    , "@fragment"
+    , "fn main() -> @location(0) vec4<f16> {"
+    , "  return vec4<f16>(1.0h);"
+    , "}"
+    ]
+
+nagaInterpolateIntLinear :: String
+nagaInterpolateIntLinear =
+  unlines
+    [ "struct Out {"
+    , "  @builtin(position) pos: vec4<f32>,"
+    , "  @location(0) @interpolate(linear) id: u32,"
+    , "}"
+    , "@vertex"
+    , "fn main(@builtin(vertex_index) i: u32) -> Out {"
+    , "  return Out(vec4<f32>(0.0, 0.0, 0.0, 1.0), i);"
+    , "}"
+    ]
+
+nagaInterpolateFloatLinear :: String
+nagaInterpolateFloatLinear =
+  unlines
+    [ "struct Out {"
+    , "  @builtin(position) pos: vec4<f32>,"
+    , "  @location(0) @interpolate(linear, centroid) uv: vec2<f32>,"
+    , "}"
+    , "@vertex"
+    , "fn main(@builtin(vertex_index) i: u32) -> Out {"
+    , "  let x = f32(i & 1u);"
+    , "  return Out(vec4<f32>(0.0, 0.0, 0.0, 1.0), vec2<f32>(x, 0.0));"
     , "}"
     ]
 
@@ -1355,6 +1788,20 @@ storageTextureShader =
     , "  let coord = vec2(x, y);"
     , "  let src = textureLoad(in_tex, coord);"
     , "  textureStore(out_tex, coord, vec4(src.x, src.y, src.z, src.w));"
+    , "}"
+    ]
+
+storageWriteAccessShader :: String
+storageWriteAccessShader =
+  unlines
+    [ "struct Data {"
+    , "  values: array<u32, 4>;"
+    , "};"
+    , "@group(0) @binding(0)"
+    , "var<storage, write> data: Data;"
+    , "@compute @workgroup_size(1)"
+    , "fn main() {"
+    , "  data.values[0] = 1u;"
     , "}"
     ]
 
@@ -2016,7 +2463,8 @@ textureAdvancedShader =
 globalsShader :: String
 globalsShader =
   unlines
-    [ "var<private> bias: f32 = 0.25;"
+    [ "enable f16;"
+    , "var<private> bias: f32 = 0.25;"
     , "var<workgroup> shared: array<u32, 4>;"
     , "@compute @workgroup_size(1, 1, 1)"
     , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
@@ -2088,7 +2536,8 @@ packUniformExtendedShader =
 packUniformExtendedShader2 :: String
 packUniformExtendedShader2 =
   unlines
-    [ "struct Inner2 {"
+    [ "enable f16;"
+    , "struct Inner2 {"
     , "  v: vec3<f32>;"
     , "  w: f32;"
     , "};"

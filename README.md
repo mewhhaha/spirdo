@@ -153,6 +153,19 @@ Note: the public API is exposed from `Spirdo.Wesl` (minimal bundle API),
 `Spirdo.Wesl.Reflection` (advanced reflection + raw compile), `Spirdo.Wesl.Uniform`,
 and `Spirdo.Wesl.Inputs`. Internal modules are not part of the supported surface area.
 
+### WGSL Compatibility Notes
+- `f16` requires `enable f16;` in shader source.
+- `@blend_src` requires `enable dual_source_blending;` in shader source.
+- Feature directives are validated against compile options:
+  use `OptEnableFeature "f16"` / `OptEnableFeature "dual_source_blending"` at runtime,
+  or `withFeatures ["f16", "dual_source_blending"]` in `CompileOptions`.
+- If `@blend_src` is used, fragment outputs must be exactly two `@location(0)` outputs:
+  one `@blend_src(0)` and one `@blend_src(1)`.
+- `@location` stage IO types must be scalar/vector `i32`, `u32`, `f16`, or `f32`.
+- `@invariant` is only accepted on `@builtin(position)` for vertex outputs and fragment inputs.
+- `@interpolate(linear|perspective, ...)` is only accepted on floating-point scalar/vector IO.
+- Storage buffer access modes support `read` and `read_write`; `var<storage, write>` buffers are rejected.
+
 ### Compile-Time Cache & Timings
 `weslShader` quasiquotes (from `Spirdo.Wesl.Reflection`) use an on-disk cache under
 `dist-newstyle/.wesl-cache`. You can control it via `CompileOptions` helpers:

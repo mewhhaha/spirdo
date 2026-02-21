@@ -724,7 +724,8 @@ emitSpirv opts modAst iface = do
     (StageVertex, Nothing) -> Left (CompileError "vertex entry point missing return type" Nothing Nothing)
     _ -> Right Nothing
   let blockStructs = [T.pack name | BindingInfo _ _ _ _ (TLStruct name _ _ _) <- iface.siBindings]
-  let state0 = emptyGenState opts.samplerBindingMode entry.epStage structLayouts blockStructs samplerLayouts
+  let enabledFeatures = [feat | DirEnable feat <- modAst.modDirectives]
+  let state0 = emptyGenState opts.samplerBindingMode entry.epStage structLayouts blockStructs samplerLayouts enabledFeatures
   let ((), state1) = emitStructs state0
   let node = ModuleNode "<merged>" [] modAst []
   let constIndex = buildConstIndex [node]
@@ -2392,6 +2393,12 @@ opAtomicXor = 242
 opAtomicExchange :: Word16
 opAtomicExchange = 229
 
+opAtomicCompareExchange :: Word16
+opAtomicCompareExchange = 230
+
+opControlBarrier :: Word16
+opControlBarrier = 224
+
 opLoopMerge :: Word16
 opLoopMerge = 246
 
@@ -2428,8 +2435,23 @@ memoryModelGLSL450 = 1
 memoryScopeDevice :: Word32
 memoryScopeDevice = 1
 
+memoryScopeWorkgroup :: Word32
+memoryScopeWorkgroup = 2
+
 memorySemanticsRelaxed :: Word32
 memorySemanticsRelaxed = 0
+
+memorySemanticsAcquireRelease :: Word32
+memorySemanticsAcquireRelease = 0x8
+
+memorySemanticsUniformMemory :: Word32
+memorySemanticsUniformMemory = 0x40
+
+memorySemanticsWorkgroupMemory :: Word32
+memorySemanticsWorkgroupMemory = 0x100
+
+memorySemanticsImageMemory :: Word32
+memorySemanticsImageMemory = 0x800
 
 executionModelGLCompute :: Word32
 executionModelGLCompute = 5
@@ -2491,8 +2513,26 @@ decorationOffset = 35
 decorationBuiltIn :: Word32
 decorationBuiltIn = 11
 
+decorationNoPerspective :: Word32
+decorationNoPerspective = 13
+
+decorationFlat :: Word32
+decorationFlat = 14
+
+decorationCentroid :: Word32
+decorationCentroid = 16
+
+decorationSample :: Word32
+decorationSample = 17
+
+decorationInvariant :: Word32
+decorationInvariant = 18
+
 decorationLocation :: Word32
 decorationLocation = 30
+
+decorationIndex :: Word32
+decorationIndex = 32
 
 dim1D :: Word32
 dim1D = 0
@@ -2728,6 +2768,7 @@ data GenState = GenState
   , gsFunctionTable :: [FunctionInfo]
   , gsFunctionsByName :: Map.Map Text [FunctionInfo]
   , gsEntryStage :: Stage
+  , gsEnabledFeatures :: Set.Set Text
   , gsConstValues :: [(Text, Value)]
   , gsConstValuesByName :: Map.Map Text Value
   , gsConstComposites :: Map.Map Word32 (TypeLayout, [Word32])
@@ -2744,8 +2785,8 @@ data GenState = GenState
   , gsSamplerLayouts :: Map.Map Text TypeLayout
   }
 
-emptyGenState :: SamplerBindingMode -> Stage -> [(Text, TypeLayout)] -> [Text] -> Map.Map Text TypeLayout -> GenState
-emptyGenState samplerMode stage structLayouts blockStructs samplerLayouts =
+emptyGenState :: SamplerBindingMode -> Stage -> [(Text, TypeLayout)] -> [Text] -> Map.Map Text TypeLayout -> [Text] -> GenState
+emptyGenState samplerMode stage structLayouts blockStructs samplerLayouts enabledFeatures =
   let (ids, nextId) = assignStructIds 1 structLayouts
   in GenState
       { gsNextId = nextId
@@ -2762,6 +2803,7 @@ emptyGenState samplerMode stage structLayouts blockStructs samplerLayouts =
       , gsFunctionTable = []
       , gsFunctionsByName = Map.empty
       , gsEntryStage = stage
+      , gsEnabledFeatures = Set.fromList enabledFeatures
       , gsConstValues = []
       , gsConstValuesByName = Map.empty
       , gsConstComposites = Map.empty
@@ -2888,6 +2930,7 @@ data VarInfo = VarInfo
   , viPtrId :: !Word32
   , viStorage :: !Word32
   , viAccess :: !VarAccess
+  , viPath :: ![Word32]
   } deriving (Eq, Show)
 
 data EntryFieldInit = EntryFieldInit
@@ -2977,7 +3020,7 @@ emitGlobals layoutCache structEnv iface entry retLayout globals st0 = do
           access = case bindInfo.biKind of
             BStorageReadWrite -> ReadWrite
             _ -> ReadOnly
-          info = VarInfo bindInfo.biType varId storageClass access
+          info = VarInfo bindInfo.biType varId storageClass access []
       in (envAcc <> [(T.pack bindInfo.biName, info)], idAcc <> [varId], st6)
 
 emitModuleGlobals :: StructLayoutCache -> [GlobalVarDecl] -> GenState -> Either CompileError ([(Text, VarInfo)], GenState)
@@ -3012,7 +3055,7 @@ emitModuleGlobals layoutCache decls st0 = foldM emitOne ([], st0) decls
               Just cid -> [ptrTy, varId, storageClass, cid]
       let st5 = addGlobal (Instr opVariable operands) st4
       let st6 = addName (Instr opName (varId : encodeString (textToString (decl.gvName)))) st5
-      let info = VarInfo layout varId storageClass ReadWrite
+      let info = VarInfo layout varId storageClass ReadWrite []
       Right (envAcc <> [(decl.gvName, info)], st6)
 
 emitEntryInputs :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
@@ -3083,7 +3126,7 @@ emitStageInputs layoutCache stage structEnv entry st0 = do
               builtinId <- case builtinInputDecoration stg builtin of
                 Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for stage input") Nothing Nothing)
                 Just bid -> Right bid
-              (info, varId, st1) <- emitInputVar name layout (InputBuiltin builtinId) st
+              (info, varId, st1) <- emitInputVar stg name layout attrs (InputBuiltin builtinId) st
               pure ((name, info):envAcc, initAcc, varId:idAcc, usedLocs, builtin:usedBuiltins, st1)
             Nothing -> do
               loc <- case paramLocation attrs of
@@ -3096,7 +3139,7 @@ emitStageInputs layoutCache stage structEnv entry st0 = do
                 Left (CompileError "compute parameters cannot use @location" Nothing Nothing)
               when (loc `elem` usedLocs) $
                 Left (CompileError "duplicate @location on stage inputs" Nothing Nothing)
-              (info, varId, st1) <- emitInputVar name layout (InputLocation loc) st
+              (info, varId, st1) <- emitInputVar stg name layout attrs (InputLocation loc) st
               pure ((name, info):envAcc, initAcc, varId:idAcc, loc:usedLocs, usedBuiltins, st1)
 
     emitStructFields stg paramName fields usedLocs usedBuiltins idAcc st = do
@@ -3125,7 +3168,7 @@ emitStageInputs layoutCache stage structEnv entry st0 = do
                 builtinId <- case builtinInputDecoration stg builtin of
                   Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for stage input") Nothing Nothing)
                   Just bid -> Right bid
-                (info, varId, st1) <- emitInputVar fullName layout (InputBuiltin builtinId) st'
+                (info, varId, st1) <- emitInputVar stg fullName layout attrs (InputBuiltin builtinId) st'
                 let fieldInit = EntryFieldInit layout info
                 go (fieldInit:accVars) (varId:accIds) accLocs (builtin:accBuiltins) st1 rest
               Nothing -> do
@@ -3139,23 +3182,26 @@ emitStageInputs layoutCache stage structEnv entry st0 = do
                   Left (CompileError "compute parameters cannot use @location" Nothing Nothing)
                 when (loc `elem` accLocs) $
                   Left (CompileError "duplicate @location on stage inputs" Nothing Nothing)
-                (info, varId, st1) <- emitInputVar fullName layout (InputLocation loc) st'
+                (info, varId, st1) <- emitInputVar stg fullName layout attrs (InputLocation loc) st'
                 let fieldInit = EntryFieldInit layout info
                 go (fieldInit:accVars) (varId:accIds) (loc:accLocs) accBuiltins st1 rest
       (vars, locs, builtins, ids, st1) <- go [] idAcc usedLocs usedBuiltins st fields
       pure (vars, locs, builtins, ids, st1)
 
-emitInputVar :: Text -> TypeLayout -> InputDecoration -> GenState -> Either CompileError (VarInfo, Word32, GenState)
-emitInputVar name layout deco st0 = do
-  let (baseTy, st1) = emitTypeFromLayout st0 layout
+emitInputVar :: Stage -> Text -> TypeLayout -> [Attr] -> InputDecoration -> GenState -> Either CompileError (VarInfo, Word32, GenState)
+emitInputVar stage name layout attrs deco st0 = do
+  validateUserStageIOType deco layout
+  let (storageLayout, path) = sampleMaskLayout layout deco
+  let (baseTy, st1) = emitTypeFromLayout st0 storageLayout
   let (ptrTy, st2) = emitPointerType st1 storageClassInput baseTy
   let (varId, st3) = freshId st2
   let st4 = addGlobal (Instr opVariable [ptrTy, varId, storageClassInput]) st3
-  let st5 = case deco of
+  let st5a = case deco of
         InputBuiltin bid -> addDecoration (Instr opDecorate [varId, decorationBuiltIn, bid]) st4
         InputLocation loc -> addDecoration (Instr opDecorate [varId, decorationLocation, loc]) st4
+  st5 <- applyIOAttrDecorations stage False layout attrs deco varId st5a
   let st6 = addName (Instr opName (varId : encodeString (textToString name))) st5
-  let info = VarInfo layout varId storageClassInput ReadOnly
+  let info = VarInfo layout varId storageClassInput ReadOnly path
   pure (info, varId, st6)
 
 emitStageOutput :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> Maybe TypeLayout -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
@@ -3177,7 +3223,7 @@ emitFragmentOutput structEnv entry retLayout st0 =
     (Just layout, Just ty) ->
       case ty of
         TyStructRef structName -> do
-          when (isJust entry.epReturnBuiltin || isJust entry.epReturnLocation) $
+          when (isJust entry.epReturnBuiltin || isJust entry.epReturnLocation || not (null entry.epReturnAttrs)) $
             Left (CompileError "struct return values cannot use @location or @builtin on the function" Nothing Nothing)
           structDecl <- case lookup structName structEnv of
             Nothing -> Left (CompileError ("unknown struct: " <> textToString structName) Nothing Nothing)
@@ -3188,6 +3234,9 @@ emitFragmentOutput structEnv entry retLayout st0 =
             Left (CompileError "resource types are not allowed as fragment outputs" Nothing Nothing)
           when (containsAtomic layout) $
             Left (CompileError "atomic types are not allowed as fragment outputs" Nothing Nothing)
+          blendSrc <- parseBlendSrcAttr entry.epReturnAttrs
+          when (isJust blendSrc) $
+            Left (CompileError "if @blend_src is used, fragment outputs must be exactly two @location(0) fields with @blend_src(0) and @blend_src(1)" Nothing Nothing)
           when (isJust entry.epReturnBuiltin && isJust entry.epReturnLocation) $
             Left (CompileError "fragment returns cannot use both @location and @builtin" Nothing Nothing)
           case entry.epReturnBuiltin of
@@ -3200,12 +3249,12 @@ emitFragmentOutput structEnv entry retLayout st0 =
               builtinId <- case builtinOutputDecoration StageFragment builtin of
                 Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for fragment output") Nothing Nothing)
                 Just bid -> Right bid
-              (info, varId, st1) <- emitOutputVar "frag_output" layout (InputBuiltin builtinId) st0
+              (info, varId, st1) <- emitOutputVar StageFragment "frag_output" layout entry.epReturnAttrs (InputBuiltin builtinId) st0
               let target = OutputTarget info layout []
               pure ([target], [varId], st1)
             Nothing -> do
               let loc = fromMaybe 0 entry.epReturnLocation
-              (info, varId, st1) <- emitOutputVar "frag_output" layout (InputLocation loc) st0
+              (info, varId, st1) <- emitOutputVar StageFragment "frag_output" layout entry.epReturnAttrs (InputLocation loc) st0
               let target = OutputTarget info layout []
               pure ([target], [varId], st1)
     _ -> Left (CompileError "fragment entry point missing return type" Nothing Nothing)
@@ -3217,7 +3266,7 @@ emitVertexOutput structEnv entry retLayout st0 =
     (Just layout, Just ty) ->
       case ty of
         TyStructRef structName -> do
-          when (isJust entry.epReturnBuiltin || isJust entry.epReturnLocation) $
+          when (isJust entry.epReturnBuiltin || isJust entry.epReturnLocation || not (null entry.epReturnAttrs)) $
             Left (CompileError "struct return values cannot use @location or @builtin on the function" Nothing Nothing)
           structDecl <- case lookup structName structEnv of
             Nothing -> Left (CompileError ("unknown struct: " <> textToString structName) Nothing Nothing)
@@ -3232,7 +3281,7 @@ emitVertexOutput structEnv entry retLayout st0 =
             Just "position" -> do
               when (TyVector 4 F32 /= ty) $
                 Left (CompileError "@builtin(position) must be vec4<f32>" Nothing Nothing)
-              (info, varId, st1) <- emitOutputVar "position" layout (InputBuiltin builtInPosition) st0
+              (info, varId, st1) <- emitOutputVar StageVertex "position" layout entry.epReturnAttrs (InputBuiltin builtInPosition) st0
               let target = OutputTarget info layout []
               pure ([target], [varId], st1)
             _ -> Left (CompileError "vertex entry point must return @builtin(position)" Nothing Nothing)
@@ -3245,6 +3294,8 @@ emitStructOutputs stage structName layout structDecl st0 =
       let fields = structDecl.sdFields
       when (length fields /= length fieldLayouts) $
         Left (CompileError ("struct layout mismatch for " <> textToString structName) Nothing Nothing)
+      when (stage == StageFragment) $
+        validateBlendSrcStructRules fields
       let go _idx accTargets accIds usedLocs usedBuiltins st [] = Right (reverse accTargets, reverse accIds, st, usedLocs, usedBuiltins)
           go idx accTargets accIds usedLocs usedBuiltins st (field:rest) = do
             let fieldName = field.fdName
@@ -3270,7 +3321,7 @@ emitStructOutputs stage structName layout structDecl st0 =
                 builtinId <- case builtinOutputDecoration stage builtin of
                   Nothing -> Left (CompileError ("unsupported @builtin(" <> textToString builtin <> ") for stage output") Nothing Nothing)
                   Just bid -> Right bid
-                (info, varId, st1) <- emitOutputVar (structName <> "_" <> fieldName) fieldLayout (InputBuiltin builtinId) st
+                (info, varId, st1) <- emitOutputVar stage (structName <> "_" <> fieldName) fieldLayout attrs (InputBuiltin builtinId) st
                 let target = OutputTarget info fieldLayout [fromIntegral idx]
                 go (idx + 1) (target:accTargets) (varId:accIds) usedLocs (builtin:usedBuiltins) st1 rest
               Nothing -> do
@@ -3279,11 +3330,17 @@ emitStructOutputs stage structName layout structDecl st0 =
                   Just n -> Right n
                 when (stage == StageCompute) $
                   Left (CompileError "compute outputs cannot use @location" Nothing Nothing)
-                when (loc `elem` usedLocs) $
-                  Left (CompileError "duplicate @location on stage outputs" Nothing Nothing)
-                (info, varId, st1) <- emitOutputVar (structName <> "_" <> fieldName) fieldLayout (InputLocation loc) st
+                blendSrc <-
+                  if stage == StageFragment
+                    then parseBlendSrcAttr attrs
+                    else Right Nothing
+                let blendIx = fromMaybe 0 blendSrc
+                    locKey = (loc, blendIx)
+                when (locKey `elem` usedLocs) $
+                  Left (CompileError "duplicate @location/@blend_src on stage outputs" Nothing Nothing)
+                (info, varId, st1) <- emitOutputVar stage (structName <> "_" <> fieldName) fieldLayout attrs (InputLocation loc) st
                 let target = OutputTarget info fieldLayout [fromIntegral idx]
-                go (idx + 1) (target:accTargets) (varId:accIds) (loc:usedLocs) usedBuiltins st1 rest
+                go (idx + 1) (target:accTargets) (varId:accIds) (locKey:usedLocs) usedBuiltins st1 rest
       (targets, ids, st1, _usedLocs, _usedBuiltins) <- go 0 [] [] [] [] st0 fields
       case stage of
         StageVertex ->
@@ -3293,19 +3350,224 @@ emitStructOutputs stage structName layout structDecl st0 =
         _ -> pure ()
       pure (targets, ids, st1)
     _ -> Left (CompileError "expected struct return type" Nothing Nothing)
+  where
+    validateBlendSrcStructRules fields = do
+      infos <- mapM fieldInfo fields
+      let usesBlendSrc = any (isJust . third3) infos
+      when usesBlendSrc $ do
+        let allLocation0 = all (\(mLoc, _mBuiltin, _mBlend) -> mLoc == Just 0) infos
+            noBuiltins = all (\(_mLoc, mBuiltin, _mBlend) -> isNothing mBuiltin) infos
+            blendIdxs = [idx | (_mLoc, _mBuiltin, Just idx) <- infos]
+            allHaveBlend = length blendIdxs == length infos
+            exactlyTwo = length infos == 2
+            bothIndices = Set.fromList blendIdxs == Set.fromList [0, 1]
+        unless (exactlyTwo && noBuiltins && allHaveBlend && allLocation0 && bothIndices) $
+          Left (CompileError "if @blend_src is used, fragment outputs must be exactly two @location(0) fields with @blend_src(0) and @blend_src(1)" Nothing Nothing)
 
-emitOutputVar :: Text -> TypeLayout -> InputDecoration -> GenState -> Either CompileError (VarInfo, Word32, GenState)
-emitOutputVar name layout deco st0 = do
-  let (baseTy, st1) = emitTypeFromLayout st0 layout
+    fieldInfo field = do
+      let attrs = field.fdAttrs
+      mBlend <- parseBlendSrcAttr attrs
+      pure (attrLocation attrs, attrBuiltin attrs, mBlend)
+
+    third3 (_a, _b, c) = c
+
+emitOutputVar :: Stage -> Text -> TypeLayout -> [Attr] -> InputDecoration -> GenState -> Either CompileError (VarInfo, Word32, GenState)
+emitOutputVar stage name layout attrs deco st0 = do
+  validateUserStageIOType deco layout
+  let (storageLayout, path) = sampleMaskLayout layout deco
+  let (baseTy, st1) = emitTypeFromLayout st0 storageLayout
   let (ptrTy, st2) = emitPointerType st1 storageClassOutput baseTy
   let (varId, st3) = freshId st2
   let st4 = addGlobal (Instr opVariable [ptrTy, varId, storageClassOutput]) st3
-  let st5 = case deco of
+  let st5a = case deco of
         InputBuiltin bid -> addDecoration (Instr opDecorate [varId, decorationBuiltIn, bid]) st4
         InputLocation loc -> addDecoration (Instr opDecorate [varId, decorationLocation, loc]) st4
+  st5 <- applyIOAttrDecorations stage True layout attrs deco varId st5a
   let st6 = addName (Instr opName (varId : encodeString (textToString name))) st5
-  let info = VarInfo layout varId storageClassOutput ReadWrite
+  let info = VarInfo layout varId storageClassOutput ReadWrite path
   pure (info, varId, st6)
+
+sampleMaskLayout :: TypeLayout -> InputDecoration -> (TypeLayout, [Word32])
+sampleMaskLayout layout deco =
+  case deco of
+    InputBuiltin bid
+      | bid == builtInSampleMask
+      , isSampleMaskScalar layout ->
+          let (a, sz) = scalarLayout U32
+              elemLayout = TLScalar U32 a sz
+          in (TLArray (Just 1) sz elemLayout a sz, [0])
+    _ -> (layout, [])
+  where
+    isSampleMaskScalar tl =
+      case tl of
+        TLScalar U32 _ _ -> True
+        _ -> False
+
+validateUserStageIOType :: InputDecoration -> TypeLayout -> Either CompileError ()
+validateUserStageIOType deco layout =
+  case deco of
+    InputBuiltin _ -> Right ()
+    InputLocation _ ->
+      if isUserStageIOType layout
+        then Right ()
+        else Left (CompileError "stage @location inputs/outputs must be scalar or vector i32/u32/f16/f32" Nothing Nothing)
+
+isUserStageIOType :: TypeLayout -> Bool
+isUserStageIOType layout =
+  case layout of
+    TLScalar scalar _ _ -> isUserStageIOScalar scalar
+    TLVector _ scalar _ _ -> isUserStageIOScalar scalar
+    _ -> False
+
+isUserStageIOScalar :: Scalar -> Bool
+isUserStageIOScalar scalar =
+  case scalar of
+    I32 -> True
+    U32 -> True
+    F16 -> True
+    F32 -> True
+    _ -> False
+
+isFloatScalarOrVector :: TypeLayout -> Bool
+isFloatScalarOrVector layout =
+  case layout of
+    TLScalar F16 _ _ -> True
+    TLScalar F32 _ _ -> True
+    TLVector _ F16 _ _ -> True
+    TLVector _ F32 _ _ -> True
+    _ -> False
+
+data InterpolateKind = InterpPerspective | InterpLinear | InterpFlat
+  deriving (Eq, Show)
+
+data InterpolateSampling = InterpCenter | InterpCentroid | InterpSample
+  deriving (Eq, Show)
+
+applyIOAttrDecorations :: Stage -> Bool -> TypeLayout -> [Attr] -> InputDecoration -> Word32 -> GenState -> Either CompileError GenState
+applyIOAttrDecorations stage isOutput layout attrs deco varId st0 = do
+  mInterpolate <- parseInterpolateAttr attrs
+  hasInvariant <- parseInvariantAttr attrs
+  mBlendSrc <- parseBlendSrcAttr attrs
+  st1 <- applyInterpolate mInterpolate st0
+  st2 <- applyBlendSrc mBlendSrc st1
+  applyInvariant hasInvariant st2
+  where
+    isBuiltin =
+      case deco of
+        InputBuiltin _ -> True
+        InputLocation _ -> False
+
+    isInterpolationSite =
+      (stage == StageVertex && isOutput)
+        || (stage == StageFragment && not isOutput)
+
+    applyInterpolate Nothing st = Right st
+    applyInterpolate (Just (kind, sampling)) st = do
+      when isBuiltin $
+        Left (CompileError "@interpolate is not allowed on @builtin variables" Nothing Nothing)
+      unless isInterpolationSite $
+        Left (CompileError "@interpolate is only allowed on vertex outputs and fragment inputs" Nothing Nothing)
+      when (kind /= InterpFlat && not (isFloatScalarOrVector layout)) $
+        Left (CompileError "@interpolate(perspective|linear, ...): only floating-point scalars/vectors are allowed" Nothing Nothing)
+      let st1 =
+            case kind of
+              InterpPerspective -> st
+              InterpLinear -> addDecoration (Instr opDecorate [varId, decorationNoPerspective]) st
+              InterpFlat -> addDecoration (Instr opDecorate [varId, decorationFlat]) st
+      let st2 =
+            case sampling of
+              InterpCenter -> st1
+              InterpCentroid -> addDecoration (Instr opDecorate [varId, decorationCentroid]) st1
+              InterpSample -> addDecoration (Instr opDecorate [varId, decorationSample]) st1
+      pure st2
+
+    applyBlendSrc Nothing st = Right st
+    applyBlendSrc (Just idx) st = do
+      unless isOutput $
+        Left (CompileError "@blend_src is only allowed on stage outputs" Nothing Nothing)
+      when (stage /= StageFragment) $
+        Left (CompileError "@blend_src is only allowed on fragment outputs" Nothing Nothing)
+      unless (Set.member "dual_source_blending" st.gsEnabledFeatures) $
+        Left (CompileError "@blend_src requires `enable dual_source_blending;`" Nothing Nothing)
+      when isBuiltin $
+        Left (CompileError "@blend_src is not allowed on @builtin variables" Nothing Nothing)
+      case deco of
+        InputLocation loc -> do
+          when (loc /= 0) $
+            Left (CompileError "@blend_src is only valid on @location(0)" Nothing Nothing)
+          pure (addDecoration (Instr opDecorate [varId, decorationIndex, idx]) st)
+        InputBuiltin _ ->
+          Left (CompileError "@blend_src requires @location" Nothing Nothing)
+
+    applyInvariant False st = Right st
+    applyInvariant True st =
+      case deco of
+        InputBuiltin bid
+          | stage == StageVertex
+          , isOutput
+          , bid == builtInPosition ->
+              Right (addDecoration (Instr opDecorate [varId, decorationInvariant]) st)
+          | stage == StageFragment
+          , not isOutput
+          , bid == builtInFragCoord ->
+              Right (addDecoration (Instr opDecorate [varId, decorationInvariant]) st)
+        _ ->
+          Left (CompileError "@invariant is only allowed on @builtin(position) vertex outputs and fragment inputs" Nothing Nothing)
+
+parseInterpolateAttr :: [Attr] -> Either CompileError (Maybe (InterpolateKind, InterpolateSampling))
+parseInterpolateAttr attrs =
+  case [args | Attr name args <- attrs, name == "interpolate"] of
+    [] -> Right Nothing
+    [args] -> Just <$> parseArgs args
+    _ -> Left (CompileError "duplicate @interpolate attributes" Nothing Nothing)
+  where
+    parseArgs args =
+      case args of
+        [AttrIdent kindName] -> do
+          kind <- parseKind kindName
+          pure (kind, InterpCenter)
+        [AttrIdent kindName, AttrIdent samplingName] -> do
+          kind <- parseKind kindName
+          sampling <- parseSampling samplingName
+          when (kind == InterpFlat && sampling /= InterpCenter) $
+            Left (CompileError "@interpolate(flat, ...): only center sampling is allowed" Nothing Nothing)
+          pure (kind, sampling)
+        _ ->
+          Left (CompileError "@interpolate expects one or two identifier arguments" Nothing Nothing)
+
+    parseKind name =
+      case name of
+        "perspective" -> Right InterpPerspective
+        "linear" -> Right InterpLinear
+        "flat" -> Right InterpFlat
+        _ -> Left (CompileError ("unknown interpolation type: " <> textToString name) Nothing Nothing)
+
+    parseSampling name =
+      case name of
+        "center" -> Right InterpCenter
+        "centroid" -> Right InterpCentroid
+        "sample" -> Right InterpSample
+        _ -> Left (CompileError ("unknown interpolation sampling: " <> textToString name) Nothing Nothing)
+
+parseInvariantAttr :: [Attr] -> Either CompileError Bool
+parseInvariantAttr attrs =
+  case [args | Attr name args <- attrs, name == "invariant"] of
+    [] -> Right False
+    [[]] -> Right True
+    [_] -> Left (CompileError "@invariant does not accept arguments" Nothing Nothing)
+    _ -> Left (CompileError "duplicate @invariant attributes" Nothing Nothing)
+
+parseBlendSrcAttr :: [Attr] -> Either CompileError (Maybe Word32)
+parseBlendSrcAttr attrs =
+  case [args | Attr name args <- attrs, name == "blend_src"] of
+    [] -> Right Nothing
+    [[AttrInt n]] -> do
+      when (n < 0 || n > 1) $
+        Left (CompileError "@blend_src index must be 0 or 1" Nothing Nothing)
+      pure (Just (fromIntegral n))
+    [[_]] -> Left (CompileError "@blend_src expects an integer argument" Nothing Nothing)
+    [_] -> Left (CompileError "@blend_src expects exactly one argument" Nothing Nothing)
+    _ -> Left (CompileError "duplicate @blend_src attributes" Nothing Nothing)
 
 emitMainFunction :: EntryPoint -> [(Text, VarInfo)] -> [EntryParamInit] -> [OutputTarget] -> GenState -> Either CompileError GenState
 emitMainFunction entry env entryInits outTargets st0 = do
@@ -3343,7 +3605,7 @@ emitEntryParamInits inits st fs = foldM emitOne (st, fs) inits
       let (varId, st5) = freshId st4
       let fs3 = addFuncLocal (Instr opVariable [ptrTy, varId, storageClassFunction]) fs2
       let fs4 = addFuncInstr (Instr opStore [varId, resId]) fs3
-      let info = VarInfo (initParam.epiLayout) varId storageClassFunction ReadOnly
+      let info = VarInfo (initParam.epiLayout) varId storageClassFunction ReadOnly []
       let fs5 = fs4
             { fsVars = (initParam.epiName, info) : fs4.fsVars
             , fsVarsByName = Map.insert initParam.epiName info fs4.fsVarsByName
@@ -3436,7 +3698,7 @@ emitFunctionParams params layouts st0 =
             (varId, st4) = freshId st3
             localInstr = Instr opVariable [ptrTy, varId, storageClassFunction]
             storeInstr = Instr opStore [varId, paramId]
-            info = VarInfo l varId storageClassFunction ReadOnly
+            info = VarInfo l varId storageClassFunction ReadOnly []
         in go st4 (paramInstr:accInstrs) (localInstr:accLocals) (storeInstr:accStores) ((p.paramName, info):accEnv) ps ls
       go st accInstrs accLocals accStores accEnv _ _ = (reverse accInstrs, reverse accLocals, reverse accStores, reverse accEnv, st)
   in go st0 [] [] [] [] params layouts
@@ -3768,8 +4030,7 @@ storeReturnValue targets valLayout valueId st fs = do
   case targets of
     [OutputTarget out layout []] -> do
       ensureTypeMatch layout valLayout
-      let fs1 = addFuncInstr (Instr opStore [out.viPtrId, valueId]) fs
-      Right (st, fs1)
+      emitStoreToVar st fs out valueId
     _ -> foldM storeOne (st, fs) targets
   where
     storeOne (st', fs') target = do
@@ -3778,14 +4039,12 @@ storeReturnValue targets valLayout valueId st fs = do
       case target.otPath of
         [] -> do
           ensureTypeMatch outLayout valLayout
-          let fs1 = addFuncInstr (Instr opStore [outInfo.viPtrId, valueId]) fs'
-          Right (st', fs1)
+          emitStoreToVar st' fs' outInfo valueId
         path -> do
           let (tyId, st1) = emitTypeFromLayout st' outLayout
           let (resId, st2) = freshId st1
           let fs1 = addFuncInstr (Instr opCompositeExtract (tyId : resId : valueId : path)) fs'
-          let fs2 = addFuncInstr (Instr opStore [outInfo.viPtrId, resId]) fs1
-          Right (st2, fs2)
+          emitStoreToVar st2 fs1 outInfo resId
 
 emitStmtList :: EntryPoint -> [OutputTarget] -> GenState -> FuncState -> [Stmt] -> Either CompileError (GenState, FuncState)
 emitStmtList entry outTargets = go
@@ -3870,8 +4129,7 @@ emitAssignStmt lv expr st fs =
     (st2, fs2, val) <- emitExpr st1 fs1 expr
     (st3, fs3, val') <- coerceValueToLayout (ptrInfo.viType) val st2 fs2
     ensureWritable ptrInfo
-    let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, val'.valId]) fs3
-    Right (st3, fs4)
+    emitStoreToVar st3 fs3 ptrInfo val'.valId
 {-# INLINE emitAssignStmt #-}
 
 emitAssignOpStmt :: LValue -> BinOp -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
@@ -3882,8 +4140,7 @@ emitAssignOpStmt lv op expr st fs =
     (st3, fs3, rhsVal) <- emitExpr st2 fs2 expr
     (st4, fs4, rhsVal') <- coerceValueToLayout (ptrInfo.viType) rhsVal st3 fs3
     (st5, fs5, resVal) <- emitBinary op (ptrInfo.viType) (lhsVal.valId) (rhsVal'.valId) st4 fs4
-    let fs6 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs5
-    Right (st5, fs6)
+    emitStoreToVar st5 fs5 ptrInfo resVal.valId
 {-# INLINE emitAssignOpStmt #-}
 
 emitIncDecStmt :: BinOp -> LValue -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
@@ -3893,8 +4150,7 @@ emitIncDecStmt op lv st fs =
     (st2, fs2, lhsVal) <- emitLoadFromPtr st1 fs1 ptrInfo
     (oneId, st3) <- emitConstOne (ptrInfo.viType) st2
     (st4, fs3, resVal) <- emitBinary op (ptrInfo.viType) (lhsVal.valId) oneId st3 fs2
-    let fs4 = addFuncInstr (Instr opStore [ptrInfo.viPtrId, resVal.valId]) fs3
-    Right (st4, fs4)
+    emitStoreToVar st4 fs3 ptrInfo resVal.valId
 {-# INLINE emitIncDecStmt #-}
 
 emitExprStmt :: GenState -> FuncState -> Expr -> Either CompileError (GenState, FuncState)
@@ -3904,6 +4160,9 @@ emitExprStmt st fs expr =
       case name of
         "textureStore" -> emitTextureStore args st fs
         "atomicStore" -> emitAtomicStore args st fs
+        "workgroupBarrier" -> emitBarrierBuiltin "workgroupBarrier" memorySemanticsWorkgroupMemory args st fs
+        "storageBarrier" -> emitBarrierBuiltin "storageBarrier" memorySemanticsUniformMemory args st fs
+        "textureBarrier" -> emitBarrierBuiltin "textureBarrier" memorySemanticsImageMemory args st fs
         _ ->
           if Map.member name st.gsFunctionsByName
             then do
@@ -3916,13 +4175,56 @@ emitExprStmt st fs expr =
       (st1, fs1, _) <- emitExpr st fs expr
       Right (st1, fs1)
 
+emitBarrierBuiltin :: String -> Word32 -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
+emitBarrierBuiltin name semMask args st fs =
+  case args of
+    [] -> do
+      let stageOk =
+            case name of
+              "workgroupBarrier" -> st.gsEntryStage == StageCompute
+              "storageBarrier" -> st.gsEntryStage == StageCompute
+              "textureBarrier" -> st.gsEntryStage == StageCompute
+              _ -> False
+      unless stageOk $
+        Left (CompileError (name <> " is not available in this shader stage") Nothing Nothing)
+      let (execScopeId, st1) = emitConstU32 st memoryScopeWorkgroup
+      let (memScopeId, st2) = emitConstU32 st1 memoryScopeWorkgroup
+      let (semanticsId, st3) = emitConstU32 st2 (memorySemanticsAcquireRelease .|. semMask)
+      let fs1 = addFuncInstr (Instr opControlBarrier [execScopeId, memScopeId, semanticsId]) fs
+      Right (st3, fs1)
+    _ -> Left (CompileError (name <> " expects no arguments") Nothing Nothing)
+
 emitLoadFromPtr :: GenState -> FuncState -> VarInfo -> Either CompileError (GenState, FuncState, Value)
 emitLoadFromPtr st fs info = do
-  let (tyId, st1) = emitTypeFromLayout st (info.viType)
-  let (resId, st2) = freshId st1
-  let fs1 = addFuncInstr (Instr opLoad [tyId, resId, info.viPtrId]) fs
-  Right (st2, fs1, Value (info.viType) resId)
+  (st1, fs1, ptrId) <- resolveVarPtr st fs info
+  let (tyId, st2) = emitTypeFromLayout st1 (info.viType)
+  let (resId, st3) = freshId st2
+  let fs2 = addFuncInstr (Instr opLoad [tyId, resId, ptrId]) fs1
+  Right (st3, fs2, Value (info.viType) resId)
 {-# INLINE emitLoadFromPtr #-}
+
+resolveVarPtr :: GenState -> FuncState -> VarInfo -> Either CompileError (GenState, FuncState, Word32)
+resolveVarPtr st fs info =
+  case info.viPath of
+    [] -> Right (st, fs, info.viPtrId)
+    path -> do
+      let addIx (acc, ids) ix =
+            let (cid, acc') = emitConstU32 acc ix
+            in (acc', ids <> [cid])
+      let (st1, indexIds) = foldl' addIx (st, []) path
+      let (elemTy, st2) = emitTypeFromLayout st1 info.viType
+      let (ptrTy, st3) = emitPointerType st2 info.viStorage elemTy
+      let (ptrId, st4) = freshId st3
+      let fs1 = addFuncInstr (Instr opAccessChain (ptrTy : ptrId : info.viPtrId : indexIds)) fs
+      Right (st4, fs1, ptrId)
+{-# INLINE resolveVarPtr #-}
+
+emitStoreToVar :: GenState -> FuncState -> VarInfo -> Word32 -> Either CompileError (GenState, FuncState)
+emitStoreToVar st fs info valueId = do
+  (st1, fs1, ptrId) <- resolveVarPtr st fs info
+  let fs2 = addFuncInstr (Instr opStore [ptrId, valueId]) fs1
+  Right (st1, fs2)
+{-# INLINE emitStoreToVar #-}
 
 emitConstOne :: TypeLayout -> GenState -> Either CompileError (Word32, GenState)
 emitConstOne layout st =
@@ -4065,7 +4367,7 @@ emitLocalValue name val st fs = do
   let (varId, st3) = freshId st2
   let fs1 = addFuncLocal (Instr opVariable [ptrTy, varId, storageClassFunction]) fs
   let fs2 = addFuncInstr (Instr opStore [varId, val.valId]) fs1
-  let info = VarInfo (val.valType) varId storageClassFunction ReadWrite
+  let info = VarInfo (val.valType) varId storageClassFunction ReadWrite []
   let fs3 = fs2
         { fsVars = (name, info) : fs2.fsVars
         , fsVarsByName = Map.insert name info fs2.fsVarsByName
@@ -4422,11 +4724,7 @@ emitLoadFromExpr st fs expr =
       (st1, fs1, ptrInfo) <- emitLValuePtr st fs lv
       case ptrInfo.viType of
         TLAtomic _ -> Left (CompileError "use atomicLoad for atomic values" Nothing Nothing)
-        _ -> pure ()
-      let (tyId, st2) = emitTypeFromLayout st1 (ptrInfo.viType)
-      let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opLoad [tyId, resId, ptrInfo.viPtrId]) fs1
-      Right (st3, fs2, Value (ptrInfo.viType) resId)
+        _ -> emitLoadFromPtr st1 fs1 ptrInfo
 
 emitFieldExpr :: GenState -> FuncState -> Expr -> Text -> Either CompileError (GenState, FuncState, Value)
 emitFieldExpr st fs base field = do
@@ -4725,6 +5023,9 @@ emitCall name args st fs =
             "dpdx" -> emitDerivative opDPdx args st fs
             "dpdy" -> emitDerivative opDPdy args st fs
             "fwidth" -> emitDerivative opFwidth args st fs
+            "workgroupBarrier" -> Left (CompileError "workgroupBarrier cannot be used as a value" Nothing Nothing)
+            "storageBarrier" -> Left (CompileError "storageBarrier cannot be used as a value" Nothing Nothing)
+            "textureBarrier" -> Left (CompileError "textureBarrier cannot be used as a value" Nothing Nothing)
             "textureLoad" -> emitTextureLoad args st fs
             "atomicLoad" -> emitAtomicLoad args st fs
             "atomicAdd" -> emitAtomicBinary (atomicOpSame "atomicAdd" opAtomicIAdd) args st fs
@@ -4735,6 +5036,7 @@ emitCall name args st fs =
             "atomicOr" -> emitAtomicBinary (atomicOpSame "atomicOr" opAtomicOr) args st fs
             "atomicXor" -> emitAtomicBinary (atomicOpSame "atomicXor" opAtomicXor) args st fs
             "atomicExchange" -> emitAtomicBinary (atomicOpSame "atomicExchange" opAtomicExchange) args st fs
+            "atomicCompareExchangeWeak" -> emitAtomicCompareExchangeWeak args st fs
             _ ->
               case parseMatrixCtorName name of
                 Just (cols, rows, targetScalar) -> emitMatrixCtor cols rows targetScalar args st fs
@@ -7662,10 +7964,11 @@ emitAtomicLoad args st fs =
       let layout = TLScalar scalar a sz
       let (tyId, st2) = emitTypeFromLayout st1 layout
       let (resId, st3) = freshId st2
-      let (scopeId, st4) = emitConstU32 st3 memoryScopeDevice
-      let (semId, st5) = emitConstU32 st4 memorySemanticsRelaxed
-      let fs2 = addFuncInstr (Instr opAtomicLoad [tyId, resId, ptrInfo.viPtrId, scopeId, semId]) fs1
-      Right (st5, fs2, Value layout resId)
+      (st4, fs2, ptrId) <- resolveVarPtr st3 fs1 ptrInfo
+      let (scopeId, st5) = emitConstU32 st4 memoryScopeDevice
+      let (semId, st6) = emitConstU32 st5 memorySemanticsRelaxed
+      let fs3 = addFuncInstr (Instr opAtomicLoad [tyId, resId, ptrId, scopeId, semId]) fs2
+      Right (st6, fs3, Value layout resId)
     _ -> Left (CompileError "atomicLoad expects (ptr)" Nothing Nothing)
 
 emitAtomicStore :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState)
@@ -7679,10 +7982,11 @@ emitAtomicStore args st fs =
       (st2, fs2, val) <- emitExpr st1 fs1 valueExpr
       let (a, sz) = scalarLayout scalar
       (st3, fs3, val') <- coerceValueToLayout (TLScalar scalar a sz) val st2 fs2
-      let (scopeId, st4) = emitConstU32 st3 memoryScopeDevice
-      let (semId, st5) = emitConstU32 st4 memorySemanticsRelaxed
-      let fs4 = addFuncInstr (Instr opAtomicStore [ptrInfo.viPtrId, scopeId, semId, val'.valId]) fs3
-      Right (st5, fs4)
+      (st4, fs4, ptrId) <- resolveVarPtr st3 fs3 ptrInfo
+      let (scopeId, st5) = emitConstU32 st4 memoryScopeDevice
+      let (semId, st6) = emitConstU32 st5 memorySemanticsRelaxed
+      let fs5 = addFuncInstr (Instr opAtomicStore [ptrId, scopeId, semId, val'.valId]) fs4
+      Right (st6, fs5)
     _ -> Left (CompileError "atomicStore expects (ptr, value)" Nothing Nothing)
 
 emitAtomicBinary :: (Scalar -> Either CompileError Word16) -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
@@ -7700,11 +8004,66 @@ emitAtomicBinary opcodeFor args st fs =
       let layout = TLScalar scalar a sz
       let (tyId, st4) = emitTypeFromLayout st3 layout
       let (resId, st5) = freshId st4
-      let (scopeId, st6) = emitConstU32 st5 memoryScopeDevice
-      let (semId, st7) = emitConstU32 st6 memorySemanticsRelaxed
-      let fs4 = addFuncInstr (Instr opcode [tyId, resId, ptrInfo.viPtrId, scopeId, semId, val'.valId]) fs3
-      Right (st7, fs4, Value layout resId)
+      (st6, fs4, ptrId) <- resolveVarPtr st5 fs3 ptrInfo
+      let (scopeId, st7) = emitConstU32 st6 memoryScopeDevice
+      let (semId, st8) = emitConstU32 st7 memorySemanticsRelaxed
+      let fs5 = addFuncInstr (Instr opcode [tyId, resId, ptrId, scopeId, semId, val'.valId]) fs4
+      Right (st8, fs5, Value layout resId)
     _ -> Left (CompileError "atomic operation expects (ptr, value)" Nothing Nothing)
+
+emitAtomicCompareExchangeWeak :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
+emitAtomicCompareExchangeWeak args st fs =
+  case args of
+    [ptrExpr, cmpExpr, valueExpr] -> do
+      (st1, fs1, ptrInfo) <- emitAtomicPtr ptrExpr st fs
+      scalar <- case ptrInfo.viType of
+        TLAtomic s -> Right s
+        _ -> Left (CompileError "atomicCompareExchangeWeak expects an atomic value" Nothing Nothing)
+      let (a, sz) = scalarLayout scalar
+      let scalarTl = TLScalar scalar a sz
+      (st2, fs2, cmpVal) <- emitExpr st1 fs1 cmpExpr
+      (st3, fs3, cmpVal') <- coerceValueToLayout scalarTl cmpVal st2 fs2
+      (st4, fs4, valueVal) <- emitExpr st3 fs3 valueExpr
+      (st5, fs5, valueVal') <- coerceValueToLayout scalarTl valueVal st4 fs4
+      (st6, fs6, ptrId) <- resolveVarPtr st5 fs5 ptrInfo
+      let (oldTyId, st7) = emitTypeFromLayout st6 scalarTl
+      let (oldId, st8) = freshId st7
+      let (scopeId, st9) = emitConstU32 st8 memoryScopeDevice
+      let (eqSemId, st10) = emitConstU32 st9 memorySemanticsRelaxed
+      let (neqSemId, st11) = emitConstU32 st10 memorySemanticsRelaxed
+      let fs7 =
+            addFuncInstr
+              (Instr opAtomicCompareExchange [oldTyId, oldId, ptrId, scopeId, eqSemId, neqSemId, valueVal'.valId, cmpVal'.valId])
+              fs6
+      let (boolA, boolSz) = scalarLayout Bool
+      let boolTl = TLScalar Bool boolA boolSz
+      let (boolTyId, st12) = emitTypeFromLayout st11 boolTl
+      let (eqId, st13) = freshId st12
+      let fs8 = addFuncInstr (Instr opIEqual [boolTyId, eqId, oldId, cmpVal'.valId]) fs7
+      let resultLayout = atomicCompareExchangeResultLayout scalar
+      let (resultTyId, st14) = emitTypeFromLayout st13 resultLayout
+      let (resultId, st15) = freshId st14
+      let fs9 = addFuncInstr (Instr opCompositeConstruct [resultTyId, resultId, oldId, eqId]) fs8
+      Right (st15, fs9, Value resultLayout resultId)
+    _ -> Left (CompileError "atomicCompareExchangeWeak expects (ptr, cmp, value)" Nothing Nothing)
+
+atomicCompareExchangeResultLayout :: Scalar -> TypeLayout
+atomicCompareExchangeResultLayout scalar =
+  let (a, sz) = scalarLayout scalar
+      oldLayout = TLScalar scalar a sz
+      (ba, bsz) = scalarLayout Bool
+      boolLayout = TLScalar Bool ba bsz
+      oldField = FieldLayout "old_value" 0 oldLayout a sz
+      exchangedOffset = roundUp sz ba
+      exchangedField = FieldLayout "exchanged" exchangedOffset boolLayout ba bsz
+      align = max a ba
+      size = roundUp (exchangedOffset + bsz) align
+      structName =
+        case scalar of
+          I32 -> "__atomic_compare_exchange_result_i32"
+          U32 -> "__atomic_compare_exchange_result_u32"
+          _ -> "__atomic_compare_exchange_result_i32"
+  in TLStruct structName [oldField, exchangedField] align size
 
 emitExprList :: GenState -> FuncState -> [Expr] -> Either CompileError (GenState, FuncState, [Value])
 emitExprList st fs [] = Right (st, fs, [])
@@ -7758,7 +8117,7 @@ emitLValuePtr st fs lv =
       (st1, fs1, val) <- emitExpr st fs expr
       case val.valType of
         TLPointer storageClass access elemLayout ->
-          Right (st1, fs1, VarInfo elemLayout (val.valId) storageClass (ptrAccessToVarAccess access))
+          Right (st1, fs1, VarInfo elemLayout (val.valId) storageClass (ptrAccessToVarAccess access) [])
         _ -> Left (CompileError "deref requires a pointer value" Nothing Nothing)
 
 emitAccessChain :: GenState -> FuncState -> VarInfo -> [Word32] -> TypeLayout -> Either CompileError (GenState, FuncState, VarInfo)
@@ -7769,7 +8128,7 @@ emitAccessChain st fs baseInfo indices elemLayout = do
   let (resId, st3) = freshId st2
   let instr = Instr opAccessChain (ptrTy : resId : baseInfo.viPtrId : indices)
   let fs1 = addFuncInstr instr fs
-  Right (st3, fs1, VarInfo elemLayout resId storageClass (baseInfo.viAccess))
+  Right (st3, fs1, VarInfo elemLayout resId storageClass (baseInfo.viAccess) [])
 
 ensureTypeMatch :: TypeLayout -> TypeLayout -> Either CompileError ()
 ensureTypeMatch a b =

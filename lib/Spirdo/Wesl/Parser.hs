@@ -412,7 +412,7 @@ parseModuleTokensWith feats toks =
                 let accOverrides' = if keep then overrideDecl : accOverrides else accOverrides
                 loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides' accAsserts accFns accEntries True True rest2
               (Token (TkIdent "fn") _ : _) -> do
-                (name, params, retType, retLoc, retBuiltin, body, rest2) <- parseFunctionGeneric feats rest1
+                (name, params, retType, retAttrs, retLoc, retBuiltin, body, rest2) <- parseFunctionGeneric feats rest1
                 let hasStageAttr = any isStageAttr attrs'
                 case entryAttributesMaybe attrs' of
                   Nothing ->
@@ -425,11 +425,13 @@ parseModuleTokensWith feats toks =
                         case retBuiltin of
                           Nothing -> pure ()
                           Just _ -> Left (errorAt rest1 "return builtin is only allowed on entry points")
+                        unless (null retAttrs) $
+                          Left (errorAt rest1 "return attributes are only allowed on entry points")
                         let fnDecl = FunctionDecl name params retType body
                         let accFns' = if keep then fnDecl : accFns else accFns
                         loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns' accEntries True True rest2
                   Just (stage, workgroup) -> do
-                    let entry = EntryPoint name stage workgroup params retType retLoc retBuiltin body
+                    let entry = EntryPoint name stage workgroup params retType retAttrs retLoc retBuiltin body
                     let accEntries' = if keep then entry : accEntries else accEntries
                     loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts accOverrides accAsserts accFns accEntries' True True rest2
               _ -> Left (errorAt rest1 "expected directive, import, alias, struct, var, let, override, const_assert, or fn")
@@ -964,15 +966,15 @@ parseAddressSpace toks =
         _ -> Left (errorAt rest "expected address space qualifier")
     _ -> Left (errorAt toks "expected address space qualifiers")
 
-parseFunctionGeneric :: FeatureSet -> [Token] -> Either CompileError (Text, [Param], Maybe Type, Maybe Word32, Maybe Text, [Stmt], [Token])
+parseFunctionGeneric :: FeatureSet -> [Token] -> Either CompileError (Text, [Param], Maybe Type, [Attr], Maybe Word32, Maybe Text, [Stmt], [Token])
 parseFunctionGeneric feats toks =
   case toks of
     (Token (TkIdent "fn") _ : Token (TkIdent name) _ : Token (TkSymbol "(") _ : rest) -> do
       (params, rest1) <- parseParams feats rest
       rest2 <- expectSymbol ")" rest1
-      (rest3, retType, retLoc, retBuiltin) <- parseReturnType rest2
+      (rest3, retType, retAttrs, retLoc, retBuiltin) <- parseReturnType rest2
       (body, rest4) <- parseBody feats rest3
-      Right (name, params, retType, retLoc, retBuiltin, body, rest4)
+      Right (name, params, retType, retAttrs, retLoc, retBuiltin, body, rest4)
     _ -> Left (errorAt toks "expected fn declaration")
 
 parseParams :: FeatureSet -> [Token] -> Either CompileError ([Param], [Token])
@@ -998,17 +1000,17 @@ parseParams feats toks =
       let param = Param pos name ty attrs'
       pure (if keep then Just param else Nothing, rest4)
 
-parseReturnType :: [Token] -> Either CompileError ([Token], Maybe Type, Maybe Word32, Maybe Text)
+parseReturnType :: [Token] -> Either CompileError ([Token], Maybe Type, [Attr], Maybe Word32, Maybe Text)
 parseReturnType toks =
   case toks of
     (Token (TkSymbol "-") _ : Token (TkSymbol ">") _ : rest) -> do
       (retAttrs, rest1) <- parseAttributes rest
       case rest1 of
-        (Token (TkIdent "void") _ : more) -> Right (more, Nothing, attrIntMaybe "location" retAttrs, attrBuiltin retAttrs)
+        (Token (TkIdent "void") _ : more) -> Right (more, Nothing, retAttrs, attrIntMaybe "location" retAttrs, attrBuiltin retAttrs)
         _ -> do
           (ty, rest2) <- parseType rest1
-          Right (rest2, Just ty, attrIntMaybe "location" retAttrs, attrBuiltin retAttrs)
-    _ -> Right (toks, Nothing, Nothing, Nothing)
+          Right (rest2, Just ty, retAttrs, attrIntMaybe "location" retAttrs, attrBuiltin retAttrs)
+    _ -> Right (toks, Nothing, [], Nothing, Nothing)
 
 parseBody :: FeatureSet -> [Token] -> Either CompileError ([Stmt], [Token])
 parseBody feats toks =
