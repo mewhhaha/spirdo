@@ -15,11 +15,7 @@
 -- | Compiler pipeline and quasiquoter implementation.
 module Spirdo.Wesl.Compiler where
 
-import Control.Concurrent (forkFinally)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.QSem (QSem, newQSem, signalQSem, waitQSem)
-import Control.Exception (IOException, SomeException, catch, evaluate, throwIO, try)
-import GHC.Conc (getNumCapabilities)
+import Control.Exception (IOException, SomeException, catch, evaluate, try)
 import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE, withExceptT)
@@ -28,7 +24,6 @@ import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char (isSpace, ord)
-import Data.Either (isLeft, partitionEithers)
 import Data.List (isInfixOf, isPrefixOf, sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -396,8 +391,23 @@ weslCacheVersion = "wesl-cache-v4"
 defaultCacheDir :: FilePath
 defaultCacheDir = "dist-newstyle" </> ".wesl-cache"
 
-weslCacheKey :: CompileOptions -> String -> String
-weslCacheKey opts src =
+weslCacheKeyWithImports :: CompileOptions -> FilePath -> Imports mods -> String -> String
+weslCacheKeyWithImports opts rootName importSet src =
+  let rootDir = takeDirectory rootName
+      importMap = normalizeImportsForRoot rootDir (importsMap importSet)
+      importEntries = sort (Map.toList importMap)
+      importLines =
+        concatMap
+          ( \(name, text) ->
+              [ "import=" <> normalise name
+              , T.unpack text
+              ]
+          )
+          importEntries
+  in weslCacheKeyFromLines opts (["kind=imports", "root=" <> normalise rootName, src] <> importLines)
+
+weslCacheKeyFromLines :: CompileOptions -> [String] -> String
+weslCacheKeyFromLines opts bodyLines =
   let keyLines =
         [ weslCacheVersion
         , "v=" <> show (opts.spirvVersion)
@@ -406,8 +416,8 @@ weslCacheKey opts src =
         , "spec=" <> show opts.overrideSpecMode
         , "samplerMode=" <> show opts.samplerBindingMode
         , "entry=" <> show opts.entryPointName
-        , src
         ]
+        <> bodyLines
       hash = foldl' updateLine fnv1a64Offset (zip [0 :: Int ..] keyLines)
       hex = showHex hash ""
   in replicate (16 - length hex) '0' <> hex
@@ -432,19 +442,18 @@ fnv1a64Step acc byte = (acc `xor` fromIntegral byte) * fnv1a64Prime
 fnv1a64 :: ByteString -> Word64
 fnv1a64 = BS.foldl' fnv1a64Step fnv1a64Offset
 
-weslCachePaths :: CompileOptions -> String -> (FilePath, FilePath)
-weslCachePaths opts src =
-  let key = weslCacheKey opts src
-      baseDir = if null opts.cacheDir then defaultCacheDir else opts.cacheDir
+weslCachePathsByKey :: CompileOptions -> String -> (FilePath, FilePath)
+weslCachePathsByKey opts key =
+  let baseDir = if null opts.cacheDir then defaultCacheDir else opts.cacheDir
       base = baseDir </> key
   in (base <.> "spv", base <.> "iface")
 
-loadWeslCache :: CompileOptions -> String -> IO (Maybe (ByteString, ShaderInterface))
-loadWeslCache opts src =
+loadWeslCacheByKey :: CompileOptions -> String -> IO (Maybe (ByteString, ShaderInterface))
+loadWeslCacheByKey opts key =
   if not (opts.cacheEnabled)
     then pure Nothing
     else do
-      let (spvPath, ifacePath) = weslCachePaths opts src
+      let (spvPath, ifacePath) = weslCachePathsByKey opts key
       okSpv <- doesFileExist spvPath
       okIface <- doesFileExist ifacePath
       if not (okSpv && okIface)
@@ -458,17 +467,25 @@ loadWeslCache opts src =
               Nothing -> pure Nothing
           ) `catch` \(_ :: SomeException) -> pure Nothing
 
-writeWeslCache :: CompileOptions -> String -> ByteString -> ShaderInterface -> IO ()
-writeWeslCache opts src bytes iface =
+loadWeslCacheWithImports :: CompileOptions -> FilePath -> Imports mods -> String -> IO (Maybe (ByteString, ShaderInterface))
+loadWeslCacheWithImports opts rootName importSet src =
+  loadWeslCacheByKey opts (weslCacheKeyWithImports opts rootName importSet src)
+
+writeWeslCacheByKey :: CompileOptions -> String -> ByteString -> ShaderInterface -> IO ()
+writeWeslCacheByKey opts key bytes iface =
   if not (opts.cacheEnabled)
     then pure ()
     else
-      let (spvPath, ifacePath) = weslCachePaths opts src
+      let (spvPath, ifacePath) = weslCachePathsByKey opts key
       in (do
             createDirectoryIfMissing True (takeDirectory spvPath)
             BS.writeFile spvPath bytes
             writeFile ifacePath (show iface)
          ) `catch` \(_ :: SomeException) -> pure ()
+
+writeWeslCacheWithImports :: CompileOptions -> FilePath -> Imports mods -> String -> ByteString -> ShaderInterface -> IO ()
+writeWeslCacheWithImports opts rootName importSet src bytes iface =
+  writeWeslCacheByKey opts (weslCacheKeyWithImports opts rootName importSet src) bytes iface
 
 -- Quasiquoter
 
@@ -486,33 +503,14 @@ weslWith _ =
     , quoteDec = const (fail "wesl: declaration context not supported")
     }
 
--- | Quasiquoter for inline WESL compiled to a shader (compile-time).
-weslShader :: QuasiQuoter
-weslShader = weslShaderWith defaultCompileOptions
-
--- | Quasiquoter for compiled WESL with explicit compile options.
-weslShaderWith :: CompileOptions -> QuasiQuoter
-weslShaderWith opts =
-  QuasiQuoter
-    { quoteExp = weslShaderExpWith opts
-    , quotePat = const (fail "weslShader: pattern context not supported")
-    , quoteType = const (fail "weslShader: type context not supported")
-    , quoteDec = const (fail "weslShader: declaration context not supported")
-    }
-
-weslShaderExpWith :: CompileOptions -> String -> Q Exp
-weslShaderExpWith opts src = do
-  (bytes, iface, sourceInfo) <- compileInlineCached opts src
-  preparedExpWith opts bytes iface sourceInfo
-
-compileInlineCached :: CompileOptions -> String -> Q (ByteString, ShaderInterface, Maybe ShaderSource)
-compileInlineCached opts src = do
-  let sourceInfo = Just (ShaderSource "<inline>" (T.pack src))
-  cached <- TH.runIO (timed opts "cache-read" (loadWeslCache opts src))
+compileInlineCachedWithImports :: CompileOptions -> FilePath -> Imports mods -> String -> Q (ByteString, ShaderInterface, Maybe ShaderSource)
+compileInlineCachedWithImports opts rootName importSet src = do
+  let sourceInfo = Just (ShaderSource rootName (T.pack src))
+  cached <- TH.runIO (timed opts "cache-read" (loadWeslCacheWithImports opts rootName importSet src))
   maybe
     compileFresh
     ( \entry@(_, iface) ->
-        case validateCachedShader opts src entry of
+        case validateCachedShader opts rootName entry of
           Right _ -> pure (fst entry, iface, sourceInfo)
           Left _ -> compileFresh
     )
@@ -520,105 +518,26 @@ compileInlineCached opts src = do
   where
     compileFresh =
       either
-        (fail . renderErrorWithSource (Just "<inline>") src)
-        (\result -> do
+        (fail . renderErrorWithSource (Just rootName) src)
+        ( \result -> do
             let bytes = result.crSpirv
                 iface = result.crInterface
-            TH.runIO (timed opts "cache-write" (writeWeslCache opts src bytes iface))
+            TH.runIO (timed opts "cache-write" (writeWeslCacheWithImports opts rootName importSet src bytes iface))
             pure (bytes, iface, result.crSource)
         )
-        (compileInlineResult opts False "<inline>" src)
+        (compileInlineResultWithImports opts False rootName importSet src)
 
--- | Compile inline WESL with an in-memory import map (compile-time).
-spirv :: Imports mods -> String -> Q Exp
-spirv = spirvWith defaultCompileOptions
-
--- | Compile inline WESL with imports and explicit compile options (compile-time).
-spirvWith :: CompileOptions -> Imports mods -> String -> Q Exp
-spirvWith opts = spirvNamed opts "<inline>"
-
--- | Compile inline WESL with imports and an explicit root name (compile-time).
-spirvNamed :: CompileOptions -> FilePath -> Imports mods -> String -> Q Exp
-spirvNamed opts rootName importSet src = do
-  result <-
-    either
-      (fail . renderErrorWithSource (Just rootName) src)
-      pure
-      (compileInlineResultWithImports opts False rootName importSet src)
-  preparedExpWith opts result.crSpirv result.crInterface result.crSource
-
-mapConcurrentlyIO :: forall a b. (a -> IO b) -> [a] -> IO [b]
-mapConcurrentlyIO f xs = do
-  caps <- getNumCapabilities
-  sem <- newQSem (max 1 caps)
-  mvars <- mapM (spawn sem) xs
-  results <- mapM takeMVar mvars
-  case partitionEithers results of
-    (err:_, _) -> throwIO err
-    ([], vals) -> pure vals
-  where
-    spawn :: QSem -> a -> IO (MVar (Either SomeException b))
-    spawn sem x = do
-      mv <- newEmptyMVar
-      waitQSem sem
-      _ <- forkFinally (f x) $ \res -> do
-        putMVar mv res
-        signalQSem sem
-      pure mv
-
-compileInlineCachedBatch :: CompileOptions -> [(String, String)] -> IO (Either String [(String, ByteString, ShaderInterface, Maybe ShaderSource)])
-compileInlineCachedBatch opts entries = do
-  let indexed = zip [0 :: Int ..] entries
-  cached <- mapM (\(_, (_, src)) -> timed opts "cache-read" (loadWeslCache opts src)) indexed
-  let hits =
-        [ (ix, Right (name, src, bytes, iface, Just (ShaderSource name (T.pack src)), True))
-        | ((ix, (name, src)), Just (bytes, iface)) <- zip indexed cached
-        , Right _ <- [validateCachedShader opts src (bytes, iface)]
-        ]
-  let misses =
-        [ (ix, name, src)
-        | ((ix, (name, src)), maybeEntry) <- zip indexed cached
-        , case maybeEntry of
-            Nothing -> True
-            Just entry -> isLeft (validateCachedShader opts src entry)
-        ]
-  missResults <- mapConcurrentlyIO (compileMiss opts) misses
-  let results = hits ++ missResults
-  case Map.lookupMin (Map.fromList [(ix, err) | (ix, Left err) <- results]) of
-    Just (_, err) -> pure (Left err)
-    Nothing -> do
-      let resultMap = Map.fromList [(i, v) | (i, Right v) <- results]
-      let missing =
-            [ ix
-            | ix <- [0 .. length entries - 1]
-            , Map.notMember ix resultMap
-            ]
-      case missing of
-        ix:_ ->
-          pure (Left ("wesl: batch compile result missing at index " <> show ix))
-        [] -> do
-          let ordered = [resultMap Map.! ix | ix <- [0 .. length entries - 1]]
-          mapM_ writeCache ordered
-          pure (Right [(name, bytes, iface, sourceInfo) | (name, _src, bytes, iface, sourceInfo, _fromCache) <- ordered])
-  where
-    compileMiss o (ix, name, src) =
-      case compileInlineResult o False name src of
-        Left err -> pure (ix, Left (renderErrorWithSource (Just name) src err))
-        Right cr -> do
-          let bytes = cr.crSpirv
-              iface = cr.crInterface
-          _ <- evaluate (BS.length bytes)
-          pure (ix, Right (name, src, bytes, iface, cr.crSource, False))
-
-    writeCache (_name, src, bytes, iface, _sourceInfo, fromCache) =
-      unless fromCache $
-        timed opts "cache-write" (writeWeslCache opts src bytes iface)
+-- | Compile inline WESL with typed imports at compile-time.
+spirv :: CompileOptions -> Imports mods -> String -> Q Exp
+spirv opts importSet src = do
+  (bytes, iface, sourceInfo) <- compileInlineCachedWithImports opts "<inline>" importSet src
+  preparedExpWith opts bytes iface sourceInfo
 
 validateCachedShader :: CompileOptions -> String -> (ByteString, ShaderInterface) -> Either String ()
-validateCachedShader opts src (bytes, iface) =
+validateCachedShader opts label (bytes, iface) =
   withSamplerModeProxy opts.samplerBindingMode $ \(_ :: SamplerModeProxy mode) ->
     case (prepareShader (CompiledShader bytes iface Nothing :: CompiledShader mode '[]) :: Either String (PreparedShader mode '[])) of
-      Left err -> Left ("cached shader invalid for " <> src <> ": " <> err)
+      Left err -> Left ("cached shader invalid for " <> label <> ": " <> err)
       Right _ -> Right ()
 
 preparedExpWith :: CompileOptions -> ByteString -> ShaderInterface -> Maybe ShaderSource -> Q Exp
@@ -651,31 +570,6 @@ preparedExpWith opts bytes iface sourceInfo = do
   let prepExp = TH.AppE (TH.VarE 'unsafePrepareInline) compiledExp
   let shaderExp = TH.AppE (TH.VarE 'shaderFromPrepared) prepExp
   pure (TH.SigE shaderExp (TH.AppT (TH.AppT (TH.ConT ''Shader) modeTy) ifaceTy))
-
--- | Compile multiple inline WESL shaders in a single splice.
-weslShaderBatch :: [(String, String)] -> Q [TH.Dec]
-weslShaderBatch = weslShaderBatchWith defaultCompileOptions
-
--- | Compile multiple inline WESL shaders with explicit options.
-weslShaderBatchWith :: CompileOptions -> [(String, String)] -> Q [TH.Dec]
-weslShaderBatchWith opts entries = do
-  compiled <- TH.runIO (compileInlineCachedBatch opts entries)
-  case compiled of
-    Left err -> fail err
-    Right items -> fmap concat (mapM compileOne items)
-  where
-    compileOne (nameStr, bytes, iface, sourceInfo) = do
-      expr <- preparedExpWith opts bytes iface sourceInfo
-      let name = TH.mkName nameStr
-      pure [TH.ValD (TH.VarP name) (TH.NormalB expr) []]
-
--- | Legacy aliases for shader batch compilation.
-weslBatch :: [(String, String)] -> Q [TH.Dec]
-weslBatch = weslShaderBatch
-
--- | Legacy alias for shader batch compilation.
-weslBatchWith :: CompileOptions -> [(String, String)] -> Q [TH.Dec]
-weslBatchWith = weslShaderBatchWith
 
 timed :: CompileOptions -> String -> IO a -> IO a
 timed opts label action =

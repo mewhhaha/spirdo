@@ -1,13 +1,14 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
 -- | Example fragment shader: Kaleidoscope.
 module Examples.Fragments.Kaleidoscope (fragmentKaleidoscopeShader) where
 
-import Spirdo.Wesl.Reflection (weslShader)
+import Spirdo.Wesl.Reflection (defaultCompileOptions, imports, spirv, wesl)
 
 fragmentKaleidoscopeShader =
-      [weslShader|
+      $(spirv defaultCompileOptions imports [wesl|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;
@@ -95,4 +96,4 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   let vignette = smoothstep(1.3, 0.2, r);
   return vec4(col.x * vignette, col.y * vignette, col.z * vignette, 1.0) * params.color;
 }
-|]
+|])

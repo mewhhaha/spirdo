@@ -1,13 +1,14 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
 -- | Example fragment shader: Volumetric Clouds (Horizon-inspired).
 module Examples.Fragments.Clouds (fragmentCloudShader) where
 
-import Spirdo.Wesl.Reflection (weslShader)
+import Spirdo.Wesl.Reflection (defaultCompileOptions, imports, spirv, wesl)
 
 fragmentCloudShader =
-      [weslShader|
+      $(spirv defaultCompileOptions imports [wesl|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;
@@ -154,4 +155,4 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let mixFactor = clamp(params.time_res.w, 0.0, 0.99);
   return vec4(outCol.x, outCol.y, outCol.z, 1.0 - mixFactor) * params.color;
 }
-|]
+|])

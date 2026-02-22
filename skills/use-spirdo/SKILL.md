@@ -17,7 +17,7 @@ Use this when the task involves:
 
 ## Preferred path (default)
 
-1. Compile with `Spirdo.Wesl.Reflection` (`weslShader`/`weslShaderWith`) when shader source is known at compile time.
+1. Compile with `Spirdo.Wesl.Reflection` (`spirv`) when shader source is known at compile time.
 2. Build bindings with `Spirdo.Wesl.Inputs` using binding names, not numeric slots.
 3. Use `inputsFor` to validate and normalize binding submission.
 4. Feed `orderedUniforms`/`inputs*` outputs into your renderer.
@@ -41,8 +41,16 @@ Do not depend on internal modules; treat them as unstable.
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 
-import Spirdo.Wesl.Reflection (Shader, SamplerBindingMode(..), weslShader)
+import Spirdo.Wesl.Reflection
+  ( Shader
+  , SamplerBindingMode(..)
+  , defaultCompileOptions
+  , imports
+  , spirv
+  , wesl
+  )
 import Spirdo.Wesl.Inputs
   ( InputsCombined
   , InputsError
@@ -56,7 +64,7 @@ import Spirdo.Wesl.Inputs
   )
 
 shader :: Shader 'SamplerCombined iface
-shader = [weslShader|
+shader = $(spirv defaultCompileOptions imports [wesl|
 struct Params { tint: vec4f; };
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var tex0: texture_2d<f32>;
@@ -64,7 +72,7 @@ struct Params { tint: vec4f; };
 @fragment fn main() -> @location(0) vec4<f32> {
   return textureSample(tex0, samp0, vec2f(0.5, 0.5)) * params.tint;
 }
-|]
+|])
 
 buildInputs
   :: ToUniform params
@@ -148,6 +156,6 @@ SPIRDO_WRITE_SPV=1 cabal run
 
 ## Fast iteration notes
 
-- Use `weslShaderBatch`/`weslShaderBatchWith` when many quasiquoted shaders live in one module.
+- Keep compile-time shaders on `spirv` and leave cache enabled.
 - Keep diagnostics off in hot loops unless you are actively debugging.
 - For parallel compile-time work, set RTS capabilities (`GHCRTS=-N`).

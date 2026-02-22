@@ -1,13 +1,14 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
 -- | Example fragment shader: Circle Pulse.
 module Examples.Fragments.CirclePulse (fragmentCirclePulseShader) where
 
-import Spirdo.Wesl.Reflection (weslShader)
+import Spirdo.Wesl.Reflection (defaultCompileOptions, imports, spirv, wesl)
 
 fragmentCirclePulseShader =
-      [weslShader|
+      $(spirv defaultCompileOptions imports [wesl|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;
@@ -47,4 +48,4 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 
   return vec4(col.x, col.y, col.z, 1.0) * params.color;
 }
-|]
+|])

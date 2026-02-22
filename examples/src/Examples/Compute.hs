@@ -1,4 +1,5 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
 -- | Example compute shaders.
@@ -7,10 +8,10 @@ module Examples.Compute
   , computeParticlesShader
   ) where
 
-import Spirdo.Wesl.Reflection (weslShader)
+import Spirdo.Wesl.Reflection (defaultCompileOptions, imports, spirv, wesl)
 
 computeShader =
-      [weslShader|
+      $(spirv defaultCompileOptions imports [wesl|
 struct Params {
 scale: f32;
 color: vec4<f32>;
@@ -91,9 +92,9 @@ let s0 = ping(params.scale);
 let s1 = ping(vec2(0.2, 0.4));
 let _sum = s0 + s1.x + col.y;
 }
-|]
+|])
 computeParticlesShader =
-      [weslShader|
+      $(spirv defaultCompileOptions imports [wesl|
 struct Params {
 time: f32;
 dt: f32;
@@ -139,4 +140,4 @@ if (p.pos.y < -params.bounds.y) { p.pos.y = params.bounds.y; }
 
 particles.items[idx] = p;
 }
-|]
+|])

@@ -3,8 +3,9 @@
 ## Unreleased
 
 ### Breaking changes
-* `wesl` now returns raw WESL source (`String`) instead of compiling to a `Shader`. Use `weslShader`/`weslShaderWith` for compile‑time shader output.
-* Inline import linking moved to a typed API: `spirv`/`spirvWith`/`spirvNamed` now take `Imports` (GADT) built with `imports`, `import_`/`module_`, and `(:>)`/`(<:)`.
+* `wesl` returns raw WESL source (`String`) instead of compiling to a `Shader`.
+* `Spirdo.Wesl.Reflection` now exposes a single compile-time shader path: use `spirv` with typed `Imports` (`imports`, `importsNil`, `import_`/`module_`, and `(:>)`/`(<:)`).
+* Removed compile-time shader quasiquoter aliases: `weslShader`, `weslShaderWith`, `weslShaderBatch`, `weslShaderBatchWith`, `weslBatch`, `weslBatchWith`.
 
 ### Added
 * Compile‑time inline import linking via `spirv` helpers (in‑memory module map).

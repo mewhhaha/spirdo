@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 
 -- | Executable entry point.
@@ -1305,7 +1306,7 @@ orderingShader :: Shader 'SamplerCombined
   '[ 'Binding "b" 'BUniform 0 1 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
    , 'Binding "a" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
    ]
-orderingShader = [weslShader|
+orderingShader = $(spirv defaultCompileOptions imports [wesl|
 struct Params { v: vec4<f32>; };
 
 @group(0) @binding(1) var<uniform> b: Params;
@@ -1315,7 +1316,7 @@ struct Params { v: vec4<f32>; };
 fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   return a.v + b.v;
 }
-|]
+|])
 
 duplicateBindingShader :: String
 duplicateBindingShader =
@@ -2462,7 +2463,7 @@ combinedInputShader :: Shader 'SamplerCombined
    , 'Binding "tex" 'BTexture2D 0 1 ('TTexture2D 'SF32)
    ]
 combinedInputShader =
-  [weslShader|
+  $(spirv defaultCompileOptions imports [wesl|
 struct Params { v: vec4<f32>; };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -2474,7 +2475,7 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   let uv = vec2(frag_coord.x / 640.0, frag_coord.y / 480.0);
   return textureSample(tex, samp, uv);
 }
-|]
+|])
 
 bitwiseShader :: String
 bitwiseShader =

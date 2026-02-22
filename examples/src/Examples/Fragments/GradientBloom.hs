@@ -1,13 +1,14 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
 -- | Example fragment shader: Gradient Bloom.
 module Examples.Fragments.GradientBloom (fragmentGradientBloomShader) where
 
-import Spirdo.Wesl.Reflection (weslShader)
+import Spirdo.Wesl.Reflection (defaultCompileOptions, imports, spirv, wesl)
 
 fragmentGradientBloomShader =
-      [weslShader|
+      $(spirv defaultCompileOptions imports [wesl|
 struct Params {
   time_res: vec4<f32>;
   color: vec4<f32>;
@@ -41,4 +42,4 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 
   return vec4(final.x, final.y, final.z, 1.0) * params.color;
 }
-|]
+|])

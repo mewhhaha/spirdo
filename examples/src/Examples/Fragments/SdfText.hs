@@ -1,13 +1,14 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
 -- | Example fragment shader: SdfText.
 module Examples.Fragments.SdfText (fragmentSdfTextShader) where
 
-import Spirdo.Wesl.Reflection (weslShader)
+import Spirdo.Wesl.Reflection (defaultCompileOptions, imports, spirv, wesl)
 
 fragmentSdfTextShader =
-      [weslShader|
+      $(spirv defaultCompileOptions imports [wesl|
 struct Params {
 time_res: vec4<f32>;
 color: vec4<f32>;
@@ -74,4 +75,4 @@ let mixAmt = clamp(alpha + glow * 0.35, 0.0, 1.0);
 let col = mix(bg, text + glowCol, vec3(mixAmt, mixAmt, mixAmt));
 return vec4(col.x, col.y, col.z, 1.0) * params.color;
 }
-|]
+|])

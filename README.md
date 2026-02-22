@@ -49,20 +49,29 @@ Use the smallest API that fits your workflow:
 ```hs
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 import qualified Data.ByteString as BS
-import Spirdo.Wesl.Reflection (Shader, SamplerBindingMode(..), shaderSpirv, weslShader)
+import Spirdo.Wesl.Reflection
+  ( Shader
+  , SamplerBindingMode(..)
+  , defaultCompileOptions
+  , imports
+  , shaderSpirv
+  , spirv
+  , wesl
+  )
 
 main :: IO ()
 main = do
   let shader :: Shader 'SamplerCombined iface
-      shader = [weslShader|
+      shader = $(spirv defaultCompileOptions imports [wesl|
 @fragment
 fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   let uv = vec2(frag_coord.x / 800.0, frag_coord.y / 600.0);
   return vec4(uv.x, uv.y, 0.4, 1.0);
 }
-|]
+|])
   BS.writeFile "example.spv" (shaderSpirv shader)
 ```
 
@@ -95,6 +104,7 @@ import Spirdo.Wesl.Reflection
   ( Shader
   , SamplerBindingMode(..)
   , Imports(..)
+  , defaultCompileOptions
   , spirv
   , module_
   , imports
@@ -106,7 +116,7 @@ somethingSrc = "@const let FOO: f32 = 1.0;"
 
 shader :: Shader 'SamplerCombined iface
 shader =
-  $(spirv
+  $(spirv defaultCompileOptions
       (imports <: module_ @"something" somethingSrc)
       [wesl|
         import something::FOO;
@@ -177,7 +187,7 @@ and `Spirdo.Wesl.Inputs`. Internal modules are not part of the supported surface
 - In statement/switch/loop bodies, only `@if(...)` attributes are accepted.
 
 ### Compile-Time Cache & Timings
-`weslShader` quasiquotes (from `Spirdo.Wesl.Reflection`) use an on-disk cache under
+`spirv` compile-time splices (from `Spirdo.Wesl.Reflection`) use an on-disk cache under
 `dist-newstyle/.wesl-cache`. You can control it via `CompileOptions` helpers:
 
 ```hs
@@ -198,7 +208,7 @@ compile-time/quasiquoter flows. Runtime `compile`/`compileFile` paths do not use
 
 Combined samplers are the default. If your backend expects **separate** sampler
 and texture bindings (e.g. explicit texture+sampler slots), set
-`withSamplerMode SamplerSeparate` via `weslShaderWith` / `compileWith` in
+`withSamplerMode SamplerSeparate` via `spirv` / `compileWith` in
 `Spirdo.Wesl.Reflection`, or use `OptSamplerMode` in the runtime API.
 Use separate mode when your renderer provides distinct bindings for textures and
 samplers; keep combined mode for SDL‑style backends or when you want a single
@@ -215,16 +225,15 @@ CompileOptions helpers you’ll typically use (Reflection API):
 ### Fast dev mode (no API change)
 For faster iteration without changing the API:
 - Keep the cache on (default): `withCache True`.
-- Use `weslShaderBatch`/`weslShaderBatchWith` when you have many shaders in a single module.
-  Batch compilation runs in parallel; set `GHCRTS=-N` during build to use all cores.
-- Avoid diagnostics in hot loops (use `compile`/`weslShader`, not the `*WithDiagnostics` variants).
+- Keep compile-time shaders on the `spirv` path so cache keys stay stable.
+- Avoid diagnostics in hot loops (use `compile`/`spirv`, not the `*WithDiagnostics` variants).
 
 Set `withCacheVerbose True` to print basic timing output (cache read/write).
 Set `withTimingVerbose True` to print per‑phase compiler timings (parse/validate/emit).
 
 ## Declarative Binding Flow (Preferred)
 For typed binding submission, use the Reflection API:
-**weslShader/compileWith → inputsFor → submit**. It’s concise, type‑safe, and renderer‑agnostic.
+**spirv/compileWith → inputsFor → submit**. It’s concise, type‑safe, and renderer‑agnostic.
 If you only need SPIR‑V + minimal layout info, use the `Spirdo.Wesl` bundle API instead.
 
 ### Minimal, Declarative Inputs (Host-Agnostic)
@@ -235,6 +244,7 @@ type‑level checks on binding names and kinds. You can use `InputsCombined` /
 ```hs
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 
 import Spirdo.Wesl.Inputs
@@ -247,11 +257,18 @@ import Spirdo.Wesl.Inputs
   , sampledTexture
   , uniform
   )
-import Spirdo.Wesl.Reflection (Shader, SamplerBindingMode(..), weslShader)
+import Spirdo.Wesl.Reflection
+  ( Shader
+  , SamplerBindingMode(..)
+  , defaultCompileOptions
+  , imports
+  , spirv
+  , wesl
+  )
 import Spirdo.Wesl.Uniform (V4(..))
 
 shader :: Shader 'SamplerCombined iface
-shader = [weslShader|
+shader = $(spirv defaultCompileOptions imports [wesl|
 struct Params { time_res: vec4<f32>; };
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var samp0: sampler;
@@ -260,7 +277,7 @@ struct Params { time_res: vec4<f32>; };
 fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   return vec4(0.0, 0.0, 0.0, 1.0);
 }
-|]
+|])
 
 inputs :: Either String (ShaderInputs iface)
 inputs =
@@ -337,14 +354,18 @@ Notes:
 ```hs
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 
 import Spirdo.Wesl.Reflection
   ( Shader
   , SamplerBindingMode(..)
+  , defaultCompileOptions
+  , imports
   , shaderSpirv
   , shaderPlan
-  , weslShader
+  , spirv
+  , wesl
   )
 import Spirdo.Wesl.Uniform (ToUniform(..), V4(..))
 import Spirdo.Wesl.Inputs
@@ -359,7 +380,7 @@ data ParamsU = ParamsU { time_res :: V4 Float }
 instance ToUniform ParamsU
 
 fragment :: Shader 'SamplerCombined iface
-fragment = [weslShader|
+fragment = $(spirv defaultCompileOptions imports [wesl|
 struct Params { time_res: vec4<f32>; };
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var tex0: texture_2d<f32>;
@@ -369,7 +390,7 @@ struct Params { time_res: vec4<f32>; };
   let n = textureSample(tex0, samp0, uv).x;
   return vec4(n, n, n, 1.0);
 }
-|]
+|])
 
 -- Pipeline setup (renderer‑agnostic):
 let spv  = shaderSpirv fragment
@@ -391,9 +412,18 @@ on the host). If your backend wants separate sampler slots, opt into
 ```hs
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 
-import Spirdo.Wesl.Reflection (Shader, SamplerBindingMode(..), defaultCompileOptions, withSamplerMode, weslShaderWith)
+import Spirdo.Wesl.Reflection
+  ( Shader
+  , SamplerBindingMode(..)
+  , defaultCompileOptions
+  , imports
+  , spirv
+  , wesl
+  , withSamplerMode
+  )
 import Spirdo.Wesl.Uniform (V4(..))
 import Spirdo.Wesl.Inputs
   ( InputsBuilder
@@ -407,7 +437,7 @@ import Spirdo.Wesl.Inputs
 let opts = withSamplerMode SamplerSeparate defaultCompileOptions
 
 shader :: Shader 'SamplerSeparate iface
-shader = [weslShaderWith opts|
+shader = $(spirv opts imports [wesl|
 struct Params { time_res: vec4<f32>; };
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(0) var tex0: texture_2d<f32>;
@@ -421,7 +451,7 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   let b = textureSample(tex1, samp1, uv).x;
   return vec4(a, b, 0.0, 1.0);
 }
-|]
+|])
 
 inputs =
   inputsFor shader $
@@ -553,31 +583,35 @@ direct SDL GPU wiring variant in minimal form:
 ```hs
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 import Spirdo.Wesl.Reflection
   ( Shader
   , SamplerBindingMode(..)
+  , defaultCompileOptions
+  , imports
+  , spirv
+  , wesl
   , shaderPlan
   , shaderSpirv
-  , weslShader
   )
 import Spirdo.Wesl.Uniform (ToUniform(..), V4(..))
 import Spirdo.Wesl.Inputs (inputsFor, orderedUniforms, uniform)
 
 fragment :: Shader 'SamplerCombined iface
-fragment = [weslShader|
+fragment = $(spirv defaultCompileOptions imports [wesl|
 struct Params { time_res: vec4<f32>; };
 @group(0) @binding(0) var<uniform> params: Params;
 @fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
   let uv = p.xy / vec2(800.0, 600.0);
   return vec4(uv, 0.2, 1.0);
 }
-|]
+|])
 
 data ParamsU = ParamsU { time_res :: V4 Float }
 instance ToUniform ParamsU
 
--- 1) Prepare once (weslShader returns Shader 'SamplerCombined)
+-- 1) Prepare once (spirv returns Shader 'SamplerCombined)
 let prepared = fragment
 
 -- 2) Create SDL shader using BindingPlan counts
@@ -616,15 +650,19 @@ Notes:
 #### Vertex + Pipeline sketch (SDL GPU)
 ```hs
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 import Spirdo.Wesl.Reflection
   ( Shader
+  , defaultCompileOptions
+  , imports
+  , spirv
+  , wesl
   , shaderInterface
   , vertexAttributes
-  , weslShader
   )
 
-vertex = [weslShader|
+vertex = $(spirv defaultCompileOptions imports [wesl|
 struct VSIn { @location(0) pos: vec2<f32>; };
 struct VSOut { @builtin(position) pos: vec4<f32>; };
 @vertex fn main(v: VSIn) -> VSOut {
@@ -632,7 +670,7 @@ struct VSOut { @builtin(position) pos: vec4<f32>; };
   o.pos = vec4(v.pos, 0.0, 1.0);
   return o;
 }
-|]
+|])
 
 let vprep = vertex
 Right vattrs = vertexAttributes (shaderInterface vprep)
@@ -644,17 +682,18 @@ Right vattrs = vertexAttributes (shaderInterface vprep)
 #### Compute sketch (SDL GPU)
 ```hs
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 
-import Spirdo.Wesl.Reflection (weslShader)
+import Spirdo.Wesl.Reflection (defaultCompileOptions, imports, spirv, wesl)
 
-compute = [weslShader|
+compute = $(spirv defaultCompileOptions imports [wesl|
 @group(0) @binding(0) var<storage, read_write> data: array<u32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   data[i] = data[i] * 2u;
 }
-|]
+|])
 
 let cprep = compute
 -- Use shaderPlan cprep to size descriptor bindings and create your graphics pipeline.
@@ -744,9 +783,7 @@ Bundle accessors
 ### `Spirdo.Wesl.Reflection`
 Compile + quasiquote
 - `wesl` (raw source)
-- `weslShader`, `weslShaderWith`
-- `weslShaderBatch`, `weslShaderBatchWith` (legacy aliases: `weslBatch*`)
-- `spirv`, `spirvWith`, `spirvNamed` (compile-time with inline imports)
+- `spirv` (compile-time with inline imports)
 - `Import`, `Imports`, `imports`, `importsNil`, `module_`, `moduleText`, `import_`, `importText`, `(:>)`, `(<:)`
 - `compile`, `compileWith`, `compileWithDiagnostics`
 - `compileFile`, `compileFileWith`, `compileFileWithDiagnostics`

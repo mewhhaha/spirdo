@@ -8,7 +8,8 @@
 module Examples.Fragments.InlineImports (fragmentInlineImportsShader) where
 
 import Spirdo.Wesl.Reflection
-  ( spirv
+  ( defaultCompileOptions
+  , spirv
   , (<:)
   , module_
   , imports
@@ -16,7 +17,7 @@ import Spirdo.Wesl.Reflection
   )
 
 fragmentInlineImportsShader =
-  $(spirv
+  $(spirv defaultCompileOptions
       (imports
         <: module_ @"palette"
             [wesl|
