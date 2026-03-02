@@ -124,6 +124,7 @@ lexWesl = go (SrcPos 1 1)
         '.' -> True
         '%' -> True
         '!' -> True
+        '~' -> True
         '&' -> True
         '|' -> True
         '^' -> True
@@ -151,6 +152,7 @@ lexWesl = go (SrcPos 1 1)
         '.' -> "."
         '%' -> "%"
         '!' -> "!"
+        '~' -> "~"
         '&' -> "&"
         '|' -> "|"
         '^' -> "^"
@@ -1480,6 +1482,9 @@ parseUnaryExpr toks =
     (Token (TkSymbol "!") pos : rest) -> do
       (expr, rest1) <- parseUnaryExpr rest
       Right (EUnary pos OpNot expr, rest1)
+    (Token (TkSymbol "~") pos : rest) -> do
+      (expr, rest1) <- parseUnaryExpr rest
+      Right (EUnary pos OpBitNot expr, rest1)
     (Token (TkSymbol "&") pos : rest) -> do
       (expr, rest1) <- parseUnaryExpr rest
       Right (EUnary pos OpAddr expr, rest1)
@@ -1784,6 +1789,9 @@ expectSymbol :: Text -> [Token] -> Either CompileError [Token]
 expectSymbol sym toks =
   case toks of
     (Token (TkSymbol s) _ : rest) | s == sym -> Right rest
+    (Token (TkSymbol ">>") pos : rest) | sym == ">" ->
+      let pos' = SrcPos pos.spLine (pos.spCol + 1)
+      in Right (Token (TkSymbol ">") pos' : rest)
     _ -> Left (errorAt toks ("expected symbol '" <> textToString sym <> "'"))
 
 parseScalar :: Text -> Scalar

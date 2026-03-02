@@ -27,10 +27,10 @@ struct VSOutput {
        }
 
        @group(0) @binding(0) var ourSampler: sampler;
-       @group(0) @binding(1) var ourTexture: 0<f32>;
+       @group(0) @binding(1) var ourTexture: texture_2d<f32>;
        @group(0) @binding(2) var<uniform> uni: Uniforms;
 
        @fragment fn fs(fsInput: VSOutput) -> @location(0) vec4f {
-          _ = uni;
-          return textureSample(ourTexture, ourSampler, 0);
+          let _uni = uni;
+          return textureSample(ourTexture, ourSampler, fsInput.texcoord);
        }

@@ -230,5 +230,5 @@ data BinOp
   | OpShr
   deriving (Eq, Show)
 
-data UnaryOp = OpNeg | OpNot | OpAddr | OpDeref
+data UnaryOp = OpNeg | OpNot | OpBitNot | OpAddr | OpDeref
   deriving (Eq, Show)

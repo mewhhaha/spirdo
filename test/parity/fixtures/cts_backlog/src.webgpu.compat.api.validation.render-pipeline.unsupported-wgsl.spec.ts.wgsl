@@ -1,6 +1,6 @@
 struct Vertex {
             @builtin(position) pos: vec4f,
-            @location(0) 0 color : vec4f,
+            @location(0) color : vec4f,
         };
         @vertex fn vs() -> Vertex {
             var v: Vertex;

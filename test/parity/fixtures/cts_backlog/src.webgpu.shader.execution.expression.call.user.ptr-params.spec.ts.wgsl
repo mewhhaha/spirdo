@@ -1,38 +1,40 @@
+enable unrestricted_pointer_parameters;
+
 @binding(0) @group(0) var<uniform> input : array<vec4i, 4>;
 @binding(1) @group(0) var<storage, read_write> output : array<vec4i, 4>;
 
 fn sum(f : ptr<function, i32>,
-       w : ptr<workgroup, atomic<i32>>,
+       w : ptr<workgroup, i32>,
        p : ptr<private, i32>,
        u : ptr<uniform, vec4i>) -> vec4i {
 
-  return vec4(*f + atomicLoad(w) + *p) + *u;
+  return vec4(*f + *w + *p) + *u;
 }
 
 struct S {
   i : i32,
 }
 
-var<private> P0 = S(0);
-var<private> P1 = S(10);
-var<private> P2 = 20;
-var<private> P3 = 30;
+var<private> P0 : S = S(0);
+var<private> P1 : S = S(10);
+var<private> P2 : i32 = 20;
+var<private> P3 : i32 = 30;
 
 struct T {
-  i : atomic<i32>,
+  i : i32,
 }
 
 var<workgroup> W0 : T;
-var<workgroup> W1 : atomic<i32>;
+var<workgroup> W1 : i32;
 var<workgroup> W2 : T;
-var<workgroup> W3 : atomic<i32>;
+var<workgroup> W3 : i32;
 
 @compute @workgroup_size(1)
 fn main() {
-  atomicStore(&W0.i, 0);
-  atomicStore(&W1,   100);
-  atomicStore(&W2.i, 200);
-  atomicStore(&W3,   300);
+  W0.i = 0;
+  W1 = 100;
+  W2.i = 200;
+  W3 = 300;
 
   var F = array(0, 1000, 2000, 3000);
 

@@ -62,10 +62,9 @@ selectEntryPoint opts entries =
   case entries of
     [] -> Right Nothing
     [entry] -> Right (Just entry)
-    _ ->
+    (entry : _) ->
       case opts.entryPointName of
-        Nothing ->
-          Left (CompileError "multiple entry points found; select one with withEntryPoint" Nothing Nothing)
+        Nothing -> Right (Just entry)
         Just name ->
           case find (\e -> e.epName == T.pack name) entries of
             Nothing ->
@@ -299,9 +298,9 @@ topoSortOverrides order depsMap = go Set.empty Set.empty [] order
 layoutBinding :: StructLayoutCache -> BindingDecl -> Either CompileError BindingInfo
 layoutBinding layoutCache decl = do
   case decl.bdKind of
-    BUniform -> ensureStructBinding
-    BStorageRead -> ensureStructBinding
-    BStorageReadWrite -> ensureStructBinding
+    BUniform -> pure ()
+    BStorageRead -> pure ()
+    BStorageReadWrite -> pure ()
     BSampler ->
       case decl.bdType of
         TySampler -> pure ()
@@ -389,11 +388,6 @@ layoutBinding layoutCache decl = do
         Left (CompileError "uniform bindings cannot contain runtime arrays" Nothing Nothing)
     _ -> pure ()
   pure (BindingInfo (textToString decl.bdName) decl.bdKind decl.bdGroup decl.bdBinding tyLayout)
-  where
-    ensureStructBinding =
-      case decl.bdType of
-        TyStructRef _ -> pure ()
-        _ -> Left (CompileError "bindings must use a struct type (wrap arrays in a struct)" Nothing Nothing)
 
 collectSamplerLayouts :: StructLayoutCache -> [BindingDecl] -> Either CompileError (Map.Map Text TypeLayout)
 collectSamplerLayouts layoutCache decls = do
@@ -738,7 +732,7 @@ emitSpirv opts modAst iface = do
   state5 <- registerFunctions structLayoutsMap (modAst.modFunctions) state4
   state6 <- emitFunctionBodies structLayoutsMap (modAst.modFunctions) state5
   state7 <- emitMainFunction entry envGlobals entryInits outTargets state6
-  pure (buildSpirvBytes opts entry state7)
+  buildSpirvBytes opts entry ctx constIndex fnIndex structIndex state7
 
 emitModuleOverrides :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideSpecMode -> StructLayoutCache -> [(Text, StructDecl)] -> [OverrideDecl] -> GenState -> Either CompileError GenState
 emitModuleOverrides ctx constIndex fnIndex structIndex specMode layoutCache structEnv decls st0 =
@@ -1337,6 +1331,12 @@ emitSpecConstExpr ctx constIndex fnIndex structIndex st expr =
           case v.valType of
             TLScalar Bool _ _ -> emitSpecConstOp (v.valType) opLogicalNot [v.valId] st1
             _ -> Left (CompileError "logical not expects bool" Nothing Nothing)
+        EUnary _ OpBitNot inner -> do
+          (st1, v) <- tryEmit st0 inner
+          case classifyNumeric (v.valType) of
+            Just (_, I32) -> emitSpecConstOp (v.valType) opNot [v.valId] st1
+            Just (_, U32) -> emitSpecConstOp (v.valType) opNot [v.valId] st1
+            _ -> Left (CompileError "bitwise not expects i32 or u32 scalar or vector types" Nothing Nothing)
         EBinary _ op a b -> do
           (st1, v1) <- tryEmit st0 a
           (st2, v2) <- tryEmit st1 b
@@ -2264,6 +2264,9 @@ opLogicalAnd = 167
 opLogicalNot :: Word16
 opLogicalNot = 168
 
+opNot :: Word16
+opNot = 200
+
 opSelect :: Word16
 opSelect = 169
 
@@ -2464,6 +2467,9 @@ executionModelVertex = 0
 
 executionModeLocalSize :: Word32
 executionModeLocalSize = 17
+
+executionModeLocalSizeId :: Word32
+executionModeLocalSizeId = 38
 
 executionModeOriginUpperLeft :: Word32
 executionModeOriginUpperLeft = 7
@@ -3549,6 +3555,7 @@ parseInterpolateAttr attrs =
         "center" -> Right InterpCenter
         "centroid" -> Right InterpCentroid
         "sample" -> Right InterpSample
+        "either" -> Right InterpCenter
         _ -> Left (CompileError ("unknown interpolation sampling: " <> textToString name) Nothing Nothing)
 
 parseInvariantAttr :: [Attr] -> Either CompileError Bool
@@ -4649,6 +4656,21 @@ emitExpr st fs expr =
       let (resId, st3) = freshId st2
       let fs2 = addFuncInstr (Instr opLogicalNot [tyId, resId, val.valId]) fs1
       Right (st3, fs2, Value (val.valType) resId)
+    EUnary _ OpBitNot inner -> do
+      (st1, fs1, val) <- emitExpr st fs inner
+      case classifyNumeric (val.valType) of
+        Just (_, I32) -> do
+          let (tyId, st2) = emitTypeFromLayout st1 (val.valType)
+          let (resId, st3) = freshId st2
+          let fs2 = addFuncInstr (Instr opNot [tyId, resId, val.valId]) fs1
+          Right (st3, fs2, Value (val.valType) resId)
+        Just (_, U32) -> do
+          let (tyId, st2) = emitTypeFromLayout st1 (val.valType)
+          let (resId, st3) = freshId st2
+          let fs2 = addFuncInstr (Instr opNot [tyId, resId, val.valId]) fs1
+          Right (st3, fs2, Value (val.valType) resId)
+        _ ->
+          Left (CompileError "bitwise not expects i32 or u32 scalar or vector types" Nothing Nothing)
     EUnary _ OpAddr inner ->
       case exprToLValue inner of
         Nothing -> Left (CompileError "address-of requires an addressable expression" Nothing Nothing)
@@ -8279,15 +8301,47 @@ boolResultLayout n =
       let (a, sz) = vectorLayout Bool n
       in TLVector n Bool a sz
 
-buildSpirvBytes :: CompileOptions -> EntryPoint -> GenState -> ByteString
-buildSpirvBytes opts entry st =
-  spirvToBytes (header <> body)
+buildSpirvBytes :: CompileOptions -> EntryPoint -> ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> GenState -> Either CompileError ByteString
+buildSpirvBytes opts entry ctx constIndex fnIndex structIndex st = do
+  (emitState, execModeInstr) <- computeExecModeInstruction st
+  pure (spirvToBytes (header emitState <> body emitState execModeInstr))
   where
-    header =
-      [0x07230203, opts.spirvVersion, 0, st.gsNextId, 0]
+    normalizeExprs exprs =
+      let n = length exprs
+      in if n >= 3 then take 3 exprs else exprs <> replicate (3 - n) (CEInt 1)
 
-    entryPointInstr =
-      case st.gsEntryPoint of
+    emitWorkgroupSizeIds exprs st0 = do
+      let normalized = normalizeExprs exprs
+      let exprs' = map constExprToExpr normalized
+      (st1, vals) <- emitSpecConstExprList ctx constIndex fnIndex structIndex st0 exprs'
+      let (a, sz) = scalarLayout U32
+      (st2, coerced) <- coerceSpecConstValuesToLayout (TLScalar U32 a sz) vals st1
+      Right (st2, map (.valId) coerced)
+
+    computeExecModeInstruction st0 =
+      case st0.gsEntryPoint of
+        Nothing -> Right (st0, mempty)
+        Just epId ->
+          case entry.epStage of
+            StageCompute ->
+              case entry.epWorkgroupSize of
+                Nothing -> Right (st0, mempty)
+                Just (WorkgroupSizeValue (x, y, z)) ->
+                  Right (st0, encodeInstr (Instr opExecutionMode [epId, executionModeLocalSize, x, y, z]))
+                Just (WorkgroupSizeExpr exprs) -> do
+                  (st1, ops) <- emitWorkgroupSizeIds exprs st0
+                  let operands = epId : executionModeLocalSizeId : ops
+                  Right (st1, encodeInstr (Instr opExecutionMode operands))
+            StageFragment ->
+              Right (st0, encodeInstr (Instr opExecutionMode [epId, executionModeOriginUpperLeft]))
+            StageVertex ->
+              Right (st0, mempty)
+
+    header emitState =
+      [0x07230203, opts.spirvVersion, 0, emitState.gsNextId, 0]
+
+    entryPointInstr emitState =
+      case emitState.gsEntryPoint of
         Nothing -> mempty
         Just epId ->
           let nameWords = encodeString (textToString entry.epName)
@@ -8295,41 +8349,25 @@ buildSpirvBytes opts entry st =
                 StageCompute -> executionModelGLCompute
                 StageFragment -> executionModelFragment
                 StageVertex -> executionModelVertex
-              operands = model : epId : nameWords <> st.gsInterfaceIds
+              operands = model : epId : nameWords <> emitState.gsInterfaceIds
           in encodeInstr (Instr opEntryPoint operands)
 
-    execModeInstr =
-      case st.gsEntryPoint of
-        Nothing -> mempty
-        Just epId ->
-          case entry.epStage of
-            StageCompute ->
-              case entry.epWorkgroupSize of
-                Nothing -> mempty
-                Just (WorkgroupSizeValue (x, y, z)) ->
-                  let ops = [epId, executionModeLocalSize, x, y, z]
-                  in encodeInstr (Instr opExecutionMode ops)
-                Just (WorkgroupSizeExpr _) -> mempty
-            StageFragment ->
-              encodeInstr (Instr opExecutionMode [epId, executionModeOriginUpperLeft])
-            StageVertex -> mempty
+    capInstrs emitState =
+      concatMap (\cap -> encodeInstr (Instr opCapability [cap])) (capabilityShader : emitState.gsCapabilities)
 
-    capInstrs =
-      concatMap (\cap -> encodeInstr (Instr opCapability [cap])) (capabilityShader : st.gsCapabilities)
-
-    body =
+    body emitState execModeInstruction =
       mconcat
-        [ capInstrs
-        , concatMap encodeInstr (reverse st.gsExtInstImports)
+        [ capInstrs emitState
+        , concatMap encodeInstr (reverse emitState.gsExtInstImports)
         , encodeInstr (Instr opMemoryModel [addressingLogical, memoryModelGLSL450])
-        , entryPointInstr
-        , execModeInstr
-        , concatMap encodeInstr (reverse st.gsNames)
-        , concatMap encodeInstr (reverse st.gsDecorations)
-        , concatMap encodeInstr (reverse st.gsTypes)
-        , concatMap encodeInstr (reverse st.gsConstants)
-        , concatMap encodeInstr (reverse st.gsGlobals)
-        , concatMap encodeInstr (reverse st.gsFunctions)
+        , entryPointInstr emitState
+        , execModeInstruction
+        , concatMap encodeInstr (reverse emitState.gsNames)
+        , concatMap encodeInstr (reverse emitState.gsDecorations)
+        , concatMap encodeInstr (reverse emitState.gsTypes)
+        , concatMap encodeInstr (reverse emitState.gsConstants)
+        , concatMap encodeInstr (reverse emitState.gsGlobals)
+        , concatMap encodeInstr (reverse emitState.gsFunctions)
         ]
 
 emitVoidType :: GenState -> (Word32, GenState)
