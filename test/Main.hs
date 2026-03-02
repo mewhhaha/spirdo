@@ -8,19 +8,21 @@
 -- | Executable entry point.
 module Main (main) where
 
-import Control.Monad (forM_, unless, replicateM, when)
+import Control.Exception (SomeException, displayException, try)
+import Control.Monad (foldM, forM_, unless, replicateM, when)
 import Data.Bits ((.|.), shiftL)
 import qualified Data.ByteString as BS
-import Data.Char (toLower)
-import Data.List (find, isInfixOf, isPrefixOf)
+import Data.Char (isSpace, toLower)
+import Data.List (find, isInfixOf, isPrefixOf, stripPrefix)
+import qualified Data.Set as Set
 import Data.Foldable (toList)
 import Data.Maybe (isJust, isNothing)
 import Data.Proxy (Proxy(..))
 import Data.Word (Word16, Word32, Word64)
 import GHC.Float (castFloatToWord32)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable, getTemporaryDirectory, listDirectory, removeFile)
+import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable, getTemporaryDirectory, removeFile)
 import System.Environment (lookupEnv)
-import System.FilePath ((</>), takeExtension, takeFileName)
+import System.FilePath ((</>), isAbsolute, takeDirectory)
 import System.Exit (ExitCode(..))
 import System.IO (hClose, openBinaryTempFile)
 import System.Process (readProcessWithExitCode)
@@ -117,6 +119,33 @@ defaultOpts = [OptEnableFeature "f16"]
 separateOpts :: [Option]
 separateOpts = [OptSamplerMode SamplerSeparate]
 
+data ParityExpected
+  = ParityPass
+  | ParityFail
+  | ParityXFail
+  deriving (Eq, Show)
+
+data ParityCase = ParityCase
+  { id :: String
+  , domain :: String
+  , specRef :: String
+  , kind :: String
+  , expected :: ParityExpected
+  , source :: ParitySource
+  , origin :: String
+  , originRef :: String
+  , options :: [Option]
+  , errContains :: Maybe String
+  , oracles :: [String]
+  , owner :: Maybe String
+  , exitCriteria :: Maybe String
+  } deriving (Show)
+
+data ParitySource
+  = ParityFile FilePath
+  | ParityInline String String
+  deriving (Show)
+
 isTruthy :: String -> Bool
 isTruthy raw =
   let lower = map toLower raw
@@ -138,6 +167,124 @@ compileBytesWithDiagnostics opts src = do
   (SomeShader shader, diags) <- compileWithDiagnostics opts (inlineSource src)
   pure ((shaderSpirv shader), diags)
 
+smokeShaders :: [(String, String)]
+smokeShaders =
+  [ ("compute-atomics", computeShader)
+  , ("compute-barriers", barrierShader)
+  , ("atomic-compare-exchange", atomicCompareExchangeShader)
+  , ("typed-ctors", typedCtorShader)
+  , ("fragment-derivatives", fragmentShader)
+  , ("fragment-sample-mask", sampleMaskShader)
+  , ("vertex-struct-io", vertexShader)
+  , ("vertex-io-attrs", vertexIoAttrShader)
+  , ("storage-texture", storageTextureShader)
+  , ("sampler-texture", samplerShader)
+  , ("bitwise-ops", bitwiseShader)
+  , ("builtin-extras", builtinExtraShader)
+  , ("runtime-array-length", runtimeArrayLengthShader)
+  , ("alias-override", aliasOverrideShader)
+  , ("layout-attrs", layoutAttrShader)
+  , ("globals-f16", globalsShader)
+  , ("switch-loop", switchLoopShader)
+  , ("switch-fallthrough", switchFallthroughShader)
+  , ("const-arith", constArithShader)
+  , ("const-float", constFloatShader)
+  , ("const-composite", constCompositeShader)
+  , ("const-fn", constFnShader)
+  , ("discard", discardShader)
+  , ("ptr-abstract-literals", pointerShader)
+  , ("texture-variants", textureVariantsShader)
+  , ("texture-load-sampled", textureLoadShader)
+  , ("storage-texture-array", storageTextureArrayShader)
+  , ("texture-advanced", textureAdvancedShader)
+  ]
+
+inlineParitySources :: [(String, String)]
+inlineParitySources =
+  [ ("computeShader", computeShader)
+  , ("barrierShader", barrierShader)
+  , ("atomicCompareExchangeShader", atomicCompareExchangeShader)
+  , ("typedCtorShader", typedCtorShader)
+  , ("sampleMaskShader", sampleMaskShader)
+  , ("fragmentShader", fragmentShader)
+  , ("vertexIoAttrShader", vertexIoAttrShader)
+  , ("vertexShader", vertexShader)
+  , ("storageTextureShader", storageTextureShader)
+  , ("samplerShader", samplerShader)
+  , ("fragmentBlendSrcShader", fragmentBlendSrcShader)
+  , ("bitwiseShader", bitwiseShader)
+  , ("builtinExtraShader", builtinExtraShader)
+  , ("runtimeArrayLengthShader", runtimeArrayLengthShader)
+  , ("aliasOverrideShader", aliasOverrideShader)
+  , ("switchLoopShader", switchLoopShader)
+  , ("switchFallthroughShader", switchFallthroughShader)
+  , ("constArithShader", constArithShader)
+  , ("constFloatShader", constFloatShader)
+  , ("constCompositeShader", constCompositeShader)
+  , ("constFnShader", constFnShader)
+  , ("discardShader", discardShader)
+  , ("pointerShader", pointerShader)
+  , ("textureVariantsShader", textureVariantsShader)
+  , ("textureLoadShader", textureLoadShader)
+  , ("storageTextureArrayShader", storageTextureArrayShader)
+  , ("textureAdvancedShader", textureAdvancedShader)
+  , ("globalsShader", globalsShader)
+  , ("layoutAttrShader", layoutAttrShader)
+  , ("fragmentBlendSrcNoEnableShader", fragmentBlendSrcNoEnableShader)
+  , ("fragmentBlendSrcOnlyOneShader", fragmentBlendSrcOnlyOneShader)
+  , ("fragmentBlendSrcLocationOneShader", fragmentBlendSrcLocationOneShader)
+  , ("textureBarrierFragmentShader", textureBarrierFragmentShader)
+  , ("vertexInterpolateIntegerShader", vertexInterpolateIntegerShader)
+  , ("vertexInvariantLocationShader", vertexInvariantLocationShader)
+  , ("vertexBoolLocationShader", vertexBoolLocationShader)
+  , ("f16NoEnableShader", f16NoEnableShader)
+  , ("storageWriteAccessShader", storageWriteAccessShader)
+  , ("pointerParamWorkgroupShader", pointerParamWorkgroupShader)
+  , ("pointerParamStorageShader", pointerParamStorageShader)
+  , ("nagaEntryPointerParam", nagaEntryPointerParam)
+  , ("nagaFragmentReturnNoBinding", nagaFragmentReturnNoBinding)
+  , ("nagaNonEntryParamIoAttrs", nagaNonEntryParamIoAttrs)
+  , ("nagaNegativeLocation", nagaNegativeLocation)
+  , ("nagaLocationTooManyArgs", nagaLocationTooManyArgs)
+  , ("nagaStageAttrWithArgs", nagaStageAttrWithArgs)
+  , ("nagaDuplicateLocationReturn", nagaDuplicateLocationReturn)
+  , ("nagaDuplicateBuiltinReturn", nagaDuplicateBuiltinReturn)
+  , ("nagaDuplicateGroupAttr", nagaDuplicateGroupAttr)
+  , ("nagaDuplicateBindingAttr", nagaDuplicateBindingAttr)
+  , ("nagaDuplicateFragmentStageAttr", nagaDuplicateFragmentStageAttr)
+  , ("nagaDuplicateWorkgroupSizeAttr", nagaDuplicateWorkgroupSizeAttr)
+  , ("nagaTextureBarrierFragment", nagaTextureBarrierFragment)
+  , ("nagaStorageWriteBuffer", nagaStorageWriteBuffer)
+  , ("nagaF16Enable", nagaF16Enable)
+  , ("nagaInterpolateFloatLinear", nagaInterpolateFloatLinear)
+  , ("duplicateBindingShader", duplicateBindingShader)
+  , ("malformedHexLiteralShader", malformedHexLiteralShader)
+  , ("badStructFieldShader", badStructFieldShader)
+  , ("nonIfStatementAttrShader", nonIfStatementAttrShader)
+  , ("nonIfSwitchCaseAttrShader", nonIfSwitchCaseAttrShader)
+  , ("nonIfLoopAttrShader", nonIfLoopAttrShader)
+  , ("negativeI32RangeShader", negativeI32RangeShader)
+  , ("computeWithoutWorkgroupSizeShader", computeWithoutWorkgroupSizeShader)
+  , ("workgroupOverrideShader", workgroupOverrideShader)
+  , ("moduleConstDeclShader", moduleConstDeclShader)
+  , ("invalidMatrixDimensionsShader", invalidMatrixDimensionsShader)
+  , ("badSwitchShader", badSwitchShader)
+  , ("badConstAssertShader", badConstAssertShader)
+  ]
+
+lookupInlineParitySource :: String -> Maybe String
+lookupInlineParitySource key = lookup key inlineParitySources
+
+runChecks :: String -> [(String, IO ())] -> IO ()
+runChecks section checks = do
+  putStrLn ("== " <> section)
+  forM_ checks $ \(label, action) -> do
+    result <- (try action :: IO (Either SomeException ()))
+    case result of
+      Left err ->
+        fail (section <> "/" <> label <> ": " <> displayException err)
+      Right _ -> pure ()
+
 main :: IO ()
 main = do
   spirvVal <- findExecutable "spirv-val"
@@ -148,116 +295,115 @@ main = do
       fail "SPIRDO_REQUIRE_VALIDATORS=1 but spirv-val was not found in PATH"
     when (isNothing nagaExe) $
       fail "SPIRDO_REQUIRE_VALIDATORS=1 but naga was not found in PATH"
-  let tests =
-        [ ("compute-atomics", computeShader)
-        , ("compute-barriers", barrierShader)
-        , ("atomic-compare-exchange", atomicCompareExchangeShader)
-        , ("typed-ctors", typedCtorShader)
-        , ("fragment-derivatives", fragmentShader)
-        , ("fragment-sample-mask", sampleMaskShader)
-        , ("vertex-struct-io", vertexShader)
-        , ("vertex-io-attrs", vertexIoAttrShader)
-        , ("storage-texture", storageTextureShader)
-        , ("sampler-texture", samplerShader)
-        , ("bitwise-ops", bitwiseShader)
-        , ("builtin-extras", builtinExtraShader)
-        , ("runtime-array-length", runtimeArrayLengthShader)
-        , ("alias-override", aliasOverrideShader)
-        , ("layout-attrs", layoutAttrShader)
-        , ("globals-f16", globalsShader)
-        , ("switch-loop", switchLoopShader)
-        , ("switch-fallthrough", switchFallthroughShader)
-        , ("const-arith", constArithShader)
-        , ("const-float", constFloatShader)
-        , ("const-composite", constCompositeShader)
-        , ("const-fn", constFnShader)
-        , ("discard", discardShader)
-        , ("ptr-abstract-literals", pointerShader)
-        , ("texture-variants", textureVariantsShader)
-        , ("texture-load-sampled", textureLoadShader)
-        , ("storage-texture-array", storageTextureArrayShader)
-        , ("texture-advanced", textureAdvancedShader)
-        ]
-  forM_ tests $ \(label, src) -> do
-    bytes <- case compileBytes defaultOpts src of
-      Left err -> fail (label <> ": " <> show err)
-      Right bs -> pure bs
-    assertSpirv spirvVal label bytes
+  parityCases <- loadParityManifest ("test" </> "parity" </> "manifest.tsv")
+  parityRules <- loadParityRules ("test" </> "parity" </> "rules.tsv")
+  assertParityRuleCoverage parityRules parityCases
+  runChecks "Smoke Compile"
+    [ ( label
+      , do
+          bytes <- case compileBytes defaultOpts src of
+            Left err -> fail (label <> ": " <> show err)
+            Right bs -> pure bs
+          assertSpirv spirvVal label bytes
+      )
+    | (label, src) <- smokeShaders
+    ]
 
-  checkIfTranslation
-  checkImportCompile spirvVal
-  checkImportItemCompile spirvVal
-  checkImportAliasCompile spirvVal
-  checkImportStructZeroCtorCompile spirvVal
-  checkImportQualifiedConstCompile spirvVal
-  checkCtsFixtures spirvVal
-  checkSwitchConstValidation
-  checkConstAssertValidation
-  checkMalformedHexLiteral
-  checkStructFieldSeparators
-  checkNonIfStatementAttrsRejected
-  checkNonIfSwitchCaseAttrsRejected
-  checkNonIfLoopAttrsRejected
-  checkModuleConstDecl
-  checkInvalidMatrixDimensionsRejected
-  checkNegativeI32Range
-  checkComputeRequiresWorkgroupSize
-  checkSuperImportContainment
-  checkOverrideSpecialization spirvVal
-  checkOverrideDefault spirvVal
-  checkOverrideMissing
-  checkWorkgroupSizeOverrideReject
-  checkOverrideDependency spirvVal
-  checkOverrideParityMode
-  checkDiagnosticOverride
-  checkDiagnosticWarning
-  checkDiagnosticUnreachable
-  checkDiagnosticUnusedExpr
-  checkDiagnosticUnusedVar
-  checkDiagnosticUnusedParam
-  checkDiagnosticShadowing
-  checkDiagnosticConstantCondition
-  checkDiagnosticDuplicateCase
-  checkNagaOracleParity nagaExe
-  checkTextureBarrierStage
-  checkBlendSrcEnabled spirvVal
-  checkBlendSrcRequiresEnable
-  checkBlendSrcPairRules
-  checkInterpolateIntegerRule
-  checkInvariantRule
-  checkLocationIoTypeRule
-  checkF16RequiresEnable
-  checkStorageWriteAccessRejected
-  checkPointerParamAddressSpaceRules
-  checkEntryPointerParamRejected
-  checkFragmentReturnBindingRequired
-  checkNonEntryParamIoAttrsRejected
-  checkNegativeLocationRejected
-  checkLocationTooManyArgsRejected
-  checkStageAttrWithArgsRejected
-  checkDuplicateLocationAttrRejected
-  checkDuplicateBuiltinAttrRejected
-  checkDuplicateGroupBindingAttrsRejected
-  checkDuplicateStageAttrsRejected
-  checkNonEntryFunctionAttrAccepted
-  checkSamplerInterface
-  checkCombinedSamplerInterface
-  checkSamplerValueCombinedError
-  checkPackUniformLayout
-  checkPackUniformErrors
-  checkPackUniformFrom
-  checkUniformStorable
-  checkVertexAttributes
-  checkBindingPlan
-  checkInputOrdering
-  checkInputsCombinedMissingSampler
-  checkInputsCombinedOk
-  checkInputsMissingBindingsRejected
-  checkInputsSeparateModeRejectsSampledTexture
-  checkInputsDuplicateBuilder
-  checkQuickCheck
-  checkDuplicateBindings
-  checkGoldenSpirv
+  runChecks "Imports and Parity Fixtures" $
+    [ ("if-translation", checkIfTranslation)
+    , ("import-compile", checkImportCompile spirvVal)
+    , ("import-item-compile", checkImportItemCompile spirvVal)
+    , ("import-alias-compile", checkImportAliasCompile spirvVal)
+    , ("import-struct-zero-ctor", checkImportStructZeroCtorCompile spirvVal)
+    , ("import-qualified-const-compile", checkImportQualifiedConstCompile spirvVal)
+    ]
+      <> [ ( "parity:" <> parityCase.id <> " [" <> parityCase.specRef <> "]" <> if isBacklogCase parityCase then " [backlog]" else ""
+           , runParityCase spirvVal nagaExe parityCase
+           )
+         | parityCase <- filter (not . isUnmappedBacklogCase) parityCases
+         ]
+
+  runChecks "Language and Typecheck"
+    [ ("switch-const-validation", checkSwitchConstValidation)
+    , ("const-assert-validation", checkConstAssertValidation)
+    , ("malformed-hex-literal", checkMalformedHexLiteral)
+    , ("struct-field-separators", checkStructFieldSeparators)
+    , ("non-if-statement-attrs-rejected", checkNonIfStatementAttrsRejected)
+    , ("non-if-switch-case-attrs-rejected", checkNonIfSwitchCaseAttrsRejected)
+    , ("non-if-loop-attrs-rejected", checkNonIfLoopAttrsRejected)
+    , ("module-const-decl", checkModuleConstDecl)
+    , ("invalid-matrix-dimensions-rejected", checkInvalidMatrixDimensionsRejected)
+    , ("negative-i32-range", checkNegativeI32Range)
+    , ("compute-requires-workgroup-size", checkComputeRequiresWorkgroupSize)
+    , ("super-import-containment", checkSuperImportContainment)
+    ]
+
+  runChecks "Overrides and Diagnostics"
+    [ ("override-specialization", checkOverrideSpecialization spirvVal)
+    , ("override-default", checkOverrideDefault spirvVal)
+    , ("override-missing", checkOverrideMissing)
+    , ("workgroup-size-override-reject", checkWorkgroupSizeOverrideReject)
+    , ("override-dependency", checkOverrideDependency spirvVal)
+    , ("override-parity-mode", checkOverrideParityMode)
+    , ("diagnostic-override", checkDiagnosticOverride)
+    , ("diagnostic-warning", checkDiagnosticWarning)
+    , ("diagnostic-unreachable", checkDiagnosticUnreachable)
+    , ("diagnostic-unused-expression", checkDiagnosticUnusedExpr)
+    , ("diagnostic-unused-variable", checkDiagnosticUnusedVar)
+    , ("diagnostic-unused-parameter", checkDiagnosticUnusedParam)
+    , ("diagnostic-shadowing", checkDiagnosticShadowing)
+    , ("diagnostic-constant-condition", checkDiagnosticConstantCondition)
+    , ("diagnostic-duplicate-case", checkDiagnosticDuplicateCase)
+    ]
+
+  runChecks "WGSL Compatibility and Oracles"
+    [ ("naga-oracle-parity", checkNagaOracleParity nagaExe)
+    , ("texture-barrier-stage", checkTextureBarrierStage)
+    , ("blend-src-enabled", checkBlendSrcEnabled spirvVal)
+    , ("blend-src-requires-enable", checkBlendSrcRequiresEnable)
+    , ("blend-src-pair-rules", checkBlendSrcPairRules)
+    , ("interpolate-integer-rule", checkInterpolateIntegerRule)
+    , ("invariant-rule", checkInvariantRule)
+    , ("location-io-type-rule", checkLocationIoTypeRule)
+    , ("f16-requires-enable", checkF16RequiresEnable)
+    , ("storage-write-access-rejected", checkStorageWriteAccessRejected)
+    , ("pointer-param-address-space-rules", checkPointerParamAddressSpaceRules)
+    , ("entry-pointer-param-rejected", checkEntryPointerParamRejected)
+    , ("fragment-return-binding-required", checkFragmentReturnBindingRequired)
+    , ("non-entry-param-io-attrs-rejected", checkNonEntryParamIoAttrsRejected)
+    , ("negative-location-rejected", checkNegativeLocationRejected)
+    , ("location-too-many-args-rejected", checkLocationTooManyArgsRejected)
+    , ("stage-attr-with-args-rejected", checkStageAttrWithArgsRejected)
+    , ("duplicate-location-attr-rejected", checkDuplicateLocationAttrRejected)
+    , ("duplicate-builtin-attr-rejected", checkDuplicateBuiltinAttrRejected)
+    , ("duplicate-group-binding-attrs-rejected", checkDuplicateGroupBindingAttrsRejected)
+    , ("duplicate-stage-attrs-rejected", checkDuplicateStageAttrsRejected)
+    , ("non-entry-function-attr-accepted", checkNonEntryFunctionAttrAccepted)
+    ]
+
+  runChecks "Interface, Uniforms, and Inputs"
+    [ ("sampler-interface", checkSamplerInterface)
+    , ("combined-sampler-interface", checkCombinedSamplerInterface)
+    , ("sampler-value-combined-error", checkSamplerValueCombinedError)
+    , ("pack-uniform-layout", checkPackUniformLayout)
+    , ("pack-uniform-errors", checkPackUniformErrors)
+    , ("pack-uniform-from", checkPackUniformFrom)
+    , ("uniform-storable", checkUniformStorable)
+    , ("vertex-attributes", checkVertexAttributes)
+    , ("binding-plan", checkBindingPlan)
+    , ("input-ordering", checkInputOrdering)
+    , ("inputs-combined-missing-sampler", checkInputsCombinedMissingSampler)
+    , ("inputs-combined-ok", checkInputsCombinedOk)
+    , ("inputs-missing-bindings-rejected", checkInputsMissingBindingsRejected)
+    , ("inputs-separate-mode-rejects-sampled-texture", checkInputsSeparateModeRejectsSampledTexture)
+    , ("inputs-duplicate-builder", checkInputsDuplicateBuilder)
+    , ("uniform-quickcheck", checkQuickCheck)
+    ]
+
+  runChecks "Regression Gates"
+    [ ("duplicate-bindings", checkDuplicateBindings)
+    , ("golden-spirv", checkGoldenSpirv)
+    ]
   putStrLn "All tests passed."
 
 assertSpirv :: Maybe FilePath -> String -> BS.ByteString -> IO ()
@@ -1467,9 +1613,8 @@ checkWorkgroupSizeOverrideReject :: IO ()
 checkWorkgroupSizeOverrideReject =
   case compileInline defaultOpts workgroupOverrideShader of
     Left err ->
-      unless ("runtime specialization" `isInfixOf` err.ceMessage) $
-        fail ("workgroup-size-overrides: unexpected error: " <> show err)
-    Right _ -> fail "workgroup-size-overrides: expected failure for override-dependent workgroup_size"
+      fail ("workgroup-size-overrides: expected success for override-dependent workgroup_size, got " <> show err)
+    Right _ -> pure ()
 
 checkImportCompile :: Maybe FilePath -> IO ()
 checkImportCompile spirvVal = do
@@ -1511,58 +1656,383 @@ checkImportQualifiedConstCompile spirvVal = do
     Left err -> fail ("import-qualified-const: " <> show err)
     Right (SomeShader shader) -> assertSpirv spirvVal "import-qualified-const" (shaderSpirv shader)
 
-checkCtsFixtures :: Maybe FilePath -> IO ()
-checkCtsFixtures spirvVal = do
-  positive <- collectCtsFixtures ("test" </> "cts" </> "positive")
-  negative <- collectCtsFixtures ("test" </> "cts" </> "negative")
-  forM_ positive $ \path -> do
-    result <- compileFile path
-    case result of
-      Left err -> fail ("cts-positive: " <> path <> ": " <> show err)
-      Right (SomeShader shader) ->
-        assertSpirv spirvVal ("cts-positive:" <> path) (shaderSpirv shader)
-  forM_ negative $ \path -> do
-    result <- compileFile path
-    case result of
-      Left err ->
-        case expectedCtsNegativeMessage path of
-          Nothing ->
-            fail ("cts-negative: missing expected error mapping for fixture " <> path)
-          Just needle ->
-            unless (needle `isInfixOf` err.ceMessage) $
+loadParityManifest :: FilePath -> IO [ParityCase]
+loadParityManifest manifestPath = do
+  exists <- doesFileExist manifestPath
+  unless exists $
+    fail ("parity-manifest: missing " <> manifestPath)
+  raw <- readFile manifestPath
+  let rows =
+        [ (lineNo, line0)
+        | (lineNo, line0) <- zip [1 :: Int ..] (lines raw)
+        , let view = trim line0
+        , not (null view)
+        , not ("#" `isPrefixOf` view)
+        ]
+  case rows of
+    [] -> fail ("parity-manifest: no rows in " <> manifestPath)
+    ((headerLineNo, header) : bodyRows) -> do
+      let expectedHeader =
+            "id\tdomain\tspec_ref\tkind\texpected\tsource\torigin\torigin_ref\terror_contains\toracles\toptions\towner\texit_criteria"
+      unless (map toLower (trim header) == map toLower expectedHeader) $
+        fail
+          ( "parity-manifest:"
+              <> manifestPath
+              <> ":"
+              <> show headerLineNo
+              <> ": expected header "
+              <> show expectedHeader
+          )
+      mapM (parseRow (takeDirectory manifestPath)) bodyRows
+  where
+    parseRow manifestDir (lineNo, line) =
+      case splitBy '\t' line of
+        [caseId, caseDomain, caseSpecRef, caseKind, caseExpectedRaw, sourceRaw, originRaw, originRefRaw, errContainsRaw, oraclesRaw, optionsRaw, ownerRaw, exitRaw] -> do
+          caseExpected <- parseExpected lineNo caseExpectedRaw
+          caseSource <- parseSource manifestDir lineNo sourceRaw
+          let caseKind' = map toLower (trim caseKind)
+          caseOrigin <- parseOrigin lineNo originRaw
+          let caseOriginRef = trim originRefRaw
+          when (null caseOriginRef) $
+            fail
+              ( "parity-manifest:"
+                  <> manifestPath
+                  <> ":"
+                  <> show lineNo
+                  <> ": origin_ref must not be empty"
+              )
+          when (caseOrigin == "cts" && caseKind' `notElem` ["backlog", "backlog-unmapped"] && isInlineSource caseSource) $
+            fail
+              ( "parity-manifest:"
+                  <> manifestPath
+                  <> ":"
+                  <> show lineNo
+                  <> ": cts origin rows must use file-backed sources"
+              )
+          caseOptions <- parseOptions lineNo optionsRaw
+          let caseOracles = map (map toLower . trim) (filter (not . null . trim) (splitBy ',' oraclesRaw))
+          let unknownOracles = filter (`notElem` ["spirv-val", "naga-pass", "naga-fail"]) caseOracles
+          unless (null unknownOracles) $
+            fail
+              ( "parity-manifest:"
+                  <> manifestPath
+                  <> ":"
+                  <> show lineNo
+                  <> ": unknown oracle(s): "
+                  <> show unknownOracles
+              )
+          let caseOwner = toMaybeField ownerRaw
+          let caseExit = toMaybeField exitRaw
+          when (caseExpected == ParityXFail && isNothing caseOwner) $
+            fail
+              ( "parity-manifest:"
+                  <> manifestPath
+                  <> ":"
+                  <> show lineNo
+                  <> ": xfail row requires owner"
+              )
+          when (caseExpected == ParityXFail && isNothing caseExit) $
+            fail
+              ( "parity-manifest:"
+                  <> manifestPath
+                  <> ":"
+                  <> show lineNo
+                  <> ": xfail row requires exit_criteria"
+              )
+          when (caseKind' `elem` ["backlog", "backlog-unmapped"] && caseExpected /= ParityXFail) $
+            fail
+              ( "parity-manifest:"
+                  <> manifestPath
+                  <> ":"
+                  <> show lineNo
+                  <> ": backlog rows require expected=xfail"
+              )
+          pure
+            ParityCase
+              { id = trim caseId
+              , domain = trim caseDomain
+              , specRef = trim caseSpecRef
+              , kind = caseKind'
+              , expected = caseExpected
+              , source = caseSource
+              , origin = caseOrigin
+              , originRef = caseOriginRef
+              , options = caseOptions
+              , errContains = toMaybeField errContainsRaw
+              , oracles = caseOracles
+              , owner = caseOwner
+              , exitCriteria = caseExit
+              }
+        _ ->
+          fail
+            ( "parity-manifest:"
+                <> manifestPath
+                <> ":"
+                <> show lineNo
+                <> ": expected 13 tab-separated columns"
+            )
+
+    parseSource manifestDir lineNo rawSource =
+      let src = trim rawSource
+      in case stripPrefix "inline:" src of
+          Just inlineKey ->
+            case lookupInlineParitySource inlineKey of
+              Just inlineSrc -> pure (ParityInline inlineKey inlineSrc)
+              Nothing ->
+                fail
+                  ( "parity-manifest:"
+                      <> manifestPath
+                      <> ":"
+                      <> show lineNo
+                      <> ": unknown inline source key: "
+                      <> show inlineKey
+                  )
+          Nothing -> do
+            let sourcePath =
+                  if isAbsolute src
+                    then src
+                    else manifestDir </> src
+            sourceExists <- doesFileExist sourcePath
+            unless sourceExists $
               fail
-                ( "cts-negative: unexpected error for "
-                    <> path
-                    <> "\nexpected to contain: "
-                    <> show needle
-                    <> "\nactual: "
-                    <> show err
+                ( "parity-manifest:"
+                    <> manifestPath
+                    <> ":"
+                    <> show lineNo
+                    <> ": source file not found: "
+                    <> sourcePath
                 )
-      Right _ -> fail ("cts-negative: expected failure for " <> path)
+            pure (ParityFile sourcePath)
 
-collectCtsFixtures :: FilePath -> IO [FilePath]
-collectCtsFixtures dir = do
-  exists <- doesDirectoryExist dir
-  if not exists
-    then pure []
-    else do
-      entries <- listDirectory dir
-      let exts = [".wesl", ".wgsl"]
-      pure [dir </> e | e <- entries, takeExtension e `elem` exts, not ("_" `isPrefixOf` e)]
+    parseOrigin lineNo rawOrigin =
+      case map toLower (trim rawOrigin) of
+        "manual" -> pure "manual"
+        "cts" -> pure "cts"
+        other ->
+          fail
+            ( "parity-manifest:"
+                <> manifestPath
+                <> ":"
+                <> show lineNo
+                <> ": unknown origin: "
+                <> show other
+            )
 
-expectedCtsNegativeMessage :: FilePath -> Maybe String
-expectedCtsNegativeMessage path =
-  case takeFileName path of
-    "import_duplicate_alias.wesl" -> Just "duplicate import aliases"
-    "import_duplicate_target.wesl" -> Just "duplicate imports:"
-    "missing_workgroup_size.wesl" -> Just "@workgroup_size is required for @compute"
-    "override_cycle.wesl" -> Just "override dependency cycle"
-    "scope_out_of_scope.wesl" -> Just "unknown identifier: inner"
-    "unknown_identifier.wesl" -> Just "unknown identifier: missing_value"
-    "const_assert_type_mismatch.wesl" -> Just "const_assert comparison requires matching types"
-    "const_assert_pointer_compare.wesl" -> Just "const int expression references a composite value"
-    "const_fn_switch_fallthrough.wesl" -> Just "non-void function must return a value"
-    _ -> Nothing
+    parseOptions lineNo rawOptions = do
+      let tokens = map trim (filter (not . null . trim) (splitBy ',' rawOptions))
+      let hasBase = "base" `elem` tokens
+      let hasNoBase = "no-base" `elem` tokens
+      when (hasBase && hasNoBase) $
+        fail
+          ( "parity-manifest:"
+              <> manifestPath
+              <> ":"
+              <> show lineNo
+              <> ": options cannot include both base and no-base"
+          )
+      let seed = if hasNoBase then [] else defaultOpts
+      let optionTokens = filter (\tok -> tok /= "base" && tok /= "no-base") tokens
+      foldM (appendOption lineNo) seed optionTokens
+
+    appendOption lineNo acc token =
+      case token of
+        "sampler:combined" -> pure (acc <> [OptSamplerMode SamplerCombined])
+        "sampler:separate" -> pure (acc <> [OptSamplerMode SamplerSeparate])
+        "spec:strict" -> pure (acc <> [OptOverrideSpecMode SpecStrict])
+        "spec:parity" -> pure (acc <> [OptOverrideSpecMode SpecParity])
+        _ ->
+          case stripPrefix "feature:" token of
+            Just feat | not (null feat) -> pure (acc <> [OptEnableFeature feat])
+            _ ->
+              fail
+                ( "parity-manifest:"
+                    <> manifestPath
+                    <> ":"
+                    <> show lineNo
+                    <> ": unknown option token: "
+                    <> show token
+                )
+
+    isInlineSource paritySource =
+      case paritySource of
+        ParityInline {} -> True
+        ParityFile {} -> False
+
+    parseExpected lineNo raw =
+      case map toLower (trim raw) of
+        "pass" -> pure ParityPass
+        "fail" -> pure ParityFail
+        "xfail" -> pure ParityXFail
+        other ->
+          fail
+            ( "parity-manifest:"
+                <> manifestPath
+                <> ":"
+                <> show lineNo
+                <> ": unknown expected value: "
+                <> show other
+                )
+
+loadParityRules :: FilePath -> IO [String]
+loadParityRules rulesPath = do
+  exists <- doesFileExist rulesPath
+  unless exists $
+    fail ("parity-rules: missing " <> rulesPath)
+  raw <- readFile rulesPath
+  let entries =
+        [ trim line0
+        | line0 <- lines raw
+        , let line = trim line0
+        , not (null line)
+        , not ("#" `isPrefixOf` line)
+        , map toLower line /= "spec_ref"
+        ]
+  when (null entries) $
+    fail ("parity-rules: no entries in " <> rulesPath)
+  pure entries
+
+assertParityRuleCoverage :: [String] -> [ParityCase] -> IO ()
+assertParityRuleCoverage ruleRefs cases = do
+  let rulesSet = Set.fromList ruleRefs
+  let mappedCases = filter (not . isUnmappedBacklogCase) cases
+  let refsFromCases = Set.fromList (map (.specRef) mappedCases)
+  let missingInCases = Set.toList (rulesSet `Set.difference` refsFromCases)
+  unless (null missingInCases) $
+    fail
+      ( "parity-rules: missing test cases for rule(s): "
+          <> show missingInCases
+      )
+  let unknownRefs = Set.toList (refsFromCases `Set.difference` rulesSet)
+  unless (null unknownRefs) $
+    fail
+      ( "parity-rules: manifest has spec_ref values not listed in rules.tsv: "
+          <> show unknownRefs
+      )
+
+isBacklogCase :: ParityCase -> Bool
+isBacklogCase = isMappedBacklogCase
+
+isMappedBacklogCase :: ParityCase -> Bool
+isMappedBacklogCase parityCase = map toLower parityCase.kind == "backlog"
+
+isUnmappedBacklogCase :: ParityCase -> Bool
+isUnmappedBacklogCase parityCase = map toLower parityCase.kind == "backlog-unmapped"
+
+runParityCase :: Maybe FilePath -> Maybe FilePath -> ParityCase -> IO ()
+runParityCase spirvVal nagaExe parityCase = do
+  result <- compileParityCase parityCase
+  srcText <- loadParitySourceText parityCase.source
+  case parityCase.expected of
+    ParityPass ->
+      case result of
+        Left err ->
+          fail
+            ( "parity-pass:"
+                <> parityCase.id
+                <> ": expected success, got "
+                <> show err
+            )
+        Right (SomeShader shader) -> do
+          when ("spirv-val" `elem` parityCase.oracles) $
+            assertSpirv spirvVal ("parity:" <> parityCase.id) (shaderSpirv shader)
+    ParityFail ->
+      expectCompileFailure "parity-fail" parityCase result
+    ParityXFail ->
+      expectCompileFailure "parity-xfail" parityCase result
+  checkNagaOracles nagaExe parityCase srcText
+
+compileParityCase :: ParityCase -> IO (Either CompileError SomeShader)
+compileParityCase parityCase =
+  case parityCase.source of
+    ParityFile path ->
+      compileFileWith parityCase.options path
+    ParityInline key src ->
+      pure (compileWith parityCase.options (SourceInline ("<inline:" <> key <> ">") src))
+
+loadParitySourceText :: ParitySource -> IO String
+loadParitySourceText paritySource =
+  case paritySource of
+    ParityFile path -> readFile path
+    ParityInline _ inlineSrc -> pure inlineSrc
+
+expectCompileFailure :: String -> ParityCase -> Either CompileError SomeShader -> IO ()
+expectCompileFailure tag parityCase result =
+  case result of
+    Left err ->
+      case parityCase.errContains of
+        Nothing -> pure ()
+        Just needle ->
+          unless (needle `isInfixOf` err.ceMessage) $
+            fail
+              ( tag
+                  <> ":"
+                  <> parityCase.id
+                  <> ": expected error containing "
+                  <> show needle
+                  <> ", got "
+                  <> show err
+              )
+    Right _ ->
+      fail
+        ( tag
+            <> ":"
+            <> parityCase.id
+            <> ": expected compile failure for "
+            <> paritySourceLabel parityCase.source
+        )
+
+checkNagaOracles :: Maybe FilePath -> ParityCase -> String -> IO ()
+checkNagaOracles mNagaExe parityCase src = do
+  let wantsPass = "naga-pass" `elem` parityCase.oracles
+  let wantsFail = "naga-fail" `elem` parityCase.oracles
+  when (wantsPass && wantsFail) $
+    fail ("parity-manifest:" <> parityCase.id <> ": cannot request both naga-pass and naga-fail")
+  when (wantsPass || wantsFail) $ do
+    nagaExe <-
+      case mNagaExe of
+        Just exe -> pure exe
+        Nothing ->
+          fail
+            ( "parity-manifest:"
+                <> parityCase.id
+                <> ": naga oracle requested but naga was not found in PATH"
+            )
+    (ok, logMsg) <- runNagaCheck nagaExe ("parity:" <> parityCase.id) src
+    let expectedOk = wantsPass
+    unless (ok == expectedOk) $
+      fail
+        ( "parity-manifest:"
+            <> parityCase.id
+            <> ": naga expected "
+            <> show expectedOk
+            <> ", got "
+            <> show ok
+            <> "\n"
+            <> logMsg
+        )
+
+paritySourceLabel :: ParitySource -> String
+paritySourceLabel paritySource =
+  case paritySource of
+    ParityFile path -> path
+    ParityInline key _ -> "inline:" <> key
+
+toMaybeField :: String -> Maybe String
+toMaybeField raw =
+  let val = trim raw
+  in if null val then Nothing else Just val
+
+trim :: String -> String
+trim = dropWhileEnd isSpace . dropWhile isSpace
+
+dropWhileEnd :: (a -> Bool) -> [a] -> [a]
+dropWhileEnd p = reverse . dropWhile p . reverse
+
+splitBy :: Char -> String -> [String]
+splitBy sep str =
+  case break (== sep) str of
+    (chunk, []) -> [chunk]
+    (chunk, _ : rest) -> chunk : splitBy sep rest
 
 checkSwitchConstValidation :: IO ()
 checkSwitchConstValidation =

@@ -1,0 +1,9 @@
+spec_ref
+WESL.alias-override
+WESL.if-attribute.loop
+WESL.if-attribute.statement
+WESL.if-attribute.switch-case
+WESL.import.basic
+WESL.import.duplicate-alias
+WESL.import.duplicate-target
+WESL.module-const-keyword

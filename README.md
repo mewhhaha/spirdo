@@ -23,6 +23,40 @@ cabal build
 cabal test
 ```
 
+Validator-backed parity run (required in CI):
+```sh
+SPIRDO_REQUIRE_VALIDATORS=1 cabal test --enable-tests
+```
+
+Parity fixture matrix:
+- Manifest: `test/parity/manifest.tsv`
+- Rule inventory: `test/parity/rules.tsv`
+- Pins: `test/parity/pins.json`
+- Generated indexes: `test/parity/generated/*.tsv`
+- CTS allow/block lists: `test/parity/cts_allowlist.tsv`, `test/parity/cts_blocklist.tsv`
+- Snapshot pins: `docs/spec-snapshots.md`
+- Per-case expectations: `pass`, `fail`, `xfail` (with owner + exit criteria for `xfail`)
+- Parity row `kind` values include:
+  - `backlog` for active, tracked xfail cases that are compiled in CI parity runs.
+  - `backlog-unmapped` for cases that remain mapped to source but are not yet materialized/executed.
+- Optional case oracles: `spirv-val`, `naga-pass`, `naga-fail`
+- Per-case compile options: feature flags, sampler mode, and override spec mode
+- Per-case provenance: `origin` + `origin_ref` columns
+
+Parity tooling:
+```sh
+scripts/parity/lint_manifest.py
+scripts/parity/generate_manifest.py
+scripts/parity/promote_cts_backlog.py
+scripts/parity/materialize_cts_backlog_fixtures.py
+scripts/parity/reclassify_backlog_expectations.sh
+# optional when syncing from pinned CTS checkout:
+scripts/parity/fetch_cts.sh
+scripts/parity/index_cts.py
+```
+
+`index_cts.py` indexes shader-related CTS sources (`*.spec.ts`, `*.wgsl`, `*.wesl`) from the pinned checkout and emits `test/parity/generated/cts_index.tsv`.
+
 Demo app (in `examples/`):
 ```sh
 cd examples

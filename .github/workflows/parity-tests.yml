@@ -1,0 +1,78 @@
+name: parity-tests
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  parity-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint parity manifest
+        run: |
+          set -euo pipefail
+          python3 scripts/parity/lint_manifest.py \
+            --manifest test/parity/manifest.tsv \
+            --rules test/parity/rules.tsv \
+            --allowlist test/parity/cts_allowlist.tsv \
+            --blocklist test/parity/cts_blocklist.tsv
+
+      - name: Check generated parity artifacts
+        run: |
+          set -euo pipefail
+          python3 scripts/parity/generate_manifest.py \
+            --manifest test/parity/manifest.tsv \
+            --rules test/parity/rules.tsv \
+            --cts-index test/parity/generated/cts_index.tsv \
+            --output-candidates test/parity/generated/cts_manifest_candidates.tsv \
+            --output-wgsl-rules test/parity/generated/wgsl_rule_index.tsv \
+            --output-wesl-rules test/parity/generated/wesl_rule_index.tsv \
+            --check
+
+      - name: Check CTS backlog promotion is up to date
+        run: |
+          set -euo pipefail
+          python3 scripts/parity/promote_cts_backlog.py
+          git diff --exit-code -- test/parity/manifest.tsv test/parity/rules.tsv
+
+      - name: Check CTS backlog fixtures are materialized
+        run: |
+          set -euo pipefail
+          python3 scripts/parity/materialize_cts_backlog_fixtures.py
+          git diff --exit-code -- test/parity/manifest.tsv test/parity/fixtures/cts_backlog
+
+  test:
+    needs: parity-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Haskell
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.12.2'
+          cabal-version: '3.14.1.1'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install validators
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y spirv-tools
+          cargo install naga-cli --locked || cargo install naga --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Refresh cabal index
+        run: cabal update
+
+      - name: Build
+        run: cabal build --enable-tests
+
+      - name: Test (validators required)
+        env:
+          SPIRDO_REQUIRE_VALIDATORS: '1'
+        run: cabal test --enable-tests
