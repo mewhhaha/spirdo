@@ -19,6 +19,11 @@ jobs:
             --allowlist test/parity/cts_allowlist.tsv \
             --blocklist test/parity/cts_blocklist.tsv
 
+      - name: Check oracle normalization drift
+        run: |
+          set -euo pipefail
+          python3 scripts/parity/normalize_oracles.py --check
+
       - name: Check generated parity artifacts
         run: |
           set -euo pipefail
@@ -63,7 +68,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y spirv-tools
-          cargo install naga-cli --locked || cargo install naga --locked
+          cargo install naga-cli --locked --version 28.0.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Refresh cabal index

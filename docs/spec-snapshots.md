@@ -29,6 +29,12 @@ Pinned source metadata is tracked in `test/parity/pins.json`.
   - CTS commit: `d213d4b8dba58ca7a0685e30cfaf1d29f4fc5d5b`
   - Parity sections are tracked via `spec_ref` labels in the manifest.
 
+- Naga:
+  - Source: `naga-cli`
+  - Version pin: `28.0.0`
+  - Origin: pinned in `.github/workflows/parity-tests.yml`
+  - Policy: `python3 scripts/parity/normalize_oracles.py --check` runs in `parity-lint` and fails on drift.
+
 ## Manifest Contract
 
 `test/parity/manifest.tsv` columns:
@@ -46,6 +52,11 @@ Pinned source metadata is tracked in `test/parity/pins.json`.
 11. `options` (`base`, `no-base`, `feature:<name>`, `sampler:combined|separate`, `spec:strict|parity`)
 12. `owner` (required for `xfail`)
 13. `exit_criteria` (required for `xfail`)
+
+WGSL oracle rule:
+- For `domain=wgsl` rows with `expected=pass`, `oracles` must include `naga-pass`.
+- For `domain=wgsl` rows with `expected=fail`, `oracles` must include `naga-fail`.
+- Backlog rows (`kind=backlog|backlog-unmapped`) are excluded from this oracle requirement.
 
 `kind` values in this repository:
 - `cts` / `manual` for standard parity fixtures.

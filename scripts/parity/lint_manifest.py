@@ -143,6 +143,7 @@ def main() -> int:
 
             source = row["source"]
             kind = row["kind"].lower()
+            domain = row["domain"].lower()
             if origin == "cts" and kind not in {"backlog", "backlog-unmapped"} and source.startswith("inline:"):
                 errors.append(f"line {line_no}: cts-origin rows must use file-backed source")
 
@@ -169,7 +170,18 @@ def main() -> int:
             if "naga-pass" in oracle_tokens and "naga-fail" in oracle_tokens:
                 errors.append(f"line {line_no}: cannot request both naga-pass and naga-fail")
 
-            option_errs = validate_options(parse_option_tokens(row["options"]))
+            option_tokens = parse_option_tokens(row["options"])
+            requires_wgsl_naga_oracle = (
+                kind not in {"backlog", "backlog-unmapped"}
+                and expected in {"pass", "fail"}
+                and domain == "wgsl"
+            )
+            if requires_wgsl_naga_oracle:
+                required_oracle = "naga-pass" if expected == "pass" else "naga-fail"
+                if required_oracle not in oracle_tokens:
+                    errors.append(f"line {line_no}: wgsl rows with expected={expected} require oracle {required_oracle}")
+
+            option_errs = validate_options(option_tokens)
             for err in option_errs:
                 errors.append(f"line {line_no}: {err}")
 
