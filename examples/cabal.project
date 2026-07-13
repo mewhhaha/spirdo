@@ -1,6 +1,9 @@
 packages: .
           ../
 
+-- The pinned Slop revision currently requires base-4.21 (GHC 9.12).
+with-compiler: ghc-9.12.2
+
 -- Hackage package versions and revisions are fixed for repeatable CI solves.
 index-state: 2026-07-01T00:00:00Z
 

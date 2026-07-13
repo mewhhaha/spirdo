@@ -33,6 +33,18 @@ bench:
 demo:
     cd examples && cabal run spirdo-demo
 
+# Run the small shader-driven 3D crystal collection game.
+game:
+    cd examples && cabal run spirdo-game
+
+# Test the pure game state transitions without opening a window.
+game-test:
+    cd examples && cabal test spirdo-game-tests --test-show-details=direct
+
+# Capture one game frame under Xvfb; use Lavapipe when no physical GPU is available.
+game-capture output="/tmp/spirdo-game.png":
+    scripts/capture_game.sh "{{output}}"
+
 # Run the demo and write its SPIR-V outputs in examples/.
 demo-spv:
     cd examples && SPIRDO_WRITE_SPV=1 cabal run spirdo-demo

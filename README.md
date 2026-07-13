@@ -59,10 +59,22 @@ just build
 just test
 just bench
 just demo
+just game
 ```
 
 The optional demo requires SDL3 and `slop`. `just demo-spv` writes its SPIR-V
-outputs for inspection.
+outputs for inspection. The examples project selects GHC 9.12.2 because the
+pinned Slop revision currently requires `base-4.21`.
+
+`just game` runs Crystal Run, a small rasterized 3D example whose vertex and
+fragment shaders are compiled by Spirdo. Move the ship with WASD or the arrow
+keys, collect all five crystals, and press R to reset. The scene uses
+procedural meshes, so it needs no external model assets.
+
+`just game-capture` runs the game under Xvfb and writes a screenshot to
+`/tmp/spirdo-game.png`. It requires Xvfb and FFmpeg. On a machine without a
+physical GPU, set `SPIRDO_VULKAN_ICD` and `SPIRDO_VULKAN_LIB_DIR` to a
+Lavapipe ICD manifest and library directory.
 
 ## Runtime compilation
 

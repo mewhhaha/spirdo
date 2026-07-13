@@ -203,4 +203,6 @@ jobs:
 
       - name: Build examples package with pinned Slop source
         working-directory: examples
-        run: cabal build --project-file=cabal.project spirdo-examples:exe:spirdo-demo
+        run: |
+          cabal build --project-file=cabal.project --enable-tests all
+          cabal test --project-file=cabal.project spirdo-game-tests

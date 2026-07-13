@@ -48,3 +48,33 @@ executable spirdo-demo
 
     hs-source-dirs:   app, src
     default-language: GHC2024
+
+executable spirdo-game
+    import:           warnings
+    main-is:          Game.hs
+    other-modules:
+        Examples.Game.Camera
+        Examples.Game.Logic
+        Examples.Game.Meshes
+        Examples.Game.Shaders
+    build-depends:
+        base >=4.21 && <4.23,
+        slop >=0.1 && <0.2,
+        spirdo >=0.2 && <0.3
+
+    hs-source-dirs:   game, src
+    default-language: GHC2024
+
+test-suite spirdo-game-tests
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          GameLogicTest.hs
+    other-modules:
+        Examples.Game.Camera
+        Examples.Game.Logic
+    build-depends:
+        base >=4.21 && <4.23,
+        slop >=0.1 && <0.2
+
+    hs-source-dirs:   test, src
+    default-language: GHC2024

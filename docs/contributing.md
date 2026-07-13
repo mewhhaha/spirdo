@@ -65,9 +65,14 @@ The demo is a separate package with SDL3/Slop system dependencies:
 ```sh
 just demo
 # or: (cd examples && cabal run spirdo-demo)
+
+just game
+# or: (cd examples && cabal run spirdo-game)
 ```
 
 Library changes must not introduce demo dependencies into the root package.
+The examples project selects GHC 9.12.2 to match the pinned Slop revision. The
+game logic can be tested without a GPU via `just game-test`.
 
 ## Change discipline
 

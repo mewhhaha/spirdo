@@ -1,0 +1,101 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE NoFieldSelectors #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+
+module Main (main) where
+
+import Control.Monad (unless)
+import Slop (V4(..), m44MulV4)
+
+import Examples.Game.Camera (gameViewProjection)
+import Examples.Game.Logic
+  ( GameInput(..)
+  , GroundPosition(..)
+  , MoveDirection(..)
+  , activeCrystals
+  , advanceGame
+  , gamePlayerPosition
+  , gameScore
+  , initialGame
+  )
+
+main :: IO ()
+main = do
+  movingForOneSecondAdvancesFiveUnits
+  diagonalMovementKeepsTheSameSpeed
+  movementStopsAtTheArenaBoundary
+  reachingACrystalCollectsItOnce
+  cameraKeepsThePlayerInsideTheClipVolume
+  resetRestoresTheInitialGame
+  invalidFrameDurationDoesNotChangeTheGame
+  putStrLn "game logic tests passed"
+
+movingForOneSecondAdvancesFiveUnits :: IO ()
+movingForOneSecondAdvancesFiveUnits = do
+  let state = advanceGame 1 (moving 1 0) initialGame
+      position = gamePlayerPosition state
+  assertApprox "one-second x movement" 5 position.x
+  assertApprox "one-second x movement leaves z unchanged" 0 position.z
+
+diagonalMovementKeepsTheSameSpeed :: IO ()
+diagonalMovementKeepsTheSameSpeed = do
+  let state = advanceGame 1 (moving 1 1) initialGame
+      position = gamePlayerPosition state
+      distance = sqrt (position.x * position.x + position.z * position.z)
+  assertApprox "diagonal movement distance" 5 distance
+
+movementStopsAtTheArenaBoundary :: IO ()
+movementStopsAtTheArenaBoundary = do
+  let state = advanceGame 10 (moving 1 0) initialGame
+      position = gamePlayerPosition state
+  assertApprox "arena boundary" 8 position.x
+
+reachingACrystalCollectsItOnce :: IO ()
+reachingACrystalCollectsItOnce = do
+  let state = advanceGame 1 (moving (-3.8) (-3.5)) initialGame
+  unless (gameScore state == 1) $
+    fail "reaching a crystal did not increase the score"
+  unless (length (activeCrystals state) == 4) $
+    fail "a collected crystal remained active"
+
+cameraKeepsThePlayerInsideTheClipVolume :: IO ()
+cameraKeepsThePlayerInsideTheClipVolume = do
+  let viewProjection = gameViewProjection (960, 540) (gamePlayerPosition initialGame)
+      V4 clipX clipY clipZ clipW = m44MulV4 viewProjection (V4 0 0.48 0 1)
+      insideHorizontal = abs clipX <= clipW && abs clipY <= clipW
+      insideDepth = clipZ >= 0 && clipZ <= clipW
+  unless (clipW > 0 && insideHorizontal && insideDepth) $
+    fail ("player is outside the clip volume: " <> show (clipX, clipY, clipZ, clipW))
+
+resetRestoresTheInitialGame :: IO ()
+resetRestoresTheInitialGame = do
+  let moved = advanceGame 1 (moving 1 0) initialGame
+      resetState = advanceGame 0 (GameInput (MoveDirection 0 0) True) moved
+  unless (resetState == initialGame) $
+    fail "reset did not restore the initial game"
+
+invalidFrameDurationDoesNotChangeTheGame :: IO ()
+invalidFrameDurationDoesNotChangeTheGame = do
+  let state = advanceGame (0 / 0) (moving 1 0) initialGame
+  unless (state == initialGame) $
+    fail "NaN frame duration changed the game"
+  unless (length (activeCrystals state) == 5) $
+    fail "invalid frame duration changed active crystals"
+
+moving :: Float -> Float -> GameInput
+moving x z =
+  GameInput
+    { move = MoveDirection x z
+    , reset = False
+    }
+
+assertApprox :: String -> Float -> Float -> IO ()
+assertApprox label expected actual =
+  unless (abs (expected - actual) < 0.0001) $
+    fail
+      ( label
+          <> ": expected "
+          <> show expected
+          <> ", got "
+          <> show actual
+      )

@@ -28,7 +28,10 @@ extra-source-files:
     examples/cabal.project
     examples/spirdo-examples.cabal
     examples/app/*.hs
+    examples/game/*.hs
+    examples/test/*.hs
     examples/src/Examples/*.hs
+    examples/src/Examples/Game/*.hs
     examples/src/Examples/Fragments/*.hs
     skills/use-spirdo/SKILL.md
     test/fixtures/*.wesl
@@ -45,6 +48,7 @@ extra-source-files:
     scripts/parity/*.sh
     scripts/parity/*.py
     scripts/parity/*.hs
+    scripts/capture_game.sh
     test/golden/*.golden
 
 common warnings
