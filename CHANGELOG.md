@@ -20,6 +20,9 @@
 
 ### Added
 
+- Crystal Run is a small rasterized 3D game example with procedural meshes,
+  Spirdo-compiled vertex and fragment shaders, pure game-state tests, and an
+  Xvfb/Lavapipe screenshot harness for headless rendering checks.
 - Runtime `sourceNamed` gives inline sources a useful diagnostic name; inline
   sources explicitly do not resolve filesystem imports.
 - Runtime `ShaderBundle` accessors expose stage, bindings, vertex attributes,

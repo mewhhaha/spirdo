@@ -176,10 +176,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake \
+            ffmpeg \
             libsdl3-dev \
             libsdl3-image-dev \
+            mesa-vulkan-drivers \
             pkg-config \
-            libsdl3-ttf-dev
+            libsdl3-ttf-dev \
+            xvfb
 
       - name: Build pinned SDL3_mixer dependency
         run: |
@@ -206,3 +209,12 @@ jobs:
         run: |
           cabal build --project-file=cabal.project --enable-tests all
           cabal test --project-file=cabal.project spirdo-game-tests
+
+      - name: Capture game with Lavapipe
+        run: |
+          set -euo pipefail
+          lavapipe_icd="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          test -n "$lavapipe_icd"
+          SPIRDO_VULKAN_ICD="$lavapipe_icd" \
+            timeout 60s bash scripts/capture_game.sh /tmp/spirdo-game.png
+          test -s /tmp/spirdo-game.png

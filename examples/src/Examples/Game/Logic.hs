@@ -68,6 +68,13 @@ collectionRadius = 0.9
 crystalAngularSpeed :: Float
 crystalAngularSpeed = 0.8
 
+-- Avoid unbounded catch-up work after the game has been suspended.
+maxFrameSeconds :: Float
+maxFrameSeconds = 10
+
+maxSimulationStep :: Float
+maxSimulationStep = 1 / 60
+
 crystalSeeds :: [CrystalSeed]
 crystalSeeds =
   [ CrystalSeed (CrystalId 0) (GroundPosition (-4.5) (-3.5)) 0.7 0.0
@@ -91,19 +98,33 @@ advanceGame :: Float -> GameInput -> GameState -> GameState
 advanceGame frameSeconds input state
   | input.reset = initialGame
   | not (isValidFrameSeconds frameSeconds) = state
-  | otherwise =
-      GameState
-        { player = nextPlayerPosition
-        , elapsed = nextElapsed
-        , score = state.score + length newlyCollected
-        , collected = state.collected <> newlyCollected
-        }
+  | otherwise = advanceSimulation (min maxFrameSeconds frameSeconds) input.move state
+
+advanceSimulation :: Float -> MoveDirection -> GameState -> GameState
+advanceSimulation remaining direction state
+  | remaining <= 0 = state
+  | otherwise = advanceSimulation (remaining - stepSeconds) direction nextState
   where
-    nextElapsed = state.elapsed + frameSeconds
-    nextPlayerPosition = movePlayer frameSeconds input.move state.player
+    stepSeconds = min maxSimulationStep remaining
+    nextState = advanceSimulationStep stepSeconds direction state
+
+advanceSimulationStep :: Float -> MoveDirection -> GameState -> GameState
+advanceSimulationStep stepSeconds direction state =
+  GameState
+    { player = nextPlayerPosition
+    , elapsed = nextElapsed
+    , score = state.score + length newlyCollected
+    , collected = state.collected <> newlyCollected
+    }
+  where
+    nextElapsed = state.elapsed + stepSeconds
+    nextPlayerPosition = movePlayer stepSeconds direction state.player
     newlyCollected =
       fmap (.id)
-        (filter (isWithinCollectionRange nextPlayerPosition) (activeCrystalsAt nextElapsed state.collected))
+        ( filter
+            (isWithinCollectionRange state.player nextPlayerPosition state.elapsed nextElapsed)
+            (filter (not . isCollected state.collected . (.id)) crystalSeeds)
+        )
 
 gamePlayerPosition :: GameState -> GroundPosition
 gamePlayerPosition = (.player)
@@ -145,12 +166,28 @@ movePlayer frameSeconds direction position
     directionMagnitude = sqrt (direction.x * direction.x + direction.z * direction.z)
     distance = playerSpeed * frameSeconds
 
-isWithinCollectionRange :: GroundPosition -> Crystal -> Bool
-isWithinCollectionRange playerPosition crystal =
-  deltaX * deltaX + deltaZ * deltaZ <= collectionRadius * collectionRadius
+isWithinCollectionRange :: GroundPosition -> GroundPosition -> Float -> Float -> CrystalSeed -> Bool
+isWithinCollectionRange playerStart playerEnd timeStart timeEnd seed =
+  closestX * closestX + closestZ * closestZ <= collectionRadius * collectionRadius
   where
-    deltaX = playerPosition.x - crystal.pos.x
-    deltaZ = playerPosition.z - crystal.pos.z
+    crystalStart = (crystalAt timeStart seed).pos
+    crystalEnd = (crystalAt timeEnd seed).pos
+    relativeStartX = playerStart.x - crystalStart.x
+    relativeStartZ = playerStart.z - crystalStart.z
+    relativeEndX = playerEnd.x - crystalEnd.x
+    relativeEndZ = playerEnd.z - crystalEnd.z
+    relativeDeltaX = relativeEndX - relativeStartX
+    relativeDeltaZ = relativeEndZ - relativeStartZ
+    relativeLengthSquared = relativeDeltaX * relativeDeltaX + relativeDeltaZ * relativeDeltaZ
+    closestFraction
+      | relativeLengthSquared == 0 = 0
+      | otherwise =
+          max 0
+            ( min 1
+                (-(relativeStartX * relativeDeltaX + relativeStartZ * relativeDeltaZ) / relativeLengthSquared)
+            )
+    closestX = relativeStartX + closestFraction * relativeDeltaX
+    closestZ = relativeStartZ + closestFraction * relativeDeltaZ
 
 isCollected :: [CrystalId] -> CrystalId -> Bool
 isCollected collectedIds crystalId = crystalId `elem` collectedIds

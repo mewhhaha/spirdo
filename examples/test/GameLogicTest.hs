@@ -25,7 +25,10 @@ main = do
   diagonalMovementKeepsTheSameSpeed
   movementStopsAtTheArenaBoundary
   reachingACrystalCollectsItOnce
+  crossingACrystalDuringALongFrameCollectsIt
+  orbitingCrystalIsCollectedBetweenMatchingEndpoints
   cameraKeepsThePlayerInsideTheClipVolume
+  cameraHandlesAZeroSizedRenderTarget
   resetRestoresTheInitialGame
   invalidFrameDurationDoesNotChangeTheGame
   putStrLn "game logic tests passed"
@@ -53,10 +56,33 @@ movementStopsAtTheArenaBoundary = do
 reachingACrystalCollectsItOnce :: IO ()
 reachingACrystalCollectsItOnce = do
   let state = advanceGame 1 (moving (-3.8) (-3.5)) initialGame
+      advancedState = advanceGame 0.1 (moving 0 0) state
   unless (gameScore state == 1) $
     fail "reaching a crystal did not increase the score"
   unless (length (activeCrystals state) == 4) $
     fail "a collected crystal remained active"
+  unless (gameScore advancedState == 1) $
+    fail "an already collected crystal increased the score again"
+
+crossingACrystalDuringALongFrameCollectsIt :: IO ()
+crossingACrystalDuringALongFrameCollectsIt = do
+  let state = advanceGame 1.2 (moving (-3.8) (-3.5)) initialGame
+  unless (gameScore state == 1) $
+    fail "crossing a crystal during a long frame did not collect it"
+
+orbitingCrystalIsCollectedBetweenMatchingEndpoints :: IO ()
+orbitingCrystalIsCollectedBetweenMatchingEndpoints = do
+  let movedLeft = advanceGame 1.2 (moving (-1) 0) initialGame
+      movedToOrbit = advanceGame 0.7 (moving 0 (-1)) movedLeft
+      oneOrbit = 2 * pi / 0.8
+      waitedOneOrbit = advanceGame oneOrbit (moving 0 0) movedToOrbit
+  unless (gameScore movedToOrbit == 0) $
+    fail
+      ( "positioning the player for the orbit regression collected a crystal early: "
+          <> show (gameScore movedLeft, gameScore movedToOrbit)
+      )
+  unless (gameScore waitedOneOrbit == 1) $
+    fail "a crystal crossing the player during a full orbit was not collected"
 
 cameraKeepsThePlayerInsideTheClipVolume :: IO ()
 cameraKeepsThePlayerInsideTheClipVolume = do
@@ -66,6 +92,14 @@ cameraKeepsThePlayerInsideTheClipVolume = do
       insideDepth = clipZ >= 0 && clipZ <= clipW
   unless (clipW > 0 && insideHorizontal && insideDepth) $
     fail ("player is outside the clip volume: " <> show (clipX, clipY, clipZ, clipW))
+
+cameraHandlesAZeroSizedRenderTarget :: IO ()
+cameraHandlesAZeroSizedRenderTarget = do
+  let viewProjection = gameViewProjection (0, 0) (gamePlayerPosition initialGame)
+      V4 clipX clipY clipZ clipW = m44MulV4 viewProjection (V4 0 0.48 0 1)
+      clipCoordinates = [clipX, clipY, clipZ, clipW]
+  unless (all isFinite clipCoordinates) $
+    fail ("zero-sized render target produced non-finite clip coordinates: " <> show clipCoordinates)
 
 resetRestoresTheInitialGame :: IO ()
 resetRestoresTheInitialGame = do
@@ -99,3 +133,6 @@ assertApprox label expected actual =
           <> ", got "
           <> show actual
       )
+
+isFinite :: Float -> Bool
+isFinite value = not (isNaN value || isInfinite value)

@@ -6,8 +6,17 @@ module Main (main) where
 
 import Control.Monad (forM_, when)
 import Control.Monad.IO.Class (liftIO)
-import Slop
-import Spirdo.Wesl.Reflection (shaderSpirv)
+import Data.Word (Word32)
+import Slop hiding (Shader)
+import Spirdo.Wesl.Reflection
+  ( BindingInfo
+  , BindingPlan(..)
+  , BindingSlotCount(..)
+  , Shader
+  , shaderPlan
+  , shaderSpirv
+  , singleGroupBindingSlotCount
+  )
 
 import Examples.Game.Camera (gameViewProjection)
 import Examples.Game.Logic
@@ -52,14 +61,17 @@ main = do
           }
   runWindow cfg $ do
     meshes <- createGameMeshes
+    -- SDL_gpu's SPIR-V ABI assigns vertex and fragment uniforms to sets 1 and 3.
+    vertexShaderCounts <- requireShaderCounts "vertex shader" 1 gameVertexShader
     vertexShader <-
       createVertexShader
         (shaderSpirv gameVertexShader)
-        (ShaderCounts 0 0 0 1)
+        vertexShaderCounts
+    fragmentShaderCounts <- requireShaderCounts "fragment shader" 3 gameFragmentShader
     fragmentShader <-
       createFragmentShader
         (shaderSpirv gameFragmentShader)
-        (ShaderCounts 0 0 0 0)
+        fragmentShaderCounts
     pipeline <-
       graphicsPipeline
         GraphicsDesc
@@ -87,6 +99,44 @@ createGameMeshes = do
   ground <- createMesh3D groundVertices
   pillar <- createMesh3D cubeVertices
   pure GameMeshes { ship, crystal, ground, pillar }
+
+requireShaderCounts :: String -> Word32 -> Shader mode iface -> WindowM ShaderCounts
+requireShaderCounts label uniformGroup shader =
+  case shaderCounts uniformGroup shader of
+    Left err -> liftIO (ioError (userError (label <> ": " <> err)))
+    Right counts -> pure counts
+
+shaderCounts :: Word32 -> Shader mode iface -> Either String ShaderCounts
+shaderCounts uniformGroup shader = do
+  let bindingPlan = shaderPlan shader
+      unsupportedResources =
+        filter ((/= 0) . snd)
+          [ ("samplers", length bindingPlan.bpSamplers)
+          , ("textures", length bindingPlan.bpTextures)
+          , ("storage textures", length bindingPlan.bpStorageTextures)
+          , ("storage buffers", length bindingPlan.bpStorageBuffers)
+          ]
+  when (not (null unsupportedResources)) $
+    Left ("unsupported non-uniform resources " <> show unsupportedResources)
+  uniformCount <- uniformBindingCount uniformGroup bindingPlan.bpUniforms
+  pure (ShaderCounts 0 0 0 uniformCount)
+
+uniformBindingCount :: Word32 -> [BindingInfo] -> Either String Word32
+uniformBindingCount expectedGroup bindings = do
+  slotCount <- singleGroupBindingSlotCount bindings
+  case slotCount of
+    Nothing -> Right 0
+    Just count
+      | count.bscGroup /= expectedGroup ->
+          Left
+            ( "uniform descriptor group "
+                <> show count.bscGroup
+                <> " does not match renderer group "
+                <> show expectedGroup
+            )
+      | count.bscSlots > fromIntegral (maxBound :: Word32) ->
+          Left ("uniform slot count exceeds Word32: " <> show count.bscSlots)
+      | otherwise -> Right (fromIntegral count.bscSlots)
 
 gameFrame :: GameMeshes -> Pipeline -> Frame -> GameState -> Loop (LoopControl GameState)
 gameFrame meshes pipeline frame state = do

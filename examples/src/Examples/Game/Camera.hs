@@ -15,7 +15,7 @@ gameViewProjection (width, height) playerPosition =
       (V3 0 1 0)
   where
     aspect
-      | height <= 0 = 1
+      | width <= 0 || height <= 0 = 1
       | otherwise = fromIntegral width / fromIntegral height
 
 viewMatrix :: V3 Float -> V3 Float -> V3 Float -> M44 Float

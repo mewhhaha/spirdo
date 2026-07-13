@@ -62,19 +62,24 @@ just demo
 just game
 ```
 
-The optional demo requires SDL3 and `slop`. `just demo-spv` writes its SPIR-V
-outputs for inspection. The examples project selects GHC 9.12.2 because the
-pinned Slop revision currently requires `base-4.21`.
+The optional examples require SDL3 and the native SDL3 image, TTF, and mixer
+libraries used by `slop`; the
+[examples CI job](https://github.com/mewhhaha/spirdo/blob/main/.github/workflows/parity-tests.yml)
+shows the Ubuntu setup. `just demo-spv` writes the gallery's SPIR-V outputs for
+inspection. The examples project selects GHC 9.12.2 because the pinned Slop
+revision currently requires `base-4.21`.
 
 `just game` runs Crystal Run, a small rasterized 3D example whose vertex and
 fragment shaders are compiled by Spirdo. Move the ship with WASD or the arrow
 keys, collect all five crystals, and press R to reset. The scene uses
 procedural meshes, so it needs no external model assets.
 
-`just game-capture` runs the game under Xvfb and writes a screenshot to
-`/tmp/spirdo-game.png`. It requires Xvfb and FFmpeg. On a machine without a
-physical GPU, set `SPIRDO_VULKAN_ICD` and `SPIRDO_VULKAN_LIB_DIR` to a
-Lavapipe ICD manifest and library directory.
+`just game-capture` builds the game, runs it under Xvfb, and writes a screenshot
+to `/tmp/spirdo-game.png`. This Linux/X11 smoke check requires Xvfb, FFmpeg,
+SDL3, and a Vulkan driver. On a machine without a physical GPU, set
+`SPIRDO_VULKAN_ICD` to an absolute Lavapipe ICD manifest path. Set
+`SPIRDO_VULKAN_LIB_DIR` as well only when Lavapipe's shared libraries are not on
+the system loader path.
 
 ## Runtime compilation
 

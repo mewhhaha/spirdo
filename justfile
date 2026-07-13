@@ -18,7 +18,7 @@ validate:
 parity:
     python3 scripts/parity/lint_manifest.py --manifest test/parity/manifest.tsv --rules test/parity/rules.tsv --allowlist test/parity/cts_allowlist.tsv --blocklist test/parity/cts_blocklist.tsv
     python3 scripts/parity/normalize_oracles.py --check
-    scripts/parity/fetch_cts.sh
+    bash scripts/parity/fetch_cts.sh
     python3 scripts/parity/index_cts.py
     git diff --exit-code -- test/parity/generated/cts_index.tsv
     python3 scripts/parity/generate_manifest.py --manifest test/parity/manifest.tsv --rules test/parity/rules.tsv --cts-index test/parity/generated/cts_index.tsv --output-candidates test/parity/generated/cts_manifest_candidates.tsv --output-wgsl-rules test/parity/generated/wgsl_rule_index.tsv --output-wesl-rules test/parity/generated/wesl_rule_index.tsv --check
@@ -43,7 +43,7 @@ game-test:
 
 # Capture one game frame under Xvfb; use Lavapipe when no physical GPU is available.
 game-capture output="/tmp/spirdo-game.png":
-    scripts/capture_game.sh "{{output}}"
+    bash scripts/capture_game.sh "{{output}}"
 
 # Run the demo and write its SPIR-V outputs in examples/.
 demo-spv:
