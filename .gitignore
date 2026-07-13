@@ -1,3 +1,11 @@
 dist-newstyle
 *.spv
 .cabal
+test/parity/vendor/
+*.prof
+*.eventlog
+*.hp
+*.hi
+*.o
+*.dyn_hi
+*.dyn_o

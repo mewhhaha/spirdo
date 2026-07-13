@@ -4,11 +4,18 @@ on:
   pull_request:
   push:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   parity-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Lint parity manifest
         run: |
@@ -23,6 +30,17 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/parity/normalize_oracles.py --check
+
+      - name: Fetch pinned CTS snapshot
+        run: |
+          set -euo pipefail
+          scripts/parity/fetch_cts.sh
+
+      - name: Refresh CTS index
+        run: |
+          set -euo pipefail
+          python3 scripts/parity/index_cts.py
+          git diff --exit-code -- test/parity/generated/cts_index.tsv
 
       - name: Check generated parity artifacts
         run: |
@@ -39,31 +57,57 @@ jobs:
       - name: Check CTS backlog promotion is up to date
         run: |
           set -euo pipefail
-          python3 scripts/parity/promote_cts_backlog.py
-          git diff --exit-code -- test/parity/manifest.tsv test/parity/rules.tsv
+          python3 scripts/parity/verify_idempotent.py \
+            --path test/parity/manifest.tsv \
+            --path test/parity/rules.tsv \
+            -- python3 scripts/parity/promote_cts_backlog.py
 
       - name: Check CTS backlog fixtures are materialized
         run: |
           set -euo pipefail
-          python3 scripts/parity/materialize_cts_backlog_fixtures.py
-          git diff --exit-code -- test/parity/manifest.tsv test/parity/fixtures/cts_backlog
+          python3 scripts/parity/verify_idempotent.py \
+            --path test/parity/manifest.tsv \
+            --path test/parity/fixtures/cts_backlog \
+            -- python3 scripts/parity/materialize_cts_backlog_fixtures.py
 
   test:
     needs: parity-lint
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ghc: '9.12.2'
+            cabal: '3.14.1.1'
+            validators: true
+          - ghc: '9.14.1'
+            cabal: '3.16.1.0'
+            validators: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup Haskell
-        uses: haskell-actions/setup@v2
+        uses: haskell-actions/setup@33d9e1bb5b321fa8d6de86d9e9bbc251b4690b80 # v2
         with:
-          ghc-version: '9.12.2'
-          cabal-version: '3.14.1.1'
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: ${{ matrix.cabal }}
+
+      - name: Cache Cabal artifacts
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-ghc-${{ matrix.ghc }}-${{ hashFiles('spirdo.cabal', 'cabal.project') }}
+          restore-keys: |
+            ${{ runner.os }}-ghc-${{ matrix.ghc }}-
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        if: matrix.validators
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Install validators
+        if: matrix.validators
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -75,9 +119,88 @@ jobs:
         run: cabal update
 
       - name: Build
-        run: cabal build --enable-tests
+        run: cabal build all --enable-tests --enable-benchmarks
 
       - name: Test (validators required)
+        if: matrix.validators
         env:
           SPIRDO_REQUIRE_VALIDATORS: '1'
         run: cabal test --enable-tests
+
+      - name: Test
+        if: ${{ !matrix.validators }}
+        run: cabal test --enable-tests
+
+      - name: Benchmark fixture smoke test
+        if: matrix.validators
+        env:
+          SPIRDO_BENCH_ITERS: '1'
+        run: cabal bench spirdo-compile-bench
+
+      - name: Check source distribution
+        run: |
+          set -euo pipefail
+          cabal check
+          sdist_dir="$(mktemp -d)"
+          trap 'rm -rf "$sdist_dir"' EXIT
+          index_state="$(awk '/^index-state:/ { print $2 }' cabal.project)"
+          test -n "$index_state"
+          cabal sdist --output-directory="$sdist_dir"
+          tarball="$(find "$sdist_dir" -maxdepth 1 -name 'spirdo-*.tar.gz' -print -quit)"
+          test -n "$tarball"
+          tar -xzf "$tarball" -C "$sdist_dir"
+          package_dir="$(find "$sdist_dir" -mindepth 1 -maxdepth 1 -type d -name 'spirdo-*' -print -quit)"
+          test -n "$package_dir"
+          (
+            cd "$package_dir"
+            cabal build all --enable-tests --index-state="$index_state"
+            cabal test spirdo-tests --enable-tests --index-state="$index_state"
+          )
+
+  examples:
+    needs: parity-lint
+    # Ubuntu 26.04 provides SDL3 >= 3.4; SDL3_mixer is built below because it is not yet packaged.
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Haskell
+        uses: haskell-actions/setup@33d9e1bb5b321fa8d6de86d9e9bbc251b4690b80 # v2
+        with:
+          ghc-version: '9.12.2'
+          cabal-version: '3.14.1.1'
+
+      - name: Install SDL3 development packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            libsdl3-dev \
+            libsdl3-image-dev \
+            pkg-config \
+            libsdl3-ttf-dev
+
+      - name: Build pinned SDL3_mixer dependency
+        run: |
+          set -euo pipefail
+          mixer_dir="$(mktemp -d)"
+          trap 'rm -rf "$mixer_dir"' EXIT
+          git init "$mixer_dir"
+          git -C "$mixer_dir" remote add origin https://github.com/libsdl-org/SDL_mixer.git
+          git -C "$mixer_dir" fetch --depth=1 origin 72a81869b45e249e8e67102db4e98dd2441f05a1
+          git -C "$mixer_dir" checkout --detach FETCH_HEAD
+          cmake -S "$mixer_dir" -B "$mixer_dir/build" \
+            -DSDLMIXER_INSTALL=ON \
+            -DSDLMIXER_VENDORED=OFF
+          cmake --build "$mixer_dir/build" --parallel
+          sudo cmake --install "$mixer_dir/build"
+          pkg-config --atleast-version=3.2 sdl3-mixer
+
+      - name: Refresh Cabal index
+        working-directory: examples
+        run: cabal update
+
+      - name: Build examples package with pinned Slop source
+        working-directory: examples
+        run: cabal build --project-file=cabal.project spirdo-examples:exe:spirdo-demo

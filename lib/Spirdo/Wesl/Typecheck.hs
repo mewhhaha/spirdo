@@ -10,15 +10,19 @@
 -- | Typechecking, validation, and import resolution.
 module Spirdo.Wesl.Typecheck where
 
-import Control.Monad (foldM, zipWithM, unless, when, replicateM)
+import Control.Exception (IOException, try)
+import Control.Monad (foldM, replicateM, unless, when, zipWithM)
 import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE)
-import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, xor)
+import Data.Char (isDigit)
 import Data.Either (partitionEithers)
+import Data.Graph (SCC(..), stronglyConnComp)
 import Data.Int (Int32)
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.IntSet as IntSet
+import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.List (isPrefixOf, nub)
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
 import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe, maybeToList)
@@ -26,11 +30,13 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word32)
+import GHC.Float (float2Double)
 import Spirdo.Wesl.Parser (parseModuleWith)
+import Spirdo.Wesl.SourceFile (Utf8File(..), maxSourceUtf8Bytes, readBoundedUtf8File)
 import Spirdo.Wesl.Syntax
 import Spirdo.Wesl.Types
 import Spirdo.Wesl.Util
-import System.Directory (doesFileExist)
+import System.Directory (canonicalizePath, doesFileExist)
 import System.FilePath (dropExtension, isRelative, makeRelative, normalise, splitDirectories, takeDirectory, (<.>), (</>))
 
 validateEntry :: EntryPoint -> Either CompileError ()
@@ -46,7 +52,8 @@ validateEntry entry =
 -- Import resolution (subset: module imports + qualified names)
 
 data ModuleNode = ModuleNode
-  { mnFile :: !FilePath
+  { mnPackageRoot :: !FilePath
+  , mnFile :: !FilePath
   , mnPath :: ![Text]
   , mnAst :: !ModuleAst
   , mnImports :: ![ImportResolved]
@@ -55,12 +62,48 @@ data ModuleNode = ModuleNode
 data ImportResolved = ImportResolved
   { irModulePath :: ![Text]
   , irModuleFile :: !FilePath
+  , irPackageRoot :: !FilePath
   , irItem :: !(Maybe Text)
   , irAlias :: !(Maybe Text)
   } deriving (Eq, Show)
 
+type ModuleIdentity = (FilePath, FilePath)
+
+moduleIdentity :: ModuleNode -> ModuleIdentity
+moduleIdentity node = (node.mnPackageRoot, node.mnFile)
+
+importModuleIdentity :: ImportResolved -> ModuleIdentity
+importModuleIdentity resolved = (resolved.irPackageRoot, resolved.irModuleFile)
+
+data PackageImportRoot = PackageImportRoot
+  { pirPath :: !FilePath
+  , pirKind :: !PackageRootKind
+  , pirManifest :: !(Maybe FilePath)
+  , pirDependencies :: !(Map.Map Text FilePath)
+  } deriving (Eq, Show)
+
+data PackageRootKind
+  = PackageDirectory
+  | PackageModule
+  deriving (Eq, Show)
+
+data FileImportRoots = FileImportRoots
+  { firCurrent :: !FilePath
+  , firPackages :: !(Map.Map FilePath PackageImportRoot)
+  , firSemanticPaths :: !(Map.Map FilePath [Text])
+  } deriving (Eq, Show)
+
 emptyModuleAst :: ModuleAst
 emptyModuleAst = ModuleAst [] [] [] [] [] [] [] [] [] [] []
+
+maxFilesystemImportModules :: Int
+maxFilesystemImportModules = 256
+
+maxFilesystemImportSourceChars :: Int
+maxFilesystemImportSourceChars = 16 * 1024 * 1024
+
+maxFilesystemImportDepth :: Int
+maxFilesystemImportDepth = 64
 
 minI32 :: Integer
 minI32 = fromIntegral (minBound :: Int32)
@@ -68,50 +111,49 @@ minI32 = fromIntegral (minBound :: Int32)
 maxI32 :: Integer
 maxI32 = fromIntegral (maxBound :: Int32)
 
-resolveImports :: CompileOptions -> FilePath -> ModuleAst -> IO (Either CompileError ModuleAst)
-resolveImports opts rootFile rootAst = runExceptT $ do
-  let rootDir = takeDirectory rootFile
-  graph <- ExceptT (loadModuleGraph opts rootDir rootFile rootAst)
-  liftEither (linkModules opts rootFile rootDir graph)
+resolveImports :: CompileOptions -> FileImportRoots -> FilePath -> Int -> ModuleAst -> IO (Either CompileError ModuleAst)
+resolveImports opts importRoots rootFile rootSourceChars rootAst = runExceptT $ do
+  packageRoot <- liftEither (lookupPackageImportRoot importRoots importRoots.firCurrent)
+  graph <- ExceptT (loadModuleGraph opts importRoots rootFile rootSourceChars rootAst)
+  liftEither (linkModules opts (importRoots.firCurrent, rootFile) packageRoot.pirPath graph)
   where
     liftEither = either throwE pure
 
 -- | Resolve imports for inline modules using an in-memory module map.
 resolveImportsInline :: CompileOptions -> FilePath -> ModuleAst -> Map.Map FilePath ModuleAst -> Either CompileError ([ModuleNode], ModuleAst)
 resolveImportsInline opts rootFile rootAst moduleMap = do
-  let rootDir = takeDirectory rootFile
-  graph <- loadModuleGraphInline opts rootDir rootFile rootAst moduleMap
-  linked <- linkModules opts rootFile rootDir graph
+  let canonicalRootFile = normalizeModuleKey rootFile
+  let rootDir = takeDirectory canonicalRootFile
+  let canonicalModuleMap =
+        Map.insert canonicalRootFile rootAst $
+          Map.fromList [(normalizeModuleKey path, ast) | (path, ast) <- Map.toList moduleMap]
+  graph <- loadModuleGraphInline opts rootDir canonicalRootFile rootAst canonicalModuleMap
+  linked <- linkModules opts (rootDir, canonicalRootFile) rootDir graph
   pure (graph, linked)
 
 loadModuleGraphInline :: CompileOptions -> FilePath -> FilePath -> ModuleAst -> Map.Map FilePath ModuleAst -> Either CompileError [ModuleNode]
-loadModuleGraphInline opts rootDir rootFile rootAst moduleMap = go Map.empty (Seq.singleton (rootFile, rootAst))
+loadModuleGraphInline opts rootDir rootFile rootAst moduleMap =
+  go (Set.singleton rootFile) [] (Seq.singleton (rootFile, rootAst))
   where
-    go acc queue =
+    go scheduled revNodes queue =
       case Seq.viewl queue of
-        Seq.EmptyL -> Right (Map.elems acc)
+        Seq.EmptyL -> Right (reverse revNodes)
         (filePath, ast) Seq.:< queueRest -> do
           let pathSegs = modulePathFromFile rootDir filePath
           importItems <- resolveImportItemsInline opts rootDir filePath ast moduleMap
           validateImportAliases importItems
-          let node = ModuleNode filePath pathSegs ast importItems
-          let acc' = Map.insert filePath node acc
-          targets <- loadImportTargets acc' importItems
-          go acc' (queueRest <> Seq.fromList targets)
+          let node = ModuleNode rootDir filePath pathSegs ast importItems
+          let moduleFiles = filter (`Set.notMember` scheduled) (uniqueImportModuleFiles importItems)
+          targets <- mapM loadOne moduleFiles
+          let scheduled' = foldl' (flip Set.insert) scheduled moduleFiles
+          go scheduled' (node : revNodes) (queueRest <> Seq.fromList targets)
 
-    loadImportTargets acc' importItems = do
-      let moduleFiles = Map.keys (Map.fromList [(imp.irModuleFile, ()) | imp <- importItems])
-      targets <- sequence (map (loadOne acc') moduleFiles)
-      pure (concat targets)
-
-    loadOne acc' moduleFile =
-      if Map.member moduleFile acc'
-        then Right []
-        else case Map.lookup moduleFile moduleMap of
-          Nothing ->
-            Left (CompileError ("import module not found: " <> moduleFile) Nothing Nothing)
-          Just ast' ->
-            Right [(moduleFile, ast')]
+    loadOne moduleFile =
+      case Map.lookup moduleFile moduleMap of
+        Nothing ->
+          Left (CompileError ("import module not found: " <> moduleFile) Nothing Nothing)
+        Just ast' ->
+          Right (moduleFile, ast')
 
 resolveImportItemsInline :: CompileOptions -> FilePath -> FilePath -> ModuleAst -> Map.Map FilePath ModuleAst -> Either CompileError [ImportResolved]
 resolveImportItemsInline opts rootDir moduleFile ast moduleMap =
@@ -120,7 +162,7 @@ resolveImportItemsInline opts rootDir moduleFile ast moduleMap =
 
 resolveImportItemInline :: CompileOptions -> FilePath -> FilePath -> Map.Map FilePath ModuleAst -> ImportDecl -> ImportItem -> Either CompileError ImportResolved
 resolveImportItemInline opts rootDir moduleFile moduleMap decl item = do
-  baseDir <- importBaseDir rootDir moduleFile decl.idRelative
+  baseDir <- importBaseDirInline rootDir moduleFile decl.idRelative
   let segs = item.iiPath
   let fullBase = appendPathSegments baseDir segs
   let fullMod = findModuleInline moduleMap fullBase
@@ -132,7 +174,7 @@ resolveImportItemInline opts rootDir moduleFile moduleMap decl item = do
       let ambiguous = ambiguousImport opts baseDir' segs'
       when ambiguous $
         Left (CompileError ("ambiguous import: " <> renderPath segs' <> " refers to both a module and an item") Nothing Nothing)
-      pure (ImportResolved (modulePathFromFile rootDir moduleBase) moduleBase Nothing item.iiAlias)
+      pure (ImportResolved (modulePathFromFile rootDir moduleBase) moduleBase rootDir Nothing item.iiAlias)
 
     resolveAsItem baseDir' segs' =
       case splitImportTarget segs' of
@@ -141,7 +183,9 @@ resolveImportItemInline opts rootDir moduleFile moduleMap decl item = do
           let moduleBasePath = appendPathSegments baseDir' modSegs
           case findModuleInline moduleMap moduleBasePath of
             Just mb ->
-              Right (ImportResolved (modulePathFromFile rootDir mb) mb (Just itemName) item.iiAlias)
+              if moduleHasItemInline moduleMap mb itemName
+                then Right (ImportResolved (modulePathFromFile rootDir mb) mb rootDir (Just itemName) item.iiAlias)
+                else Left (importItemNotFound segs')
             Nothing ->
               Left (importNotFound modSegs)
 
@@ -158,6 +202,9 @@ resolveImportItemInline opts rootDir moduleFile moduleMap decl item = do
         [] -> CompileError "import path is empty" Nothing Nothing
         _ -> CompileError ("import module not found: " <> renderPath segs') Nothing Nothing
 
+    importItemNotFound segs' =
+      CompileError ("import item not found: " <> renderPath segs') Nothing Nothing
+
 findModuleInline :: Map.Map FilePath ModuleAst -> FilePath -> Maybe FilePath
 findModuleInline moduleMap base =
   let key = normalizeModuleKey base
@@ -169,50 +216,202 @@ moduleHasItemInline :: Map.Map FilePath ModuleAst -> FilePath -> Text -> Bool
 moduleHasItemInline moduleMap moduleBase itemName =
   case Map.lookup moduleBase moduleMap of
     Nothing -> False
-    Just ast ->
-      Set.member itemName (moduleItemNames ast)
-  where
-    moduleItemNames ast =
-      Set.fromList $
-        map (.sdName) ast.modStructs
-          <> map (.bdName) ast.modBindings
-          <> map (.gvName) ast.modGlobals
-          <> map (.cdName) ast.modConsts
-          <> map (.odName) ast.modOverrides
-          <> map (.adName) ast.modAliases
-          <> map (.fnName) ast.modFunctions
-          <> map (.epName) ast.modEntries
+    Just ast -> Set.member itemName (moduleItemNames ast)
 
-loadModuleGraph :: CompileOptions -> FilePath -> FilePath -> ModuleAst -> IO (Either CompileError [ModuleNode])
-loadModuleGraph opts rootDir rootFile rootAst = runExceptT (go Map.empty (Seq.singleton (rootFile, rootAst)))
+loadModuleGraph :: CompileOptions -> FileImportRoots -> FilePath -> Int -> ModuleAst -> IO (Either CompileError [ModuleNode])
+loadModuleGraph opts importRoots rootFile rootSourceChars rootAst = do
+  moduleCache <- newIORef (Map.singleton rootFile rootAst)
+  sourceChars <- newIORef rootSourceChars
+  let loadCached moduleFile = do
+        cached <- Map.lookup moduleFile <$> readIORef moduleCache
+        case cached of
+          Just ast -> pure (Right ast)
+          Nothing -> do
+            loadedSourceChars <- readIORef sourceChars
+            loaded <- loadModuleFromFile opts loadedSourceChars moduleFile
+            case loaded of
+              Right (ast, totalSourceChars) -> do
+                modifyIORef' moduleCache (Map.insert moduleFile ast)
+                modifyIORef' sourceChars (const totalSourceChars)
+                pure (Right ast)
+              Left err -> pure (Left err)
+  loaded <-
+    runExceptT
+      ( go
+          loadCached
+          (Set.singleton (importRoots.firCurrent, rootFile))
+          []
+          (Seq.singleton (importRoots.firCurrent, rootFile, rootAst, 0))
+      )
+  pure (loaded >>= validateFilesystemImportGraphDepth (importRoots.firCurrent, rootFile))
   where
-    go acc queue =
+    go loadModule scheduled revNodes queue =
       case Seq.viewl queue of
-        Seq.EmptyL -> pure (Map.elems acc)
-        (filePath, ast) Seq.:< queueRest -> do
-          let pathSegs = modulePathFromFile rootDir filePath
-          importItems <- ExceptT (resolveImportItems opts rootDir filePath ast)
+        Seq.EmptyL -> pure (reverse revNodes)
+        (packageRoot, filePath, ast, depth) Seq.:< queueRest -> do
+          pathSegs <- liftEither (modulePathFromPackage importRoots packageRoot filePath)
+          importItems <- ExceptT (resolveImportItems loadModule opts importRoots packageRoot filePath ast)
           liftEither (validateImportAliases importItems)
-          let node = ModuleNode filePath pathSegs ast importItems
-          let acc' = Map.insert filePath node acc
-          targets <- loadImportTargets opts acc' importItems
-          go acc' (queueRest <> Seq.fromList targets)
+          let node = ModuleNode packageRoot filePath pathSegs ast importItems
+          let modules = filter (`Set.notMember` scheduled) (uniqueImportModules importItems)
+          let remainingCapacity = maxFilesystemImportModules - Set.size scheduled
+          case drop remainingCapacity modules of
+            (_, moduleFile) : _ ->
+              liftEither
+                (Left (moduleCountLimitError moduleFile (maxFilesystemImportModules + 1)))
+            [] -> pure ()
+          let nextDepth = depth + 1
+          mapM_ (liftEither . importDepthLimitError nextDepth . snd) modules
+          targets <- mapM (ExceptT . loadOne loadModule) modules
+          let scheduled' = foldl' (flip Set.insert) scheduled modules
+          let targetsWithDepth = [(package, target, targetAst, nextDepth) | (package, target, targetAst) <- targets]
+          go loadModule scheduled' (node : revNodes) (queueRest <> Seq.fromList targetsWithDepth)
 
-    loadImportTargets opts' acc' importItems = do
-      let moduleFiles = Map.keys (Map.fromList [(imp.irModuleFile, ()) | imp <- importItems])
-      results <- liftIO (mapM (loadOne opts' acc') moduleFiles)
-      targets <- liftEither (sequence results)
-      pure (concat targets)
-
-    loadOne opts' acc' moduleFile =
-      if Map.member moduleFile acc'
-        then pure (Right [])
-        else do
-          moduleAst <- loadModuleFromFile opts' moduleFile
-          pure (fmap (\ast' -> [(moduleFile, ast')]) moduleAst)
+    loadOne loadModule (packageRoot, moduleFile) =
+      fmap ((packageRoot, moduleFile,) <$>) (loadModule moduleFile)
 
     liftEither :: Either CompileError a -> ExceptT CompileError IO a
     liftEither = either throwE pure
+
+validateFilesystemImportGraphDepth :: ModuleIdentity -> [ModuleNode] -> Either CompileError [ModuleNode]
+validateFilesystemImportGraphDepth rootIdentity nodes = do
+  rootComponent <-
+    maybe
+      ( Left
+          ( CompileError
+              ("filesystem import graph is missing its root module: " <> snd rootIdentity)
+              Nothing
+              Nothing
+          )
+      )
+      Right
+      (Map.lookup rootIdentity componentByModule)
+  let rootDepth = Map.findWithDefault 1 rootComponent componentWeights - 1
+      finalDepths = relaxDepths componentCount (Map.singleton rootComponent rootDepth)
+      (deepestPath, deepestDepth) =
+        foldl' selectDeeper (snd rootIdentity, 0) (Map.toList finalDepths)
+  importDepthLimitError deepestDepth deepestPath
+  Right nodes
+  where
+    adjacency =
+      Map.fromList
+        [ (moduleIdentity node, uniqueImportModules node.mnImports)
+        | node <- nodes
+        ]
+    components =
+      zip
+        [0 :: Int ..]
+        ( stronglyConnComp
+            [ (identity, identity, Map.findWithDefault [] identity adjacency)
+            | identity <- Map.keys adjacency
+            ]
+        )
+    componentModules stronglyConnected =
+      case stronglyConnected of
+        AcyclicSCC identity -> [identity]
+        CyclicSCC identities -> identities
+    componentByModule =
+      Map.fromList
+        [ (identity, componentId)
+        | (componentId, stronglyConnected) <- components
+        , identity <- componentModules stronglyConnected
+        ]
+    componentWeights =
+      Map.fromList
+        [ (componentId, length (componentModules stronglyConnected))
+        | (componentId, stronglyConnected) <- components
+        ]
+    componentRepresentatives =
+      Map.fromList
+        [ ( componentId
+          , maybe (snd rootIdentity) snd (listToMaybe (componentModules stronglyConnected))
+          )
+        | (componentId, stronglyConnected) <- components
+        ]
+    componentEdges =
+      Map.fromList
+        [ ( componentId
+          , Set.toList
+              ( Set.fromList
+                  [ targetComponent
+                  | identity <- componentModules stronglyConnected
+                  , targetIdentity <- Map.findWithDefault [] identity adjacency
+                  , Just targetComponent <- [Map.lookup targetIdentity componentByModule]
+                  , targetComponent /= componentId
+                  ]
+              )
+          )
+        | (componentId, stronglyConnected) <- components
+        ]
+    componentCount = length components
+
+    relaxDepths remaining depths
+      | remaining <= 0 = depths
+      | otherwise = relaxDepths (remaining - 1) (foldl' relaxComponent depths (map fst components))
+
+    relaxComponent depths componentId =
+      case Map.lookup componentId depths of
+        Nothing -> depths
+        Just sourceDepth ->
+          foldl'
+            (\acc targetComponent ->
+              let targetDepth = sourceDepth + Map.findWithDefault 1 targetComponent componentWeights
+              in Map.insertWith max targetComponent targetDepth acc
+            )
+            depths
+            (Map.findWithDefault [] componentId componentEdges)
+
+    selectDeeper current@(currentPath, currentDepth) (componentId, candidateDepth)
+      | candidateDepth <= currentDepth = current
+      | otherwise =
+          (Map.findWithDefault currentPath componentId componentRepresentatives, candidateDepth)
+
+moduleCountLimitError :: FilePath -> Int -> CompileError
+moduleCountLimitError path count =
+  CompileError
+    ( "filesystem import graph module count exceeds limit: " <> path
+        <> " (" <> show count <> " modules, limit " <> show maxFilesystemImportModules <> ")"
+    )
+    Nothing
+    Nothing
+
+sourceCharsLimitError :: FilePath -> Int -> CompileError
+sourceCharsLimitError path chars =
+  CompileError
+    ( "filesystem import graph decoded source characters exceed limit: " <> path
+        <> " (" <> show chars <> " characters, limit " <> show maxFilesystemImportSourceChars <> ")"
+    )
+    Nothing
+    Nothing
+
+importDepthLimitError :: Int -> FilePath -> Either CompileError ()
+importDepthLimitError depth path
+  | depth <= maxFilesystemImportDepth = Right ()
+  | otherwise =
+      Left
+        ( CompileError
+            ( "filesystem import graph depth exceeds limit: " <> path
+                <> " (depth " <> show depth <> ", limit " <> show maxFilesystemImportDepth <> ")"
+            )
+            Nothing
+            Nothing
+        )
+
+uniqueImportModuleFiles :: [ImportResolved] -> [FilePath]
+uniqueImportModuleFiles = reverse . fst . foldl' add ([], Set.empty)
+  where
+    add (revFiles, seen) imp
+      | Set.member imp.irModuleFile seen = (revFiles, seen)
+      | otherwise = (imp.irModuleFile : revFiles, Set.insert imp.irModuleFile seen)
+
+uniqueImportModules :: [ImportResolved] -> [ModuleIdentity]
+uniqueImportModules = reverse . fst . foldl' add ([], Set.empty)
+  where
+    add (revModules, seen) imp
+      | Set.member identity seen = (revModules, seen)
+      | otherwise = (identity : revModules, Set.insert identity seen)
+      where
+        identity = importModuleIdentity imp
 
 validateImportAliases :: [ImportResolved] -> Either CompileError ()
 validateImportAliases importItems =
@@ -227,11 +426,9 @@ validateImportAliases importItems =
         Left (CompileError ("duplicate imports: " <> T.unpack (T.intercalate ", " dupTargets)) Nothing Nothing)
   where
     aliasFor imp =
-      let alias =
-            case imp.irItem of
-              Nothing -> fromMaybe (last imp.irModulePath) imp.irAlias
-              Just item -> fromMaybe item imp.irAlias
-      in nonEmptyText alias
+      case imp.irItem of
+        Nothing -> defaultModuleAlias imp >>= nonEmptyText
+        Just item -> nonEmptyText (fromMaybe item imp.irAlias)
 
     importTarget imp =
       let modName = T.intercalate "::" imp.irModulePath
@@ -248,93 +445,152 @@ validateImportAliases importItems =
       | T.null txt = Nothing
       | otherwise = Just txt
 
-resolveImportItems :: CompileOptions -> FilePath -> FilePath -> ModuleAst -> IO (Either CompileError [ImportResolved])
-resolveImportItems opts rootDir moduleFile ast = runExceptT $ do
+defaultModuleAlias :: ImportResolved -> Maybe Text
+defaultModuleAlias imp =
+  case imp.irAlias of
+    Just alias -> Just alias
+    Nothing -> listToMaybe (reverse imp.irModulePath)
+
+resolveImportItems :: (FilePath -> IO (Either CompileError ModuleAst)) -> CompileOptions -> FileImportRoots -> FilePath -> FilePath -> ModuleAst -> IO (Either CompileError [ImportResolved])
+resolveImportItems loadModule opts importRoots packageRoot moduleFile ast = runExceptT $ do
   let items = [(decl, item) | decl <- ast.modImports, item <- decl.idItems]
   mapM (ExceptT . resolveOne) items
   where
-    resolveOne (decl, item) = resolveImportItem opts rootDir moduleFile decl item
+    resolveOne (decl, item) = resolveImportItem loadModule opts importRoots packageRoot moduleFile decl item
 
-loadModuleFromFile :: CompileOptions -> FilePath -> IO (Either CompileError ModuleAst)
-loadModuleFromFile opts path = do
-  sourceFile <- pickFirstExisting [path <.> "wesl", path <.> "wgsl"]
-  maybe (pure (Right emptyModuleAst)) parseModule sourceFile
-  where
-    parseModule file = do
-      src <- readFile file
-      pure (first (annotateErrorWithSource (Just file) src) (parseModuleWith opts.enabledFeatures src))
+loadModuleFromFile :: CompileOptions -> Int -> FilePath -> IO (Either CompileError (ModuleAst, Int))
+loadModuleFromFile opts loadedSourceChars path = do
+  readResult <- readBoundedUtf8File "imported module" maxSourceUtf8Bytes path
+  pure $ do
+    sourceFile <- readResult
+    let Utf8File { text = src } = sourceFile
+        totalSourceChars = loadedSourceChars + T.length src
+    when (totalSourceChars > maxFilesystemImportSourceChars) $
+      Left (sourceCharsLimitError path totalSourceChars)
+    ast <-
+      first
+        (annotateErrorWithSource (Just path) (T.unpack src))
+        (parseModuleWith opts.enabledFeatures (T.unpack src))
+    pure (ast, totalSourceChars)
 
-pickFirstExisting :: [FilePath] -> IO (Maybe FilePath)
-pickFirstExisting files =
-  case files of
-    [] -> pure Nothing
-    (file:rest) -> do
-      exists <- doesFileExist file
-      if exists
-        then pure (Just file)
-        else pickFirstExisting rest
-
-resolveImportItem :: CompileOptions -> FilePath -> FilePath -> ImportDecl -> ImportItem -> IO (Either CompileError ImportResolved)
-resolveImportItem opts rootDir moduleFile decl item = runExceptT $ do
-  baseDir <- ExceptT (pure (importBaseDir rootDir moduleFile decl.idRelative))
-  let segs = item.iiPath
+resolveImportItem :: (FilePath -> IO (Either CompileError ModuleAst)) -> CompileOptions -> FileImportRoots -> FilePath -> FilePath -> ImportDecl -> ImportItem -> IO (Either CompileError ImportResolved)
+resolveImportItem loadModule opts importRoots currentPackage moduleFile decl item = runExceptT $ do
+  currentRoot <- ExceptT (pure (lookupPackageImportRoot importRoots currentPackage))
+  (targetPackage, targetRoot, baseDir, segs) <-
+    ExceptT (pure (importStart importRoots currentPackage currentRoot moduleFile decl item.iiPath))
   let fullBase = appendPathSegments baseDir segs
-  fullMod <- liftIO (findModuleFile fullBase)
+  fullMod <- ExceptT (findModuleFile targetRoot fullBase)
   case fullMod of
-    Just moduleBase -> resolveAsModule baseDir segs moduleBase
-    Nothing -> resolveAsItem baseDir segs
+    Just moduleFile' -> resolveAsModule targetPackage targetRoot baseDir segs moduleFile'
+    Nothing -> resolveAsItem currentRoot targetPackage targetRoot baseDir segs
   where
-    resolveAsModule baseDir' segs' moduleBase = do
-      ambiguous <- liftIO (ambiguousImport opts baseDir' segs')
+    resolveAsModule targetPackage targetRoot baseDir' segs' moduleFile' = do
+      ambiguous <- ambiguousImport opts targetRoot baseDir' segs'
       when ambiguous $
-        throwE (CompileError ("ambiguous import: " <> renderPath segs' <> " refers to both a module and an item") Nothing Nothing)
-      pure (ImportResolved (modulePathFromFile rootDir moduleBase) moduleBase Nothing item.iiAlias)
+        throwE (CompileError ("ambiguous import: " <> renderPath item.iiPath <> " refers to both a module and an item") Nothing Nothing)
+      modulePath <- ExceptT (pure (modulePathFromPackage importRoots targetPackage moduleFile'))
+      let moduleAlias =
+            case (segs', item.iiAlias) of
+              ([], Nothing) -> listToMaybe (reverse item.iiPath)
+              _ -> item.iiAlias
+      pure (ImportResolved modulePath moduleFile' targetPackage Nothing moduleAlias)
 
-    resolveAsItem baseDir' segs' =
+    resolveAsItem currentRoot targetPackage targetRoot baseDir' segs' =
       case splitImportTarget segs' of
-        Nothing -> throwE (importNotFound segs')
+        Nothing -> resolveRootItem currentRoot targetPackage targetRoot baseDir' segs'
         Just (modSegs, itemName) -> do
           let moduleBasePath = appendPathSegments baseDir' modSegs
-          moduleBase <- liftIO (findModuleFile moduleBasePath)
-          case moduleBase of
-            Just mb ->
-              pure (ImportResolved (modulePathFromFile rootDir mb) mb (Just itemName) item.iiAlias)
+          selectedModule <- ExceptT (findModuleFile targetRoot moduleBasePath)
+          case selectedModule of
+            Just moduleFile' -> do
+              hasItem <- ExceptT (moduleHasItem loadModule moduleFile' itemName)
+              unless hasItem $
+                throwE (importItemNotFound item.iiPath)
+              modulePath <- ExceptT (pure (modulePathFromPackage importRoots targetPackage moduleFile'))
+              pure (ImportResolved modulePath moduleFile' targetPackage (Just itemName) item.iiAlias)
             Nothing ->
-              throwE (importNotFound modSegs)
+              throwE (importNotFound currentRoot item.iiPath)
 
-    ambiguousImport opts' baseDir' segs' =
+    resolveRootItem currentRoot targetPackage targetRoot baseDir' segs' =
+      case (segs', targetRoot.pirKind, normalise baseDir' == normalise (packageModuleBase targetRoot)) of
+        ([itemName], PackageModule, True) -> do
+          hasItem <- ExceptT (moduleHasItem loadModule targetRoot.pirPath itemName)
+          unless hasItem $
+            throwE (importItemNotFound item.iiPath)
+          modulePath <- ExceptT (pure (modulePathFromPackage importRoots targetPackage targetRoot.pirPath))
+          pure (ImportResolved modulePath targetRoot.pirPath targetPackage (Just itemName) item.iiAlias)
+        _ -> throwE (importNotFound currentRoot item.iiPath)
+
+    ambiguousImport _opts targetRoot baseDir' segs' =
       case splitImportTarget segs' of
-        Nothing -> pure False
+        Nothing ->
+          case (segs', targetRoot.pirKind, normalise baseDir' == normalise (packageModuleBase targetRoot)) of
+            ([itemName], PackageModule, True) -> ExceptT (moduleHasItem loadModule targetRoot.pirPath itemName)
+            _ -> pure False
         Just (modSegs, itemName) -> do
           let moduleBasePath = appendPathSegments baseDir' modSegs
-          moduleBaseItem <- findModuleFile moduleBasePath
-          maybe (pure False) (\mb -> moduleHasItem opts' mb itemName) moduleBaseItem
+          selectedModule <- ExceptT (findModuleFile targetRoot moduleBasePath)
+          case selectedModule of
+            Nothing -> pure False
+            Just moduleFile' -> ExceptT (moduleHasItem loadModule moduleFile' itemName)
 
-    importNotFound segs' =
-      case segs' of
-        [] -> CompileError "import path is empty" Nothing Nothing
+    importNotFound currentRoot segs' =
+      case (decl.idRelative, segs', currentRoot.pirManifest) of
+        (Nothing, packageName : _, Just manifest)
+          | Map.notMember packageName currentRoot.pirDependencies ->
+              CompileError
+                ( "unknown package dependency: " <> T.unpack packageName
+                    <> " (import " <> renderPath segs' <> " in " <> moduleFile
+                    <> "; manifest " <> manifest <> ")"
+                )
+                Nothing
+                Nothing
+        (_, [], _) -> CompileError "import path is empty" Nothing Nothing
         _ -> CompileError ("import module not found: " <> renderPath segs') Nothing Nothing
 
-moduleHasItem :: CompileOptions -> FilePath -> Text -> IO Bool
-moduleHasItem opts moduleBase itemName = do
-  astResult <- loadModuleFromFile opts moduleBase
-  pure (either (const False) (Set.member itemName . moduleItemNames) astResult)
-  where
-    moduleItemNames ast =
-      Set.fromList $
-        map (.sdName) ast.modStructs
-          <> map (.bdName) ast.modBindings
-          <> map (.gvName) ast.modGlobals
-          <> map (.cdName) ast.modConsts
-          <> map (.odName) ast.modOverrides
-          <> map (.adName) ast.modAliases
-          <> map (.fnName) ast.modFunctions
-          <> map (.epName) ast.modEntries
+    importItemNotFound segs' =
+      case segs' of
+        [] -> CompileError "import path is empty" Nothing Nothing
+        _ -> CompileError ("import item not found: " <> renderPath segs') Nothing Nothing
 
-findModuleFile :: FilePath -> IO (Maybe FilePath)
-findModuleFile base = do
-  sourceFile <- pickFirstExisting [base <.> "wesl", base <.> "wgsl"]
-  pure (base <$ sourceFile)
+moduleHasItem :: (FilePath -> IO (Either CompileError ModuleAst)) -> FilePath -> Text -> IO (Either CompileError Bool)
+moduleHasItem loadModule moduleBase itemName = do
+  astResult <- loadModule moduleBase
+  pure (Set.member itemName . moduleItemNames <$> astResult)
+
+moduleItemNames :: ModuleAst -> Set.Set Text
+moduleItemNames ast =
+  Set.fromList $
+    map (.sdName) ast.modStructs
+      <> map (.bdName) ast.modBindings
+      <> map (.gvName) ast.modGlobals
+      <> map (.cdName) ast.modConsts
+      <> map (.odName) ast.modOverrides
+      <> map (.adName) ast.modAliases
+      <> map (.fnName) ast.modFunctions
+      <> map (.epName) ast.modEntries
+
+findModuleFile :: PackageImportRoot -> FilePath -> IO (Either CompileError (Maybe FilePath))
+findModuleFile packageRoot base
+  | packageRoot.pirKind == PackageModule && normalise base == normalise (dropExtension packageRoot.pirPath) =
+      pure (Right (Just packageRoot.pirPath))
+  | otherwise = pickSourceFile packageRoot [base <.> "wesl", base <.> "wgsl"]
+
+pickSourceFile :: PackageImportRoot -> [FilePath] -> IO (Either CompileError (Maybe FilePath))
+pickSourceFile _ [] = pure (Right Nothing)
+pickSourceFile packageRoot (candidate:rest) = do
+  exists <- doesFileExist candidate
+  if not exists
+    then pickSourceFile packageRoot rest
+    else do
+      canonicalResult <- try (canonicalizePath candidate) :: IO (Either IOException FilePath)
+      pure $ do
+        canonical <-
+          first
+            (\ioErr -> CompileError ("failed to resolve imported module " <> candidate <> " (" <> show ioErr <> ")") Nothing Nothing)
+            canonicalResult
+        ensureSelectedInPackage packageRoot candidate canonical
+        pure (Just canonical)
 
 appendPathSegments :: FilePath -> [Text] -> FilePath
 appendPathSegments base segs = foldl (</>) base (map T.unpack segs)
@@ -353,33 +609,212 @@ modulePathFromFile rootDir filePath =
   let rel = dropExtension (makeRelative rootDir filePath)
   in map T.pack (filter (not . null) (splitDirectories rel))
 
-importBaseDir :: FilePath -> FilePath -> Maybe ImportRelative -> Either CompileError FilePath
-importBaseDir rootDir moduleFile rel =
-  case rel of
-    Nothing -> ensureInRoot rootDir rootDir
-    Just ImportPackage -> ensureInRoot rootDir rootDir
-    Just (ImportSuper n) -> ensureInRoot rootDir (superModuleFile (normalise moduleFile) n)
+importBaseDirInline :: FilePath -> FilePath -> Maybe ImportRelative -> Either CompileError FilePath
+importBaseDirInline rootDir moduleFile relative =
+  case relative of
+    Nothing -> ensureInlineImportInRoot rootDir rootDir
+    Just ImportPackage -> ensureInlineImportInRoot rootDir rootDir
+    Just (ImportSuper depth) ->
+      case superModuleFile (normalise moduleFile) depth of
+        Nothing -> Left (CompileError "invalid super import depth" Nothing Nothing)
+        Just path -> ensureInlineImportInRoot rootDir path
 
-ensureInRoot :: FilePath -> FilePath -> Either CompileError FilePath
-ensureInRoot rootDir path =
-  let rel = makeRelative (normalise rootDir) (normalise path)
-  in if isRelative rel && not (isEscaping rel)
+ensureInlineImportInRoot :: FilePath -> FilePath -> Either CompileError FilePath
+ensureInlineImportInRoot rootDir path =
+  let relative = makeRelative (normalise rootDir) (normalise path)
+  in if isRelative relative && not (any (== "..") (splitDirectories relative))
       then Right (normalise path)
       else Left (CompileError "import path escapes package root" Nothing Nothing)
+
+lookupPackageImportRoot :: FileImportRoots -> FilePath -> Either CompileError PackageImportRoot
+lookupPackageImportRoot importRoots packagePath =
+  case Map.lookup packagePath importRoots.firPackages of
+    Just packageRoot -> Right packageRoot
+    Nothing ->
+      Left
+        ( CompileError
+            ("package import root is not registered: " <> packagePath)
+            Nothing
+            Nothing
+        )
+
+buildPackageSemanticPaths :: FilePath -> Map.Map FilePath PackageImportRoot -> Either CompileError (Map.Map FilePath [Text])
+buildPackageSemanticPaths currentPackage packages = do
+  unless (Map.member currentPackage packages) $
+    Left
+      ( CompileError
+          ("current package import root is not registered: " <> currentPackage)
+          Nothing
+          Nothing
+      )
+  case missingDependencies of
+    [] -> go (Map.singleton currentPackage []) (Seq.singleton (currentPackage, []))
+    (packagePath, dependencyName, dependencyPath) : _ ->
+      Left
+        ( CompileError
+            ( "package dependency root is not registered: " <> dependencyPath
+                <> " (dependency " <> T.unpack dependencyName
+                <> " of " <> packagePath <> ")"
+            )
+            Nothing
+            Nothing
+        )
   where
-    isEscaping relPath = any (== "..") (splitDirectories relPath)
+    missingDependencies =
+      [ (packagePath, dependencyName, dependencyPath)
+      | (packagePath, packageRoot) <- Map.toList packages
+      , (dependencyName, dependencyPath) <- Map.toList packageRoot.pirDependencies
+      , Map.notMember dependencyPath packages
+      ]
 
-superModuleFile :: FilePath -> Int -> FilePath
+    go semanticPaths queue =
+      case Seq.viewl queue of
+        Seq.EmptyL -> Right semanticPaths
+        (packagePath, semanticPath) Seq.:< rest ->
+          case Map.lookup packagePath semanticPaths of
+            Just currentPath
+              | currentPath == semanticPath ->
+                  case Map.lookup packagePath packages of
+                    Nothing ->
+                      Left
+                        ( CompileError
+                            ("package import root disappeared while assigning semantic paths: " <> packagePath)
+                            Nothing
+                            Nothing
+                        )
+                    Just packageRoot ->
+                      let (semanticPaths', queue') =
+                            foldl' (registerDependency semanticPath) (semanticPaths, rest) (Map.toList packageRoot.pirDependencies)
+                      in go semanticPaths' queue'
+            _ -> go semanticPaths rest
+
+    registerDependency parentPath (semanticPaths, queue) (dependencyName, dependencyPath) =
+      let candidate = parentPath <> [dependencyName]
+      in case Map.lookup dependencyPath semanticPaths of
+          Just existing
+            | semanticPathOrder existing <= semanticPathOrder candidate ->
+                (semanticPaths, queue)
+          _ ->
+            ( Map.insert dependencyPath candidate semanticPaths
+            , queue Seq.|> (dependencyPath, candidate)
+            )
+
+    semanticPathOrder path = (length path, path)
+
+packageModuleBase :: PackageImportRoot -> FilePath
+packageModuleBase packageRoot =
+  case packageRoot.pirKind of
+    PackageDirectory -> packageRoot.pirPath
+    PackageModule -> dropExtension packageRoot.pirPath
+
+modulePathFromPackage :: FileImportRoots -> FilePath -> FilePath -> Either CompileError [Text]
+modulePathFromPackage importRoots packagePath filePath = do
+  packageRoot <- lookupPackageImportRoot importRoots packagePath
+  semanticPath <-
+    case Map.lookup packagePath importRoots.firSemanticPaths of
+      Just path -> Right path
+      Nothing ->
+        Left
+          ( CompileError
+              ("package semantic path is not registered: " <> packagePath)
+              Nothing
+              Nothing
+          )
+  let base = packageModuleBase packageRoot
+      relativeModule =
+        case packageRoot.pirKind of
+          PackageModule | normalise filePath == normalise packageRoot.pirPath -> []
+          _ -> modulePathFromFile base filePath
+      packagePrefix =
+        if packagePath == importRoots.firCurrent
+          then [currentPackagePathMarker, packageModulePathMarker]
+          else dependencyPackagePathMarker : semanticPath <> [packageModulePathMarker]
+  pure (packagePrefix <> relativeModule)
+
+importStart :: FileImportRoots -> FilePath -> PackageImportRoot -> FilePath -> ImportDecl -> [Text] -> Either CompileError (FilePath, PackageImportRoot, FilePath, [Text])
+importStart importRoots currentPackage currentRoot moduleFile decl segs =
+  case decl.idRelative of
+    Nothing ->
+      case segs of
+        packageName : rest ->
+          case Map.lookup packageName currentRoot.pirDependencies of
+            Nothing -> Right (currentPackage, currentRoot, packageModuleBase currentRoot, segs)
+            Just dependencyPath -> do
+              dependencyRoot <- lookupPackageImportRoot importRoots dependencyPath
+              Right (dependencyPath, dependencyRoot, packageModuleBase dependencyRoot, rest)
+        [] -> Right (currentPackage, currentRoot, packageModuleBase currentRoot, [])
+    Just ImportPackage ->
+      Right (currentPackage, currentRoot, packageModuleBase currentRoot, segs)
+    Just (ImportSuper depth) -> do
+      baseDir <- importBaseDir currentRoot moduleFile depth
+      Right (currentPackage, currentRoot, baseDir, segs)
+
+importBaseDir :: PackageImportRoot -> FilePath -> Int -> Either CompileError FilePath
+importBaseDir packageRoot moduleFile depth =
+  case superModuleFile (normalise moduleFile) depth of
+    Nothing -> Left (CompileError "invalid super import depth" Nothing Nothing)
+    Just path -> ensureInPackage packageRoot path
+
+ensureInPackage :: PackageImportRoot -> FilePath -> Either CompileError FilePath
+ensureInPackage packageRoot path =
+  let normalized = normalise path
+  in if packageContains packageRoot normalized
+      then Right normalized
+      else
+        Left
+          ( CompileError
+              ("import path escapes package root: " <> normalized <> " is outside " <> packageRoot.pirPath)
+              Nothing
+              Nothing
+          )
+
+ensureSelectedInPackage :: PackageImportRoot -> FilePath -> FilePath -> Either CompileError ()
+ensureSelectedInPackage packageRoot selected canonical =
+  unless (packageContains packageRoot canonical) $
+    Left
+      ( CompileError
+          ( "import path escapes package root: " <> selected
+              <> " resolves to " <> canonical
+              <> ", outside " <> packageRoot.pirPath
+          )
+          Nothing
+          Nothing
+      )
+
+packageContains :: PackageImportRoot -> FilePath -> Bool
+packageContains packageRoot path =
+  case packageRoot.pirKind of
+    PackageDirectory -> pathWithin packageRoot.pirPath path
+    PackageModule ->
+      normalise path == normalise packageRoot.pirPath
+        || pathWithin (dropExtension packageRoot.pirPath) path
+
+pathWithin :: FilePath -> FilePath -> Bool
+pathWithin rootDir path =
+  let relative = makeRelative (normalise rootDir) (normalise path)
+  in isRelative relative && not (any (== "..") (splitDirectories relative))
+
+superModuleFile :: FilePath -> Int -> Maybe FilePath
 superModuleFile filePath n =
-  iterate takeDirectory filePath !! n
+  if n < 0
+    then Nothing
+    else Just (ascend n filePath)
+  where
+    ascend 0 path = path
+    ascend count path = ascend (count - 1) (takeDirectory path)
 
-linkModules :: CompileOptions -> FilePath -> FilePath -> [ModuleNode] -> Either CompileError ModuleAst
-linkModules opts rootFile rootDir nodes = do
-  rootNode <- case listToMaybe [n | n <- nodes, n.mnFile == rootFile] of
+linkModules :: CompileOptions -> ModuleIdentity -> FilePath -> [ModuleNode] -> Either CompileError ModuleAst
+linkModules opts rootIdentity rootDir nodes = do
+  rootNode <- case listToMaybe [n | n <- nodes, moduleIdentity n == rootIdentity] of
     Just n -> Right n
     Nothing -> Left (CompileError "root module not found during import resolution" Nothing Nothing)
   let rootPath = rootNode.mnPath
-  let otherEntries = [n | n <- nodes, n.mnFile /= rootFile, not (null n.mnAst.modEntries)]
+  let otherEntries =
+        [ n
+        | n <- nodes
+        , moduleIdentity n /= rootIdentity
+        , not (null n.mnAst.modEntries)
+        ]
   unless (null otherEntries) $
     Left (CompileError "entry points are only supported in the root module" Nothing Nothing)
   let constIndex = buildConstIndex nodes
@@ -387,11 +822,31 @@ linkModules opts rootFile rootDir nodes = do
   let structIndex = buildStructIndex nodes
   let overrideIndex = buildOverrideIndex nodes
   validateModuleScopes opts True rootPath rootDir constIndex fnIndex structIndex overrideIndex nodes
-  let contexts = Map.fromList [(n.mnFile, buildModuleContext rootPath rootDir n) | n <- nodes]
+  let contexts =
+        Map.fromList
+          [(moduleIdentity n, buildModuleContext rootPath rootDir n) | n <- nodes]
   let qualified = map (qualifyModule rootPath contexts) nodes
   let merged = foldr mergeModule emptyModuleAst qualified
-  let rootEntries = concat [q.mnAst.modEntries | q <- qualified, q.mnFile == rootFile]
-  Right merged { modEntries = rootEntries }
+  let rootEntries =
+        concat
+          [ q.mnAst.modEntries
+          | q <- qualified
+          , moduleIdentity q == rootIdentity
+          ]
+  -- Keep the root feature in the merged directive set; imported bindings carry
+  -- their module-local uniform layout decision on BindingDecl.
+  let enabledDirectives =
+        [ dir
+        | q <- qualified
+        , dir@(DirEnable feature) <- q.mnAst.modDirectives
+        , feature /= "uniform_buffer_standard_layout" || moduleIdentity q == rootIdentity
+        ]
+  let rootDiagnostics = [dir | dir@(DirDiagnostic _ _) <- rootNode.mnAst.modDirectives]
+  Right
+    merged
+      { modDirectives = enabledDirectives <> rootDiagnostics
+      , modEntries = rootEntries
+      }
 
 mergeModule :: ModuleNode -> ModuleAst -> ModuleAst
 mergeModule node acc =
@@ -579,17 +1034,18 @@ lookupFunctionIndex idx path name = do
   IntMap.lookup pid idx.fiEntries >>= IntMap.lookup nid
 
 lowerOverridesWith :: [Text] -> [(Text, OverrideValue)] -> ModuleAst -> Either CompileError ModuleAst
-lowerOverridesWith rootPath overridesMap ast =
-  case ast.modOverrides of
+lowerOverridesWith rootPath overrideValues ast = do
+  let overrides = ast.modOverrides
+  overrideLookup <- resolveOverrideValues rootPath overrides overrideValues
+  case overrides of
     [] -> Right ast
-    overrides -> do
+    _ -> do
       let existing = Set.fromList (map (.cdName) ast.modConsts)
       let (dups, _) = foldl' collect ([], Set.empty) (map (.odName) overrides)
       unless (null dups) $
         Left (CompileError ("duplicate override declarations: " <> T.unpack (T.intercalate ", " dups)) Nothing Nothing)
       when (any ((`Set.member` existing) . (.odName)) overrides) $
         Left (CompileError "override names must not conflict with const declarations" Nothing Nothing)
-      let overrideLookup = buildOverrideValueMap rootPath overridesMap
       let structEnv = [(s.sdName, s) | s <- ast.modStructs]
       (consts, kept) <- foldM (partitionOverride structEnv overrideLookup) ([], []) overrides
       Right ast { modConsts = ast.modConsts <> reverse consts, modOverrides = reverse kept }
@@ -608,27 +1064,96 @@ lowerOverridesWith rootPath overridesMap ast =
           Right (ConstDecl o.odName (Just ty) expr : constAcc, keepAcc)
         Nothing -> Right (constAcc, o : keepAcc)
 
-buildOverrideValueMap :: [Text] -> [(Text, OverrideValue)] -> Map.Map Text OverrideValue
-buildOverrideValueMap rootPath overrides =
-  Map.fromList
-    [ (candidate, val)
-    | (key, val) <- overrides
-    , candidate <- overrideKeyCandidates rootPath key
-    ]
+resolveOverrideValues :: [Text] -> [OverrideDecl] -> [(Text, OverrideValue)] -> Either CompileError (Map.Map Text OverrideValue)
+resolveOverrideValues rootPath overrides overrideValues = do
+  let rawKeys = map fst overrideValues
+  ensureNoDuplicates "override option keys" rawKeys
+  let matches =
+        [ (rawKey, value, matchingOverrides rawKey)
+        | (rawKey, value) <- overrideValues
+        ]
+  let unknown = [rawKey | (rawKey, _, []) <- matches]
+  unless (null unknown) $
+    Left
+      ( CompileError
+          ("unknown override option keys: " <> T.unpack (T.intercalate ", " unknown))
+          Nothing
+          Nothing
+      )
+  case [(rawKey, candidates) | (rawKey, _, candidates@(_ : _ : _)) <- matches] of
+    [] -> pure ()
+    (rawKey, candidates) : _ ->
+      Left
+        ( CompileError
+            ( "ambiguous override option key " <> T.unpack rawKey
+                <> " matches " <> T.unpack (T.intercalate ", " (map publicQualifiedName candidates))
+            )
+            Nothing
+            Nothing
+        )
+  let resolved = [(candidate, value) | (_, value, [candidate]) <- matches]
+  ensureNoDuplicates "override option targets" (map fst resolved)
+  Right (Map.fromList resolved)
+  where
+    matchingOverrides rawKey =
+      case
+        [ override.odName
+        | override <- overrides
+        , publicQualifiedName override.odName == rawKey
+        ] of
+        [] ->
+          let declared = Set.fromList (map (.odName) overrides)
+          in filter (`Set.member` declared) (overrideKeyCandidates rootPath rawKey)
+        exactMatches -> exactMatches
 
 overrideKeyCandidates :: [Text] -> Text -> [Text]
 overrideKeyCandidates rootPath key
-  | "__wesl__" `T.isPrefixOf` key = [key]
+  | qualifiedNamePrefix `T.isPrefixOf` key = []
   | otherwise =
       case splitQName key of
         [] -> []
         [single] -> [single]
         segs ->
-          let path = init segs
-              name = last segs
-          in if path == rootPath || null rootPath
-                then [name]
-                else ["__wesl__" <> T.intercalate "__" path <> "__" <> name]
+          case splitLast segs of
+            Nothing -> []
+            Just (path, name) ->
+              nub
+                (case path of
+                  "package" : currentPackagePath ->
+                    [currentPackageOverrideCandidate currentPackagePath name]
+                  _ ->
+                    case canonicalDependencyOverrideCandidate path name of
+                      Just candidate -> [candidate]
+                      Nothing
+                        | path == rootPath -> [name]
+                        | otherwise ->
+                            qualifyOverridePath path name : dependencyOverrideCandidates path name
+                )
+  where
+    qualifyOverridePath path name
+      | null path || path == rootPath = name
+      | otherwise = encodeQualifiedName (path <> [name])
+
+    currentPackageOverrideCandidate path name =
+      encodeQualifiedName
+        (currentPackagePathMarker : packageModulePathMarker : path <> [name])
+
+    canonicalDependencyOverrideCandidate path name =
+      case break (== publicPackageBoundary) path of
+        ([], _ : _) -> Nothing
+        (packagePath, _ : modulePath) ->
+          Just
+            ( encodeQualifiedName
+                (dependencyPackagePathMarker : packagePath <> [packageModulePathMarker] <> modulePath <> [name])
+            )
+        _ -> Nothing
+
+    dependencyOverrideCandidates path name =
+      [ encodeQualifiedName
+          (dependencyPackagePathMarker : packagePath <> [packageModulePathMarker] <> modulePath <> [name])
+      | packageLength <- [1 .. length path]
+      , let (packagePath, modulePath) = splitAt packageLength path
+      ]
 
 overrideValueToExpr :: [(Text, StructDecl)] -> Type -> OverrideValue -> Either CompileError Expr
 overrideValueToExpr structEnv ty ov =
@@ -647,13 +1172,13 @@ overrideValueToExpr structEnv ty ov =
         _ -> Left (CompileError "override value must be a u32" Nothing Nothing)
     TyScalar F32 ->
       case ov of
-        OVF32 v -> Right (EFloat syntheticPos v)
-        OVF16 v -> Right (ECall syntheticPos "f32" [EFloat syntheticPos v])
+        OVF32 v -> Right (EFloat syntheticPos (realToFrac v))
+        OVF16 v -> Right (ECall syntheticPos "f32" [EFloat syntheticPos (realToFrac v)])
         _ -> Left (CompileError "override value must be an f32" Nothing Nothing)
     TyScalar F16 ->
       case ov of
-        OVF16 v -> Right (ECall syntheticPos "f16" [EFloat syntheticPos v])
-        OVF32 v -> Right (ECall syntheticPos "f16" [EFloat syntheticPos v])
+        OVF16 v -> Right (ECall syntheticPos "f16" [EFloat syntheticPos (realToFrac v)])
+        OVF32 v -> Right (ECall syntheticPos "f16" [EFloat syntheticPos (realToFrac v)])
         _ -> Left (CompileError "override value must be an f16" Nothing Nothing)
     TyVector n scalar ->
       case ov of
@@ -714,17 +1239,20 @@ resolveTypeAliases ast = do
   constAsserts <- mapM (expandConstAssert expand) ast.modConstAsserts
   functions <- mapM (expandFunction expand) ast.modFunctions
   entries <- mapM (expandEntry expand) ast.modEntries
-  Right ast
-    { modAliases = aliases
-    , modStructs = structs
-    , modBindings = bindings
-    , modGlobals = globals
-    , modConsts = consts
-    , modOverrides = overrides
-    , modConstAsserts = constAsserts
-    , modFunctions = functions
-    , modEntries = entries
-    }
+  let resolved =
+        ast
+          { modAliases = aliases
+          , modStructs = structs
+          , modBindings = bindings
+          , modGlobals = globals
+          , modConsts = consts
+          , modOverrides = overrides
+          , modConstAsserts = constAsserts
+          , modFunctions = functions
+          , modEntries = entries
+          }
+  validateFunctionOverloads resolved.modFunctions
+  Right resolved
   where
     collect (acc, seen) name =
       if Set.member name seen
@@ -742,6 +1270,7 @@ resolveTypeAliases ast = do
                     then Left (CompileError ("type alias cycle involving: " <> T.unpack name) Nothing Nothing)
                     else go (Set.insert name stack) aliasTy
             TyArray elemTy n -> TyArray <$> go stack elemTy <*> pure n
+            TyPtr addr access elemTy -> TyPtr addr access <$> go stack elemTy
             _ -> Right ty
 
     expandStruct expand decl = do
@@ -829,7 +1358,7 @@ resolveTypeAliases ast = do
 
 inferOverrideTypes :: [Text] -> FilePath -> ModuleAst -> Either CompileError ModuleAst
 inferOverrideTypes rootPath rootDir ast = do
-  let node = ModuleNode "<inline>" rootPath ast []
+  let node = ModuleNode rootDir "<inline>" rootPath ast []
   let ctx = buildModuleContext rootPath rootDir node
   let constIndex = buildConstIndex [node]
   let fnIndex = buildFunctionIndex [node]
@@ -844,15 +1373,21 @@ inferOverrideTypes rootPath rootDir ast = do
           case o.odExpr of
             Nothing -> Left (CompileError "override declarations require a type or initializer" Nothing Nothing)
             Just expr -> do
-              val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex Map.empty Set.empty Set.empty expr
+              val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex emptyConstEnv Set.empty Set.empty expr
               let ty = constValueType val
               Right o { odType = Just ty }
 
 resolveConstExprs :: [Text] -> FilePath -> ModuleAst -> Either CompileError ModuleAst
 resolveConstExprs rootPath rootDir ast = do
-  let node = ModuleNode "<inline>" rootPath ast []
+  let node = ModuleNode rootDir "<inline>" rootPath ast []
   let ctx = buildModuleContext rootPath rootDir node
   let constIndex = buildConstIndex [node]
+  let fixedConstNode = node { mnAst = ast { modOverrides = [] } }
+  let fixedConstIndex = buildConstIndex [fixedConstNode]
+  let defaultConstNode = node
+  let defaultConstIndex = buildConstIndex [defaultConstNode]
+  let placeholderConstNode = node { mnAst = ast { modOverrides = map addMissingOverridePlaceholder ast.modOverrides } }
+  let placeholderConstIndex = buildConstIndex [placeholderConstNode]
   let fnIndex = buildFunctionIndex [node]
   let structIndex = buildStructIndex [node]
   aliases <- mapM (resolveAlias ctx constIndex fnIndex structIndex) ast.modAliases
@@ -863,7 +1398,7 @@ resolveConstExprs rootPath rootDir ast = do
   overrides <- mapM (resolveOverride ctx constIndex fnIndex structIndex) ast.modOverrides
   constAsserts <- mapM (resolveConstAssertExpr ctx constIndex fnIndex structIndex) ast.modConstAsserts
   functions <- mapM (resolveFunction ctx constIndex fnIndex structIndex) ast.modFunctions
-  entries <- mapM (resolveEntry ctx constIndex fnIndex structIndex) ast.modEntries
+  entries <- mapM (resolveEntry ctx constIndex fixedConstIndex defaultConstIndex placeholderConstIndex fnIndex structIndex) ast.modEntries
   Right ast
     { modAliases = aliases
     , modStructs = structs
@@ -946,12 +1481,12 @@ resolveConstExprs rootPath rootDir ast = do
       body <- mapM (resolveStmt ctx constIndex fnIndex structIndex) fn.fnBody
       Right fn { fnParams = params, fnReturnType = retTy, fnBody = body }
 
-    resolveEntry ctx constIndex fnIndex structIndex entry = do
+    resolveEntry ctx constIndex fixedConstIndex defaultConstIndex placeholderConstIndex fnIndex structIndex entry = do
       params <- mapM (resolveParam ctx constIndex fnIndex structIndex) entry.epParams
       retTy <- mapM (resolveType ctx constIndex fnIndex structIndex) entry.epReturnType
       retAttrs <- resolveAttrs ctx constIndex fnIndex structIndex entry.epReturnAttrs
       validateLocationBuiltinAttrs retAttrs
-      wg <- resolveWorkgroup ctx constIndex fnIndex structIndex entry.epStage entry.epWorkgroupSize
+      wg <- resolveWorkgroup ctx fixedConstIndex defaultConstIndex placeholderConstIndex fnIndex structIndex entry.epStage entry.epWorkgroupSize
       body <- mapM (resolveStmt ctx constIndex fnIndex structIndex) entry.epBody
       Right
         entry
@@ -1097,29 +1632,30 @@ resolveConstExprs rootPath rootDir ast = do
           ConstInt _ v <- evalConstIntExpr ctx constIndex fnIndex structIndex (constExprToExpr expr)
           Right (AttrInt v)
 
-    resolveWorkgroup ctx constIndex fnIndex structIndex stage wg =
+    resolveWorkgroup ctx fixedConstIndex defaultConstIndex placeholderConstIndex fnIndex structIndex stage wg =
       case (stage, wg) of
         (StageCompute, Nothing) ->
           Left (CompileError "@workgroup_size is required for @compute" Nothing Nothing)
         (StageCompute, Just (WorkgroupSizeExpr exprs)) -> do
-          when (any (containsOverrideInWorkgroupExpr ctx) exprs) $
-            Left (CompileError "@workgroup_size does not support runtime specialization via overrides" Nothing Nothing)
           when (null exprs || length exprs > 3) $
             Left (CompileError "@workgroup_size expects 1, 2, or 3 values" Nothing Nothing)
-          vals <- mapM (evalConstIntExpr ctx constIndex fnIndex structIndex . constExprToExpr) exprs
-          let ints = map (\(ConstInt _ v) -> v) vals
-          when (any (<= 0) ints) $
-            Left (CompileError "@workgroup_size values must be positive" Nothing Nothing)
-          when (any (> fromIntegral (maxBound :: Word32)) ints) $
-            Left (CompileError "@workgroup_size value is too large" Nothing Nothing)
-          let xs = map fromIntegral ints
-          let (x, y, z) =
-                case xs of
-                  [a] -> (a, 1, 1)
-                  [a, b] -> (a, b, 1)
-                  [a, b, c] -> (a, b, c)
-                  _ -> (1, 1, 1)
-          Right (Just (WorkgroupSizeValue (x, y, z)))
+          _ <-
+            evaluateWorkgroupSizeDefault
+              ctx
+              defaultConstIndex
+              placeholderConstIndex
+              fnIndex
+              structIndex
+              missingOverrideNames
+              exprs
+          let fixedResults =
+                [ evalConstIntExpr ctx fixedConstIndex fnIndex structIndex (constExprToExpr expr)
+                | expr <- exprs
+                ]
+          case sequence fixedResults of
+            Right fixedValues ->
+              Just . WorkgroupSizeValue <$> workgroupDimensions fixedValues
+            Left _ -> Right (Just (WorkgroupSizeExpr exprs))
         (StageCompute, Just (WorkgroupSizeValue _)) -> Right wg
         (StageVertex, Nothing) -> Right Nothing
         (StageFragment, Nothing) -> Right Nothing
@@ -1127,13 +1663,184 @@ resolveConstExprs rootPath rootDir ast = do
           Left (CompileError "@workgroup_size is not allowed for @vertex" Nothing Nothing)
         (StageFragment, Just _) ->
           Left (CompileError "@workgroup_size is not allowed for @fragment" Nothing Nothing)
-    containsOverrideInWorkgroupExpr ctx expr =
+
+    missingOverrideNames =
+      Set.fromList
+        [ decl.odName
+        | decl <- ast.modOverrides
+        , case decl.odExpr of
+            Nothing -> True
+            Just _ -> False
+        ]
+
+workgroupSizeDefault :: ModuleAst -> WorkgroupSize -> Either CompileError (Maybe (Word32, Word32, Word32))
+workgroupSizeDefault ast workgroupSize =
+  case workgroupSize of
+    WorkgroupSizeValue dimensions -> Right (Just dimensions)
+    WorkgroupSizeExpr exprs -> do
+      when (null exprs || length exprs > 3) $
+        Left (CompileError "@workgroup_size expects 1, 2, or 3 values" Nothing Nothing)
+      let node = ModuleNode "" "<workgroup-size>" [] ast []
+          ctx = buildModuleContext [] "" node
+          constIndex = buildConstIndex [node]
+          placeholderNode = node { mnAst = ast { modOverrides = map addMissingOverridePlaceholder ast.modOverrides } }
+          placeholderConstIndex = buildConstIndex [placeholderNode]
+          fnIndex = buildFunctionIndex [node]
+          structIndex = buildStructIndex [node]
+      evaluateWorkgroupSizeDefault
+        ctx
+        constIndex
+        placeholderConstIndex
+        fnIndex
+        structIndex
+        missingOverrideNames
+        exprs
+      where
+        missingOverrideNames =
+          Set.fromList
+            [ decl.odName
+            | decl <- ast.modOverrides
+            , case decl.odExpr of
+                Nothing -> True
+                Just _ -> False
+            ]
+
+evaluateWorkgroupSize :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> [ConstExpr] -> Either CompileError (Word32, Word32, Word32)
+evaluateWorkgroupSize ctx constIndex fnIndex structIndex exprs = do
+  values <- evaluateWorkgroupSizeValues ctx constIndex fnIndex structIndex exprs
+  scalar <- inferWorkgroupDimensionScalar ctx constIndex fnIndex structIndex exprs
+  values' <- mapM (materializeWorkgroupDimension scalar) values
+  workgroupDimensions values'
+
+data WorkgroupDimensionDefault
+  = WorkgroupDimensionKnown !ConstInt
+  | WorkgroupDimensionMissing !(Maybe ConstInt)
+
+evaluateWorkgroupSizeDefault :: ModuleContext -> ConstIndex -> ConstIndex -> FunctionIndex -> StructIndex -> Set.Set Text -> [ConstExpr] -> Either CompileError (Maybe (Word32, Word32, Word32))
+evaluateWorkgroupSizeDefault ctx defaultConstIndex placeholderConstIndex fnIndex structIndex missingOverrideNames exprs = do
+  dimensions <- mapM evaluateDimension exprs
+  scalar <- inferWorkgroupDimensionScalar ctx placeholderConstIndex fnIndex structIndex exprs
+  dimensions' <- mapM (materializeDimension scalar) dimensions
+  let values = mapMaybe dimensionValue dimensions'
+  validateWorkgroupDimensionTypes values
+  case traverse knownDimension dimensions' of
+    Just knownValues -> Just <$> workgroupDimensions knownValues
+    Nothing -> do
+      mapM_ validateWorkgroupDimension [value | WorkgroupDimensionKnown value <- dimensions']
+      Right Nothing
+  where
+    evaluateDimension expr =
+      case evaluateWorkgroupSizeValue ctx defaultConstIndex fnIndex structIndex expr of
+        Right value -> Right (WorkgroupDimensionKnown value)
+        Left err
+          | isMissingOverrideError err ->
+              Right
+                ( WorkgroupDimensionMissing
+                    ( either
+                        (const Nothing)
+                        Just
+                        (evaluateWorkgroupSizeValue ctx placeholderConstIndex fnIndex structIndex expr)
+                    )
+                )
+          | otherwise -> Left err
+
+    dimensionValue dimension =
+      case dimension of
+        WorkgroupDimensionKnown value -> Just value
+        WorkgroupDimensionMissing value -> value
+
+    knownDimension dimension =
+      case dimension of
+        WorkgroupDimensionKnown value -> Just value
+        WorkgroupDimensionMissing _ -> Nothing
+
+    materializeDimension scalar dimension =
+      case dimension of
+        WorkgroupDimensionKnown value -> WorkgroupDimensionKnown <$> materializeWorkgroupDimension scalar value
+        WorkgroupDimensionMissing value ->
+          WorkgroupDimensionMissing <$> mapM (materializeWorkgroupDimension scalar) value
+
+    isMissingOverrideError err =
+      any
+        (\name -> err.ceMessage == "unknown constant: " <> textToString name)
+        (Set.toList missingOverrideNames)
+
+inferWorkgroupDimensionScalar :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> [ConstExpr] -> Either CompileError (Maybe Scalar)
+inferWorkgroupDimensionScalar ctx constIndex fnIndex structIndex exprs =
+  case Set.toList (Set.fromList (concatMap scalarHints exprs)) of
+    [] -> Right Nothing
+    [scalar] -> Right (Just scalar)
+    _ -> Left (CompileError "@workgroup_size values must all have the same i32 or u32 type" Nothing Nothing)
+  where
+    scalarHints expr =
       case expr of
-        CEInt _ -> False
-        CEIdent name -> Set.member name ctx.mcOverrideNames
-        CEUnaryNeg inner -> containsOverrideInWorkgroupExpr ctx inner
-        CEBinary _ lhs rhs -> containsOverrideInWorkgroupExpr ctx lhs || containsOverrideInWorkgroupExpr ctx rhs
-        CECall _ args -> any (containsOverrideInWorkgroupExpr ctx) args
+        CEInt _ -> []
+        CEIdent _ ->
+          case evaluateWorkgroupSizeValue ctx constIndex fnIndex structIndex expr of
+            Right (ConstInt scalar _) -> [scalar]
+            Left _ -> []
+        CEUnaryNeg inner -> scalarHints inner
+        CEBinary _ lhs rhs -> scalarHints lhs <> scalarHints rhs
+        CECall name args
+          | name == "i32" -> [I32]
+          | name == "u32" -> [U32]
+          | otherwise -> concatMap scalarHints args
+
+materializeWorkgroupDimension :: Maybe Scalar -> ConstInt -> Either CompileError ConstInt
+materializeWorkgroupDimension scalar value =
+  case scalar of
+    Nothing -> Right value
+    Just target -> coerceConstIntToScalar target value
+
+evaluateWorkgroupSizeValues :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> [ConstExpr] -> Either CompileError [ConstInt]
+evaluateWorkgroupSizeValues ctx constIndex fnIndex structIndex =
+  mapM (evaluateWorkgroupSizeValue ctx constIndex fnIndex structIndex)
+
+evaluateWorkgroupSizeValue :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstExpr -> Either CompileError ConstInt
+evaluateWorkgroupSizeValue ctx constIndex fnIndex structIndex =
+  evalConstIntExpr ctx constIndex fnIndex structIndex . constExprToExpr
+
+validateWorkgroupDimensionTypes :: [ConstInt] -> Either CompileError ()
+validateWorkgroupDimensionTypes values =
+  case [scalar | ConstInt scalar _ <- values] of
+    [] -> Right ()
+    firstScalar : remainingScalars ->
+      when (any (/= firstScalar) remainingScalars) $
+        Left (CompileError "@workgroup_size values must all have the same i32 or u32 type" Nothing Nothing)
+
+workgroupDimensions :: [ConstInt] -> Either CompileError (Word32, Word32, Word32)
+workgroupDimensions values = do
+  validateWorkgroupDimensionTypes values
+  mapM_ validateWorkgroupDimension values
+  let integers = [value | ConstInt _ value <- values]
+  case map fromIntegral integers of
+    [x] -> Right (x, 1, 1)
+    [x, y] -> Right (x, y, 1)
+    [x, y, z] -> Right (x, y, z)
+    _ -> Left (CompileError "@workgroup_size expects 1, 2, or 3 values" Nothing Nothing)
+
+validateWorkgroupDimension :: ConstInt -> Either CompileError ()
+validateWorkgroupDimension (ConstInt _ value) = do
+  when (value <= 0) $
+    Left (CompileError "@workgroup_size values must be positive" Nothing Nothing)
+  when (value > fromIntegral (maxBound :: Word32)) $
+    Left (CompileError "@workgroup_size value is too large" Nothing Nothing)
+
+addMissingOverridePlaceholder :: OverrideDecl -> OverrideDecl
+addMissingOverridePlaceholder decl =
+  case (decl.odType, decl.odExpr) of
+    (Just ty, Nothing) -> decl { odExpr = missingOverridePlaceholder ty }
+    _ -> decl
+
+missingOverridePlaceholder :: Type -> Maybe Expr
+missingOverridePlaceholder ty =
+  case ty of
+    TyScalar Bool -> Just (EBool syntheticPos False)
+    TyScalar I32 -> Just (EInt syntheticPos 1)
+    TyScalar U32 -> Just (ECall syntheticPos "u32" [EInt syntheticPos 1])
+    TyScalar F32 -> Just (EFloat syntheticPos 1)
+    TyScalar F16 -> Just (ECall syntheticPos "f16" [EFloat syntheticPos 1])
+    _ -> Nothing
 
 constExprToExpr :: ConstExpr -> Expr
 constExprToExpr expr =
@@ -1164,10 +1871,10 @@ buildAliasMaps = foldl' add (Map.empty, Map.empty)
     add (modAcc, itemAcc) imp =
       case imp.irItem of
         Nothing ->
-          let alias = fromMaybe (last imp.irModulePath) imp.irAlias
-          in if T.null alias
-              then (modAcc, itemAcc)
-              else (Map.insert alias imp.irModulePath modAcc, itemAcc)
+          case defaultModuleAlias imp of
+            Just alias | not (T.null alias) ->
+              (Map.insert alias imp.irModulePath modAcc, itemAcc)
+            _ -> (modAcc, itemAcc)
         Just item ->
           let alias = fromMaybe item imp.irAlias
               target = imp.irModulePath <> [item]
@@ -1185,6 +1892,9 @@ data Scope = Scope
   , scEnabledFeatures :: Set.Set Text
   , scAllowShadowing :: Bool
   , scAllowFallthrough :: Bool
+  , scAllowBreak :: Bool
+  , scAllowContinue :: Bool
+  , scAllowBreakIf :: Bool
   }
 
 validateDirectives :: CompileOptions -> [Directive] -> Either CompileError DiagnosticConfig
@@ -1215,6 +1925,8 @@ validateModuleScopes opts skipConstAsserts rootPath rootDir constIndex fnIndex s
 validateModuleScope :: CompileOptions -> Bool -> [Text] -> FilePath -> ConstIndex -> FunctionIndex -> StructIndex -> OverrideIndex -> ModuleNode -> Either CompileError ()
 validateModuleScope opts skipConstAsserts rootPath rootDir constIndex fnIndex structIndex overrideIndex node = do
   let ctx = buildModuleContext rootPath rootDir node
+  validateModuleDeclarations node.mnAst
+  validateImportDeclarationConflicts ctx node.mnAst
   diagConfig <- validateDirectives opts node.mnAst.modDirectives
   let allowShadowing = diagnosticSeverity diagConfig "shadowing" /= DiagError
   let (nt1, globalsIds) = internNameSet emptyNameTable (Set.toList ctx.mcLocals)
@@ -1233,6 +1945,9 @@ validateModuleScope opts skipConstAsserts rootPath rootDir constIndex fnIndex st
           , scEnabledFeatures = enabledFeatures
           , scAllowShadowing = allowShadowing
           , scAllowFallthrough = False
+          , scAllowBreak = False
+          , scAllowContinue = False
+          , scAllowBreakIf = False
           }
   validateModuleAst ctx constIndex fnIndex structIndex overrideIndex scope0 diagConfig skipConstAsserts node.mnAst
 
@@ -1250,10 +1965,11 @@ validateModuleAst ctx constIndex fnIndex structIndex overrideIndex scope diagCon
     mapM_ (validateConstAssert ctx constIndex fnIndex structIndex diagConfig) ast.modConstAsserts
   mapM_ (validateFunction ctx constIndex fnIndex structIndex skipConstAsserts scope) ast.modFunctions
   mapM_ (validateEntryPoint ctx constIndex fnIndex structIndex skipConstAsserts scope) ast.modEntries
+  validateTriggeredErrorDiagnostics ctx constIndex fnIndex structIndex diagConfig ast
 
 validateConstAssertsMerged :: CompileOptions -> [Text] -> ModuleAst -> Either CompileError ()
 validateConstAssertsMerged opts rootPath ast = do
-  let node = ModuleNode "<merged>" rootPath ast []
+  let node = ModuleNode "" "<merged>" rootPath ast []
   let constIndex = buildConstIndex [node]
   let fnIndex = buildFunctionIndex [node]
   let structIndex = buildStructIndex [node]
@@ -1264,7 +1980,7 @@ validateConstAssertsMerged opts rootPath ast = do
 
 collectDiagnosticsMerged :: CompileOptions -> [Text] -> ModuleAst -> Either CompileError [Diagnostic]
 collectDiagnosticsMerged opts rootPath ast = do
-  let node = ModuleNode "<merged>" rootPath ast []
+  let node = ModuleNode "" "<merged>" rootPath ast []
   let constIndex = buildConstIndex [node]
   let fnIndex = buildFunctionIndex [node]
   let structIndex = buildStructIndex [node]
@@ -1278,16 +1994,41 @@ collectDiagnosticsMerged opts rootPath ast = do
   let shadowingDiags = collectShadowingDiagnostics diagConfig ast
   let constantCondDiags = collectConstantConditionDiagnostics diagConfig ctx constIndex fnIndex structIndex ast
   let duplicateCaseDiags = collectDuplicateCaseDiagnostics diagConfig ctx constIndex fnIndex structIndex ast
-  Right
-    ( constDiags
-        <> unreachableDiags
-        <> unusedExprDiags
-        <> unusedVarDiags
-        <> unusedParamDiags
-        <> shadowingDiags
-        <> constantCondDiags
-        <> duplicateCaseDiags
+  let diagnostics =
+        constDiags
+          <> unreachableDiags
+          <> unusedExprDiags
+          <> unusedVarDiags
+          <> unusedParamDiags
+          <> shadowingDiags
+          <> constantCondDiags
+          <> duplicateCaseDiags
+  rejectErrorDiagnostics diagnostics
+  Right diagnostics
+
+validateTriggeredErrorDiagnostics :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> DiagnosticConfig -> ModuleAst -> Either CompileError ()
+validateTriggeredErrorDiagnostics ctx constIndex fnIndex structIndex diagConfig ast =
+  rejectErrorDiagnostics
+    ( collectUnreachableDiagnostics diagConfig ast
+        <> collectUnusedExpressionDiagnostics diagConfig ast
+        <> collectUnusedVariableDiagnostics diagConfig ast
+        <> collectUnusedParameterDiagnostics diagConfig ast
+        <> collectShadowingDiagnostics diagConfig ast
+        <> collectConstantConditionDiagnostics diagConfig ctx constIndex fnIndex structIndex ast
+        <> collectDuplicateCaseDiagnostics diagConfig ctx constIndex fnIndex structIndex ast
     )
+
+rejectErrorDiagnostics :: [Diagnostic] -> Either CompileError ()
+rejectErrorDiagnostics diagnostics =
+  case listToMaybe [diag | diag <- diagnostics, diag.diagSeverity == DiagError] of
+    Nothing -> Right ()
+    Just diag ->
+      Left
+        ( CompileError
+            (diag.diagRule <> ": " <> diag.diagMessage)
+            diag.diagLine
+            diag.diagColumn
+        )
 
 collectConstAssertDiagnostic :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> DiagnosticConfig -> ConstAssert -> Either CompileError [Diagnostic]
 collectConstAssertDiagnostic ctx constIndex fnIndex structIndex diagConfig (ConstAssert pos expr) =
@@ -1718,7 +2459,8 @@ collectUsesInLValue lv =
     LVDeref _ expr -> collectUsesInExpr expr
 
 validateStruct :: ModuleContext -> Scope -> StructDecl -> Either CompileError ()
-validateStruct ctx scope decl =
+validateStruct ctx scope decl = do
+  ensureNoDuplicates ("fields in struct " <> decl.sdName) (map (.fdName) decl.sdFields)
   mapM_ (validateType ctx scope . (.fdType)) decl.sdFields
 
 validateBinding :: ModuleContext -> Scope -> BindingDecl -> Either CompileError ()
@@ -1745,7 +2487,7 @@ validateConst ctx constIndex fnIndex structIndex scope decl = do
   case decl.cdType of
     Nothing -> Right ()
     Just ty -> do
-      val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex Map.empty Set.empty Set.empty decl.cdExpr
+      val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex emptyConstEnv Set.empty Set.empty decl.cdExpr
       _ <- coerceConstValueToType ctx structIndex ty val
       Right ()
 
@@ -1780,8 +2522,9 @@ validateConstAssert ctx constIndex fnIndex structIndex diagConfig (ConstAssert p
 validateFunction :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> FunctionDecl -> Either CompileError ()
 validateFunction ctx constIndex fnIndex structIndex skipConstEval scope fn = do
   mapM_ (validateType ctx scope . (.paramType)) fn.fnParams
-  mapM_ validateFunctionParamType fn.fnParams
+  mapM_ (validateFunctionParamType scope) fn.fnParams
   mapM_ (validateType ctx scope) (maybeToList fn.fnReturnType)
+  mapM_ validateFunctionReturnType fn.fnReturnType
   let paramNames = map (.paramName) fn.fnParams
   let paramNamesWithPos = map (\p -> (p.paramName, p.paramPos)) fn.fnParams
   ensureNoDuplicatesAt "function parameters" paramNamesWithPos
@@ -1793,18 +2536,26 @@ validateEntryPoint ctx constIndex fnIndex structIndex skipConstEval scope entry 
   mapM_ (validateType ctx scope . (.paramType)) entry.epParams
   mapM_ validateEntryParamType entry.epParams
   mapM_ (validateType ctx scope) (maybeToList entry.epReturnType)
+  mapM_ validateEntryReturnType entry.epReturnType
   let paramNames = map (.paramName) entry.epParams
   let paramNamesWithPos = map (\p -> (p.paramName, p.paramPos)) entry.epParams
   ensureNoDuplicatesAt "entry point parameters" paramNamesWithPos
   let scope1 = scopeWithParams scope paramNames
   validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope1 entry.epBody
 
-validateFunctionParamType :: Param -> Either CompileError ()
-validateFunctionParamType param =
+validateFunctionParamType :: Scope -> Param -> Either CompileError ()
+validateFunctionParamType scope param =
   case param.paramType of
     TyPtr addr _ _ ->
-      if addr `elem` ["function", "private"]
+      let allowedByDefault = ["function", "private"]
+          unrestricted = scopeFeatureEnabled scope "unrestricted_pointer_parameters"
+          allowedWithFeature = allowedByDefault <> ["workgroup", "storage"]
+          allowed = if unrestricted then allowedWithFeature else allowedByDefault
+      in if addr `elem` allowed
         then Right ()
+        else if unrestricted && addr == "uniform"
+          then withPos param.paramPos $
+            Left (CompileError "function pointer parameters cannot use ptr<uniform,...> with SPIR-V Logical addressing" Nothing Nothing)
         else withPos param.paramPos $
           Left (CompileError "function pointer parameters must use ptr<function,...> or ptr<private,...>" Nothing Nothing)
     _ -> Right ()
@@ -1815,6 +2566,18 @@ validateEntryParamType param =
     TyPtr {} ->
       withPos param.paramPos $
         Left (CompileError "entry point parameters cannot be pointers" Nothing Nothing)
+    _ -> Right ()
+
+validateFunctionReturnType :: Type -> Either CompileError ()
+validateFunctionReturnType ty =
+  case ty of
+    TyPtr {} -> Left (CompileError "function return types cannot be pointers" Nothing Nothing)
+    _ -> Right ()
+
+validateEntryReturnType :: Type -> Either CompileError ()
+validateEntryReturnType ty =
+  case ty of
+    TyPtr {} -> Left (CompileError "entry point return types cannot be pointers" Nothing Nothing)
     _ -> Right ()
 
 validateStmtList :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> [Stmt] -> Either CompileError ()
@@ -1849,11 +2612,18 @@ validateStmt ctx constIndex fnIndex structIndex skipConstEval scope stmt =
         Right scope
       SWhile _ cond body -> do
         validateExpr ctx scope cond
-        validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope) body
+        let loopScope = (enterBlock scope) { scAllowBreak = True, scAllowContinue = True }
+        validateStmtList ctx constIndex fnIndex structIndex skipConstEval loopScope body
         Right scope
       SLoop _ body continuing -> do
-        validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope) body
-        mapM_ (validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope)) continuing
+        let loopScope = (enterBlock scope) { scAllowBreak = True, scAllowContinue = True }
+        validateStmtList ctx constIndex fnIndex structIndex skipConstEval loopScope body
+        let continuingScope =
+              (enterBlock scope)
+                { scAllowBreak = False
+                , scAllowContinue = False
+                }
+        mapM_ (validateContinuingStmtList ctx constIndex fnIndex structIndex skipConstEval continuingScope) continuing
         Right scope
       SFor _ initStmt condExpr contStmt body -> do
         scope1 <- case initStmt of
@@ -1861,16 +2631,27 @@ validateStmt ctx constIndex fnIndex structIndex skipConstEval scope stmt =
           Just s -> validateStmt ctx constIndex fnIndex structIndex skipConstEval scope s
         mapM_ (validateExpr ctx scope1) condExpr
         mapM_ (validateStmt ctx constIndex fnIndex structIndex skipConstEval scope1) contStmt
-        validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope1) body
+        let loopScope = (enterBlock scope1) { scAllowBreak = True, scAllowContinue = True }
+        validateStmtList ctx constIndex fnIndex structIndex skipConstEval loopScope body
         Right scope
       SSwitch _ expr cases defBody -> do
         validateExpr ctx scope expr
         mapM_ (validateSwitchCase ctx constIndex fnIndex structIndex skipConstEval scope) cases
-        mapM_ (validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope)) defBody
+        let switchScope = (enterBlock scope) { scAllowBreak = True }
+        mapM_ (validateStmtList ctx constIndex fnIndex structIndex skipConstEval switchScope) defBody
         Right scope
-      SBreak _ -> Right scope
-      SBreakIf _ cond -> validateExpr ctx scope cond >> Right scope
-      SContinue _ -> Right scope
+      SBreak _ ->
+        if scope.scAllowBreak
+          then Right scope
+          else Left (CompileError "break is only allowed in a loop or switch" Nothing Nothing)
+      SBreakIf _ cond ->
+        if scope.scAllowBreakIf
+          then validateExpr ctx scope cond >> Right scope
+          else Left (CompileError "break if is only allowed as the final statement of a loop continuing block" Nothing Nothing)
+      SContinue _ ->
+        if scope.scAllowContinue
+          then Right scope
+          else Left (CompileError "continue is only allowed in a loop" Nothing Nothing)
       SDiscard _ -> Right scope
       SFallthrough _ ->
         if scope.scAllowFallthrough
@@ -1883,16 +2664,24 @@ validateSwitchCase ctx constIndex fnIndex structIndex skipConstEval scope sc = d
   _ <- analyzeFallthroughPlacement sc.scBody
   unless skipConstEval $
     mapM_ (evalConstIntExpr ctx constIndex fnIndex structIndex) sc.scSelectors
-  let scope' = scope { scAllowFallthrough = True }
+  let scope' = scope { scAllowFallthrough = True, scAllowBreak = True }
   validateStmtList ctx constIndex fnIndex structIndex skipConstEval (enterBlock scope') sc.scBody
+
+validateContinuingStmtList :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Bool -> Scope -> [Stmt] -> Either CompileError ()
+validateContinuingStmtList ctx constIndex fnIndex structIndex skipConstEval scope stmts =
+  case reverse stmts of
+    SBreakIf pos cond : revBefore -> do
+      validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope (reverse revBefore)
+      _ <- validateStmt ctx constIndex fnIndex structIndex skipConstEval (scope { scAllowBreakIf = True }) (SBreakIf pos cond)
+      Right ()
+    _ -> validateStmtList ctx constIndex fnIndex structIndex skipConstEval scope stmts
 
 analyzeFallthroughPlacement :: [Stmt] -> Either CompileError (Bool, [Stmt])
 analyzeFallthroughPlacement body =
-  case body of
+  case reverse body of
     [] -> Right (False, [])
-    _ ->
-      let initStmts = init body
-          lastStmt = last body
+    lastStmt : revInitStmts ->
+      let initStmts = reverse revInitStmts
           nestedFallthrough = any stmtHasFallthrough initStmts
       in case lastStmt of
           SFallthrough pos ->
@@ -1930,7 +2719,7 @@ expandSwitchCases cases defBody = do
       Right (selectors, stripped, fallthrough)
 
     go acc _ [] = Right acc
-    go acc nextChain ((selectors, body, fallthrough):rest) =
+    go acc nextChain ((selectors, body, fallthrough) : rest) =
       case fallthrough of
         True ->
           case nextChain of
@@ -1948,8 +2737,14 @@ data ConstInt = ConstInt
   , ciValue :: Integer
   } deriving (Eq, Show)
 
+data ConstFloatKind
+  = ConstAbstractFloat
+  | ConstConcreteF32
+  | ConstConcreteF16
+  deriving (Eq, Show)
+
 data ConstFloat = ConstFloat
-  { cfScalar :: Scalar
+  { cfKind :: ConstFloatKind
   , cfValue :: Double
   } deriving (Eq, Show)
 
@@ -1969,13 +2764,53 @@ data ConstBinding = ConstBinding
   , cbMutable :: Bool
   } deriving (Eq, Show)
 
-type ConstEnv = Map.Map Text ConstBinding
+newtype ConstEnv = ConstEnv [Map.Map Text ConstBinding]
+
+emptyConstEnv :: ConstEnv
+emptyConstEnv = ConstEnv []
+
+constEnvFromBindings :: [(Text, ConstBinding)] -> ConstEnv
+constEnvFromBindings bindings = ConstEnv [Map.fromList bindings]
+
+enterConstScope :: ConstEnv -> ConstEnv
+enterConstScope (ConstEnv frames) = ConstEnv (Map.empty : frames)
+
+leaveConstScope :: ConstEnv -> ConstEnv
+leaveConstScope (ConstEnv []) = ConstEnv []
+leaveConstScope (ConstEnv (_ : frames)) = ConstEnv frames
+
+lookupConstBinding :: Text -> ConstEnv -> Maybe ConstBinding
+lookupConstBinding name (ConstEnv frames) = firstBinding frames
+  where
+    firstBinding [] = Nothing
+    firstBinding (frame : rest) =
+      case Map.lookup name frame of
+        Just binding -> Just binding
+        Nothing -> firstBinding rest
+
+declareConstBinding :: Text -> ConstBinding -> ConstEnv -> ConstEnv
+declareConstBinding name binding (ConstEnv []) =
+  ConstEnv [Map.singleton name binding]
+declareConstBinding name binding (ConstEnv (frame : frames)) =
+  ConstEnv (Map.insert name binding frame : frames)
+
+updateConstBinding :: Text -> (ConstBinding -> Either CompileError ConstBinding) -> ConstEnv -> Either CompileError ConstEnv
+updateConstBinding name update (ConstEnv frames) = ConstEnv <$> updateFrames frames
+  where
+    updateFrames [] =
+      Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
+    updateFrames (frame : rest) =
+      case Map.lookup name frame of
+        Just binding -> do
+          updated <- update binding
+          Right (Map.insert name updated frame : rest)
+        Nothing -> (frame :) <$> updateFrames rest
 
 constValueType :: ConstValue -> Type
 constValueType val =
   case val of
     CVInt (ConstInt scalar _) -> TyScalar scalar
-    CVFloat (ConstFloat scalar _) -> TyScalar scalar
+    CVFloat cf -> TyScalar (constFloatDefaultScalar cf)
     CVBool _ -> TyScalar Bool
     CVVector n scalar _ -> TyVector n scalar
     CVMatrix cols rows scalar _ -> TyMatrix cols rows scalar
@@ -1987,7 +2822,7 @@ constScalarType :: ConstValue -> Either CompileError Scalar
 constScalarType val =
   case val of
     CVInt (ConstInt scalar _) -> Right scalar
-    CVFloat (ConstFloat scalar _) -> Right scalar
+    CVFloat cf -> Right (constFloatDefaultScalar cf)
     CVBool _ -> Right Bool
     _ -> Left (CompileError "expected scalar constant" Nothing Nothing)
 
@@ -2001,7 +2836,7 @@ constValueToFloat :: ConstValue -> Either CompileError ConstFloat
 constValueToFloat val =
   case val of
     CVFloat v -> Right v
-    CVInt (ConstInt _ v) -> Right (ConstFloat F32 (fromIntegral v))
+    CVInt (ConstInt _ v) -> Right (ConstFloat ConstAbstractFloat (fromIntegral v))
     _ -> Left (CompileError "expected float constant" Nothing Nothing)
 
 constValueToBool :: ConstValue -> Either CompileError Bool
@@ -2009,6 +2844,21 @@ constValueToBool val =
   case val of
     CVBool b -> Right b
     _ -> Left (CompileError "expected bool constant" Nothing Nothing)
+
+ensureFiniteConstFloat :: String -> Double -> Either CompileError ()
+ensureFiniteConstFloat target value =
+  if isNaN value || isInfinite value
+    then Left (CompileError ("constant " <> target <> " conversion requires a finite value") Nothing Nothing)
+    else Right ()
+
+isConstFloatEvaluationError :: CompileError -> Bool
+isConstFloatEvaluationError err =
+  any (`isPrefixOf` err.ceMessage)
+    [ "constant f16"
+    , "constant f32"
+    , "constant abstract-float"
+    , "constant float operation"
+    ]
 
 coerceConstScalarValue :: Scalar -> ConstValue -> Either CompileError ConstValue
 coerceConstScalarValue target val =
@@ -2021,6 +2871,7 @@ coerceConstScalarValue target val =
       case val of
         CVInt ci -> CVInt <$> coerceConstIntToScalar I32 ci
         CVFloat (ConstFloat _ v) -> do
+          ensureFiniteConstFloat "i32" v
           let n = truncate v :: Integer
           when (n < minI32 || n > maxI32) $
             Left (CompileError "constant i32 is out of range" Nothing Nothing)
@@ -2030,6 +2881,7 @@ coerceConstScalarValue target val =
       case val of
         CVInt ci -> CVInt <$> coerceConstIntToScalar U32 ci
         CVFloat (ConstFloat _ v) -> do
+          ensureFiniteConstFloat "u32" v
           let n = truncate v :: Integer
           when (n < 0 || n > fromIntegral (maxBound :: Word32)) $
             Left (CompileError "constant u32 is out of range" Nothing Nothing)
@@ -2037,13 +2889,13 @@ coerceConstScalarValue target val =
         _ -> Left (CompileError "expected integer constant" Nothing Nothing)
     F32 ->
       case val of
-        CVFloat cf -> Right (CVFloat (convertConstFloatTo F32 cf))
-        CVInt (ConstInt _ v) -> Right (CVFloat (ConstFloat F32 (fromIntegral v)))
+        CVFloat cf -> CVFloat <$> convertConstFloatTo F32 cf
+        CVInt (ConstInt _ v) -> CVFloat <$> materializeConstFloat F32 (fromIntegral v)
         _ -> Left (CompileError "expected float constant" Nothing Nothing)
     F16 ->
       case val of
-        CVFloat cf -> Right (CVFloat (convertConstFloatTo F16 cf))
-        CVInt (ConstInt _ v) -> Right (CVFloat (convertConstFloatTo F16 (ConstFloat F32 (fromIntegral v))))
+        CVFloat cf -> CVFloat <$> convertConstFloatTo F16 cf
+        CVInt (ConstInt _ v) -> CVFloat <$> materializeConstFloat F16 (fromIntegral v)
         _ -> Left (CompileError "expected float constant" Nothing Nothing)
 
 coerceConstValueToType :: ModuleContext -> StructIndex -> Type -> ConstValue -> Either CompileError ConstValue
@@ -2096,16 +2948,16 @@ defaultConstValue ctx structIndex ty =
   case ty of
     TyScalar I32 -> Right (CVInt (ConstInt I32 0))
     TyScalar U32 -> Right (CVInt (ConstInt U32 0))
-    TyScalar F32 -> Right (CVFloat (ConstFloat F32 0.0))
-    TyScalar F16 -> Right (CVFloat (ConstFloat F16 0.0))
+    TyScalar F32 -> Right (CVFloat (ConstFloat ConstConcreteF32 0.0))
+    TyScalar F16 -> Right (CVFloat (ConstFloat ConstConcreteF16 0.0))
     TyScalar Bool -> Right (CVBool False)
     TyVector n scalar -> do
       let scalarVal =
             case scalar of
               I32 -> CVInt (ConstInt I32 0)
               U32 -> CVInt (ConstInt U32 0)
-              F32 -> CVFloat (ConstFloat F32 0.0)
-              F16 -> CVFloat (ConstFloat F16 0.0)
+              F32 -> CVFloat (ConstFloat ConstConcreteF32 0.0)
+              F16 -> CVFloat (ConstFloat ConstConcreteF16 0.0)
               Bool -> CVBool False
       Right (CVVector n scalar (replicate n scalarVal))
     TyMatrix cols rows scalar -> do
@@ -2113,8 +2965,8 @@ defaultConstValue ctx structIndex ty =
             case scalar of
               I32 -> CVInt (ConstInt I32 0)
               U32 -> CVInt (ConstInt U32 0)
-              F32 -> CVFloat (ConstFloat F32 0.0)
-              F16 -> CVFloat (ConstFloat F16 0.0)
+              F32 -> CVFloat (ConstFloat ConstConcreteF32 0.0)
+              F16 -> CVFloat (ConstFloat ConstConcreteF16 0.0)
               Bool -> CVBool False
           col = CVVector rows scalar (replicate rows scalarVal)
       Right (CVMatrix cols rows scalar (replicate cols col))
@@ -2199,7 +3051,7 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
           ptr <- go seen fnSeen inner
           derefConstPointer seen fnSeen ptr
         EVar _ name ->
-          case Map.lookup name env of
+          case lookupConstBinding name env of
             Just envBinding -> Right envBinding.cbValue
             Nothing -> do
               (path, ident) <- resolveConstRef ctx name
@@ -2256,7 +3108,9 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
                 Right v -> Right (CVBool v)
                 Left _ -> Left (firstError errI errF)
 
-    firstError errI _ = errI
+    firstError errI errF
+      | isConstFloatEvaluationError errF = errF
+      | otherwise = errI
 
     evalConstVectorCtor n targetScalar seen fnSeen args = do
       if null args
@@ -2298,8 +3152,8 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
           case s of
             I32 -> CVInt (ConstInt I32 0)
             U32 -> CVInt (ConstInt U32 0)
-            F32 -> CVFloat (ConstFloat F32 0)
-            F16 -> CVFloat (ConstFloat F16 0)
+            F32 -> CVFloat (ConstFloat ConstConcreteF32 0)
+            F16 -> CVFloat (ConstFloat ConstConcreteF16 0)
             Bool -> CVBool False
         flattenArg v =
           case v of
@@ -2366,8 +3220,8 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
           case s of
             I32 -> CVInt (ConstInt I32 0)
             U32 -> CVInt (ConstInt U32 0)
-            F32 -> CVFloat (ConstFloat F32 0)
-            F16 -> CVFloat (ConstFloat F16 0)
+            F32 -> CVFloat (ConstFloat ConstConcreteF32 0)
+            F16 -> CVFloat (ConstFloat ConstConcreteF16 0)
             Bool -> CVBool False
         chunk n xs =
           case splitAt n xs of
@@ -2385,7 +3239,8 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
             CVInt (ConstInt scalar _) -> do
               coerced <- mapM (coerceConstScalarValue scalar) (v:vs)
               Right (CVArray (TyScalar scalar) coerced)
-            CVFloat (ConstFloat scalar _) -> do
+            CVFloat cf -> do
+              let scalar = constFloatDefaultScalar cf
               coerced <- mapM (coerceConstScalarValue scalar) (v:vs)
               Right (CVArray (TyScalar scalar) coerced)
             CVBool _ -> do
@@ -2437,7 +3292,8 @@ evalConstValueWithEnv ctx constIndex fnIndex structIndex env = go
           when (length args /= length fields) $
             Left (CompileError ("struct constructor arity mismatch for " <> textToString name) Nothing Nothing)
           vals <- mapM (go seen fnSeen) args
-          let pairs = zip (map (.fdName) fields) vals
+          coerced <- zipWithM (coerceConstValueToType ctx structIndex . (.fdType)) fields vals
+          let pairs = zip (map (.fdName) fields) coerced
           Right (CVStruct name pairs)
 
     evalConstAddressOf seen fnSeen inner =
@@ -2501,7 +3357,7 @@ evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seenConsts seen
           Left (CompileError "const function overload not found" Nothing Nothing)
         coercedArgs <- zipWithM (coerceConstValueToType ctx structIndex . (.paramType)) params argVals
         let bindings = [ConstBinding val False | val <- coercedArgs]
-        let env' = Map.fromList (zip (map (.paramName) params) bindings)
+        let env' = constEnvFromBindings (zip (map (.paramName) params) bindings)
         evalConstFunctionValueWithEnv ctx constIndex fnIndex structIndex env' seenConsts seenFns' decl
   let (errs, results) = partitionEithers (map attempt decls)
   case results of
@@ -2532,6 +3388,12 @@ evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns = go
         CCNone -> go envNext fuelNext rest
         _ -> Right (envNext, ctrl, fuelNext)
 
+evalConstScopedStmtList :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Int -> [Stmt] -> Either CompileError (ConstEnv, ConstControl, Int)
+evalConstScopedStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stmts = do
+  (scopedEnv, ctrl, fuel') <-
+    evalConstStmtList ctx constIndex fnIndex structIndex (enterConstScope env) seenConsts seenFns fuel stmts
+  Right (leaveConstScope scopedEnv, ctrl, fuel')
+
 evalConstStmt :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Int -> Stmt -> Either CompileError (ConstEnv, ConstControl, Int)
 evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stmt =
   withPos (stmtPos stmt) $ do
@@ -2542,7 +3404,7 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
         val <- case mType of
           Nothing -> Right val0
           Just ty -> coerceConstValueToType ctx structIndex ty val0
-        Right (Map.insert name (ConstBinding val False) env, CCNone, fuel')
+        Right (declareConstBinding name (ConstBinding val False) env, CCNone, fuel')
       SVar _ name mType mExpr -> do
         val0 <- case mExpr of
           Just expr -> evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
@@ -2551,9 +3413,9 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
               Nothing -> Left (CompileError "var declaration requires a type or initializer" Nothing Nothing)
               Just ty -> defaultConstValue ctx structIndex ty
         val <- case mType of
-          Nothing -> Right val0
+          Nothing -> coerceConstValueToType ctx structIndex (constValueType val0) val0
           Just ty -> coerceConstValueToType ctx structIndex ty val0
-        Right (Map.insert name (ConstBinding val True) env, CCNone, fuel')
+        Right (declareConstBinding name (ConstBinding val True) env, CCNone, fuel')
       SAssign _ lv expr -> do
         oldVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv
         newVal <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
@@ -2585,21 +3447,16 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
         _ <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
         Right (env, CCNone, fuel')
       SSwitch _ expr cases defBody -> do
-        cases' <- expandSwitchCases cases defBody
         ConstInt _ selector <- evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns expr
-        matchCase selector cases' defBody fuel'
+        evalConstSwitch selector cases defBody fuel'
       SIf _ cond thenBody elseBody -> do
         ok <- evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns cond
         if ok
-          then do
-            (env', ctrl, fuel'') <- evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel' thenBody
-            Right (env', ctrl, fuel'')
+          then evalConstScopedStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel' thenBody
           else
             case elseBody of
               Nothing -> Right (env, CCNone, fuel')
-              Just body -> do
-                (env', ctrl, fuel'') <- evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel' body
-                Right (env', ctrl, fuel'')
+              Just body -> evalConstScopedStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel' body
       SWhile _ cond body -> evalConstWhile cond body fuel'
       SLoop _ body continuing -> evalConstLoop body continuing fuel'
       SFor _ initStmt condExpr contStmt body -> evalConstFor initStmt condExpr contStmt body fuel'
@@ -2616,15 +3473,40 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
       _ ->
         Left (CompileError "const function bodies may only contain let/var, if, switch, loops, assignments, expr, and return statements" Nothing Nothing)
   where
-    matchCase _ [] defBody fuel'' =
-      case defBody of
-        Nothing -> Right (env, CCNone, fuel'')
-        Just body -> evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel'' body
-    matchCase selector (case0:rest) defBody fuel'' = do
-      matched <- or <$> mapM (matchesSelector selector) case0.scSelectors
-      if matched
-        then evalConstStmtList ctx constIndex fnIndex structIndex env seenConsts seenFns fuel'' case0.scBody
-        else matchCase selector rest defBody fuel''
+    evalConstSwitch selector cases defBody fuel'' = findMatchingCase cases
+      where
+        findMatchingCase [] = evalDefault env fuel''
+        findMatchingCase remaining@(case0 : rest) = do
+          matched <- or <$> mapM (matchesSelector selector) case0.scSelectors
+          if matched
+            then evalCases env fuel'' remaining
+            else findMatchingCase rest
+
+        evalCases envSwitch fuelSwitch [] = evalDefault envSwitch fuelSwitch
+        evalCases envSwitch fuelSwitch (case0 : rest) = do
+          (fallthrough, body) <- analyzeFallthroughPlacement case0.scBody
+          (envCase, ctrl, fuelCase) <-
+            evalConstScopedStmtList ctx constIndex fnIndex structIndex envSwitch seenConsts seenFns fuelSwitch body
+          case ctrl of
+            CCBreak -> Right (envCase, CCNone, fuelCase)
+            CCNone
+              | fallthrough ->
+                  case (rest, defBody) of
+                    ([], Nothing) ->
+                      Left (CompileError "fallthrough requires a following case or default" Nothing Nothing)
+                    _ -> evalCases envCase fuelCase rest
+              | otherwise -> Right (envCase, CCNone, fuelCase)
+            _ -> Right (envCase, ctrl, fuelCase)
+
+        evalDefault envSwitch fuelSwitch =
+          case defBody of
+            Nothing -> Right (envSwitch, CCNone, fuelSwitch)
+            Just body -> do
+              (envDefault, ctrl, fuelDefault) <-
+                evalConstScopedStmtList ctx constIndex fnIndex structIndex envSwitch seenConsts seenFns fuelSwitch body
+              case ctrl of
+                CCBreak -> Right (envDefault, CCNone, fuelDefault)
+                _ -> Right (envDefault, ctrl, fuelDefault)
 
     matchesSelector selector ex = do
       ConstInt _ val <- evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seenConsts seenFns ex
@@ -2643,7 +3525,7 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
           if not ok
             then Right (envLoop, CCNone, fuelNext)
             else do
-              (envBody, ctrl, fuelBody) <- evalConstStmtList ctx constIndex fnIndex structIndex envLoop seenConsts seenFns fuelNext body
+              (envBody, ctrl, fuelBody) <- evalConstScopedStmtList ctx constIndex fnIndex structIndex envLoop seenConsts seenFns fuelNext body
               case ctrl of
                 CCNone -> loop fuelBody envBody
                 CCContinue -> loop fuelBody envBody
@@ -2654,7 +3536,7 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
       where
         loop fuelLoop envLoop = do
           fuelNext <- consumeConstFuel fuelLoop
-          (envBody, ctrl, fuelBody) <- evalConstStmtList ctx constIndex fnIndex structIndex envLoop seenConsts seenFns fuelNext body
+          (envBody, ctrl, fuelBody) <- evalConstScopedStmtList ctx constIndex fnIndex structIndex envLoop seenConsts seenFns fuelNext body
           case ctrl of
             CCReturn _ -> Right (envBody, ctrl, fuelBody)
             CCBreak -> Right (envBody, CCNone, fuelBody)
@@ -2665,20 +3547,24 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
           case continuing of
             Nothing -> loop fuelLoop envLoop
             Just contBody -> do
-              (envCont, ctrlCont, fuelCont) <- evalConstStmtList ctx constIndex fnIndex structIndex envLoop seenConsts seenFns fuelLoop contBody
+              (envCont, ctrlCont, fuelCont) <- evalConstScopedStmtList ctx constIndex fnIndex structIndex envLoop seenConsts seenFns fuelLoop contBody
               case ctrlCont of
                 CCReturn _ -> Right (envCont, ctrlCont, fuelCont)
                 CCBreak -> Right (envCont, CCNone, fuelCont)
                 _ -> loop fuelCont envCont
 
     evalConstFor initStmt condExpr contStmt body fuel'' = do
-      (envInit, ctrlInit, fuelInit) <- case initStmt of
-        Nothing -> Right (env, CCNone, fuel'')
-        Just s -> evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel'' s
-      case ctrlInit of
-        CCNone -> loop fuelInit envInit
-        _ -> Left (CompileError "invalid control flow in for initializer" Nothing Nothing)
+      (envFor, ctrlFor, fuelFor) <- initialize (enterConstScope env)
+      Right (leaveConstScope envFor, ctrlFor, fuelFor)
       where
+        initialize envFor = do
+          (envInit, ctrlInit, fuelInit) <- case initStmt of
+            Nothing -> Right (envFor, CCNone, fuel'')
+            Just s -> evalConstStmt ctx constIndex fnIndex structIndex envFor seenConsts seenFns fuel'' s
+          case ctrlInit of
+            CCNone -> loop fuelInit envInit
+            _ -> Left (CompileError "invalid control flow in for initializer" Nothing Nothing)
+
         loop fuelLoop envLoop = do
           fuelNext <- consumeConstFuel fuelLoop
           ok <- case condExpr of
@@ -2687,7 +3573,8 @@ evalConstStmt ctx constIndex fnIndex structIndex env seenConsts seenFns fuel stm
           if not ok
             then Right (envLoop, CCNone, fuelNext)
             else do
-              (envBody, ctrlBody, fuelBody) <- evalConstStmtList ctx constIndex fnIndex structIndex envLoop seenConsts seenFns fuelNext body
+              (envBody, ctrlBody, fuelBody) <-
+                evalConstScopedStmtList ctx constIndex fnIndex structIndex envLoop seenConsts seenFns fuelNext body
               case ctrlBody of
                 CCReturn _ -> Right (envBody, ctrlBody, fuelBody)
                 CCBreak -> Right (envBody, CCNone, fuelBody)
@@ -2704,7 +3591,7 @@ evalConstLValueGet :: ModuleContext -> ConstIndex -> FunctionIndex -> StructInde
 evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv =
   case lv of
     LVVar _ name ->
-      case Map.lookup name env of
+      case lookupConstBinding name env of
         Just envBinding -> Right envBinding.cbValue
         Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
     LVField _ base field -> do
@@ -2723,13 +3610,7 @@ evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns lv 
 evalConstLValueSet :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> LValue -> ConstValue -> Either CompileError ConstEnv
 evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv newVal =
   case lv of
-    LVVar _ name ->
-        case Map.lookup name env of
-          Nothing -> Left (CompileError ("unknown variable: " <> textToString name) Nothing Nothing)
-          Just envBinding ->
-            if envBinding.cbMutable
-              then Right (Map.insert name envBinding { cbValue = newVal } env)
-              else Left (CompileError "cannot assign to immutable let binding" Nothing Nothing)
+    LVVar _ name -> updateConstBinding name updateValue env
     LVField _ base field -> do
       baseVal <- evalConstLValueGet ctx constIndex fnIndex structIndex env seenConsts seenFns base
       updated <- updateFieldValue baseVal field newVal
@@ -2744,6 +3625,11 @@ evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns lv 
       case ptr of
         CVPointer _ ptrLv -> evalConstLValueSet ctx constIndex fnIndex structIndex env seenConsts seenFns ptrLv newVal
         _ -> Left (CompileError "deref requires a pointer value" Nothing Nothing)
+  where
+    updateValue envBinding =
+      if envBinding.cbMutable
+        then Right envBinding { cbValue = newVal }
+        else Left (CompileError "cannot assign to immutable let binding" Nothing Nothing)
 
 updateFieldValue :: ConstValue -> Text -> ConstValue -> Either CompileError ConstValue
 updateFieldValue base field newVal =
@@ -2801,7 +3687,7 @@ constScalarOne :: ConstValue -> Either CompileError ConstValue
 constScalarOne val =
   case val of
     CVInt (ConstInt scalar _) -> Right (CVInt (ConstInt scalar 1))
-    CVFloat (ConstFloat scalar _) -> Right (CVFloat (ConstFloat scalar 1.0))
+    CVFloat (ConstFloat kind _) -> Right (CVFloat (ConstFloat kind 1.0))
     _ -> Left (CompileError "increment/decrement requires a scalar integer or float" Nothing Nothing)
 
 evalConstAssignOp :: BinOp -> ConstValue -> ConstValue -> Either CompileError ConstValue
@@ -2810,9 +3696,10 @@ evalConstAssignOp op lhs rhs =
     (CVInt (ConstInt scalar a), CVInt (ConstInt _ b)) -> do
       let result = applyIntOp scalar a b
       CVInt <$> result
-    (CVFloat (ConstFloat scalar a), CVFloat (ConstFloat _ b)) -> do
-      v <- applyFloatOp a b
-      Right (CVFloat (ConstFloat scalar (if scalar == F16 then quantizeF16 v else v)))
+    (CVFloat lhsFloat, CVFloat rhsFloat) -> do
+      rhsFloat' <- convertConstFloatToKind lhsFloat.cfKind rhsFloat
+      v <- applyFloatOp lhsFloat.cfValue rhsFloat'.cfValue
+      CVFloat <$> finishConstFloatOp lhsFloat.cfKind v
     (CVBool a, CVBool b) ->
       case op of
         OpAnd -> Right (CVBool (a && b))
@@ -2842,11 +3729,15 @@ evalConstAssignOp op lhs rhs =
         OpBitAnd -> makeInt scalar (a .&. b)
         OpBitOr -> makeInt scalar (a .|. b)
         OpBitXor -> makeInt scalar (xor a b)
-        OpShl ->
-          if b < 0 then Left (CompileError "shift amount must be non-negative" Nothing Nothing) else makeInt scalar (shiftL a (fromIntegral b))
-        OpShr ->
-          if b < 0 then Left (CompileError "shift amount must be non-negative" Nothing Nothing) else makeInt scalar (shiftR a (fromIntegral b))
+        OpShl -> applyShift scalar a b True
+        OpShr -> applyShift scalar a b False
         _ -> Left (CompileError "unsupported integer assignment operation" Nothing Nothing)
+
+    applyShift scalar value amount isLeft
+      | amount < 0 = Left (CompileError "shift amount must be non-negative" Nothing Nothing)
+      | amount >= 32 = Left (CompileError "shift amount must be less than 32" Nothing Nothing)
+      | isLeft = makeInt scalar (shiftL value (fromIntegral amount))
+      | otherwise = makeInt scalar (shiftR value (fromIntegral amount))
 
     makeInt scalar n =
       case scalar of
@@ -2907,7 +3798,7 @@ evalConstIndexAccess val (ConstInt _ raw) = do
 
 evalConstIntExpr :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Expr -> Either CompileError ConstInt
 evalConstIntExpr ctx constIndex fnIndex structIndex =
-  evalConstIntExprWithEnv ctx constIndex fnIndex structIndex Map.empty Set.empty Set.empty
+  evalConstIntExprWithEnv ctx constIndex fnIndex structIndex emptyConstEnv Set.empty Set.empty
 
 evalConstIntExprWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Expr -> Either CompileError ConstInt
 evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
@@ -2948,6 +3839,7 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
               Right (ConstInt U32 n)
             _ -> do
               ConstFloat _ v <- evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen arg
+              ensureFiniteConstFloat "u32" v
               let n = truncate v :: Integer
               checkU32 n
               Right (ConstInt U32 n)
@@ -2960,11 +3852,15 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
               Right (ConstInt I32 n)
             _ -> do
               ConstFloat _ v <- evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen arg
+              ensureFiniteConstFloat "i32" v
               let n = truncate v :: Integer
               checkI32 n
               Right (ConstInt I32 n)
         ECall _ "i32" [] ->
           Right (ConstInt I32 0)
+        ECall _ "select" [aExpr, bExpr, condExpr] -> do
+          cond <- evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen condExpr
+          if cond then go seen fnSeen bExpr else go seen fnSeen aExpr
         EBitcast _ _ _ ->
           Left (CompileError "bitcast is not allowed in const integer expressions" Nothing Nothing)
         ECall _ name args
@@ -2988,7 +3884,7 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
             OpShr -> applyShift scalar x y False
             _ -> Left (CompileError "unsupported const integer operation" Nothing Nothing)
         EVar _ name ->
-          case Map.lookup name env of
+          case lookupConstBinding name env of
             Just envBinding ->
               case envBinding.cbValue of
                 CVInt v -> Right v
@@ -3073,6 +3969,8 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
     applyShift scalar x y isLeft =
       if y < 0
         then Left (CompileError "shift amount must be non-negative" Nothing Nothing)
+        else if y >= 32
+          then Left (CompileError "shift amount must be less than 32" Nothing Nothing)
         else
           let v = if isLeft
                     then shiftL x (fromIntegral y)
@@ -3082,73 +3980,154 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
               U32 -> checkU32 v >> Right (ConstInt U32 v)
               _ -> Left (CompileError "unsupported const integer shift" Nothing Nothing)
 
-convertConstFloatTo :: Scalar -> ConstFloat -> ConstFloat
-convertConstFloatTo target (ConstFloat _ v) =
-  ConstFloat target (if target == F16 then quantizeF16 v else v)
+constFloatDefaultScalar :: ConstFloat -> Scalar
+constFloatDefaultScalar cf =
+  case cf.cfKind of
+    ConstAbstractFloat -> F32
+    ConstConcreteF32 -> F32
+    ConstConcreteF16 -> F16
 
-quantizeF16 :: Double -> Double
-quantizeF16 v =
-  let f = realToFrac v :: Float
-      bits = floatToHalfBits f
-  in realToFrac (halfBitsToFloat bits) :: Double
+convertConstFloatTo :: Scalar -> ConstFloat -> Either CompileError ConstFloat
+convertConstFloatTo target = materializeConstFloat target . (.cfValue)
+
+convertConstFloatToKind :: ConstFloatKind -> ConstFloat -> Either CompileError ConstFloat
+convertConstFloatToKind target cf =
+  case target of
+    ConstAbstractFloat -> do
+      ensureFiniteConstFloat "abstract-float" cf.cfValue
+      Right (ConstFloat ConstAbstractFloat cf.cfValue)
+    ConstConcreteF32 -> convertConstFloatTo F32 cf
+    ConstConcreteF16 -> convertConstFloatTo F16 cf
+
+materializeConstFloat :: Scalar -> Double -> Either CompileError ConstFloat
+materializeConstFloat target value = do
+  ensureFiniteConstFloat (constFloatKindName target) value
+  when (abs value > maxFiniteValue target) $
+    Left (CompileError ("constant " <> constFloatKindName target <> " conversion is out of range: " <> show value) Nothing Nothing)
+  rounded <-
+    case target of
+      F32 ->
+        let narrowed = realToFrac value :: Float
+        in if isInfinite narrowed
+            then Left (CompileError ("constant f32 conversion is out of range: " <> show value) Nothing Nothing)
+            else Right (float2Double narrowed)
+      F16 ->
+        let bits = doubleToHalfBits value
+            roundedValue = halfBitsToFloat bits
+        in if isInfinite roundedValue
+            then Left (CompileError ("constant f16 conversion is out of range: " <> show value) Nothing Nothing)
+            else Right (float2Double roundedValue)
+      _ -> Left (CompileError "expected f16 or f32 scalar" Nothing Nothing)
+  kind <-
+    case target of
+      F32 -> Right ConstConcreteF32
+      F16 -> Right ConstConcreteF16
+      _ -> Left (CompileError "expected f16 or f32 scalar" Nothing Nothing)
+  Right (ConstFloat kind rounded)
+  where
+    constFloatKindName scalar =
+      case scalar of
+        F32 -> "f32"
+        F16 -> "f16"
+        _ -> "float"
+
+    maxFiniteValue scalar =
+      case scalar of
+        F32 -> realToFrac (encodeFloat (2 ^ (24 :: Int) - 1) (127 - 23) :: Float)
+        F16 -> 65504
+        _ -> 0
+
+commonConstFloatKind :: ConstFloatKind -> ConstFloatKind -> ConstFloatKind
+commonConstFloatKind left right =
+  case (left, right) of
+    (ConstAbstractFloat, kind) -> kind
+    (kind, ConstAbstractFloat) -> kind
+    (ConstConcreteF32, _) -> ConstConcreteF32
+    (_, ConstConcreteF32) -> ConstConcreteF32
+    _ -> ConstConcreteF16
+
+coerceConstFloatPair :: ConstFloat -> ConstFloat -> Either CompileError (ConstFloatKind, Double, Double)
+coerceConstFloatPair left right = do
+  let kind = commonConstFloatKind left.cfKind right.cfKind
+  left' <- convertConstFloatToKind kind left
+  right' <- convertConstFloatToKind kind right
+  Right (kind, left'.cfValue, right'.cfValue)
+
+finishConstFloatOp :: ConstFloatKind -> Double -> Either CompileError ConstFloat
+finishConstFloatOp kind value = do
+  ensureFiniteConstFloat "float operation" value
+  case kind of
+    ConstAbstractFloat -> Right (ConstFloat ConstAbstractFloat value)
+    ConstConcreteF32 -> materializeConstFloat F32 value
+    ConstConcreteF16 -> materializeConstFloat F16 value
+
+applyConstFloatUnary :: (Double -> Double) -> ConstFloat -> Either CompileError ConstFloat
+applyConstFloatUnary operation cf = finishConstFloatOp cf.cfKind (operation cf.cfValue)
+
+applyConstFloatBinary :: (Double -> Double -> Double) -> ConstFloat -> ConstFloat -> Either CompileError ConstFloat
+applyConstFloatBinary operation left right = do
+  (kind, leftValue, rightValue) <- coerceConstFloatPair left right
+  finishConstFloatOp kind (operation leftValue rightValue)
 
 evalConstFloatExprWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Expr -> Either CompileError ConstFloat
 evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env = go
   where
     go seen fnSeen ex =
       case ex of
-        EFloat _ f -> Right (ConstFloat F32 (realToFrac f))
+        EFloat _ value -> do
+          ensureFiniteConstFloat "abstract-float literal" value
+          Right (ConstFloat ConstAbstractFloat value)
         EInt _ n -> do
           (_, val) <- selectIntLiteralScalar n
-          Right (ConstFloat F32 (fromIntegral val))
+          Right (ConstFloat ConstAbstractFloat (fromIntegral val))
         EUnary _ OpNeg inner -> do
           cf <- go seen fnSeen inner
-          Right (applyFloatOp cf.cfScalar negate cf.cfValue)
+          applyConstFloatUnary negate cf
         EUnary _ OpDeref _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToFloat val
         ECall _ "f32" [arg] -> do
           cf <- evalFloatArg seen fnSeen arg
-          Right (convertConstFloatTo F32 cf)
+          convertConstFloatTo F32 cf
         ECall _ "f32" [] ->
-          Right (ConstFloat F32 0.0)
+          Right (ConstFloat ConstConcreteF32 0.0)
         ECall _ "f16" [arg] -> do
           cf <- evalFloatArg seen fnSeen arg
-          Right (convertConstFloatTo F16 cf)
+          convertConstFloatTo F16 cf
         ECall _ "f16" [] ->
-          Right (ConstFloat F16 0.0)
+          Right (ConstFloat ConstConcreteF16 0.0)
         ECall _ "abs" [arg] -> do
           cf <- evalFloatArg seen fnSeen arg
-          Right (applyFloatOp cf.cfScalar abs cf.cfValue)
+          applyConstFloatUnary abs cf
         ECall _ "min" [a, b] -> do
           cfA <- evalFloatArg seen fnSeen a
           cfB <- evalFloatArg seen fnSeen b
-          let (scalar, x, y) = coerceFloatPair cfA cfB
-          Right (applyFloatOp scalar id (min x y))
+          applyConstFloatBinary min cfA cfB
         ECall _ "max" [a, b] -> do
           cfA <- evalFloatArg seen fnSeen a
           cfB <- evalFloatArg seen fnSeen b
-          let (scalar, x, y) = coerceFloatPair cfA cfB
-          Right (applyFloatOp scalar id (max x y))
+          applyConstFloatBinary max cfA cfB
         ECall _ "clamp" [xExpr, loExpr, hiExpr] -> do
           cfX <- evalFloatArg seen fnSeen xExpr
           cfLo <- evalFloatArg seen fnSeen loExpr
           cfHi <- evalFloatArg seen fnSeen hiExpr
-          let (scalar1, x, lo) = coerceFloatPair cfX cfLo
-          let ConstFloat _ hi = convertConstFloatTo scalar1 cfHi
-          Right (applyFloatOp scalar1 id (min (max x lo) hi))
+          lowerBounded <- applyConstFloatBinary max cfX cfLo
+          applyConstFloatBinary min lowerBounded cfHi
         ECall _ "mix" [aExpr, bExpr, tExpr] -> do
           cfA <- evalFloatArg seen fnSeen aExpr
           cfB <- evalFloatArg seen fnSeen bExpr
           cfT <- evalFloatArg seen fnSeen tExpr
-          let (scalar1, a, b) = coerceFloatPair cfA cfB
-          let ConstFloat _ t = convertConstFloatTo scalar1 cfT
-          Right (applyFloatOp scalar1 id (a * (1.0 - t) + b * t))
+          let one = ConstFloat ConstAbstractFloat 1.0
+          oneMinusT <- applyConstFloatBinary (-) one cfT
+          leftTerm <- applyConstFloatBinary (*) cfA oneMinusT
+          rightTerm <- applyConstFloatBinary (*) cfB cfT
+          applyConstFloatBinary (+) leftTerm rightTerm
         ECall _ "select" [aExpr, bExpr, condExpr] -> do
           cond <- evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen condExpr
           cfA <- evalFloatArg seen fnSeen aExpr
           cfB <- evalFloatArg seen fnSeen bExpr
-          Right (if cond then cfB else cfA)
+          (kind, aValue, bValue) <- coerceConstFloatPair cfA cfB
+          finishConstFloatOp kind (if cond then bValue else aValue)
         ECall _ name args
           | not (isBuiltinName name) -> do
               val <- evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seen fnSeen name args
@@ -3156,22 +4135,22 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env = go
         EBinary _ op a b -> do
           cfA <- evalFloatArg seen fnSeen a
           cfB <- evalFloatArg seen fnSeen b
-          let (scalar, x, y) = coerceFloatPair cfA cfB
           case op of
-            OpAdd -> Right (applyFloatOp scalar id (x + y))
-            OpSub -> Right (applyFloatOp scalar id (x - y))
-            OpMul -> Right (applyFloatOp scalar id (x * y))
-            OpDiv ->
-              if y == 0.0
+            OpAdd -> applyConstFloatBinary (+) cfA cfB
+            OpSub -> applyConstFloatBinary (-) cfA cfB
+            OpMul -> applyConstFloatBinary (*) cfA cfB
+            OpDiv -> do
+              (_, _, divisor) <- coerceConstFloatPair cfA cfB
+              if divisor == 0.0
                 then Left (CompileError "division by zero in constant expression" Nothing Nothing)
-                else Right (applyFloatOp scalar id (x / y))
+                else applyConstFloatBinary (/) cfA cfB
             _ -> Left (CompileError "unsupported const float operation" Nothing Nothing)
         EVar _ name ->
-          case Map.lookup name env of
+          case lookupConstBinding name env of
             Just envBinding ->
               case envBinding.cbValue of
                 CVFloat v -> Right v
-                CVInt (ConstInt _ v) -> Right (ConstFloat F32 (fromIntegral v))
+                CVInt (ConstInt _ v) -> Right (ConstFloat ConstAbstractFloat (fromIntegral v))
                 CVBool _ -> Left (CompileError "const float expression references a bool value" Nothing Nothing)
                 _ -> Left (CompileError "const float expression references a composite value" Nothing Nothing)
             Nothing -> do
@@ -3200,19 +4179,9 @@ evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env = go
       cf <- go seen fnSeen ex
       Right cf
 
-    coerceFloatPair a b =
-      let scalar = if a.cfScalar == F32 || b.cfScalar == F32 then F32 else F16
-          a' = convertConstFloatTo scalar a
-          b' = convertConstFloatTo scalar b
-      in (scalar, a'.cfValue, b'.cfValue)
-
-    applyFloatOp scalar f v =
-      let v' = f v
-      in ConstFloat scalar (if scalar == F16 then quantizeF16 v' else v')
-
 evalConstBoolExpr :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Expr -> Either CompileError Bool
 evalConstBoolExpr ctx constIndex fnIndex structIndex =
-  evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex Map.empty Set.empty Set.empty
+  evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex emptyConstEnv Set.empty Set.empty
 
 evalConstBoolExprWithEnv :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> ConstEnv -> Set.Set Text -> Set.Set Text -> Expr -> Either CompileError Bool
 evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env = go
@@ -3224,8 +4193,12 @@ evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env = go
         EUnary _ OpDeref _ -> do
           val <- evalConstValueWithEnv ctx constIndex fnIndex structIndex env seen fnSeen ex
           constValueToBool val
-        EBinary _ OpAnd a b -> (&&) <$> go seen fnSeen a <*> go seen fnSeen b
-        EBinary _ OpOr a b -> (||) <$> go seen fnSeen a <*> go seen fnSeen b
+        EBinary _ OpAnd a b -> do
+          lhs <- go seen fnSeen a
+          if lhs then go seen fnSeen b else Right False
+        EBinary _ OpOr a b -> do
+          lhs <- go seen fnSeen a
+          if lhs then Right True else go seen fnSeen b
         EBinary _ OpEq a b -> evalEq seen fnSeen a b
         EBinary _ OpNe a b -> not <$> evalEq seen fnSeen a b
         EBinary _ OpLt a b -> evalCmp seen fnSeen (<) (<) a b
@@ -3242,7 +4215,7 @@ evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env = go
               val <- evalConstUserFunctionCall ctx constIndex fnIndex structIndex env seen fnSeen name args
               constValueToBool val
         EVar _ name ->
-          case Map.lookup name env of
+          case lookupConstBinding name env of
             Just envBinding ->
               case envBinding.cbValue of
                 CVBool b -> Right b
@@ -3305,8 +4278,10 @@ evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env = go
                       let floatA = evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen a
                           floatB = evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen b
                       in case (floatA, floatB) of
-                          (Right (ConstFloat _ x), Right (ConstFloat _ y)) -> Right (x == y)
-                          _ -> Left (firstError intA intB)
+                          (Right left, Right right) -> do
+                            (_, x, y) <- coerceConstFloatPair left right
+                            Right (x == y)
+                          _ -> Left (floatComparisonError intA intB floatA floatB)
 
     evalCmp seen fnSeen cmpInt cmpFloat a b =
       let intA = evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen a
@@ -3317,8 +4292,21 @@ evalConstBoolExprWithEnv ctx constIndex fnIndex structIndex env = go
             let floatA = evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen a
                 floatB = evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen b
             in case (floatA, floatB) of
-                (Right (ConstFloat _ x), Right (ConstFloat _ y)) -> Right (cmpFloat x y)
-                _ -> Left (firstError intA intB)
+                (Right left, Right right) -> do
+                  (_, x, y) <- coerceConstFloatPair left right
+                  Right (cmpFloat x y)
+                _ -> Left (floatComparisonError intA intB floatA floatB)
+
+    floatComparisonError intA intB floatA floatB =
+      case (specificFloatError floatA, specificFloatError floatB) of
+        (Just err, _) -> err
+        (_, Just err) -> err
+        _ -> firstError intA intB
+
+    specificFloatError result =
+      case result of
+        Left err | isConstFloatEvaluationError err -> Just err
+        _ -> Nothing
 
     firstError ea eb =
       case ea of
@@ -3452,6 +4440,115 @@ validateType ctx scope ty =
     TySamplerComparison -> Right ()
     TyScalar _ -> Right ()
 
+validatePointerTypeShapes :: ModuleAst -> Either CompileError ()
+validatePointerTypeShapes ast = do
+  mapM_ (validateDirectPointerType "type alias" . (.adType)) ast.modAliases
+  mapM_ validateStructDecl ast.modStructs
+  mapM_ (validatePointerFreeType "binding" . (.bdType)) ast.modBindings
+  mapM_ validateGlobalDecl ast.modGlobals
+  mapM_ validateConstDecl ast.modConsts
+  mapM_ validateOverrideDecl ast.modOverrides
+  mapM_ validateFunctionDecl ast.modFunctions
+  mapM_ validateEntryDecl ast.modEntries
+  where
+    validateStructDecl decl =
+      mapM_
+        (validatePointerFreeType ("field of struct " <> textToString decl.sdName) . (.fdType))
+        decl.sdFields
+
+    validateGlobalDecl decl = do
+      validatePointerFreeType ("global " <> textToString decl.gvName) decl.gvType
+      mapM_ validateExprTypeShapes decl.gvInit
+
+    validateConstDecl decl = do
+      mapM_ (validatePointerFreeType ("const " <> textToString decl.cdName)) decl.cdType
+      validateExprTypeShapes decl.cdExpr
+
+    validateOverrideDecl decl = do
+      mapM_ (validatePointerFreeType ("override " <> textToString decl.odName)) decl.odType
+      mapM_ validateExprTypeShapes decl.odExpr
+
+    validateFunctionDecl decl = do
+      mapM_
+        (validateDirectPointerType ("parameter of function " <> textToString decl.fnName) . (.paramType))
+        decl.fnParams
+      mapM_ (validatePointerFreeType ("return type of function " <> textToString decl.fnName)) decl.fnReturnType
+      validateStmtTypeShapes decl.fnBody
+
+    validateEntryDecl decl = do
+      mapM_
+        (validatePointerFreeType ("parameter of entry point " <> textToString decl.epName) . (.paramType))
+        decl.epParams
+      mapM_ (validatePointerFreeType ("return type of entry point " <> textToString decl.epName)) decl.epReturnType
+      validateStmtTypeShapes decl.epBody
+
+    validateDirectPointerType context ty =
+      case ty of
+        TyPtr _ _ pointee ->
+          when (typeContainsPointer pointee) $
+            Left (CompileError (context <> " pointer store type cannot contain pointers") Nothing Nothing)
+        _ -> validatePointerFreeType context ty
+
+    validatePointerFreeType context ty =
+      when (typeContainsPointer ty) $
+        Left (CompileError (context <> " cannot contain pointer types") Nothing Nothing)
+
+    validateStmtTypeShapes = mapM_ validateStmtShape
+
+    validateStmtShape stmt =
+      case stmt of
+        SLet _ _ mType expr -> mapM_ (validateDirectPointerType "let binding") mType >> validateExprTypeShapes expr
+        SVar _ _ mType mExpr -> mapM_ (validatePointerFreeType "var binding") mType >> mapM_ validateExprTypeShapes mExpr
+        SAssign _ lv expr -> validateLValueTypeShapes lv >> validateExprTypeShapes expr
+        SAssignOp _ lv _ expr -> validateLValueTypeShapes lv >> validateExprTypeShapes expr
+        SInc _ lv -> validateLValueTypeShapes lv
+        SDec _ lv -> validateLValueTypeShapes lv
+        SExpr _ expr -> validateExprTypeShapes expr
+        SIf _ cond thenBody elseBody ->
+          validateExprTypeShapes cond >> validateStmtTypeShapes thenBody >> mapM_ validateStmtTypeShapes elseBody
+        SWhile _ cond body -> validateExprTypeShapes cond >> validateStmtTypeShapes body
+        SLoop _ body continuing -> validateStmtTypeShapes body >> mapM_ validateStmtTypeShapes continuing
+        SFor _ initStmt cond cont body ->
+          mapM_ validateStmtShape initStmt
+            >> mapM_ validateExprTypeShapes cond
+            >> mapM_ validateStmtShape cont
+            >> validateStmtTypeShapes body
+        SSwitch _ expr cases defBody -> do
+          validateExprTypeShapes expr
+          mapM_ validateCaseShape cases
+          mapM_ validateStmtTypeShapes defBody
+        SBreakIf _ expr -> validateExprTypeShapes expr
+        SReturn _ expr -> mapM_ validateExprTypeShapes expr
+        _ -> Right ()
+
+    validateCaseShape switchCase = do
+      mapM_ validateExprTypeShapes switchCase.scSelectors
+      validateStmtTypeShapes switchCase.scBody
+
+    validateLValueTypeShapes lv =
+      case lv of
+        LVVar {} -> Right ()
+        LVField _ base _ -> validateLValueTypeShapes base
+        LVIndex _ base index -> validateLValueTypeShapes base >> validateExprTypeShapes index
+        LVDeref _ expr -> validateExprTypeShapes expr
+
+    validateExprTypeShapes expr =
+      case expr of
+        EBinary _ _ left right -> validateExprTypeShapes left >> validateExprTypeShapes right
+        EUnary _ _ inner -> validateExprTypeShapes inner
+        ECall _ _ args -> mapM_ validateExprTypeShapes args
+        EBitcast _ ty inner -> validatePointerFreeType "bitcast type" ty >> validateExprTypeShapes inner
+        EField _ base _ -> validateExprTypeShapes base
+        EIndex _ base index -> validateExprTypeShapes base >> validateExprTypeShapes index
+        _ -> Right ()
+
+typeContainsPointer :: Type -> Bool
+typeContainsPointer ty =
+  case ty of
+    TyPtr {} -> True
+    TyArray elemTy _ -> typeContainsPointer elemTy
+    _ -> False
+
 ensureTypeFeatures :: Scope -> Type -> Either CompileError ()
 ensureTypeFeatures scope ty = do
   when (typeUsesF16 ty && not (scopeFeatureEnabled scope "f16")) $
@@ -3561,7 +4658,11 @@ scopeOuterLocals scope =
     _ : rest -> foldl' IntSet.union IntSet.empty rest
 
 enterBlock :: Scope -> Scope
-enterBlock scope = scope { scScopes = IntSet.empty : scope.scScopes }
+enterBlock scope =
+  scope
+    { scScopes = IntSet.empty : scope.scScopes
+    , scAllowBreakIf = False
+    }
 
 scopeWithParams :: Scope -> [Text] -> Scope
 scopeWithParams scope names =
@@ -3593,6 +4694,66 @@ ensureNoDuplicatesAt label names =
       if Set.member name seen
         then Left (errorAtPos pos ("duplicate " <> textToString label <> ": " <> T.unpack name))
         else go (Set.insert name seen) rest
+
+validateModuleDeclarations :: ModuleAst -> Either CompileError ()
+validateModuleDeclarations ast = do
+  ensureNoDuplicates "type aliases" (map (.adName) ast.modAliases)
+  ensureNoDuplicates "struct declarations" (map (.sdName) ast.modStructs)
+  ensureNoDuplicates "bindings" (map (.bdName) ast.modBindings)
+  ensureNoDuplicates "global variables" (map (.gvName) ast.modGlobals)
+  ensureNoDuplicates "const declarations" (map (.cdName) ast.modConsts)
+  ensureNoDuplicates "override declarations" (map (.odName) ast.modOverrides)
+  ensureNoDuplicates "entry points" (map (.epName) ast.modEntries)
+  let reservedNames = moduleReservedNames ast
+  ensureNoDuplicates "module declarations" reservedNames
+  let reserved = Set.fromList reservedNames
+  let functionCollisions =
+        Set.toList $
+          Set.fromList
+            [ fn.fnName
+            | fn <- ast.modFunctions
+            , Set.member fn.fnName reserved
+            ]
+  unless (null functionCollisions) $
+    Left
+      ( CompileError
+          ("duplicate module declarations: " <> T.unpack (T.intercalate ", " functionCollisions))
+          Nothing
+          Nothing
+      )
+
+validateImportDeclarationConflicts :: ModuleContext -> ModuleAst -> Either CompileError ()
+validateImportDeclarationConflicts ctx ast =
+  let declarationNames = Set.fromList (moduleReservedNames ast <> map (.fnName) ast.modFunctions)
+      importNames = Set.fromList (Map.keys ctx.mcModuleAliases <> Map.keys ctx.mcItemAliases)
+      conflicts = Set.toList (Set.intersection declarationNames importNames)
+  in unless (null conflicts) $
+      Left
+        ( CompileError
+            ("import aliases conflict with module declarations: " <> T.unpack (T.intercalate ", " conflicts))
+            Nothing
+            Nothing
+        )
+
+moduleReservedNames :: ModuleAst -> [Text]
+moduleReservedNames ast =
+  map (.adName) ast.modAliases
+    <> map (.sdName) ast.modStructs
+    <> map (.bdName) ast.modBindings
+    <> map (.gvName) ast.modGlobals
+    <> map (.cdName) ast.modConsts
+    <> map (.odName) ast.modOverrides
+    <> map (.epName) ast.modEntries
+
+validateFunctionOverloads :: [FunctionDecl] -> Either CompileError ()
+validateFunctionOverloads = go []
+  where
+    go _ [] = Right ()
+    go seen (fn:rest) =
+      let signature = (fn.fnName, map (.paramType) fn.fnParams)
+      in if signature `elem` seen
+          then Left (CompileError ("duplicate function overload: " <> textToString fn.fnName) Nothing Nothing)
+          else go (signature : seen) rest
 
 isBuiltinName :: Text -> Bool
 isBuiltinName name =
@@ -3722,9 +4883,12 @@ builtinNames =
     , "atomicCompareExchangeWeak"
     ]
 
-qualifyModule :: [Text] -> Map.Map FilePath ModuleContext -> ModuleNode -> ModuleNode
+qualifyModule :: [Text] -> Map.Map ModuleIdentity ModuleContext -> ModuleNode -> ModuleNode
 qualifyModule rootPath ctxs node =
-  let ctx = fromMaybe (buildModuleContext rootPath "" node) (Map.lookup node.mnFile ctxs)
+  let ctx =
+        fromMaybe
+          (buildModuleContext rootPath "" node)
+          (Map.lookup (moduleIdentity node) ctxs)
       ast = node.mnAst
       prefix = ctx.mcPath
       rename = qualNameWithRoot ctx.mcRootPath prefix
@@ -3804,11 +4968,80 @@ qualifyModule rootPath ctxs node =
           }
   in node { mnAst = ast' }
 
+dependencyPackagePathMarker :: Text
+dependencyPackagePathMarker = "$package$"
+
+currentPackagePathMarker :: Text
+currentPackagePathMarker = "$current$"
+
+packageModulePathMarker :: Text
+packageModulePathMarker = "$module$"
+
+publicPackageBoundary :: Text
+publicPackageBoundary = "package"
+
+qualifiedNamePrefix :: Text
+qualifiedNamePrefix = "__wesl__q"
+
+encodeQualifiedName :: [Text] -> Text
+encodeQualifiedName =
+  (qualifiedNamePrefix <>) . T.concat . map encodeSegment
+  where
+    encodeSegment segment =
+      T.pack (show (T.length segment)) <> "_" <> segment
+
+decodeQualifiedName :: Text -> Maybe [Text]
+decodeQualifiedName name = do
+  encoded <- T.stripPrefix qualifiedNamePrefix name
+  segments <- decodeSegments [] encoded
+  if null segments then Nothing else Just segments
+  where
+    decodeSegments acc encoded
+      | T.null encoded = Just (reverse acc)
+      | otherwise = do
+          let (digits, suffix) = T.span isDigit encoded
+          unlessMaybe (not (T.null digits))
+          ('_', remainder) <- T.uncons suffix
+          segmentLength <- readNatural digits
+          let (segment, rest) = T.splitAt segmentLength remainder
+          unlessMaybe (segmentLength > 0 && T.length segment == segmentLength)
+          decodeSegments (segment : acc) rest
+
+    readNatural digits =
+      case reads (T.unpack digits) of
+        [(value, "")] | value >= 0 -> Just value
+        _ -> Nothing
+
+    unlessMaybe condition = if condition then Just () else Nothing
+
+publicQualifiedName :: Text -> Text
+publicQualifiedName name =
+  case decodeQualifiedName name of
+    Nothing -> name
+    Just segments ->
+      let publicSegments =
+            case segments of
+              currentMarker : moduleMarker : modulePath
+                | currentMarker == currentPackagePathMarker
+                , moduleMarker == packageModulePathMarker ->
+                    publicPackageBoundary : modulePath
+              dependencyMarker : rest
+                | dependencyMarker == dependencyPackagePathMarker ->
+                    case break (== packageModulePathMarker) rest of
+                      ([packageName], _ : modulePath) -> [packageName] <> modulePath
+                      (packagePath@(_ : _ : _), _ : modulePath) ->
+                        packagePath <> [publicPackageBoundary] <> modulePath
+                      _ -> segments
+              _ -> segments
+      in if null publicSegments
+          then name
+          else T.intercalate "::" publicSegments
+
 qualNameWithRoot :: [Text] -> [Text] -> Text -> Text
 qualNameWithRoot rootPath path name =
   if null path || path == rootPath
     then name
-    else "__wesl__" <> T.intercalate "__" path <> "__" <> name
+    else encodeQualifiedName (path <> [name])
 
 rewriteIdent :: ModuleContext -> Text -> Text
 rewriteIdent ctx name =

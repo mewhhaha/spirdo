@@ -16,6 +16,8 @@ module Spirdo.Wesl.Uniform
   , uniform
   , packUniform
   , packUniformFrom
+  , validateUniformStorableUnchecked
+  , packUniformStorableUnchecked
   , validateUniformStorable
   , packUniformStorable
   ) where

@@ -1,6 +1,11 @@
 packages: .
           ../
 
+-- Hackage package versions and revisions are fixed for repeatable CI solves.
+index-state: 2026-07-01T00:00:00Z
+
+-- Pin the demo backend to the reviewed Slop revision until it publishes a
+-- compatible Hackage release.
 source-repository-package
   type: git
   location: https://github.com/mewhhaha/slop

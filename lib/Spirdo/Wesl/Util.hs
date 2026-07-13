@@ -39,6 +39,7 @@ module Spirdo.Wesl.Util
   , ptrAccessCompatible
   , vectorFieldIndex
   , vectorFieldIndices
+  , doubleToHalfBits
   , floatToHalfBits
   , halfBitsToFloat
   , builtInGlobalInvocationId
@@ -59,7 +60,7 @@ module Spirdo.Wesl.Util
   , storageFormatToImageFormat
   ) where
 
-import Data.Bits ((.&.), (.|.), shiftL, shiftR)
+import Data.Bits ((.&.), (.|.), countLeadingZeros, shiftL, shiftR)
 import Data.Char (chr, digitToInt, isAlphaNum, isDigit, isHexDigit, ord)
 import Data.Int (Int32)
 import Data.List (isInfixOf, isPrefixOf)
@@ -68,7 +69,7 @@ import Control.Monad (when)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word16, Word32)
-import GHC.Float (castFloatToWord32)
+import GHC.Float (castDoubleToWord64, castWord32ToFloat, float2Double)
 import Spirdo.Wesl.Syntax (Expr(..), LValue(..), SrcPos(..), Stage(..), Stmt(..), Token(..), UnaryOp(..), WorkgroupSize(..))
 import Spirdo.Wesl.Types
 import Text.Read (readMaybe)
@@ -669,55 +670,80 @@ vectorFieldIndices field n = do
         then Right ()
         else Left (CompileError ("vector field out of range: " <> textToString name) Nothing Nothing)
 
-floatToHalfBits :: Float -> Word16
-floatToHalfBits val =
-  let w = castFloatToWord32 val
-      sign = fromIntegral ((w `shiftR` 16) .&. 0x8000) :: Word16
-      expBits = fromIntegral ((w `shiftR` 23) .&. 0xFF) :: Int
-      mant = w .&. 0x7FFFFF
-      expUnbiased = expBits - 127
-  in case expBits of
-      0xFF ->
-        if mant == 0
-          then sign .|. 0x7C00
-          else sign .|. 0x7C00 .|. fromIntegral ((mant `shiftR` 13) .&. 0x3FF) .|. 0x1
+doubleToHalfBits :: Double -> Word16
+doubleToHalfBits value =
+  let bits = castDoubleToWord64 value
+      sign = fromIntegral ((bits `shiftR` 48) .&. 0x8000)
+      exponentBits = fromIntegral ((bits `shiftR` 52) .&. 0x7ff) :: Int
+      fractionBits = bits .&. 0x000fffffffffffff
+  in case exponentBits of
+      0x7ff ->
+        if fractionBits == 0
+          then sign .|. 0x7c00
+          else
+            let payload = fromIntegral ((fractionBits `shiftR` 42) .&. 0x03ff)
+            in sign .|. 0x7c00 .|. payload .|. 0x0200
+      0 -> sign
       _ ->
-        if expUnbiased > 15
-          then sign .|. 0x7C00
-          else if expUnbiased >= -14
-            then
-              let exp16 = expUnbiased + 15
-                  mantRounded = mant + 0x1000
-                  exp16' = if mantRounded .&. 0x800000 /= 0 then exp16 + 1 else exp16
-                  mant16 = (mantRounded `shiftR` 13) .&. 0x3FF
-              in if exp16' >= 31
-                  then sign .|. 0x7C00
-                  else sign .|. (fromIntegral exp16' `shiftL` 10) .|. fromIntegral mant16
-            else if expUnbiased >= -24
-              then
-                let shift = (-expUnbiased) - 14
-                    mant32 = mant .|. 0x800000
-                    mantRounded = mant32 + (1 `shiftL` (shift + 12))
-                    mant16 = mantRounded `shiftR` (shift + 13)
-                in sign .|. fromIntegral mant16
-              else sign
+        let binaryExponent = exponentBits - 1023
+            binarySignificand = toInteger (fractionBits .|. 0x0010000000000000)
+        in if binaryExponent >= -14
+            then encodeNormal sign binaryExponent binarySignificand
+            else encodeSubnormal sign binaryExponent binarySignificand
+  where
+    encodeNormal sign binaryExponent binarySignificand =
+      let rounded = roundShiftRightEven binarySignificand 42
+          (normalized, exponent') =
+            if rounded == 0x800
+              then (0x400, binaryExponent + 1)
+              else (rounded, binaryExponent)
+          halfExponent = exponent' + 15
+      in if halfExponent >= 31
+          then sign .|. 0x7c00
+          else
+            sign
+              .|. (fromIntegral halfExponent `shiftL` 10)
+              .|. fromIntegral (normalized - 0x400)
+
+    encodeSubnormal sign binaryExponent binarySignificand =
+      let rounded = roundShiftRightEven binarySignificand (28 - binaryExponent)
+      in sign .|. fromIntegral rounded
+
+roundShiftRightEven :: Integer -> Int -> Integer
+roundShiftRightEven value shift
+  | shift <= 0 = value `shiftL` negate shift
+  | otherwise =
+      let divisor = 1 `shiftL` shift
+          midpoint = divisor `div` 2
+          (quotient, remainder) = value `quotRem` divisor
+      in if remainder > midpoint || (remainder == midpoint && odd quotient)
+          then quotient + 1
+          else quotient
+
+floatToHalfBits :: Float -> Word16
+floatToHalfBits = doubleToHalfBits . float2Double
 
 halfBitsToFloat :: Word16 -> Float
-halfBitsToFloat bits =
-  let sign = if bits .&. 0x8000 == 0 then 1.0 else -1.0
-      expBits = fromIntegral ((bits `shiftR` 10) .&. 0x1F) :: Int
-      mant = fromIntegral (bits .&. 0x3FF) :: Float
-  in case expBits of
-      0 ->
-        if mant == 0
-          then sign * 0.0
-          else sign * (2 ** (-14)) * (mant / 1024.0)
-      31 ->
-        if mant == 0
-          then sign * (1 / 0)
-          else 0 / 0
-      _ ->
-        sign * (2 ** fromIntegral (expBits - 15)) * (1.0 + mant / 1024.0)
+halfBitsToFloat bits = castWord32ToFloat (signBits .|. magnitudeBits)
+  where
+    signBits = fromIntegral (bits .&. 0x8000) `shiftL` 16
+    halfExponent = fromIntegral ((bits `shiftR` 10) .&. 0x1f) :: Int
+    fraction = bits .&. 0x03ff
+
+    magnitudeBits =
+      case halfExponent of
+        0
+          | fraction == 0 -> 0
+          | otherwise ->
+              let leadingBit = 15 - countLeadingZeros fraction
+                  exponentBits = fromIntegral (leadingBit + 103) `shiftL` 23
+                  leadingValue = (1 :: Word16) `shiftL` leadingBit
+                  fractionBits = fromIntegral (fraction - leadingValue) `shiftL` (23 - leadingBit)
+              in exponentBits .|. fractionBits
+        31 -> 0x7f800000 .|. (fromIntegral fraction `shiftL` 13)
+        _ ->
+          (fromIntegral (halfExponent + 112) `shiftL` 23)
+            .|. (fromIntegral fraction `shiftL` 13)
 
 builtInGlobalInvocationId :: Word32
 builtInGlobalInvocationId = 28

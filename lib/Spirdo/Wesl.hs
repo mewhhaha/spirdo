@@ -7,9 +7,9 @@ module Spirdo.Wesl
   , renderCompileErrorWithSource
   , Source
   , sourceText
+  , sourceNamed
   , sourceFile
   , Option(..)
-  , CachePolicy(..)
   , OverrideSpecMode(..)
   , OverrideValue(..)
   , SamplerBindingMode(..)
@@ -42,8 +42,7 @@ import Data.Word (Word32)
 
 import qualified Spirdo.Wesl.Compiler as Compiler
 import Spirdo.Wesl.Types
-  ( CachePolicy(..)
-  , CompileError(..)
+  ( CompileError(..)
   , Diagnostic(..)
   , DiagnosticSeverity(..)
   , Option(..)
@@ -70,7 +69,7 @@ data ShaderBundle = ShaderBundle
   , sbOverrides :: ![OverrideLayout]
   , sbSamplerMode :: !SamplerBindingMode
   , sbWorkgroupSize :: !(Maybe (Word32, Word32, Word32))
-  } deriving (Eq, Show, Read)
+  } deriving (Eq, Show)
 
 -- | Simplified binding metadata (no type layout).
 data BindingLayout = BindingLayout
@@ -110,13 +109,20 @@ shaderOverrides bundle = bundle.sbOverrides
 shaderSamplerMode :: ShaderBundle -> SamplerBindingMode
 shaderSamplerMode bundle = bundle.sbSamplerMode
 
--- | Workgroup size for compute shaders.
+-- | Known/default workgroup size for compute shaders, when available.
 shaderWorkgroupSize :: ShaderBundle -> Maybe (Word32, Word32, Word32)
 shaderWorkgroupSize bundle = bundle.sbWorkgroupSize
 
 -- | Build an inline source with a default name.
 sourceText :: String -> Source
 sourceText = SourceInline "<inline>"
+
+-- | Build inline source with a name used in diagnostics.
+--
+-- Inline sources cannot resolve filesystem imports; use 'sourceFile' when the
+-- source imports other modules.
+sourceNamed :: FilePath -> String -> Source
+sourceNamed = SourceInline
 
 -- | Build a file source (imports resolved from this file).
 sourceFile :: FilePath -> Source

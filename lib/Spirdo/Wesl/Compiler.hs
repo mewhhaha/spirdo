@@ -13,39 +13,42 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 -- | Compiler pipeline and quasiquoter implementation.
-module Spirdo.Wesl.Compiler where
+module Spirdo.Wesl.Compiler
+  ( module Spirdo.Wesl.Compiler
+  , module Spirdo.Wesl.Compiler.Cache
+  ) where
 
-import Control.Exception (IOException, SomeException, catch, evaluate, try)
-import Control.Monad (unless)
+import Control.Exception (IOException, evaluate, try)
+import Control.Monad (foldM, unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT(..), runExceptT, throwE, withExceptT)
 import Data.Bifunctor (first)
-import Data.Bits (xor)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
-import Data.Char (isSpace, ord)
+import Data.Char (isAlpha, isAlphaNum, isSpace)
+import Data.Graph (SCC(..), stronglyConnComp)
 import Data.List (isInfixOf, isPrefixOf, sort)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Set as Set
-import Data.Word (Word8, Word64)
+import Data.Word (Word64)
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import Language.Haskell.TH (Exp, Q)
 import qualified Language.Haskell.TH as TH
 import Language.Haskell.TH.Quote (QuasiQuoter(..))
-import Numeric (showFFloat, showHex)
+import Numeric (showFFloat)
+import Spirdo.Wesl.Compiler.Cache
 import Spirdo.Wesl.Emit
 import Spirdo.Wesl.Parser
+import Spirdo.Wesl.SourceFile
 import Spirdo.Wesl.Syntax
 import Spirdo.Wesl.Typecheck
 import Spirdo.Wesl.Types
 import Spirdo.Wesl.Util (annotateErrorWithSource, renderErrorWithSource)
-import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.FilePath (dropExtension, isRelative, makeRelative, normalise, splitDirectories, takeDirectory, (<.>), (</>))
-import Text.Read (readMaybe)
+import System.Directory (canonicalizePath, doesDirectoryExist, doesFileExist, makeAbsolute)
+import System.FilePath (isAbsolute, makeRelative, normalise, takeDirectory, (<.>), (</>))
 
 overrideValuesText :: [(String, OverrideValue)] -> [(Text, OverrideValue)]
 overrideValuesText = map (first T.pack)
@@ -191,7 +194,7 @@ compileInlineResult opts wantDiagnostics name src = do
   moduleAst <- resolveConstExprs [] "" moduleAst2'
   unless (null moduleAst.modImports) $
     Left (CompileError "imports require file-based compilation" Nothing Nothing)
-  let node = ModuleNode "<inline>" [] moduleAst []
+  let node = ModuleNode "" "<inline>" [] moduleAst []
   let constIndex = buildConstIndex [node]
   let fnIndex = buildFunctionIndex [node]
   let structIndex = buildStructIndex [node]
@@ -211,52 +214,6 @@ compileInlineResult opts wantDiagnostics name src = do
     , crSource = Just (ShaderSource name (T.pack src))
     }
 
-compileInlineResultIO :: CompileOptions -> Bool -> FilePath -> String -> IO (Either CompileError CompileResult)
-compileInlineResultIO opts wantDiagnostics name src = runExceptT $ do
-  moduleAst0 <- ExceptT (timedPhase opts "parse" (evaluate (parseModuleWith opts.enabledFeatures src)))
-  moduleAst1 <- ExceptT (timedPhase opts "type-aliases" (evaluate (resolveTypeAliases moduleAst0)))
-  moduleAst2 <- ExceptT (timedPhase opts "infer-overrides" (evaluate (inferOverrideTypes [] "" moduleAst1)))
-  moduleAst2' <- ExceptT (timedPhase opts "overrides" (evaluate (lowerOverridesWith [] (overrideValuesText opts.overrideValues) moduleAst2)))
-  moduleAst <- ExceptT (timedPhase opts "resolve-const" (evaluate (resolveConstExprs [] "" moduleAst2')))
-  unless (null moduleAst.modImports) $
-    throwE (CompileError "imports require file-based compilation" Nothing Nothing)
-  let node = ModuleNode "<inline>" [] moduleAst []
-  let constIndex = buildConstIndex [node]
-  let fnIndex = buildFunctionIndex [node]
-  let structIndex = buildStructIndex [node]
-  let overrideIndex = buildOverrideIndex [node]
-  _ <- ExceptT (timedPhase opts "validate" (evaluate (validateModuleScopes opts False [] "" constIndex fnIndex structIndex overrideIndex [node])))
-  iface <- ExceptT (timedPhase opts "interface" (evaluate (buildInterface opts moduleAst)))
-  spirvBytes <- ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts moduleAst iface)))
-  diagList <-
-    if wantDiagnostics
-      then ExceptT (timedPhase opts "diagnostics" (evaluate (collectDiagnosticsMerged opts [] moduleAst)))
-      else pure []
-  pure
-    CompileResult
-      { crAst = moduleAst
-      , crInterface = iface
-      , crSpirv = spirvBytes
-      , crDiagnostics = diagList
-      , crSource = Just (ShaderSource name (T.pack src))
-      }
-
-normalizeImportsForRoot :: FilePath -> Map.Map FilePath Text -> Map.Map FilePath Text
-normalizeImportsForRoot rootDir imports0 =
-  if null rootDir || rootDir == "."
-    then imports0
-    else foldl' add imports0 (Map.toList imports0)
-  where
-    add acc (key, src)
-      | isRelative key && not (isUnder rootDir key) =
-          Map.insertWith (\_ old -> old) (rootDir </> key) src acc
-      | otherwise = acc
-
-    isUnder base path =
-      let baseSegs = splitDirectories (normalise base)
-          pathSegs = splitDirectories (normalise path)
-      in baseSegs `isPrefixOf` pathSegs
-
 parseModuleMap :: CompileOptions -> Map.Map FilePath Text -> Either CompileError (Map.Map FilePath ModuleAst)
 parseModuleMap opts modules =
   fmap Map.fromList (mapM parseOne (Map.toList modules))
@@ -270,9 +227,6 @@ validateInlineImports :: FilePath -> Imports mods -> [ModuleNode] -> Either Comp
 validateInlineImports rootName importSet nodes = do
   let rootDir = takeDirectory rootName
   let provided = importsNames importSet
-  let dupes = duplicates provided
-  unless (null dupes) $
-    Left (CompileError ("duplicate import modules: " <> showListComma dupes) Nothing Nothing)
   let usedFiles =
         [ node.mnFile
         | node <- nodes
@@ -299,17 +253,38 @@ validateInlineImports rootName importSet nodes = do
             Nothing
         )
   where
-    duplicates xs =
-      let groups = Map.fromListWith (+) [(x, (1 :: Int)) | x <- xs]
-      in [x | (x, n) <- Map.toList groups, n > 1]
-
     showListComma xs = T.unpack (T.intercalate ", " (map T.pack xs))
 
     formatImportDelta _ [] = ""
     formatImportDelta label xs = " (" <> label <> ": " <> showListComma (sort xs) <> ")"
 
+validateInlineImportNames :: Imports mods -> Either CompileError ()
+validateInlineImportNames importSet =
+  unless (null collisions) $
+    Left
+      ( CompileError
+          ("duplicate import modules after normalization: " <> showListComma (map showCollision collisions))
+          Nothing
+          Nothing
+      )
+  where
+    groups =
+      Map.fromListWith (<>)
+        [ (normalizeModuleKey name, [name])
+        | name <- importsNames importSet
+        ]
+    collisions =
+      [ (normalizedName, sort rawNames)
+      | (normalizedName, rawNames) <- Map.toList groups
+      , length rawNames > 1
+      ]
+    showCollision (normalizedName, rawNames) =
+      normalizedName <> " (from " <> showListComma rawNames <> ")"
+    showListComma names = T.unpack (T.intercalate ", " (map T.pack names))
+
 compileInlineResultWithImports :: CompileOptions -> Bool -> FilePath -> Imports mods -> String -> Either CompileError CompileResult
 compileInlineResultWithImports opts wantDiagnostics rootName importSet src = do
+  validateInlineImportNames importSet
   let rootDir = takeDirectory rootName
   moduleAst0 <- parseModuleWith opts.enabledFeatures src
   let importMap = normalizeImportsForRoot rootDir (importsMap importSet)
@@ -338,20 +313,27 @@ compileInlineResultWithImports opts wantDiagnostics rootName importSet src = do
     }
 
 compileFileResult :: CompileOptions -> Bool -> FilePath -> IO (Either CompileError CompileResult)
-compileFileResult opts wantDiagnostics path =
+compileFileResult opts wantDiagnostics path = do
+  result <- try (compileFileResultUnchecked opts wantDiagnostics path) :: IO (Either IOException (Either CompileError CompileResult))
+  pure $
+    case result of
+      Left ioErr ->
+        Left
+          ( CompileError
+              ("failed to compile file: " <> path <> " (" <> show ioErr <> ")")
+              Nothing
+              Nothing
+          )
+      Right compiled -> compiled
+
+compileFileResultUnchecked :: CompileOptions -> Bool -> FilePath -> IO (Either CompileError CompileResult)
+compileFileResultUnchecked opts wantDiagnostics path =
   runExceptT $ do
-    filePath <- ExceptT (resolveInputPath path)
-    src <- do
-      readResult <- liftIO (try (timedPhase opts "read-file" (readFile filePath)) :: IO (Either IOException String))
-      case readResult of
-        Left ioErr ->
-          throwE
-            ( CompileError
-                ("failed to read file: " <> filePath <> " (" <> show ioErr <> ")")
-                Nothing
-                Nothing
-            )
-        Right text -> pure text
+    input <- ExceptT (resolveInputPath path)
+    let filePath = input.riCanonical
+    sourceFile <- ExceptT (timedPhase opts "read-file" (readBoundedUtf8File "input file" maxSourceUtf8Bytes filePath))
+    let src = T.unpack sourceFile.text
+    importRoots <- ExceptT (discoverFileImportRoots input.riSelected filePath)
     let annotate :: ExceptT CompileError IO a -> ExceptT CompileError IO a
         annotate = withExceptT annotateErr
         annotateErr err
@@ -361,11 +343,22 @@ compileFileResult opts wantDiagnostics path =
                 (Just _, Just _) -> annotateErrorWithSource (Just filePath) src err
                 _ -> err
     moduleAst0 <- annotate (ExceptT (timedPhase opts "parse" (evaluate (parseModuleWith opts.enabledFeatures src))))
-    -- resolveImports performs module linking and validateModuleScopes for file-based builds.
-    linked <- ExceptT (timedPhase opts "imports" (resolveImports opts (dropExtension filePath) moduleAst0))
+    -- resolveImports reads every imported module below this boundary.
+    importResult <- liftIO (try (timedPhase opts "imports" (resolveImports opts importRoots filePath (T.length sourceFile.text) moduleAst0)) :: IO (Either IOException (Either CompileError ModuleAst)))
+    linked <-
+      case importResult of
+        Left ioErr ->
+          throwE
+            ( CompileError
+                ("failed to read an imported module while compiling " <> filePath <> " (" <> show ioErr <> ")")
+                Nothing
+                Nothing
+            )
+        Right result -> ExceptT (pure result)
     linked' <- annotate (ExceptT (timedPhase opts "type-aliases" (evaluate (resolveTypeAliases linked))))
-    let rootDir = takeDirectory filePath
-        rootPath = modulePathFromFile rootDir filePath
+    rootPackage <- ExceptT (pure (lookupPackageImportRoot importRoots importRoots.firCurrent))
+    rootPath <- ExceptT (pure (modulePathFromPackage importRoots importRoots.firCurrent filePath))
+    let rootDir = rootPackage.pirPath
     linked'' <- annotate (ExceptT (timedPhase opts "infer-overrides" (evaluate (inferOverrideTypes rootPath rootDir linked'))))
     lowered0 <- annotate (ExceptT (timedPhase opts "overrides" (evaluate (lowerOverridesWith rootPath (overrideValuesText opts.overrideValues) linked''))))
     lowered <- annotate (ExceptT (timedPhase opts "resolve-const" (evaluate (resolveConstExprs rootPath rootDir lowered0))))
@@ -382,120 +375,14 @@ compileFileResult opts wantDiagnostics path =
       , crInterface = iface
       , crSpirv = spirvBytes
       , crDiagnostics = diags
-      , crSource = Just (ShaderSource filePath (T.pack src))
+      , crSource = Just (ShaderSource filePath sourceFile.text)
       }
-
-weslCacheVersion :: String
-weslCacheVersion = "wesl-cache-v4"
-
-defaultCacheDir :: FilePath
-defaultCacheDir = "dist-newstyle" </> ".wesl-cache"
-
-weslCacheKeyWithImports :: CompileOptions -> FilePath -> Imports mods -> String -> String
-weslCacheKeyWithImports opts rootName importSet src =
-  let rootDir = takeDirectory rootName
-      importMap = normalizeImportsForRoot rootDir (importsMap importSet)
-      importEntries = sort (Map.toList importMap)
-      importLines =
-        concatMap
-          ( \(name, text) ->
-              [ "import=" <> normalise name
-              , T.unpack text
-              ]
-          )
-          importEntries
-  in weslCacheKeyFromLines opts (["kind=imports", "root=" <> normalise rootName, src] <> importLines)
-
-weslCacheKeyFromLines :: CompileOptions -> [String] -> String
-weslCacheKeyFromLines opts bodyLines =
-  let keyLines =
-        [ weslCacheVersion
-        , "v=" <> show (opts.spirvVersion)
-        , "features=" <> show (opts.enabledFeatures)
-        , "overrides=" <> show opts.overrideValues
-        , "spec=" <> show opts.overrideSpecMode
-        , "samplerMode=" <> show opts.samplerBindingMode
-        , "entry=" <> show opts.entryPointName
-        ]
-        <> bodyLines
-      hash = foldl' updateLine fnv1a64Offset (zip [0 :: Int ..] keyLines)
-      hex = showHex hash ""
-  in replicate (16 - length hex) '0' <> hex
-
-updateLine :: Word64 -> (Int, String) -> Word64
-updateLine acc (ix, line) =
-  let acc' =
-        if ix == 0
-          then acc
-          else fnv1a64Step acc (fromIntegral (ord '\n'))
-  in foldl' (\a ch -> fnv1a64Step a (fromIntegral (ord ch))) acc' line
-
-fnv1a64Offset :: Word64
-fnv1a64Offset = 14695981039346656037
-
-fnv1a64Prime :: Word64
-fnv1a64Prime = 1099511628211
-
-fnv1a64Step :: Word64 -> Word8 -> Word64
-fnv1a64Step acc byte = (acc `xor` fromIntegral byte) * fnv1a64Prime
-
-fnv1a64 :: ByteString -> Word64
-fnv1a64 = BS.foldl' fnv1a64Step fnv1a64Offset
-
-weslCachePathsByKey :: CompileOptions -> String -> (FilePath, FilePath)
-weslCachePathsByKey opts key =
-  let baseDir = if null opts.cacheDir then defaultCacheDir else opts.cacheDir
-      base = baseDir </> key
-  in (base <.> "spv", base <.> "iface")
-
-loadWeslCacheByKey :: CompileOptions -> String -> IO (Maybe (ByteString, ShaderInterface))
-loadWeslCacheByKey opts key =
-  if not (opts.cacheEnabled)
-    then pure Nothing
-    else do
-      let (spvPath, ifacePath) = weslCachePathsByKey opts key
-      okSpv <- doesFileExist spvPath
-      okIface <- doesFileExist ifacePath
-      if not (okSpv && okIface)
-        then pure Nothing
-        else
-          (do
-            bytes <- BS.readFile spvPath
-            ifaceText <- readFile ifacePath
-            case readMaybe ifaceText of
-              Just iface -> pure (Just (bytes, iface))
-              Nothing -> pure Nothing
-          ) `catch` \(_ :: SomeException) -> pure Nothing
-
-loadWeslCacheWithImports :: CompileOptions -> FilePath -> Imports mods -> String -> IO (Maybe (ByteString, ShaderInterface))
-loadWeslCacheWithImports opts rootName importSet src =
-  loadWeslCacheByKey opts (weslCacheKeyWithImports opts rootName importSet src)
-
-writeWeslCacheByKey :: CompileOptions -> String -> ByteString -> ShaderInterface -> IO ()
-writeWeslCacheByKey opts key bytes iface =
-  if not (opts.cacheEnabled)
-    then pure ()
-    else
-      let (spvPath, ifacePath) = weslCachePathsByKey opts key
-      in (do
-            createDirectoryIfMissing True (takeDirectory spvPath)
-            BS.writeFile spvPath bytes
-            writeFile ifacePath (show iface)
-         ) `catch` \(_ :: SomeException) -> pure ()
-
-writeWeslCacheWithImports :: CompileOptions -> FilePath -> Imports mods -> String -> ByteString -> ShaderInterface -> IO ()
-writeWeslCacheWithImports opts rootName importSet src bytes iface =
-  writeWeslCacheByKey opts (weslCacheKeyWithImports opts rootName importSet src) bytes iface
 
 -- Quasiquoter
 
 -- | Quasiquoter for raw inline WESL source.
 wesl :: QuasiQuoter
-wesl = weslWith defaultCompileOptions
-
--- | Quasiquoter for raw WESL source (options ignored).
-weslWith :: CompileOptions -> QuasiQuoter
-weslWith _ =
+wesl =
   QuasiQuoter
     { quoteExp = \src -> pure (TH.LitE (TH.StringL src))
     , quotePat = const (fail "wesl: pattern context not supported")
@@ -505,6 +392,10 @@ weslWith _ =
 
 compileInlineCachedWithImports :: CompileOptions -> FilePath -> Imports mods -> String -> Q (ByteString, ShaderInterface, Maybe ShaderSource)
 compileInlineCachedWithImports opts rootName importSet src = do
+  either
+    (fail . renderErrorWithSource (Just rootName) src)
+    pure
+    (validateInlineImportNames importSet)
   let sourceInfo = Just (ShaderSource rootName (T.pack src))
   cached <- TH.runIO (timed opts "cache-read" (loadWeslCacheWithImports opts rootName importSet src))
   maybe
@@ -611,162 +502,689 @@ unsafePrepareInline shader =
 
 -- Package metadata
 
--- | Minimal package metadata parsed from @wesl.toml@.
+-- | Package metadata parsed from @wesl.toml@.
 data PackageInfo = PackageInfo
   { pkgName :: String
   , pkgVersion :: Maybe String
   , pkgRoot :: FilePath
   , pkgSourceRoot :: FilePath
   , pkgDependencies :: [PackageDependency]
+  , pkgEdition :: String
+  , pkgPackageManager :: Maybe String
+  , pkgManifest :: FilePath
   } deriving (Eq, Show)
 
 -- | Dependency entry from @wesl.toml@.
 data PackageDependency = PackageDependency
   { depName :: String
   , depVersion :: Maybe String
+  , depPackage :: Maybe String
   , depPath :: Maybe FilePath
   } deriving (Eq, Show)
+
+data LoadedPackage = LoadedPackage
+  { package :: !PackageInfo
+  , manifestBytes :: !Int
+  }
 
 data TomlSection
   = TomlSectionNone
   | TomlSectionPackage
   | TomlSectionDependencies
   | TomlSectionDependency String
+  | TomlSectionOther
   deriving (Eq, Show)
 
+data ManifestState = ManifestState
+  { msSection :: !TomlSection
+  , msSections :: !(Set.Set String)
+  , msPackageFields :: !(Map.Map String String)
+  , msDependencies :: !(Map.Map String PackageDependency)
+  }
+
+emptyManifestState :: ManifestState
+emptyManifestState =
+  ManifestState TomlSectionNone Set.empty Map.empty Map.empty
+
 -- | Find and parse the nearest @wesl.toml@ above a file path.
-discoverPackageInfo :: FilePath -> IO (Maybe PackageInfo)
-discoverPackageInfo filePath = do
-  let start = takeDirectory filePath
-  findWeslToml start
+discoverPackageInfo :: FilePath -> IO (Either CompileError (Maybe LoadedPackage))
+discoverPackageInfo filePath = findWeslToml (takeDirectory filePath)
   where
     findWeslToml dir = do
       let candidate = dir </> "wesl.toml"
       exists <- doesFileExist candidate
       if exists
-        then parseWeslToml candidate
+        then fmap Just <$> loadWeslPackage candidate
         else
           let parent = takeDirectory dir
           in if parent == dir
-              then pure Nothing
+              then pure (Right Nothing)
               else findWeslToml parent
 
-parseWeslToml :: FilePath -> IO (Maybe PackageInfo)
-parseWeslToml path = do
-  contents <- readFile path
-  let root = takeDirectory path
-      (_, mName, mVersion, mSource, deps) = foldl (parseLine root) (TomlSectionNone, Nothing, Nothing, Nothing, Map.empty) (lines contents)
-      name = fromMaybe "wesl-package" mName
-      sourceRoot = fromMaybe "." mSource
-  pure (Just (PackageInfo name mVersion root (root </> sourceRoot) (Map.elems deps)))
+parseWeslToml :: FilePath -> IO (Either CompileError PackageInfo)
+parseWeslToml path = fmap (fmap (\loaded -> loaded.package)) (loadWeslPackage path)
+
+loadWeslPackage :: FilePath -> IO (Either CompileError LoadedPackage)
+loadWeslPackage path = runExceptT $ do
+  manifest <- ExceptT (canonicalizeExistingPath "WESL manifest" path)
+  manifestFile <- ExceptT (readBoundedUtf8File "WESL manifest" maxManifestUtf8Bytes manifest)
+  packageInfo <- ExceptT (pure (parseWeslTomlText manifest (T.unpack manifestFile.text)))
+  sourceRoot <- ExceptT (canonicalizeExistingPath "package root" packageInfo.pkgSourceRoot)
+  pure
+    LoadedPackage
+      { package = packageInfo { pkgSourceRoot = sourceRoot }
+      , manifestBytes = manifestFile.bytes
+      }
+
+parseWeslTomlText :: FilePath -> String -> Either CompileError PackageInfo
+parseWeslTomlText manifest contents = do
+  parsed <- foldM parseLine emptyManifestState (zip [1 :: Int ..] (lines contents))
+  edition <-
+    case Map.lookup "edition" parsed.msPackageFields of
+      Just value -> Right value
+      Nothing -> Left (manifestError manifest Nothing "missing required [package] field edition")
+  let packageManager = Map.lookup "package-manager" parsed.msPackageFields
+  case packageManager of
+    Just value | value `notElem` ["npm", "cargo"] ->
+      Left (manifestError manifest Nothing ("unsupported package-manager: " <> value))
+    _ -> pure ()
+  let manifestRoot = takeDirectory manifest
+      source = Map.findWithDefault "./shaders" "root" parsed.msPackageFields
+      name = Map.findWithDefault "wesl-package" "name" parsed.msPackageFields
+      version = Map.lookup "version" parsed.msPackageFields
+  pure
+    PackageInfo
+      { pkgName = name
+      , pkgVersion = version
+      , pkgRoot = manifestRoot
+      , pkgSourceRoot = normalise (manifestRoot </> source)
+      , pkgDependencies = Map.elems parsed.msDependencies
+      , pkgEdition = edition
+      , pkgPackageManager = packageManager
+      , pkgManifest = manifest
+      }
   where
-    parseLine root (section, mName, mVersion, mSource, deps) line =
-      let trimmed = trim (takeWhile (/= '#') line)
-      in case trimmed of
-          [] -> (section, mName, mVersion, mSource, deps)
-          ('[':rest) ->
-            case dropWhileEnd (== ']') rest of
-              "package" -> (TomlSectionPackage, mName, mVersion, mSource, deps)
-              "dependencies" -> (TomlSectionDependencies, mName, mVersion, mSource, deps)
-              name
-                | "dependencies." `isPrefixOf` name ->
-                    let depName = drop (length ("dependencies." :: String)) name
-                    in (TomlSectionDependency depName, mName, mVersion, mSource, deps)
-              _ -> (TomlSectionNone, mName, mVersion, mSource, deps)
+    parseLine state (lineNumber, rawLine) =
+      let line = trim (stripTomlComment rawLine)
+      in case line of
+          [] -> Right state
+          ('[':_) -> parseSection manifest lineNumber line state
           _ ->
-            case break (== '=') trimmed of
-              (key, '=':val) ->
-                let key' = trim key
-                    val' = trim val
-                in case section of
-                    TomlSectionPackage ->
-                      case key' of
-                        "name" -> (section, Just (stripQuotes val'), mVersion, mSource, deps)
-                        "version" -> (section, mName, Just (stripQuotes val'), mSource, deps)
-                        "source_root" -> (section, mName, mVersion, Just (stripQuotes val'), deps)
-                        _ -> (section, mName, mVersion, mSource, deps)
-                    TomlSectionDependencies ->
-                      let (dep, deps') = parseDependencyLine root key' val' deps
-                      in (section, mName, mVersion, mSource, Map.insert (dep.depName) dep deps')
-                    TomlSectionDependency depName ->
-                      let deps' = updateDependency root depName key' val' deps
-                      in (section, mName, mVersion, mSource, deps')
-                    _ -> (section, mName, mVersion, mSource, deps)
-              _ -> (section, mName, mVersion, mSource, deps)
+            case state.msSection of
+              TomlSectionPackage -> parsePackageField manifest lineNumber line state
+              TomlSectionDependencies -> parseDependencyField manifest lineNumber line state
+              TomlSectionDependency name -> parseDependencyTableField manifest lineNumber name line state
+              TomlSectionNone -> Right state
+              TomlSectionOther -> Right state
 
-    parseDependencyLine root name val deps =
-      if "{" `isPrefixOf` val
-        then
-          let fields = parseInlineTable val
-              dep = applyDepFields root (emptyDep name) fields
-          in (dep, deps)
-        else
-          let dep = (emptyDep name) { depVersion = Just (stripQuotes val) }
-          in (dep, deps)
+parseSection :: FilePath -> Int -> String -> ManifestState -> Either CompileError ManifestState
+parseSection manifest lineNumber line =
+  case line of
+    '[' : rest
+      | not (null rest) && last rest == ']' && '[' `notElem` init rest && ']' `notElem` init rest ->
+          selectSection (init rest)
+    _ -> const (Left (manifestError manifest (Just lineNumber) "malformed manifest section header"))
+  where
+    selectSection name state =
+      case name of
+        "package" -> enterRelevantSection name TomlSectionPackage state
+        "dependencies" -> enterRelevantSection name TomlSectionDependencies state
+        _
+          | "dependencies." `isPrefixOf` name ->
+              enterDependencySection (drop (length ("dependencies." :: String)) name) state
+          | otherwise -> Right state { msSection = TomlSectionOther }
 
-    updateDependency root name key val deps =
-      let dep0 = Map.findWithDefault (emptyDep name) name deps
-          dep1 =
-            case key of
-              "version" -> dep0 { depVersion = Just (stripQuotes val) }
-              "path" -> dep0 { depPath = Just (resolvePath root (stripQuotes val)) }
-              _ -> dep0
-      in Map.insert name dep1 deps
+    enterRelevantSection name section state
+      | Set.member name state.msSections =
+          Left (manifestError manifest (Just lineNumber) ("duplicate manifest section [" <> name <> "]"))
+      | otherwise =
+          Right
+            state
+              { msSection = section
+              , msSections = Set.insert name state.msSections
+              }
 
-    emptyDep name = PackageDependency name Nothing Nothing
+    enterDependencySection dependencyName state = do
+      unless (validWeslName dependencyName) $
+        Left (manifestError manifest (Just lineNumber) ("invalid dependency name: " <> dependencyName))
+      let sectionName = "dependencies." <> dependencyName
+      when (Set.member sectionName state.msSections || Map.member dependencyName state.msDependencies) $
+        Left (manifestError manifest (Just lineNumber) ("duplicate dependency: " <> dependencyName))
+      let dependency = PackageDependency dependencyName Nothing Nothing Nothing
+      Right
+        state
+          { msSection = TomlSectionDependency dependencyName
+          , msSections = Set.insert sectionName state.msSections
+          , msDependencies = Map.insert dependencyName dependency state.msDependencies
+          }
 
-    applyDepFields root =
-      foldl
-        (\d (k, v) ->
-           case k of
-             "version" -> d { depVersion = Just v }
-             "path" -> d { depPath = Just (resolvePath root v) }
-             _ -> d)
+parsePackageField :: FilePath -> Int -> String -> ManifestState -> Either CompileError ManifestState
+parsePackageField manifest lineNumber line state = do
+  (rawKey, rawValue) <- parseAssignment manifest lineNumber line
+  let key = trim rawKey
+  case key of
+    "root" -> recordStringField "root" rawValue
+    "source_root" -> recordStringField "root" rawValue
+    "edition" -> recordStringField "edition" rawValue
+    "package-manager" -> recordStringField "package-manager" rawValue
+    "name" -> recordStringField "name" rawValue
+    "version" -> recordStringField "version" rawValue
+    _ -> Right state
+  where
+    recordStringField key rawValue = do
+      when (Map.member key state.msPackageFields) $
+        Left (manifestError manifest (Just lineNumber) ("duplicate [package] field " <> key))
+      value <- parseTomlString manifest lineNumber rawValue
+      when (key == "root" && isManifestAbsolute value) $
+        Left (manifestError manifest (Just lineNumber) ("package root must be relative: " <> value))
+      Right state { msPackageFields = Map.insert key value state.msPackageFields }
 
-    parseInlineTable raw =
-      let inner = trim (dropWhile (== '{') (dropWhileEnd (== '}') raw))
-      in mapMaybe parsePair (splitComma inner)
+parseDependencyField :: FilePath -> Int -> String -> ManifestState -> Either CompileError ManifestState
+parseDependencyField manifest lineNumber line state = do
+  (rawName, rawValue) <- parseAssignment manifest lineNumber line
+  let name = trim rawName
+  unless (validWeslName name) $
+    Left (manifestError manifest (Just lineNumber) ("invalid dependency name: " <> name))
+  when (Map.member name state.msDependencies) $
+    Left (manifestError manifest (Just lineNumber) ("duplicate dependency: " <> name))
+  fields <-
+    if "{" `isPrefixOf` trim rawValue
+      then parseInlineDependency manifest lineNumber rawValue
+      else do
+        version <- parseTomlString manifest lineNumber rawValue
+        Right (Map.singleton "version" version)
+  dependency <- dependencyFromFields manifest lineNumber name fields
+  Right state { msDependencies = Map.insert name dependency state.msDependencies }
 
-    parsePair item =
-      case break (== '=') item of
-        (k, '=':v) ->
-          let key = trim k
-              val = stripQuotes (trim v)
-          in if null key then Nothing else Just (key, val)
-        _ -> Nothing
+parseDependencyTableField :: FilePath -> Int -> String -> String -> ManifestState -> Either CompileError ManifestState
+parseDependencyTableField manifest lineNumber name line state = do
+  (rawKey, rawValue) <- parseAssignment manifest lineNumber line
+  let key = trim rawKey
+  unless (key `elem` ["package", "path", "version"]) $
+    Left (manifestError manifest (Just lineNumber) ("unsupported dependency field: " <> key))
+  value <- parseTomlString manifest lineNumber rawValue
+  dependency <-
+    case Map.lookup name state.msDependencies of
+      Nothing -> Left (manifestError manifest (Just lineNumber) ("dependency table is not registered: " <> name))
+      Just current -> addDependencyField manifest lineNumber key value current
+  Right state { msDependencies = Map.insert name dependency state.msDependencies }
 
-    splitComma str = go str [] []
-      where
-        go [] acc cur = reverse (reverse cur : acc)
-        go (c:cs) acc cur
-          | c == ',' = go cs (reverse cur : acc) []
-          | otherwise = go cs acc (c : cur)
+dependencyFromFields :: FilePath -> Int -> String -> Map.Map String String -> Either CompileError PackageDependency
+dependencyFromFields manifest lineNumber name fields = do
+  let packageName = Map.lookup "package" fields
+      rawPath = Map.lookup "path" fields
+      version = Map.lookup "version" fields
+  when (packageName /= Nothing && rawPath /= Nothing) $
+    Left (manifestError manifest (Just lineNumber) ("dependency " <> name <> " cannot specify both package and path"))
+  dependencyPath <-
+    case rawPath of
+      Nothing -> Right Nothing
+      Just value -> do
+        when (isManifestAbsolute value) $
+          Left (manifestError manifest (Just lineNumber) ("dependency path must be relative: " <> value))
+        Right (Just (normalise (takeDirectory manifest </> value)))
+  let dependency =
+        PackageDependency
+          { depName = name
+          , depVersion = version
+          , depPackage = if dependencyPath == Nothing then Just (fromMaybe name packageName) else Nothing
+          , depPath = dependencyPath
+          }
+  Right dependency
 
-    resolvePath root val =
-      if isRelative val
-        then normalise (root </> val)
-        else val
+addDependencyField :: FilePath -> Int -> String -> String -> PackageDependency -> Either CompileError PackageDependency
+addDependencyField manifest lineNumber key value dependency =
+  case key of
+    "package" -> do
+      when (dependency.depPackage /= Nothing) duplicateField
+      when (dependency.depPath /= Nothing) conflictingFields
+      Right dependency { depPackage = Just value }
+    "path" -> do
+      when (dependency.depPath /= Nothing) duplicateField
+      when (dependency.depPackage /= Nothing) conflictingFields
+      when (isManifestAbsolute value) $
+        Left (manifestError manifest (Just lineNumber) ("dependency path must be relative: " <> value))
+      Right dependency { depPath = Just (normalise (takeDirectory manifest </> value)) }
+    "version" -> do
+      when (dependency.depVersion /= Nothing) duplicateField
+      Right dependency { depVersion = Just value }
+    _ -> Left (manifestError manifest (Just lineNumber) ("unsupported dependency field: " <> key))
+  where
+    duplicateField = Left (manifestError manifest (Just lineNumber) ("duplicate dependency field: " <> key))
+    conflictingFields =
+      Left (manifestError manifest (Just lineNumber) ("dependency " <> dependency.depName <> " cannot specify both package and path"))
 
-    trim = dropWhileEnd isSpace . dropWhile isSpace
-    dropWhileEnd f = reverse . dropWhile f . reverse
-    stripQuotes s =
-      case s of
-        ('"':rest) -> reverse (drop 1 (reverse rest))
-        _ -> s
+parseInlineDependency :: FilePath -> Int -> String -> Either CompileError (Map.Map String String)
+parseInlineDependency manifest lineNumber raw =
+  let value = trim raw
+  in case value of
+      '{' : rest | not (null rest) && last rest == '}' -> do
+        let body = trim (init rest)
+        if null body
+          then Right Map.empty
+          else foldM addField Map.empty (splitTomlComma body)
+      _ -> Left (manifestError manifest (Just lineNumber) "dependency must be an inline table with package or path")
+  where
+    addField fields rawField = do
+      (rawKey, rawValue) <- parseAssignment manifest lineNumber rawField
+      let key = trim rawKey
+      unless (key `elem` ["package", "path", "version"]) $
+        Left (manifestError manifest (Just lineNumber) ("unsupported dependency field: " <> key))
+      when (Map.member key fields) $
+        Left (manifestError manifest (Just lineNumber) ("duplicate dependency field: " <> key))
+      value <- parseTomlString manifest lineNumber rawValue
+      Right (Map.insert key value fields)
 
-resolveInputPath :: FilePath -> IO (Either CompileError FilePath)
-resolveInputPath path = do
-  exists <- doesFileExist path
-  if exists
-    then pure (Right path)
-    else do
-      let weslPath = path <.> "wesl"
-      let wgslPath = path <.> "wgsl"
-      weslExists <- doesFileExist weslPath
-      if weslExists
-        then pure (Right weslPath)
+parseAssignment :: FilePath -> Int -> String -> Either CompileError (String, String)
+parseAssignment manifest lineNumber line =
+  case break (== '=') line of
+    (key, '=' : value)
+      | not (null (trim key)) && not (null (trim value)) -> Right (key, value)
+    _ -> Left (manifestError manifest (Just lineNumber) "malformed manifest assignment")
+
+parseTomlString :: FilePath -> Int -> String -> Either CompileError String
+parseTomlString manifest lineNumber raw =
+  case reads (trim raw) of
+    [(value, "")] -> Right value
+    _ -> Left (manifestError manifest (Just lineNumber) "manifest field must be a quoted string")
+
+splitTomlComma :: String -> [String]
+splitTomlComma = go False False [] []
+  where
+    go _ _ current parts [] = reverse (trim (reverse current) : parts)
+    go quoted escaped current parts (char:rest)
+      | escaped = go quoted False (char : current) parts rest
+      | quoted && char == '\\' = go quoted True (char : current) parts rest
+      | char == '"' = go (not quoted) False (char : current) parts rest
+      | char == ',' && not quoted = go False False [] (trim (reverse current) : parts) rest
+      | otherwise = go quoted False (char : current) parts rest
+
+stripTomlComment :: String -> String
+stripTomlComment = go False False
+  where
+    go _ _ [] = []
+    go quoted escaped (char:rest)
+      | escaped = char : go quoted False rest
+      | quoted && char == '\\' = char : go quoted True rest
+      | char == '"' = char : go (not quoted) False rest
+      | char == '#' && not quoted = []
+      | otherwise = char : go quoted False rest
+
+validWeslName :: String -> Bool
+validWeslName name =
+  case name of
+    [] -> False
+    firstChar : rest ->
+      (firstChar == '_' || isAlpha firstChar)
+        && all (\char -> char == '_' || isAlphaNum char) rest
+        && case validateImportName (SrcPos 1 1) (T.pack name) of
+          Right () -> True
+          Left _ -> False
+
+isManifestAbsolute :: FilePath -> Bool
+isManifestAbsolute path =
+  isAbsolute path
+    || case path of
+      separator : _ | separator `elem` ['/', '\\'] -> True
+      drive : ':' : _ -> isAlpha drive
+      _ -> False
+
+manifestError :: FilePath -> Maybe Int -> String -> CompileError
+manifestError manifest lineNumber message =
+  CompileError
+    ( manifest
+        <> maybe "" ((":" <>) . show) lineNumber
+        <> ": " <> message
+    )
+    Nothing
+    Nothing
+
+discoverFileImportRoots :: FilePath -> FilePath -> IO (Either CompileError FileImportRoots)
+discoverFileImportRoots selectedPath filePath = runExceptT $ do
+  selectedPackage <- ExceptT (discoverPackageInfo selectedPath)
+  discoveredPackage <-
+    case selectedPackage of
+      Just package -> pure (Just package)
+      Nothing
+        | normalise selectedPath /= normalise filePath -> ExceptT (discoverPackageInfo filePath)
+        | otherwise -> pure Nothing
+  case discoveredPackage of
+    Nothing -> do
+      let packagePath = takeDirectory filePath
+          packageRoot = PackageImportRoot packagePath PackageDirectory Nothing Map.empty
+          packageRegistry = Map.singleton packagePath packageRoot
+          semanticPaths = Map.singleton packagePath []
+      pure (FileImportRoots packagePath packageRegistry semanticPaths)
+    Just package -> do
+      let packageMetadata = package.package
+      packageKind <- ExceptT (packageRootKind packageMetadata.pkgSourceRoot)
+      let currentRoot =
+            PackageImportRoot packageMetadata.pkgSourceRoot packageKind (Just packageMetadata.pkgManifest) Map.empty
+      unless (packageContains currentRoot filePath) $
+        throwE
+          ( CompileError
+              ( "input file is outside package root: " <> filePath
+                  <> " is not within " <> packageMetadata.pkgSourceRoot
+                  <> " from " <> packageMetadata.pkgManifest
+              )
+              Nothing
+              Nothing
+          )
+      packageRegistry <- loadPackageRegistry package
+      semanticPaths <-
+        ExceptT
+          (pure (buildPackageSemanticPaths packageMetadata.pkgSourceRoot packageRegistry))
+      pure (FileImportRoots packageMetadata.pkgSourceRoot packageRegistry semanticPaths)
+
+maxPackageCount :: Int
+maxPackageCount = 256
+
+maxPackageDependencyDepth :: Int
+maxPackageDependencyDepth = 64
+
+maxPackageManifestUtf8Bytes :: Int
+maxPackageManifestUtf8Bytes = 1024 * 1024
+
+data PackageLoadState = PackageLoadState
+  { registry :: !(Map.Map FilePath PackageImportRoot)
+  , packagesByManifest :: !(Map.Map FilePath LoadedPackage)
+  , manifestBySourceRoot :: !(Map.Map FilePath FilePath)
+  , cumulativeManifestBytes :: !Int
+  }
+
+loadPackageRegistry :: LoadedPackage -> ExceptT CompileError IO (Map.Map FilePath PackageImportRoot)
+loadPackageRegistry rootPackage = do
+  when (rootPackage.manifestBytes > maxPackageManifestUtf8Bytes) $
+    throwE
+      ( CompileError
+          ( "cumulative package manifest bytes " <> show rootPackage.manifestBytes
+              <> " exceeds limit " <> show maxPackageManifestUtf8Bytes
+              <> " while loading " <> rootPackage.package.pkgManifest
+          )
+          Nothing
+          Nothing
+      )
+  let initialState =
+        PackageLoadState
+          { registry = Map.empty
+          , packagesByManifest = Map.singleton rootPackage.package.pkgManifest rootPackage
+          , manifestBySourceRoot =
+              Map.singleton rootPackage.package.pkgSourceRoot rootPackage.package.pkgManifest
+          , cumulativeManifestBytes = rootPackage.manifestBytes
+          }
+  finalState <- loadPackage initialState rootPackage
+  case validatePackageDependencyDepth rootPackage.package.pkgSourceRoot finalState.registry of
+    Left err -> throwE err
+    Right () -> pure finalState.registry
+  where
+    loadPackage state loadedPackage = do
+      if Map.member package.pkgSourceRoot state.registry
+        then pure state
         else do
-          wgslExists <- doesFileExist wgslPath
-          if wgslExists
-            then pure (Right wgslPath)
-            else pure (Left (CompileError ("file not found: " <> path) Nothing Nothing))
+          (stateWithDependencies, reversedDependencies) <-
+            foldM
+              (loadDependency package)
+              (state, [])
+              package.pkgDependencies
+          kind <- ExceptT (packageRootKind package.pkgSourceRoot)
+          let dependencyRoots =
+                Map.fromList
+                  [ (T.pack dependency.depName, dependencyPackage.pkgSourceRoot)
+                  | (dependency, loadedDependency) <- reverse reversedDependencies
+                  , let dependencyPackage = loadedDependency.package
+                  ]
+              packageRoot =
+                PackageImportRoot
+                  package.pkgSourceRoot
+                  kind
+                  (Just package.pkgManifest)
+                  dependencyRoots
+              stateWithRoot =
+                stateWithDependencies
+                  { registry = Map.insert package.pkgSourceRoot packageRoot stateWithDependencies.registry
+                  }
+          foldM
+            (\currentState (_, dependencyPackage) -> loadPackage currentState dependencyPackage)
+            stateWithRoot
+            (reverse reversedDependencies)
+      where
+        package = loadedPackage.package
+
+    loadDependency package (state, dependencies) dependency =
+      case dependency.depPath of
+        Nothing ->
+          throwE
+            ( CompileError
+                ( "package-manager dependency resolution is unsupported: " <> dependency.depName
+                    <> " refers to " <> fromMaybe dependency.depName dependency.depPackage
+                    <> " in " <> package.pkgManifest
+                    <> maybe "" (" using " <>) package.pkgPackageManager
+                )
+                Nothing
+                Nothing
+            )
+        Just dependencyPath -> do
+          canonicalDirectory <- ExceptT (canonicalizeExistingPath ("path dependency " <> dependency.depName) dependencyPath)
+          isDirectory <- liftIO (doesDirectoryExist canonicalDirectory)
+          unless isDirectory $
+            throwE
+              ( CompileError
+                  ( "path dependency " <> dependency.depName <> " is not a directory: " <> canonicalDirectory
+                  )
+                  Nothing
+                  Nothing
+              )
+          manifest <- ExceptT (canonicalizeExistingPath "WESL manifest" (canonicalDirectory </> "wesl.toml"))
+          case Map.lookup manifest state.packagesByManifest of
+            Just loadedDependency -> pure (state, (dependency, loadedDependency) : dependencies)
+            Nothing -> do
+              let packageCount = Map.size state.packagesByManifest + 1
+              when (packageCount > maxPackageCount) $
+                throwE
+                  ( CompileError
+                      ( "package count " <> show packageCount
+                          <> " exceeds limit " <> show maxPackageCount
+                          <> " while loading " <> manifest
+                      )
+                      Nothing
+                      Nothing
+                  )
+              loadedDependency <- ExceptT (loadWeslPackage manifest)
+              let dependencyPackage = loadedDependency.package
+              case Map.lookup dependencyPackage.pkgSourceRoot state.manifestBySourceRoot of
+                Just registeredManifest
+                  | registeredManifest /= manifest ->
+                      throwE
+                        ( CompileError
+                            ( "package source root collision: " <> dependencyPackage.pkgSourceRoot
+                                <> " is declared by both " <> registeredManifest
+                                <> " and " <> manifest
+                            )
+                            Nothing
+                            Nothing
+                        )
+                _ -> pure ()
+              let manifestBytes = state.cumulativeManifestBytes + loadedDependency.manifestBytes
+              when (manifestBytes > maxPackageManifestUtf8Bytes) $
+                throwE
+                  ( CompileError
+                      ( "cumulative package manifest bytes " <> show manifestBytes
+                          <> " exceeds limit " <> show maxPackageManifestUtf8Bytes
+                          <> " while loading " <> manifest
+                      )
+                      Nothing
+                      Nothing
+                  )
+              let stateWithDependency =
+                    state
+                      { packagesByManifest = Map.insert manifest loadedDependency state.packagesByManifest
+                      , manifestBySourceRoot =
+                          Map.insert dependencyPackage.pkgSourceRoot manifest state.manifestBySourceRoot
+                      , cumulativeManifestBytes = manifestBytes
+                      }
+              pure (stateWithDependency, (dependency, loadedDependency) : dependencies)
+
+
+validatePackageDependencyDepth :: FilePath -> Map.Map FilePath PackageImportRoot -> Either CompileError ()
+validatePackageDependencyDepth rootPath packages = do
+  rootComponent <-
+    maybe
+      ( Left
+          ( CompileError
+              ("package graph is missing its root: " <> rootPath)
+              Nothing
+              Nothing
+          )
+      )
+      Right
+      (Map.lookup rootPath componentByPackage)
+  let rootDepth = Map.findWithDefault 1 rootComponent componentWeights
+      finalDepths = relaxDepths componentCount (Map.singleton rootComponent rootDepth)
+      (deepestManifest, deepestDepth) =
+        foldl' selectDeeper (manifestFor rootPath, rootDepth) (Map.toList finalDepths)
+  if deepestDepth <= maxPackageDependencyDepth
+    then Right ()
+    else
+      Left
+        ( CompileError
+            ( "package dependency depth " <> show deepestDepth
+                <> " exceeds limit " <> show maxPackageDependencyDepth
+                <> " while loading " <> deepestManifest
+            )
+            Nothing
+            Nothing
+        )
+  where
+    adjacency =
+      Map.map (Map.elems . (.pirDependencies)) packages
+    components =
+      zip
+        [0 :: Int ..]
+        ( stronglyConnComp
+            [ (packagePath, packagePath, Map.findWithDefault [] packagePath adjacency)
+            | packagePath <- Map.keys packages
+            ]
+        )
+    componentPackages stronglyConnected =
+      case stronglyConnected of
+        AcyclicSCC packagePath -> [packagePath]
+        CyclicSCC packagePaths -> packagePaths
+    componentByPackage =
+      Map.fromList
+        [ (packagePath, componentId)
+        | (componentId, stronglyConnected) <- components
+        , packagePath <- componentPackages stronglyConnected
+        ]
+    componentWeights =
+      Map.fromList
+        [ (componentId, length (componentPackages stronglyConnected))
+        | (componentId, stronglyConnected) <- components
+        ]
+    componentRepresentatives =
+      Map.fromList
+        [ ( componentId
+          , case componentPackages stronglyConnected of
+              packagePath : _ -> manifestFor packagePath
+              [] -> manifestFor rootPath
+          )
+        | (componentId, stronglyConnected) <- components
+        ]
+    componentEdges =
+      Map.fromList
+        [ ( componentId
+          , Set.toList
+              ( Set.fromList
+                  [ targetComponent
+                  | packagePath <- componentPackages stronglyConnected
+                  , targetPath <- Map.findWithDefault [] packagePath adjacency
+                  , Just targetComponent <- [Map.lookup targetPath componentByPackage]
+                  , targetComponent /= componentId
+                  ]
+              )
+          )
+        | (componentId, stronglyConnected) <- components
+        ]
+    componentCount = length components
+
+    relaxDepths remaining depths
+      | remaining <= 0 = depths
+      | otherwise =
+          relaxDepths
+            (remaining - 1)
+            (foldl' relaxComponent depths (map fst components))
+
+    relaxComponent depths componentId =
+      case Map.lookup componentId depths of
+        Nothing -> depths
+        Just sourceDepth ->
+          foldl'
+            (\currentDepths targetComponent ->
+              let targetDepth =
+                    sourceDepth + Map.findWithDefault 1 targetComponent componentWeights
+              in Map.insertWith max targetComponent targetDepth currentDepths
+            )
+            depths
+            (Map.findWithDefault [] componentId componentEdges)
+
+    selectDeeper current@(_, currentDepth) (componentId, candidateDepth)
+      | candidateDepth <= currentDepth = current
+      | otherwise =
+          ( Map.findWithDefault (manifestFor rootPath) componentId componentRepresentatives
+          , candidateDepth
+          )
+
+    manifestFor packagePath =
+      case Map.lookup packagePath packages >>= (.pirManifest) of
+        Just manifest -> manifest
+        Nothing -> packagePath
+
+packageRootKind :: FilePath -> IO (Either CompileError PackageRootKind)
+packageRootKind path = do
+  isDirectory <- doesDirectoryExist path
+  exists <- doesFileExist path
+  pure $
+    if isDirectory
+      then Right PackageDirectory
+      else if exists
+        then Right PackageModule
+        else Left (CompileError ("package root disappeared after resolution: " <> path) Nothing Nothing)
+
+canonicalizeExistingPath :: String -> FilePath -> IO (Either CompileError FilePath)
+canonicalizeExistingPath label path = do
+  isDirectory <- doesDirectoryExist path
+  isFile <- doesFileExist path
+  if not (isDirectory || isFile)
+    then pure (Left (CompileError (label <> " not found: " <> path) Nothing Nothing))
+    else do
+      result <- try (canonicalizePath path) :: IO (Either IOException FilePath)
+      pure $
+        first
+          (\ioErr -> CompileError ("failed to resolve " <> label <> ": " <> path <> " (" <> show ioErr <> ")") Nothing Nothing)
+          result
+
+data ResolvedInput = ResolvedInput
+  { riSelected :: !FilePath
+  , riCanonical :: !FilePath
+  }
+
+resolveInputPath :: FilePath -> IO (Either CompileError ResolvedInput)
+resolveInputPath path = selectInput [path, path <.> "wesl", path <.> "wgsl"]
+  where
+    selectInput [] = pure (Left (CompileError ("file not found: " <> path) Nothing Nothing))
+    selectInput (candidate:rest) = do
+      exists <- doesFileExist candidate
+      if exists
+        then do
+          absoluteResult <- try (makeAbsolute candidate) :: IO (Either IOException FilePath)
+          case absoluteResult of
+            Left ioErr ->
+              pure (Left (CompileError ("failed to resolve input file: " <> candidate <> " (" <> show ioErr <> ")") Nothing Nothing))
+            Right selected ->
+              fmap (ResolvedInput selected) <$> canonicalizeExistingPath "input file" candidate
+        else selectInput rest
+
+trim :: String -> String
+trim = dropWhileEnd isSpace . dropWhile isSpace
+
+dropWhileEnd :: (a -> Bool) -> [a] -> [a]
+dropWhileEnd predicate = reverse . dropWhile predicate . reverse

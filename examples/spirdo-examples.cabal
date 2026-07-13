@@ -1,11 +1,19 @@
 cabal-version:      3.14
 name:               spirdo-examples
-version:            0.1.0.0
+version:            0.2.0.0
+synopsis:           Interactive GPU shader demo for Spirdo
+description:
+    An optional SDL GPU demo that renders the WESL and WGSL shaders compiled
+    by Spirdo. It exercises fragment, vertex, compute, resource, and override
+    workflows against a live GPU backend.
+homepage:            https://github.com/mewhhaha/spirdo
+bug-reports:         https://github.com/mewhhaha/spirdo/issues
 license:            MIT
-license-file:       ../LICENSE
 author:             mewhhaha
 maintainer:         kopatheonlyone@hotmail.com
+category:           Graphics
 build-type:         Simple
+tested-with:         GHC ==9.12.2
 
 common warnings
     ghc-options: -Wall
@@ -25,18 +33,18 @@ executable spirdo-demo
         Examples.Fragments.NoiseFlow
         Examples.Fragments.PlasmaStorm
         Examples.Fragments.RippleCaustics
+        Examples.Fragments.SdfText
         Examples.Fragments.SineWaves
         Examples.Fragments.SpectrumShift
         Examples.Fragments.SwirlVortex
         Examples.Fragments.VignetteGlow
         Examples.Override
         Examples.Vertex
-    -- other-extensions:
     build-depends:
-        base ^>=4.21.0.0,
-        bytestring,
-        slop,
-        spirdo
+        base >=4.21 && <4.23,
+        bytestring >=0.12 && <0.13,
+        slop >=0.1 && <0.2,
+        spirdo >=0.2 && <0.3
 
     hs-source-dirs:   app, src
     default-language: GHC2024

@@ -148,6 +148,10 @@ data FieldLayout = FieldLayout
   } deriving (Eq, Show, Read)
 
 -- | Layout metadata used for uniform packing and reflection.
+--
+-- A runtime-sized 'TLArray' has a reflected size of zero. Its stride remains
+-- available, but its byte footprint depends on the bound buffer at execution
+-- time and must not be used for host allocation or packing.
 data TypeLayout
   = TLScalar !Scalar !Word32 !Word32
   | TLVector !Int !Scalar !Word32 !Word32
@@ -253,7 +257,7 @@ vectorLayout scalar n =
       elemSize = elemAlign
   in case n of
       2 -> (elemAlign * 2, elemSize * 2)
-      3 -> (elemAlign * 4, elemSize * 4)
+      3 -> (elemAlign * 4, elemSize * 3)
       4 -> (elemAlign * 4, elemSize * 4)
       _ -> (elemAlign * 4, elemSize * 4)
 

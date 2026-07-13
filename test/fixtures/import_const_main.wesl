@@ -1,3 +1,4 @@
+enable uniform_buffer_standard_layout;
 import import_const_lib;
 
 struct Local {

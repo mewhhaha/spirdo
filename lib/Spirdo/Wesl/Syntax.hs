@@ -52,7 +52,7 @@ data FloatSuffix = FloatSuffixF | FloatSuffixH
 data TokKind
   = TkIdent !Text
   | TkInt !Integer !(Maybe IntSuffix)
-  | TkFloat !Float !(Maybe FloatSuffix)
+  | TkFloat !Double !(Maybe FloatSuffix)
   | TkString !Text
   | TkSymbol !Text
   deriving (Eq, Show)
@@ -114,6 +114,7 @@ data BindingDecl = BindingDecl
   , bdGroup :: !Word32
   , bdBinding :: !Word32
   , bdType :: !Type
+  , bdStandardUniformLayout :: !Bool
   } deriving (Eq, Show)
 
 data GlobalVarDecl = GlobalVarDecl
@@ -199,7 +200,7 @@ data LValue
 data Expr
   = EVar !SrcPos !Text
   | EInt !SrcPos !Integer
-  | EFloat !SrcPos !Float
+  | EFloat !SrcPos !Double
   | EBool !SrcPos !Bool
   | EBinary !SrcPos !BinOp !Expr !Expr
   | EUnary !SrcPos !UnaryOp !Expr

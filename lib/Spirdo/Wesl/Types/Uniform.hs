@@ -20,25 +20,30 @@ module Spirdo.Wesl.Types.Uniform
   , uniform
   , packUniform
   , packUniformFrom
+  , validateUniformStorableUnchecked
+  , packUniformStorableUnchecked
   , validateUniformStorable
   , packUniformStorable
   ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.ByteString.Builder (Builder, byteString, toLazyByteString, word16LE, word32LE)
+import Data.ByteString.Builder (Builder, lazyByteString, toLazyByteString, word16LE, word32LE)
 import qualified Data.ByteString.Lazy as BSL
 import Control.Applicative ((<|>))
+import Control.Exception (bracket)
 import Control.Monad (foldM)
 import Data.Bifunctor (first)
+import Data.Bits ((.&.))
 import Data.Int (Int32)
 import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word16, Word32)
 import Data.Proxy (Proxy(..))
-import Foreign.Marshal.Alloc (alloca)
-import Foreign.Ptr (castPtr)
+import Foreign.Marshal.Alloc (free, mallocBytes)
+import Foreign.Marshal.Utils (fillBytes)
+import Foreign.Ptr (alignPtr, castPtr)
 import Foreign.Storable (Storable(..))
 import GHC.Float (castFloatToWord32)
 import GHC.Generics (Generic, Rep, K1(..), M1(..), (:*:)(..), Selector, selName, S, from)
@@ -49,6 +54,9 @@ import Spirdo.Wesl.Types.Layout
   , TypeLayout(..)
   , layoutAlign
   , layoutSize
+  , matrixLayout
+  , scalarLayout
+  , vectorLayout
   )
 
 -- | Typed uniform values for packing.
@@ -289,7 +297,7 @@ type UniformPath = String
 -- | Pack a uniform value against a reflected layout.
 packUniform :: TypeLayout -> UniformValue -> Either String ByteString
 packUniform layout value = do
-  let size = fromIntegral (layoutSize layout)
+  size <- validatePackingLayout layout
   (builder, pos) <- emitValue size "" 0 layout value 0
   if pos > size
     then Left "uniform write out of bounds"
@@ -301,29 +309,201 @@ packUniform layout value = do
 packUniformFrom :: ToUniform a => TypeLayout -> a -> Either String ByteString
 packUniformFrom layout value = packUniform layout (uniform value)
 
--- | Validate that a 'Storable' matches the requested layout.
-validateUniformStorable :: forall a. Storable a => TypeLayout -> Proxy a -> Either String ()
-validateUniformStorable layout _ =
-  let wantSize = fromIntegral (layoutSize layout)
-      wantAlign = fromIntegral (layoutAlign layout)
+-- | Check only the size and alignment of a 'Storable' against a uniform layout.
+--
+-- This does not verify field offsets, padding, scalar representation, byte
+-- order, or platform ABI compatibility. Prefer 'packUniformFrom' unless the
+-- host type's ABI has been independently verified for every target platform.
+validateUniformStorableUnchecked :: forall a. Storable a => TypeLayout -> Proxy a -> Either String ()
+validateUniformStorableUnchecked layout _ = do
+  wantSize <- validatePackingLayout layout
+  let wantAlign = fromIntegral (layoutAlign layout)
       gotSize = sizeOf (undefined :: a)
       gotAlign = alignment (undefined :: a)
-  in if gotSize /= wantSize
-      then Left ("storable size mismatch: expected " <> show wantSize <> ", got " <> show gotSize)
-      else if wantAlign > gotAlign
-        then Left ("storable alignment mismatch: expected >= " <> show wantAlign <> ", got " <> show gotAlign)
+  if gotSize /= wantSize
+    then Left ("storable size mismatch: expected " <> show wantSize <> ", got " <> show gotSize)
+    else if not (isPowerOfTwoInt gotAlign) || wantAlign > gotAlign
+      then Left ("storable alignment mismatch: expected >= " <> show wantAlign <> ", got " <> show gotAlign)
+      else if toInteger gotSize + toInteger gotAlign - 1 > maxPackingBytes
+        then Left ("storable allocation exceeds packing limit: size " <> show gotSize <> ", alignment " <> show gotAlign)
         else Right ()
 
--- | Pack a 'Storable' into a layout-compatible byte blob.
-packUniformStorable :: forall a. Storable a => TypeLayout -> a -> IO (Either String ByteString)
-packUniformStorable layout value =
-  case validateUniformStorable layout (Proxy @a) of
+-- | Copy a 'Storable' value into bytes after only a size-and-alignment check.
+--
+-- This inherits the ABI caveats of 'validateUniformStorableUnchecked'. In
+-- particular, it cannot establish that fields or padding match the shader
+-- layout. Prefer 'packUniformFrom' for portable, layout-aware packing.
+packUniformStorableUnchecked :: forall a. Storable a => TypeLayout -> a -> IO (Either String ByteString)
+packUniformStorableUnchecked layout value =
+  case validateUniformStorableUnchecked layout (Proxy @a) of
     Left err -> pure (Left err)
     Right () -> do
       let size = fromIntegral (layoutSize layout)
-      alloca $ \ptr -> do
+          align = alignment (undefined :: a)
+          allocationSize = size + align - 1
+      bracket (mallocBytes allocationSize) free $ \allocation -> do
+        let ptr = alignPtr allocation align
+        fillBytes ptr 0 size
         poke ptr value
         Right <$> BS.packCStringLen (castPtr ptr, size)
+
+-- | Legacy name for 'validateUniformStorableUnchecked'.
+{-# DEPRECATED validateUniformStorable "Use validateUniformStorableUnchecked; this check covers only size and alignment, not the complete shader ABI." #-}
+validateUniformStorable :: forall a. Storable a => TypeLayout -> Proxy a -> Either String ()
+validateUniformStorable = validateUniformStorableUnchecked
+
+-- | Legacy name for 'packUniformStorableUnchecked'.
+{-# DEPRECATED packUniformStorable "Use packUniformStorableUnchecked; this function relies on an unchecked host ABI layout." #-}
+packUniformStorable :: forall a. Storable a => TypeLayout -> a -> IO (Either String ByteString)
+packUniformStorable = packUniformStorableUnchecked
+
+-- Public layout constructors must not permit unbounded allocation or traversal.
+maxPackingBytes :: Integer
+maxPackingBytes = 64 * 1024 * 1024
+
+maxPackingLayoutDepth :: Int
+maxPackingLayoutDepth = 128
+
+maxPackingLayoutNodes :: Int
+maxPackingLayoutNodes = 4096
+
+validatePackingLayout :: TypeLayout -> Either String Int
+validatePackingLayout layout = do
+  let byteCount = toInteger (layoutSize layout)
+  validateByteCount "" byteCount
+  _ <- validateLayout 0 maxPackingLayoutNodes "" layout
+  if byteCount > toInteger (maxBound :: Int)
+    then Left "uniform layout size exceeds host Int"
+    else Right (fromInteger byteCount)
+
+validateLayout :: Int -> Int -> UniformPath -> TypeLayout -> Either String Int
+validateLayout depth remaining ctx layout
+  | depth > maxPackingLayoutDepth =
+      Left (formatAt ctx ("uniform layout nesting exceeds " <> show maxPackingLayoutDepth))
+  | remaining <= 0 =
+      Left (formatAt ctx ("uniform layout contains more than " <> show maxPackingLayoutNodes <> " nodes"))
+  | otherwise = do
+      validateByteCount ctx (toInteger (layoutSize layout))
+      case layout of
+        TLScalar scalar align size -> do
+          let (expectedAlign, expectedSize) = scalarLayout scalar
+          requireLayoutWord ctx "scalar alignment" expectedAlign align
+          requireLayoutWord ctx "scalar size" expectedSize size
+          Right (remaining - 1)
+        TLVector width scalar align size -> do
+          requireDimension ctx "vector width" width
+          let (expectedAlign, expectedSize) = vectorLayout scalar width
+          requireLayoutWord ctx "vector alignment" expectedAlign align
+          requireLayoutWord ctx "vector size" expectedSize size
+          Right (remaining - 1)
+        TLMatrix cols rows scalar align size stride -> do
+          requireDimension ctx "matrix column count" cols
+          requireDimension ctx "matrix row count" rows
+          case scalar of
+            F16 -> pure ()
+            F32 -> pure ()
+            _ -> Left (formatAt ctx ("matrix scalar must be F16 or F32, got " <> show scalar))
+          case matrixLayout cols rows scalar of
+            TLMatrix _ _ _ expectedAlign expectedSize expectedStride -> do
+              requireLayoutWord ctx "matrix alignment" expectedAlign align
+              requireLayoutWord ctx "matrix size" expectedSize size
+              requireLayoutWord ctx "matrix column stride" expectedStride stride
+            _ -> Left (formatAt ctx "internal matrix layout error")
+          Right (remaining - 1)
+        TLArray Nothing _ _ _ _ ->
+          Left (formatAt ctx "runtime-sized arrays cannot be packed as uniforms")
+        TLArray (Just count) stride elemLayout align size -> do
+          if count <= 0
+            then Left (formatAt ctx ("array length must be positive, got " <> show count))
+            else pure ()
+          remaining' <- validateLayout (depth + 1) (remaining - 1) (ctxIndex ctx 0) elemLayout
+          let elemAlign = layoutAlign elemLayout
+              elemSize = layoutSize elemLayout
+              expectedStride = roundUpInteger (toInteger elemSize) (toInteger elemAlign)
+              expectedSize = expectedStride * toInteger count
+          requireLayoutWord ctx "array alignment" elemAlign align
+          requireLayoutInteger ctx "array stride" expectedStride stride
+          requireLayoutInteger ctx "array size" expectedSize size
+          Right remaining'
+        TLStruct structName fields align size ->
+          let structCtx = if null ctx then structName else ctx
+          in do
+            (remaining', expectedAlign, fieldEnd) <-
+              validateFields depth (remaining - 1) structCtx Set.empty 0 1 fields
+            requireLayoutWord structCtx "struct alignment" expectedAlign align
+            requireLayoutInteger structCtx "struct size" (roundUpInteger fieldEnd (toInteger expectedAlign)) size
+            Right remaining'
+        _ -> Left (formatAt ctx "layout is not a packable uniform value type")
+
+validateFields
+  :: Int
+  -> Int
+  -> UniformPath
+  -> Set.Set String
+  -> Integer
+  -> Word32
+  -> [FieldLayout]
+  -> Either String (Int, Word32, Integer)
+validateFields _ remaining _ _ fieldEnd structAlign [] =
+  Right (remaining, structAlign, fieldEnd)
+validateFields depth remaining ctx names fieldEnd structAlign (field : fields)
+  | Set.member field.flName names =
+      Left (formatAt ctx ("duplicate layout field: " <> field.flName))
+  | otherwise = do
+      let fieldCtx = ctxField ctx field.flName
+      remaining' <- validateLayout (depth + 1) remaining fieldCtx field.flType
+      if not (isPowerOfTwo field.flAlign)
+        then Left (formatAt fieldCtx ("field alignment must be a power of two, got " <> show field.flAlign))
+        else pure ()
+      if field.flAlign < layoutAlign field.flType
+        then Left (formatAt fieldCtx ("field alignment " <> show field.flAlign <> " is below natural alignment " <> show (layoutAlign field.flType)))
+        else pure ()
+      if field.flSize < layoutSize field.flType
+        then Left (formatAt fieldCtx ("field size " <> show field.flSize <> " is below natural size " <> show (layoutSize field.flType)))
+        else pure ()
+      let expectedOffset = roundUpInteger fieldEnd (toInteger field.flAlign)
+      requireLayoutInteger fieldCtx "field offset" expectedOffset field.flOffset
+      let nextEnd = expectedOffset + toInteger field.flSize
+      validateByteCount fieldCtx nextEnd
+      validateFields
+        depth
+        remaining'
+        ctx
+        (Set.insert field.flName names)
+        nextEnd
+        (max structAlign field.flAlign)
+        fields
+
+validateByteCount :: UniformPath -> Integer -> Either String ()
+validateByteCount ctx byteCount
+  | byteCount < 0 = Left (formatAt ctx ("uniform byte size is negative: " <> show byteCount))
+  | byteCount > maxPackingBytes =
+      Left (formatAt ctx ("uniform byte size " <> show byteCount <> " exceeds packing limit " <> show maxPackingBytes))
+  | otherwise = Right ()
+
+requireDimension :: UniformPath -> String -> Int -> Either String ()
+requireDimension ctx name dimension
+  | dimension >= 2 && dimension <= 4 = Right ()
+  | otherwise = Left (formatAt ctx (name <> " must be between 2 and 4, got " <> show dimension))
+
+requireLayoutWord :: UniformPath -> String -> Word32 -> Word32 -> Either String ()
+requireLayoutWord ctx name expected actual
+  | actual == expected = Right ()
+  | otherwise = Left (formatAt ctx (name <> " mismatch: expected " <> show expected <> ", got " <> show actual))
+
+requireLayoutInteger :: UniformPath -> String -> Integer -> Word32 -> Either String ()
+requireLayoutInteger ctx name expected actual
+  | toInteger actual == expected = Right ()
+  | otherwise = Left (formatAt ctx (name <> " mismatch: expected " <> show expected <> ", got " <> show actual))
+
+roundUpInteger :: Integer -> Integer -> Integer
+roundUpInteger value align = ((value + align - 1) `div` align) * align
+
+isPowerOfTwo :: Word32 -> Bool
+isPowerOfTwo value = value /= 0 && value .&. (value - 1) == 0
+
+isPowerOfTwoInt :: Int -> Bool
+isPowerOfTwoInt value = value > 0 && value .&. (value - 1) == 0
 
 emitValue :: Int -> UniformPath -> Int -> TypeLayout -> UniformValue -> Int -> Either String (Builder, Int)
 emitValue size ctx off layout value pos =
@@ -332,44 +512,40 @@ emitValue size ctx off layout value pos =
       emitScalar ctx s v >>= \(chunk, chunkLen) ->
         emitSegment size off chunkLen chunk pos
     (TLVector n s _ _, UVVector n' vals)
-      | n == n' ->
+      | n == n' -> do
+          requireExactCount ctx "vector value count" n vals
           foldMBuilderIndexed pos vals $ \ix val curPos ->
             emitScalar (ctxIndex ctx ix) s val >>= \(chunk, chunkLen) ->
               emitSegment size (off + ix * scalarByteSize s) chunkLen chunk curPos
       | otherwise ->
           Left (formatAt ctx ("vector length mismatch: expected " <> show n <> ", got " <> show n'))
     (TLMatrix cols rows s _ _ stride, UVMatrix c r vals)
-      | cols == c && rows == r && valCount == expectedVals ->
+      | cols == c && rows == r -> do
+          requireExactCount ctx "matrix value count" expectedVals vals
           foldMBuilderIndexed pos vals $ \ix val curPos ->
             let col = ix `div` rows
                 row = ix `mod` rows
                 base = off + col * fromIntegral stride + row * scalarByteSize s
             in emitScalar (ctxIndex (ctxIndex ctx col) row) s val >>= \(chunk, chunkLen) ->
                 emitSegment size base chunkLen chunk curPos
-      | cols == c && rows == r ->
-          Left (formatAt ctx ("matrix value count mismatch: expected " <> show expectedVals <> ", got " <> show valCount))
       | otherwise ->
           Left (formatAt ctx ("matrix size mismatch: expected " <> show cols <> "x" <> show rows <> ", got " <> show c <> "x" <> show r))
       where
         expectedVals = cols * rows
-        valCount = length vals
-    (TLArray mlen stride elemLayout _ _, UVArray elems) ->
-      case mlen of
-        Just n | n /= elemCount ->
-          Left (formatAt ctx ("array length mismatch: expected " <> show n <> ", got " <> show elemCount))
-        _ ->
-          foldMBuilderIndexed pos elems $ \ix el curPos ->
-            emitValue size (ctxIndex ctx ix) (off + ix * fromIntegral stride) elemLayout el curPos
-      where
-        elemCount = length elems
+    (TLArray (Just n) stride elemLayout _ _, UVArray elems) -> do
+      requireExactCount ctx "array length" n elems
+      foldMBuilderIndexed pos elems $ \ix el curPos ->
+        emitValue size (ctxIndex ctx ix) (off + ix * fromIntegral stride) elemLayout el curPos
     (TLStruct structName fields _ _, UVStruct vals) ->
-      emitStruct (if null ctx then structName else ctx) fields vals
+      let structCtx = if null ctx then structName else ctx
+      in emitStruct structCtx fields vals
     _ ->
       Left (formatAt ctx ("uniform value does not match layout: " <> show layout))
   where
     emitStruct structCtx fields vals =
       let fieldSet = Set.fromList (map (.flName) fields)
-          (valMap, dupes, extras) = foldl' (collectField fieldSet) (Map.empty, Set.empty, Set.empty) vals
+          boundedVals = take (length fields + 1) vals
+          (valMap, dupes, extras) = foldl' (collectField fieldSet) (Map.empty, Set.empty, Set.empty) boundedVals
       in case structFieldError dupes extras of
           Just err -> Left (formatAt structCtx err)
           Nothing ->
@@ -415,16 +591,7 @@ emitSegment size off chunkLen chunk pos
 padBytes :: Int -> Builder
 padBytes n
   | n <= 0 = mempty
-  | otherwise = go n
-  where
-    chunkSize = BS.length zeroPadChunk
-    go m
-      | m <= 0 = mempty
-      | m >= chunkSize = byteString zeroPadChunk <> go (m - chunkSize)
-      | otherwise = byteString (BS.take m zeroPadChunk)
-
-zeroPadChunk :: ByteString
-zeroPadChunk = BS.replicate 64 0
+  | otherwise = lazyByteString (BSL.replicate (fromIntegral n) 0)
 
 foldMBuilder :: Int -> [a] -> (a -> Int -> Either String (Builder, Int)) -> Either String (Builder, Int)
 foldMBuilder start items step = foldM go (mempty, start) items
@@ -440,6 +607,21 @@ foldMBuilderIndexed start items step = go mempty start 0 items
     go acc pos ix (x:xs) = do
       (chunk, pos') <- step ix x pos
       go (acc <> chunk) pos' (ix + 1) xs
+
+requireExactCount :: UniformPath -> String -> Int -> [a] -> Either String ()
+requireExactCount ctx name expected values =
+  case countUpTo expected values of
+    Just actual
+      | actual == expected -> Right ()
+      | otherwise -> Left (formatAt ctx (name <> " mismatch: expected " <> show expected <> ", got " <> show actual))
+    Nothing -> Left (formatAt ctx (name <> " mismatch: expected " <> show expected <> ", got more than " <> show expected))
+
+countUpTo :: Int -> [a] -> Maybe Int
+countUpTo limit = go 0 limit
+  where
+    go count _ [] = Just count
+    go _ 0 (_ : _) = Nothing
+    go count remaining (_ : rest) = go (count + 1) (remaining - 1) rest
 
 formatAt :: UniformPath -> String -> String
 formatAt ctx msg =

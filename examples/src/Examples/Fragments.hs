@@ -9,6 +9,7 @@ module Examples.Fragments
   , fragmentSineWavesShader
   , fragmentCheckerWarpShader
   , fragmentRippleCausticsShader
+  , fragmentSdfTextShader
   , fragmentPlasmaStormShader
   , fragmentVignetteGlowShader
   , fragmentNoiseFlowShader
@@ -26,6 +27,7 @@ import Examples.Fragments.Metaballs (fragmentMetaballsShader)
 import Examples.Fragments.NoiseFlow (fragmentNoiseFlowShader)
 import Examples.Fragments.PlasmaStorm (fragmentPlasmaStormShader)
 import Examples.Fragments.RippleCaustics (fragmentRippleCausticsShader)
+import Examples.Fragments.SdfText (fragmentSdfTextShader)
 import Examples.Fragments.SineWaves (fragmentSineWavesShader)
 import Examples.Fragments.SpectrumShift (fragmentSpectrumShiftShader)
 import Examples.Fragments.SwirlVortex (fragmentSwirlVortexShader)

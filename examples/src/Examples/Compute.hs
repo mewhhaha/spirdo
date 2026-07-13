@@ -65,9 +65,9 @@ switch (idx) {
 
 loop {
   acc = acc + 1;
-  break if (acc > 8);
   continuing {
     acc = acc + 1;
+    break if (acc > 8);
   }
 }
 

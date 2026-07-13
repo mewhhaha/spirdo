@@ -32,8 +32,11 @@ Pinned source metadata is tracked in `test/parity/pins.json`.
 - Naga:
   - Source: `naga-cli`
   - Version pin: `28.0.0`
-  - Origin: pinned in `.github/workflows/parity-tests.yml`
-  - Policy: `python3 scripts/parity/normalize_oracles.py --check` runs in `parity-lint` and fails on drift.
+  - Origin: recorded in `test/parity/pins.json` and installed explicitly in
+    `.github/workflows/parity-tests.yml`.
+  - Policy: update both locations together in a dedicated parity change.
+    `normalize_oracles.py --check` validates manifest oracle assignments; it
+    does not validate the tool-version pin.
 
 ## Manifest Contract
 
@@ -78,10 +81,15 @@ WGSL oracle rule:
 - `scripts/parity/promote_cts_backlog.py` promotes all CTS candidates into manifest rows as either `backlog` (mapped) or `backlog-unmapped` (placeholder/unmapped source).
 - `scripts/parity/materialize_cts_backlog_fixtures.py` materializes CTS-derived `backlog` / `backlog-unmapped` rows to file-backed fixtures under `test/parity/fixtures/cts_backlog/`.
 - `scripts/parity/reclassify_backlog_expectations.sh` recompiles mapped backlog fixtures and promotes successful cases from `kind=backlog expected=xfail` to `kind=cts expected=pass`.
-- Regenerate via:
+- Refresh the snapshot via:
+  - `scripts/parity/fetch_cts.sh`
   - `scripts/parity/index_cts.py`
   - `scripts/parity/generate_manifest.py`
-- `scripts/parity/promote_cts_backlog.py`
-- `scripts/parity/materialize_cts_backlog_fixtures.py`
-- `scripts/parity/reclassify_backlog_expectations.sh`
+  - `scripts/parity/promote_cts_backlog.py`
+  - `scripts/parity/materialize_cts_backlog_fixtures.py`
+  - `scripts/parity/reclassify_backlog_expectations.sh`
+- Validate the refreshed snapshot with:
   - `scripts/parity/lint_manifest.py`
+  - `scripts/parity/normalize_oracles.py --check`
+  - `scripts/parity/generate_manifest.py --check` with the arguments used by
+    `just parity`.

@@ -13,9 +13,13 @@ module Spirdo.Wesl.Reflection
   , IOParam(..)
   , StageIO(..)
   , BindingPlan(..)
+  , BindingSlotCount(..)
+  , bindingSlotCounts
+  , singleGroupBindingSlotCount
+  , bindingInfoFor
   , shaderStage
   , ShaderSource(..)
-  , Shader(..)
+  , Shader
   , SomeShader(..)
   , shaderSpirv
   , shaderInterface
@@ -30,6 +34,8 @@ module Spirdo.Wesl.Reflection
   , packUniformFrom
   , validateUniformStorable
   , packUniformStorable
+  , validateUniformStorableUnchecked
+  , packUniformStorableUnchecked
   , V2(..)
   , V3(..)
   , V4(..)
@@ -58,7 +64,6 @@ module Spirdo.Wesl.Reflection
   , renderCompileError
   , renderCompileErrorWithSource
   , Source(..)
-  , CachePolicy(..)
   , Option(..)
   , CompileOptions
   , SamplerBindingMode(..)
@@ -74,6 +79,7 @@ module Spirdo.Wesl.Reflection
   , withOverrides
   , withOverrideSpecMode
   , withSamplerMode
+  , withEntryPoint
   , withCache
   , withCacheDir
   , withCacheVerbose
@@ -85,7 +91,6 @@ module Spirdo.Wesl.Reflection
   , compileFileWith
   , compileFileWithDiagnostics
   , wesl
-  , weslWith
   , spirv
   , Imports(..)
   , Import(..)

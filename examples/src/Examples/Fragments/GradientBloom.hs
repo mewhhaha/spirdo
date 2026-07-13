@@ -38,8 +38,8 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   let col = palette(band + t);
   let glow = smoothstep(0.9, 0.0, r);
   let vignette = smoothstep(1.2, 0.4, r);
-  let final = col * (0.4 + glow * 0.9) * vignette + vec3(0.02, 0.03, 0.05);
+  let finalColor = col * (0.4 + glow * 0.9) * vignette + vec3(0.02, 0.03, 0.05);
 
-  return vec4(final.x, final.y, final.z, 1.0) * params.color;
+  return vec4(finalColor.x, finalColor.y, finalColor.z, 1.0) * params.color;
 }
 |])

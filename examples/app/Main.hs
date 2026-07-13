@@ -10,7 +10,7 @@ import Control.Applicative ((<|>))
 import Control.Monad (forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Char (toLower)
-import Data.List (find)
+import Data.List (find, intercalate)
 import Data.Word (Word32)
 import qualified Data.ByteString as BS
 import Foreign.Ptr (nullPtr, wordPtrToPtr)
@@ -23,6 +23,8 @@ import Slop.SDL.Raw (GPUDevice(..), GPUSampler(..), GPUTexture(..))
 import Spirdo.Wesl.Reflection
   ( BindingInfo(..)
   , BindingPlan(..)
+  , BindingSlotCount(..)
+  , singleGroupBindingSlotCount
   , Shader
   , SomeShader(..)
   , ShaderInterface(..)
@@ -84,6 +86,7 @@ spvOutputs =
   , ("fragment-10.spv", SomeShader fragmentSwirlVortexShader)
   , ("fragment-11.spv", SomeShader fragmentMetaballsShader)
   , ("fragment-12.spv", SomeShader fragmentKaleidoscopeShader)
+  , ("fragment-13.spv", SomeShader fragmentSdfTextShader)
   , ("compute-1.spv", SomeShader computeShader)
   , ("compute-2.spv", SomeShader computeParticlesShader)
   , ("vertex-1.spv", SomeShader vertexShader)
@@ -174,7 +177,8 @@ main = do
   runWindow cfg $ do
     mesh <- createMesh vertexLayout quadVertices
     let vprep = vertexShader
-    vshader <- createVertexShader (shaderSpirv vprep) (countsFromShader vprep)
+    vshaderCounts <- requireShaderCounts "vertex shader" vprep
+    vshader <- createVertexShader (shaderSpirv vprep) vshaderCounts
 
     let baseVariants =
           [ FragmentVariant "Gradient Bloom" BlendNone fragmentGradientBloomShader (Inputs.uniform @"params")
@@ -190,6 +194,7 @@ main = do
           , FragmentVariant "Swirl Vortex" BlendNone fragmentSwirlVortexShader (Inputs.uniform @"params")
           , FragmentVariant "Metaballs" BlendNone fragmentMetaballsShader (Inputs.uniform @"params")
           , FragmentVariant "Kaleidoscope" BlendNone fragmentKaleidoscopeShader (Inputs.uniform @"params")
+          , FragmentVariant "SDF Text" BlendNone fragmentSdfTextShader (Inputs.uniform @"params")
           ]
 
     variants <- mapM (\(FragmentVariant name blend shader mkInputs) -> mkVariant name blend shader mkInputs vshader) baseVariants
@@ -242,7 +247,8 @@ main = do
 
 mkVariant :: RequireUniform "params" iface => String -> BlendMode -> Shader mode iface -> (ParamsU -> InputsBuilder mode iface) -> VertexShader -> WindowM Variant
 mkVariant name blend prep mkInputs vshader = do
-  fshader <- createFragmentShader (shaderSpirv prep) (countsFromShader prep)
+  fshaderCounts <- requireShaderCounts ("fragment variant " <> name) prep
+  fshader <- createFragmentShader (shaderSpirv prep) fshaderCounts
   pipeline <- graphicsPipeline
     GraphicsDesc
       { gfxVertex = vshader
@@ -287,12 +293,19 @@ historyUpdated history valid =
     Nothing -> error "missing history render target"
 
 
-countsFromShader :: Shader mode iface -> ShaderCounts
-countsFromShader shader =
+requireShaderCounts :: String -> Shader mode iface -> WindowM ShaderCounts
+requireShaderCounts label shader =
+  case countsFromShader shader of
+    Left err -> liftIO (ioError (userError (label <> ": " <> err)))
+    Right counts -> pure counts
+
+countsFromShader :: Shader mode iface -> Either String ShaderCounts
+countsFromShader shader = do
   let bindingPlan = shaderPlan shader
       iface = shaderInterface shader
       BindingPlan
-        { bpSamplers = planSamplers
+        { bpBindings = planBindings
+        , bpSamplers = planSamplers
         , bpTextures = planTextures
         , bpStorageTextures = planStorageTextures
         , bpStorageBuffers = planStorageBuffers
@@ -303,19 +316,53 @@ countsFromShader shader =
         case samplerMode of
           SamplerCombined -> planTextures
           SamplerSeparate -> planSamplers
-      samplerCount = bindingCount samplerBindings
-      storageTextureCount = bindingCount planStorageTextures
-      storageBufferCount = bindingCount planStorageBuffers
-      uniformCount = bindingCount planUniforms
-  in ShaderCounts
-      samplerCount
-      storageTextureCount
-      storageBufferCount
-      uniformCount
-  where
-    bindingCount :: [BindingInfo] -> Word32
-    bindingCount [] = 0
-    bindingCount xs = maximum (map (.biBinding) xs) + 1
+  requireRendererGroup planBindings
+  when (not (null planStorageBuffers)) $
+    Left
+      ( "renderer does not submit storage-buffer bindings: "
+          <> intercalate ", " (map bindingLocation planStorageBuffers)
+      )
+  samplerCount <- rendererBindingCount "sampler" samplerBindings
+  storageTextureCount <- rendererBindingCount "storage texture" planStorageTextures
+  uniformCount <- rendererBindingCount "uniform" planUniforms
+  pure (ShaderCounts samplerCount storageTextureCount 0 uniformCount)
+
+requireRendererGroup :: [BindingInfo] -> Either String ()
+requireRendererGroup bindings =
+  case filter ((/= 0) . (.biGroup)) bindings of
+    [] -> Right ()
+    unsupported ->
+      Left
+        ( "renderer supports descriptor group 0 only; unsupported bindings: "
+            <> intercalate ", " (map bindingLocation unsupported)
+        )
+
+rendererBindingCount :: String -> [BindingInfo] -> Either String Word32
+rendererBindingCount resource bindings = do
+  slotCount <- singleGroupBindingSlotCount bindings
+  case slotCount of
+    Nothing -> Right 0
+    Just count
+      | count.bscSlots > fromIntegral (maxBound :: Word32) ->
+          Left
+            ( resource
+                <> " slot count "
+                <> show count.bscSlots
+                <> " in descriptor group "
+                <> show count.bscGroup
+                <> " exceeds renderer limit "
+                <> show (maxBound :: Word32)
+            )
+      | otherwise -> Right (fromIntegral count.bscSlots)
+
+bindingLocation :: BindingInfo -> String
+bindingLocation binding =
+  binding.biName
+    <> " (group "
+    <> show binding.biGroup
+    <> ", binding "
+    <> show binding.biBinding
+    <> ")"
 
 bindingsFromInputs :: ShaderInputs iface -> [Binding]
 bindingsFromInputs inputs =

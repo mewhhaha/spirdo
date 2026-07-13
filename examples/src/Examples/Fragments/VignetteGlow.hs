@@ -54,8 +54,8 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   let grain = noise(uv * 140.0 + vec2(t, -t)) * 0.05;
 
   let col = palette(uv.x + uv.y + t * 0.2) * (0.4 + glow * 0.9);
-  let final = (col + vec3(grain, grain, grain)) * vignette;
+  let finalColor = (col + vec3(grain, grain, grain)) * vignette;
 
-  return vec4(final.x, final.y, final.z, 1.0) * params.color;
+  return vec4(finalColor.x, finalColor.y, finalColor.z, 1.0) * params.color;
 }
 |])

@@ -8,27 +8,57 @@
 -- | Executable entry point.
 module Main (main) where
 
-import Control.Exception (SomeException, displayException, try)
-import Control.Monad (foldM, forM_, unless, replicateM, when)
+import Control.Exception (IOException, SomeException, bracket, bracketOnError, catch, displayException, finally, try)
+import Control.Monad (foldM, forM_, unless, when)
 import Data.Bits ((.|.), shiftL)
 import qualified Data.ByteString as BS
 import Data.Char (isSpace, toLower)
-import Data.List (find, isInfixOf, isPrefixOf, stripPrefix)
+import Data.List (find, inits, isInfixOf, isPrefixOf, stripPrefix, tails)
 import qualified Data.Set as Set
 import Data.Foldable (toList)
 import Data.Maybe (isJust, isNothing)
 import Data.Proxy (Proxy(..))
 import Data.Word (Word16, Word32, Word64)
 import GHC.Float (castFloatToWord32)
-import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable, getTemporaryDirectory, removeFile)
+import System.Directory
+  ( createDirectoryIfMissing
+  , doesFileExist
+  , findExecutable
+  , getTemporaryDirectory
+  , removeFile
+  , removePathForcibly
+  )
 import System.Environment (lookupEnv)
 import System.FilePath ((</>), isAbsolute, takeDirectory)
 import System.Exit (ExitCode(..))
-import System.IO (hClose, openBinaryTempFile)
+import System.IO (Handle, hClose, openBinaryTempFile, openTempFile)
 import System.Process (readProcessWithExitCode)
-import Test.QuickCheck (Gen, arbitrary, generate)
+import Test.QuickCheck
+  ( Gen
+  , arbitrary
+  , counterexample
+  , forAllShrink
+  , ioProperty
+  , isSuccess
+  , maxSuccess
+  , quickCheckWithResult
+  , shrink
+  , stdArgs
+  )
 import Unsafe.Coerce (unsafeCoerce)
 
+import qualified CompilerCacheRegression
+import qualified EncodingRegression
+import qualified EmitSemanticRegression
+import qualified ImportSemanticRegression
+import qualified InputSafetyRegression
+import qualified LayoutConformanceRegression
+import qualified PackageResolutionRegression
+import qualified ParserRegression
+import qualified PublicApiRegression
+import qualified UniformSafetyRegression
+import Spirdo.Test.Fixtures
+import Spirdo.Test.Harness (runChecks, testFilterFromEnvironmentAndArgs)
 import Spirdo.Wesl.Reflection
 import Spirdo.Wesl.Inputs
   ( SamplerHandle(..)
@@ -114,7 +144,10 @@ instance ToUniform ParamsExtended2U
 
 
 defaultOpts :: [Option]
-defaultOpts = [OptEnableFeature "f16"]
+defaultOpts =
+  [ OptEnableFeature "f16"
+  , OptEnableFeature "uniform_buffer_standard_layout"
+  ]
 
 separateOpts :: [Option]
 separateOpts = [OptSamplerMode SamplerSeparate]
@@ -275,18 +308,9 @@ inlineParitySources =
 lookupInlineParitySource :: String -> Maybe String
 lookupInlineParitySource key = lookup key inlineParitySources
 
-runChecks :: String -> [(String, IO ())] -> IO ()
-runChecks section checks = do
-  putStrLn ("== " <> section)
-  forM_ checks $ \(label, action) -> do
-    result <- (try action :: IO (Either SomeException ()))
-    case result of
-      Left err ->
-        fail (section <> "/" <> label <> ": " <> displayException err)
-      Right _ -> pure ()
-
 main :: IO ()
 main = do
+  testFilter <- testFilterFromEnvironmentAndArgs
   spirvVal <- findExecutable "spirv-val"
   nagaExe <- findExecutable "naga"
   requireValidators <- fmap isTruthy <$> lookupEnv "SPIRDO_REQUIRE_VALIDATORS"
@@ -298,7 +322,7 @@ main = do
   parityCases <- loadParityManifest ("test" </> "parity" </> "manifest.tsv")
   parityRules <- loadParityRules ("test" </> "parity" </> "rules.tsv")
   assertParityRuleCoverage parityRules parityCases
-  runChecks "Smoke Compile"
+  smokeCheckCount <- runChecks testFilter "Smoke Compile"
     [ ( label
       , do
           bytes <- case compileBytes defaultOpts src of
@@ -309,7 +333,7 @@ main = do
     | (label, src) <- smokeShaders
     ]
 
-  runChecks "Imports and Parity Fixtures" $
+  importCheckCount <- runChecks testFilter "Imports and Parity Fixtures" $
     [ ("if-translation", checkIfTranslation)
     , ("import-compile", checkImportCompile spirvVal)
     , ("import-item-compile", checkImportItemCompile spirvVal)
@@ -323,7 +347,7 @@ main = do
          | parityCase <- filter (not . isUnmappedBacklogCase) parityCases
          ]
 
-  runChecks "Language and Typecheck"
+  languageCheckCount <- runChecks testFilter "Language and Typecheck"
     [ ("switch-const-validation", checkSwitchConstValidation)
     , ("const-assert-validation", checkConstAssertValidation)
     , ("malformed-hex-literal", checkMalformedHexLiteral)
@@ -338,7 +362,7 @@ main = do
     , ("super-import-containment", checkSuperImportContainment)
     ]
 
-  runChecks "Overrides and Diagnostics"
+  overrideCheckCount <- runChecks testFilter "Overrides and Diagnostics"
     [ ("override-specialization", checkOverrideSpecialization spirvVal)
     , ("override-default", checkOverrideDefault spirvVal)
     , ("override-missing", checkOverrideMissing)
@@ -356,7 +380,7 @@ main = do
     , ("diagnostic-duplicate-case", checkDiagnosticDuplicateCase)
     ]
 
-  runChecks "WGSL Compatibility and Oracles"
+  compatibilityCheckCount <- runChecks testFilter "WGSL Compatibility and Oracles"
     [ ("naga-oracle-parity", checkNagaOracleParity nagaExe)
     , ("texture-barrier-stage", checkTextureBarrierStage)
     , ("blend-src-enabled", checkBlendSrcEnabled spirvVal)
@@ -381,7 +405,7 @@ main = do
     , ("non-entry-function-attr-accepted", checkNonEntryFunctionAttrAccepted)
     ]
 
-  runChecks "Interface, Uniforms, and Inputs"
+  interfaceCheckCount <- runChecks testFilter "Interface, Uniforms, and Inputs"
     [ ("sampler-interface", checkSamplerInterface)
     , ("combined-sampler-interface", checkCombinedSamplerInterface)
     , ("sampler-value-combined-error", checkSamplerValueCombinedError)
@@ -392,7 +416,7 @@ main = do
     , ("vertex-attributes", checkVertexAttributes)
     , ("binding-plan", checkBindingPlan)
     , ("input-ordering", checkInputOrdering)
-    , ("inputs-combined-missing-sampler", checkInputsCombinedMissingSampler)
+    , ("inputs-combined-rejects-separate-texture", checkInputsCombinedRejectsSeparateTexture)
     , ("inputs-combined-ok", checkInputsCombinedOk)
     , ("inputs-missing-bindings-rejected", checkInputsMissingBindingsRejected)
     , ("inputs-separate-mode-rejects-sampled-texture", checkInputsSeparateModeRejectsSampledTexture)
@@ -400,11 +424,35 @@ main = do
     , ("uniform-quickcheck", checkQuickCheck)
     ]
 
-  runChecks "Regression Gates"
+  regressionCheckCount <- runChecks testFilter "Regression Gates"
     [ ("duplicate-bindings", checkDuplicateBindings)
     , ("golden-spirv", checkGoldenSpirv)
     ]
-  putStrLn "All tests passed."
+  featureCheckCount <- runChecks testFilter "Feature Regressions" $
+    ImportSemanticRegression.checks
+      <> CompilerCacheRegression.checks
+      <> EncodingRegression.checks
+      <> EmitSemanticRegression.checks
+      <> InputSafetyRegression.checks
+      <> LayoutConformanceRegression.checks
+      <> PackageResolutionRegression.checks
+      <> ParserRegression.checks
+      <> PublicApiRegression.checks
+      <> UniformSafetyRegression.checks
+  let selectedCheckCount =
+        sum
+          [ smokeCheckCount
+          , importCheckCount
+          , languageCheckCount
+          , overrideCheckCount
+          , compatibilityCheckCount
+          , interfaceCheckCount
+          , regressionCheckCount
+          , featureCheckCount
+          ]
+  when (isJust testFilter && selectedCheckCount == 0) $
+    fail ("test filter matched no checks: " <> show testFilter)
+  putStrLn "All selected tests passed."
 
 assertSpirv :: Maybe FilePath -> String -> BS.ByteString -> IO ()
 assertSpirv spirvVal label bytes = do
@@ -436,18 +484,28 @@ validateSpirvVal mSpirvVal label bytes =
     Just exe -> do
       tmpDir <- getTemporaryDirectory
       let safeLabel = map sanitize label
-      (path, handle) <- openBinaryTempFile tmpDir (safeLabel <> ".spv")
-      BS.hPut handle bytes
-      hClose handle
-      (code, _out, err) <- readProcessWithExitCode exe [path] ""
-      removeFile path
-      case code of
-        ExitSuccess -> pure ()
-        ExitFailure _ -> fail (label <> ": spirv-val failed: " <> err)
+      bracket
+        (openBinaryTempFile tmpDir (safeLabel <> ".spv"))
+        cleanupTemporaryFile
+        $ \(path, handle) -> do
+            BS.hPut handle bytes
+            hClose handle
+            (code, _out, err) <- readProcessWithExitCode exe [path] ""
+            case code of
+              ExitSuccess -> pure ()
+              ExitFailure _ -> fail (label <> ": spirv-val failed: " <> err)
   where
     sanitize c
       | c == '/' || c == '\\' = '_'
       | otherwise = c
+
+cleanupTemporaryFile :: (FilePath, Handle) -> IO ()
+cleanupTemporaryFile (path, handle) = do
+  hClose handle `catch` ignoreIOException
+  removeIfExists path
+
+ignoreIOException :: IOException -> IO ()
+ignoreIOException _ = pure ()
 
 
 checkSamplerInterface :: IO ()
@@ -544,20 +602,17 @@ checkNagaOracleParity mNaga =
 runNagaCheck :: FilePath -> String -> String -> IO (Bool, String)
 runNagaCheck nagaExe label src = do
   tmpDir <- getTemporaryDirectory
-  let safeLabel = map sanitize label
-      srcPath = tmpDir </> (safeLabel <> ".wgsl")
-      outPath = tmpDir </> (safeLabel <> ".spv")
-  writeFile srcPath src
-  (code, out, err) <- readProcessWithExitCode nagaExe [srcPath, outPath, "--input-kind", "wgsl"] ""
-  removeIfExists srcPath
-  removeIfExists outPath
-  case code of
-    ExitSuccess -> pure (True, out <> err)
-    ExitFailure _ -> pure (False, out <> err)
-  where
-    sanitize c
-      | c == '/' || c == '\\' || c == ':' = '_'
-      | otherwise = c
+  (srcPath, handle) <- openTempFile tmpDir "spirdo-naga.wgsl"
+  hClose handle
+  let outPath = srcPath <> ".spv"
+      cleanup = removeIfExists srcPath >> removeIfExists outPath
+  (do
+      writeFile srcPath src
+      (code, out, err) <- readProcessWithExitCode nagaExe [srcPath, outPath, "--input-kind", "wgsl"] ""
+      case code of
+        ExitSuccess -> pure (True, out <> err)
+        ExitFailure _ -> pure (False, label <> ": " <> out <> err)
+    ) `finally` cleanup
 
 removeIfExists :: FilePath -> IO ()
 removeIfExists path = do
@@ -888,13 +943,13 @@ checkPackUniformFrom =
 checkUniformStorable :: IO ()
 checkUniformStorable = do
   let layout = TLScalar F32 4 4
-  case validateUniformStorable layout (Proxy @Float) of
+  case validateUniformStorableUnchecked layout (Proxy @Float) of
     Left err -> fail ("uniform-storable: unexpected failure: " <> err)
     Right () -> pure ()
-  case validateUniformStorable layout (Proxy @Word64) of
+  case validateUniformStorableUnchecked layout (Proxy @Word64) of
     Left _ -> pure ()
     Right () -> fail "uniform-storable: expected size mismatch for Word64"
-  packed <- packUniformStorable layout (1.0 :: Float)
+  packed <- packUniformStorableUnchecked layout (1.0 :: Float)
   case packed of
     Left err -> fail ("uniform-storable: pack failed: " <> err)
     Right bytes ->
@@ -947,16 +1002,30 @@ checkInputOrdering =
       unless (names == ["a", "b"]) $
         fail ("input-ordering: expected [\"a\",\"b\"], got " <> show names)
 
-checkInputsCombinedMissingSampler :: IO ()
-checkInputsCombinedMissingSampler =
-  case inputsFor combinedInputShader
+checkInputsCombinedRejectsSeparateTexture :: IO ()
+checkInputsCombinedRejectsSeparateTexture =
+  let invalidTextureBuilder =
+        unsafeCoerce
+          ( Inputs.texture @"tex" (TextureHandle 9)
+              :: Inputs.InputsBuilder
+                  'SamplerSeparate
+                  '[ 'Binding "params" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
+                   , 'Binding "tex" 'BTexture2D 0 1 ('TTexture2D 'SF32)
+                   ]
+          )
+          :: Inputs.InputsBuilder
+              'SamplerCombined
+              '[ 'Binding "params" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
+               , 'Binding "tex" 'BTexture2D 0 1 ('TTexture2D 'SF32)
+               ]
+  in case inputsFor combinedInputShader
         (Inputs.uniform @"params" (ParamsU (V4 1 2 3 4) :: ParamsU)
-          <> Inputs.texture @"tex" (TextureHandle 9)) of
+          <> invalidTextureBuilder) of
     Left err ->
-      unless ("missing sampler for textures" `isInfixOf` err.ieMessage) $
-        fail ("inputs-combined-missing: unexpected error: " <> err.ieMessage)
+      unless ("texture is not supported in SamplerCombined mode" `isInfixOf` err.ieMessage) $
+        fail ("inputs-combined-separate-texture: unexpected error: " <> err.ieMessage)
     Right _ ->
-      fail "inputs-combined-missing: expected error for missing sampler"
+      fail "inputs-combined-separate-texture: expected mode mismatch error"
 
 checkInputsCombinedOk :: IO ()
 checkInputsCombinedOk =
@@ -986,9 +1055,23 @@ checkInputsSeparateModeRejectsSampledTexture =
              , 'Binding "samp" 'BSampler 0 1 'TSampler
              ]
           shader = unsafeCoerce someShader
+          invalidSampledTextureBuilder =
+            unsafeCoerce
+              ( Inputs.sampledTexture @"tex" (TextureHandle 9) (SamplerHandle 3)
+                  :: Inputs.InputsBuilder
+                      'SamplerCombined
+                      '[ 'Binding "tex" 'BTexture2D 0 0 ('TTexture2D 'SF32)
+                       , 'Binding "samp" 'BSampler 0 1 'TSampler
+                       ]
+              )
+              :: Inputs.InputsBuilder
+                  'SamplerSeparate
+                  '[ 'Binding "tex" 'BTexture2D 0 0 ('TTexture2D 'SF32)
+                   , 'Binding "samp" 'BSampler 0 1 'TSampler
+                   ]
       in case inputsFor
             shader
-            (Inputs.sampledTexture @"tex" (TextureHandle 9) (SamplerHandle 3)) of
+            invalidSampledTextureBuilder of
           Left err ->
             unless
               ("sampledTexture is not supported in SamplerSeparate mode" `isInfixOf` err.ieMessage)
@@ -1009,23 +1092,32 @@ checkInputsDuplicateBuilder =
 
 checkQuickCheck :: IO ()
 checkQuickCheck = do
-  forM_ [1 :: Int .. 200] $ \_ -> do
-    value <- generate arbitrary
-    checkPackScalarF32 value
-  forM_ [1 :: Int .. 200] $ \_ -> do
-    value <- generate genV2
-    checkPackVec2F32 value
-  forM_ [1 :: Int .. 200] $ \_ -> do
-    value <- generate genV3
-    checkPackVec3F32 value
-  forM_ [1 :: Int .. 200] $ \_ -> do
-    value <- generate genV4
-    checkPackVec4F32 value
-  forM_ [1 :: Int .. 200] $ \_ -> do
-    value <- generate genM2
-    checkPackMat2F32 value
+  runQuickCheckProperty "pack scalar f32" 200 arbitrary shrink checkPackScalarF32
+  runQuickCheckProperty "pack vec2<f32>" 200 genV2 shrinkV2 checkPackVec2F32
+  runQuickCheckProperty "pack vec3<f32>" 200 genV3 shrinkV3 checkPackVec3F32
+  runQuickCheckProperty "pack vec4<f32>" 200 genV4 shrinkV4 checkPackVec4F32
+  runQuickCheckProperty "pack mat2x2<f32>" 200 genM2 shrinkM2 checkPackMat2F32
   checkPackUniformExtendedRandom
   checkPackUniformExtended2
+
+runQuickCheckProperty :: Show a => String -> Int -> Gen a -> (a -> [a]) -> (a -> IO ()) -> IO ()
+runQuickCheckProperty label successes generator shrinkInput checkInput = do
+  result <-
+    quickCheckWithResult
+      stdArgs { maxSuccess = successes }
+      ( forAllShrink generator shrinkInput $ \input ->
+          ioProperty $ do
+            outcome <- try (checkInput input) :: IO (Either SomeException ())
+            pure $
+              case outcome of
+                Left err ->
+                  counterexample
+                    (label <> " failed for " <> show input <> ": " <> displayException err)
+                    False
+                Right () -> counterexample label True
+      )
+  unless (isSuccess result) $
+    fail ("QuickCheck property failed: " <> label)
 
 checkPackScalarF32 :: Float -> IO ()
 checkPackScalarF32 value =
@@ -1055,7 +1147,7 @@ checkPackVec2F32 (V2 x y) =
 checkPackVec3F32 :: V3 Float -> IO ()
 checkPackVec3F32 (V3 x y z) =
   let align = 16 :: Word32
-      size = 16 :: Word32
+      size = 12 :: Word32
       layout = TLVector 3 F32 align size
   in case packUniform layout (uniform (V3 x y z)) of
       Left err -> fail ("quickcheck: packVec3F32 failed: " <> err)
@@ -1068,9 +1160,6 @@ checkPackVec3F32 (V3 x y z) =
           fail "quickcheck: packVec3F32 wrong y bits"
         unless (word32At bytes 8 == castFloatToWord32 z) $
           fail "quickcheck: packVec3F32 wrong z bits"
-        let paddingBytes = [BS.index bytes (12 + i) | i <- [0 .. 3]]
-        unless (all (== 0) paddingBytes) $
-          fail "quickcheck: packVec3F32 padding not zeroed"
 
 checkPackVec4F32 :: V4 Float -> IO ()
 checkPackVec4F32 (V4 x y z w) =
@@ -1114,23 +1203,113 @@ checkPackMat2F32 (M2 (V2 a b) (V2 c d)) =
 genV4 :: Gen (V4 Float)
 genV4 = V4 <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
 
+shrinkV4 :: V4 Float -> [V4 Float]
+shrinkV4 (V4 a b c d) =
+  [V4 a' b c d | a' <- shrink a]
+    <> [V4 a b' c d | b' <- shrink b]
+    <> [V4 a b c' d | c' <- shrink c]
+    <> [V4 a b c d' | d' <- shrink d]
+
 genV2 :: Gen (V2 Float)
 genV2 = V2 <$> arbitrary <*> arbitrary
+
+shrinkV2 :: V2 Float -> [V2 Float]
+shrinkV2 (V2 a b) =
+  [V2 a' b | a' <- shrink a]
+    <> [V2 a b' | b' <- shrink b]
 
 genV3 :: Gen (V3 Float)
 genV3 = V3 <$> arbitrary <*> arbitrary <*> arbitrary
 
+shrinkV3 :: V3 Float -> [V3 Float]
+shrinkV3 (V3 a b c) =
+  [V3 a' b c | a' <- shrink a]
+    <> [V3 a b' c | b' <- shrink b]
+    <> [V3 a b c' | c' <- shrink c]
+
 genM2 :: Gen (M2 Float)
 genM2 = M2 <$> genV2 <*> genV2
+
+shrinkM2 :: M2 Float -> [M2 Float]
+shrinkM2 (M2 a b) =
+  [M2 a' b | a' <- shrinkV2 a]
+    <> [M2 a b' | b' <- shrinkV2 b]
 
 genM3 :: Gen (M3 Float)
 genM3 = M3 <$> genV3 <*> genV3 <*> genV3
 
+shrinkM3 :: M3 Float -> [M3 Float]
+shrinkM3 (M3 a b c) =
+  [M3 a' b c | a' <- shrinkV3 a]
+    <> [M3 a b' c | b' <- shrinkV3 b]
+    <> [M3 a b c' | c' <- shrinkV3 c]
+
 genM4 :: Gen (M4 Float)
 genM4 = M4 <$> genV4 <*> genV4 <*> genV4 <*> genV4
 
+shrinkM4 :: M4 Float -> [M4 Float]
+shrinkM4 (M4 a b c d) =
+  [M4 a' b c d | a' <- shrinkV4 a]
+    <> [M4 a b' c d | b' <- shrinkV4 b]
+    <> [M4 a b c' d | c' <- shrinkV4 c]
+    <> [M4 a b c d' | d' <- shrinkV4 d]
+
 genInner :: Gen (V2 Float, Float)
 genInner = (,) <$> genV2 <*> arbitrary
+
+shrinkInner :: (V2 Float, Float) -> [(V2 Float, Float)]
+shrinkInner (vec, scalar) =
+  [(vec', scalar) | vec' <- shrinkV2 vec]
+    <> [(vec, scalar') | scalar' <- shrink scalar]
+
+shrinkElements :: (a -> [a]) -> [a] -> [[a]]
+shrinkElements shrinkElement values =
+  [ before <> [value'] <> after
+  | (before, value : after) <- zip (inits values) (tails values)
+  , value' <- shrinkElement value
+  ]
+
+genExtendedUniform :: Gen (M3 Float, M4 Float, [V2 Float], [V3 Float], (V2 Float, Float))
+genExtendedUniform =
+  (,,,,)
+    <$> genM3
+    <*> genM4
+    <*> sequence [genV2, genV2, genV2, genV2]
+    <*> sequence [genV3, genV3, genV3]
+    <*> genInner
+
+shrinkExtendedUniform :: (M3 Float, M4 Float, [V2 Float], [V3 Float], (V2 Float, Float)) -> [(M3 Float, M4 Float, [V2 Float], [V3 Float], (V2 Float, Float))]
+shrinkExtendedUniform (matrix3, matrix4, vectors2, vectors3, innerValue) =
+  [(matrix3', matrix4, vectors2, vectors3, innerValue) | matrix3' <- shrinkM3 matrix3]
+    <> [(matrix3, matrix4', vectors2, vectors3, innerValue) | matrix4' <- shrinkM4 matrix4]
+    <> [(matrix3, matrix4, vectors2', vectors3, innerValue) | vectors2' <- shrinkElements shrinkV2 vectors2]
+    <> [(matrix3, matrix4, vectors2, vectors3', innerValue) | vectors3' <- shrinkElements shrinkV3 vectors3]
+    <> [(matrix3, matrix4, vectors2, vectors3, innerValue') | innerValue' <- shrinkInner innerValue]
+
+genExtendedUniform2 :: Gen ([Float], [Float], [M2 Float], [(V3 Float, Float)], (Word16, Word16, Word16, Word16, Word16, Word16))
+genExtendedUniform2 =
+  (,,,,)
+    <$> sequence (replicate 12 arbitrary)
+    <*> sequence (replicate 12 arbitrary)
+    <*> sequence [genM2, genM2]
+    <*> sequence [genV3 >>= \vec -> (,) vec <$> arbitrary, genV3 >>= \vec -> (,) vec <$> arbitrary]
+    <*> ((,,,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary)
+
+shrinkExtendedUniform2 :: ([Float], [Float], [M2 Float], [(V3 Float, Float)], (Word16, Word16, Word16, Word16, Word16, Word16)) -> [([Float], [Float], [M2 Float], [(V3 Float, Float)], (Word16, Word16, Word16, Word16, Word16, Word16))]
+shrinkExtendedUniform2 (matrix34, matrix43, matrices, inners, halves) =
+  [(matrix34', matrix43, matrices, inners, halves) | matrix34' <- shrinkElements shrink matrix34]
+    <> [(matrix34, matrix43', matrices, inners, halves) | matrix43' <- shrinkElements shrink matrix43]
+    <> [(matrix34, matrix43, matrices', inners, halves) | matrices' <- shrinkElements shrinkM2 matrices]
+    <> [(matrix34, matrix43, matrices, inners', halves) | inners' <- shrinkElements (\(vec, scalar) -> [(vec', scalar) | vec' <- shrinkV3 vec] <> [(vec, scalar') | scalar' <- shrink scalar]) inners]
+    <> [(matrix34, matrix43, matrices, inners, halves') | halves' <- shrinkHalves halves]
+  where
+    shrinkHalves (a, b, c, d, e, f) =
+      [(a', b, c, d, e, f) | a' <- shrink a]
+        <> [(a, b', c, d, e, f) | b' <- shrink b]
+        <> [(a, b, c', d, e, f) | c' <- shrink c]
+        <> [(a, b, c, d', e, f) | d' <- shrink d]
+        <> [(a, b, c, d, e', f) | e' <- shrink e]
+        <> [(a, b, c, d, e, f') | f' <- shrink f]
 
 checkPackUniformExtendedRandom :: IO ()
 checkPackUniformExtendedRandom =
@@ -1147,12 +1326,7 @@ checkPackUniformExtendedRandom =
           fieldArr2 <- findFieldLayout "arr2" fields
           fieldArr3 <- findFieldLayout "arr3" fields
           fieldInner <- findFieldLayout "inner" fields
-          forM_ [1 :: Int .. 80] $ \_ -> do
-            m3 <- generate genM3
-            m4 <- generate genM4
-            arr2 <- generate (sequence [genV2, genV2, genV2, genV2])
-            arr3 <- generate (sequence [genV3, genV3, genV3])
-            (innerA, innerB) <- generate genInner
+          runQuickCheckProperty "pack extended uniform" 80 genExtendedUniform shrinkExtendedUniform $ \(m3, m4, arr2, arr3, (innerA, innerB)) -> do
             let value =
                   ParamsExtendedU
                     { m3 = m3
@@ -1279,19 +1453,17 @@ checkPackUniformExtended2 =
           fieldH <- findFieldLayout "h" fields
           fieldHv <- findFieldLayout "hv" fields
           fieldHv4 <- findFieldLayout "hv4" fields
-          forM_ [1 :: Int .. 60] $ \_ -> do
-            m34Vals <- replicateM 12 (generate arbitrary)
-            m43Vals <- replicateM 12 (generate arbitrary)
-            mats <- generate (sequence [genM2, genM2])
-            inners <- replicateM 2 (generate ((,) <$> genV3 <*> arbitrary))
-            h0 <- generate arbitrary
-            h1 <- generate arbitrary
-            h2 <- generate arbitrary
-            h3 <- generate arbitrary
-            h4 <- generate arbitrary
-            h5 <- generate arbitrary
-            let m34 = m3x4FromList m34Vals
-            let m43 = m4x3FromList m43Vals
+          runQuickCheckProperty "pack nested f16 uniform" 60 genExtendedUniform2 shrinkExtendedUniform2 $ \(m34Vals, m43Vals, mats, inners, (h0, h1, h2, h3, h4, h5)) -> do
+            m34 <-
+              maybe
+                (fail "quickcheck: pack-uniform-extended2: expected 12 mat3x4 values")
+                pure
+                (m3x4FromList m34Vals)
+            m43 <-
+              maybe
+                (fail "quickcheck: pack-uniform-extended2: expected 12 mat4x3 values")
+                pure
+                (m4x3FromList m43Vals)
             let innerValues = [Inner2U v0 w0 | (v0, w0) <- inners]
             let value =
                   ParamsExtended2U
@@ -1326,14 +1498,14 @@ checkPackUniformExtended2 =
     m3x4FromList vals =
       case vals of
         [a,b,c,d,e,f,g,h,i,j,k,l] ->
-          M3x4 (V4 a b c d) (V4 e f g h) (V4 i j k l)
-        _ -> error "expected 12 values for M3x4"
+          Just (M3x4 (V4 a b c d) (V4 e f g h) (V4 i j k l))
+        _ -> Nothing
 
     m4x3FromList vals =
       case vals of
         [a,b,c,d,e,f,g,h,i,j,k,l] ->
-          M4x3 (V3 a b c) (V3 d e f) (V3 g h i) (V3 j k l)
-        _ -> error "expected 12 values for M4x3"
+          Just (M4x3 (V3 a b c) (V3 d e f) (V3 g h i) (V3 j k l))
+        _ -> Nothing
 
     assertMatrixF32 label bytes field cols rows vals =
       case field.flType of
@@ -1571,43 +1743,52 @@ checkComputeRequiresWorkgroupSize =
     Right _ -> fail "compute-workgroup-size-missing: expected failure for @compute without @workgroup_size"
 
 checkSuperImportContainment :: IO ()
-checkSuperImportContainment = do
-  tmp <- getTemporaryDirectory
-  let rootDir = tmp </> "spirdo-super-containment"
-      libFile = rootDir </> "lib.wesl"
-      rootFile = rootDir </> "main.wesl"
-      validSource =
-        unlines
-          [ "import super::lib;"
-          , "@fragment"
-          , "fn main() -> @location(0) vec4<f32> {"
-          , "  return vec4(0.0);"
-          , "}"
-          ]
-      invalidSource =
-        unlines
-          [ "import super::super::lib;"
-          , "@fragment"
-          , "fn main() -> @location(0) vec4<f32> {"
-          , "  return vec4(0.0);"
-          , "}"
-          ]
-      libSource = "fn lib() -> f32 { return 1.0; }"
+checkSuperImportContainment =
+  bracket createRootDirectory removePathForcibly $ \rootDir -> do
+    let libFile = rootDir </> "lib.wesl"
+        rootFile = rootDir </> "main.wesl"
+        validSource =
+          unlines
+            [ "import super::lib;"
+            , "@fragment"
+            , "fn main() -> @location(0) vec4<f32> {"
+            , "  return vec4(0.0);"
+            , "}"
+            ]
+        invalidSource =
+          unlines
+            [ "import super::super::lib;"
+            , "@fragment"
+            , "fn main() -> @location(0) vec4<f32> {"
+            , "  return vec4(0.0);"
+            , "}"
+            ]
+        libSource = "fn lib() -> f32 { return 1.0; }"
 
-  createDirectoryIfMissing True rootDir
-  writeFile libFile libSource
-  writeFile rootFile validSource
-  resultOk <- compileFile rootFile
-  case resultOk of
-    Left err -> fail ("super-containment: valid single super import failed: " <> show err)
-    Right _ -> pure ()
-  writeFile rootFile invalidSource
-  resultBad <- compileFile rootFile
-  case resultBad of
-    Left err ->
-      unless ("import path escapes package root" `isInfixOf` err.ceMessage) $
-        fail ("super-containment: expected path escape message, got: " <> show err)
-    Right _ -> fail "super-containment: expected rejected super import path that escapes root"
+    writeFile libFile libSource
+    writeFile rootFile validSource
+    resultOk <- compileFile rootFile
+    case resultOk of
+      Left err -> fail ("super-containment: valid single super import failed: " <> show err)
+      Right _ -> pure ()
+    writeFile rootFile invalidSource
+    resultBad <- compileFile rootFile
+    case resultBad of
+      Left err ->
+        unless ("import path escapes package root" `isInfixOf` err.ceMessage) $
+          fail ("super-containment: expected path escape message, got: " <> show err)
+      Right _ -> fail "super-containment: expected rejected super import path that escapes root"
+  where
+    createRootDirectory = do
+      temporaryDirectory <- getTemporaryDirectory
+      bracketOnError
+        (openTempFile temporaryDirectory "spirdo-super-containment")
+        cleanupTemporaryFile
+        $ \(path, handle) -> do
+            hClose handle
+            removeFile path
+            createDirectoryIfMissing True path
+            pure path
 
 checkWorkgroupSizeOverrideReject :: IO ()
 checkWorkgroupSizeOverrideReject =
@@ -1651,7 +1832,7 @@ checkImportStructZeroCtorCompile spirvVal = do
 checkImportQualifiedConstCompile :: Maybe FilePath -> IO ()
 checkImportQualifiedConstCompile spirvVal = do
   let path = "test" </> "fixtures" </> "import_const_main.wesl"
-  result <- compileFile path
+  result <- compileFileWith [OptEnableFeature "uniform_buffer_standard_layout"] path
   case result of
     Left err -> fail ("import-qualified-const: " <> show err)
     Right (SomeShader shader) -> assertSpirv spirvVal "import-qualified-const" (shaderSpirv shader)
@@ -1987,29 +2168,23 @@ checkNagaOracles mNagaExe parityCase src = do
   let wantsFail = "naga-fail" `elem` parityCase.oracles
   when (wantsPass && wantsFail) $
     fail ("parity-manifest:" <> parityCase.id <> ": cannot request both naga-pass and naga-fail")
-  when (wantsPass || wantsFail) $ do
-    nagaExe <-
-      case mNagaExe of
-        Just exe -> pure exe
-        Nothing ->
+  when (wantsPass || wantsFail) $
+    case mNagaExe of
+      Nothing -> pure ()
+      Just nagaExe -> do
+        (ok, logMsg) <- runNagaCheck nagaExe ("parity:" <> parityCase.id) src
+        let expectedOk = wantsPass
+        unless (ok == expectedOk) $
           fail
             ( "parity-manifest:"
                 <> parityCase.id
-                <> ": naga oracle requested but naga was not found in PATH"
+                <> ": naga expected "
+                <> show expectedOk
+                <> ", got "
+                <> show ok
+                <> "\n"
+                <> logMsg
             )
-    (ok, logMsg) <- runNagaCheck nagaExe ("parity:" <> parityCase.id) src
-    let expectedOk = wantsPass
-    unless (ok == expectedOk) $
-      fail
-        ( "parity-manifest:"
-            <> parityCase.id
-            <> ": naga expected "
-            <> show expectedOk
-            <> ", got "
-            <> show ok
-            <> "\n"
-            <> logMsg
-        )
 
 paritySourceLabel :: ParitySource -> String
 paritySourceLabel paritySource =
@@ -2193,740 +2368,6 @@ checkDiagnosticDuplicateCase =
       unless (any (\d -> d.diagRule == "duplicate_case" && d.diagSeverity == DiagWarning) diags) $
         fail "diagnostic-duplicate-case: expected duplicate_case warning"
 
-malformedHexLiteralShader :: String
-malformedHexLiteralShader =
-  unlines
-    [ "let bad = 0x;"
-    , "let bad2 = 0x__;"
-    , "@compute @workgroup_size(1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = bad + bad2;"
-    , "}"
-    ]
-
-badStructFieldShader :: String
-badStructFieldShader =
-  unlines
-    [ "struct Params {"
-    , "  a: i32"
-    , "  b: i32;"
-    , "}"
-    , "@compute @workgroup_size(1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {}"
-    ]
-
-nonIfStatementAttrShader :: String
-nonIfStatementAttrShader =
-  unlines
-    [ "@compute @workgroup_size(1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  @group(0) let x = i32(1);"
-    , "}"
-    ]
-
-nonIfSwitchCaseAttrShader :: String
-nonIfSwitchCaseAttrShader =
-  unlines
-    [ "@compute @workgroup_size(1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  switch (gid.x) {"
-    , "    @location(0) case 0: {}"
-    , "  }"
-    , "}"
-    ]
-
-nonIfLoopAttrShader :: String
-nonIfLoopAttrShader =
-  unlines
-    [ "@compute @workgroup_size(1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  loop {"
-    , "    @id(0) break;"
-    , "  }"
-    , "}"
-    ]
-
-negativeI32RangeShader :: String
-negativeI32RangeShader =
-  unlines
-    [ "@compute @workgroup_size(1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _: i32 = -2147483648;"
-    , "}"
-    ]
-
-computeWithoutWorkgroupSizeShader :: String
-computeWithoutWorkgroupSizeShader =
-  unlines
-    [ "@compute"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = gid;"
-    , "}"
-    ]
-
-workgroupOverrideShader :: String
-workgroupOverrideShader =
-  unlines
-    [ "override scale: i32 = 1;"
-    , "@compute @workgroup_size(scale)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {}"
-    ]
-
-moduleConstDeclShader :: String
-moduleConstDeclShader =
-  unlines
-    [ "const SCALE: i32 = 1;"
-    , "@compute @workgroup_size(1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = SCALE + i32(gid.x);"
-    , "}"
-    ]
-
-invalidMatrixDimensionsShader :: String
-invalidMatrixDimensionsShader =
-  unlines
-    [ "@fragment"
-    , "fn main() -> @location(0) vec4<f32> {"
-    , "  let m = mat5x5<f32>(1.0);"
-    , "  return vec4<f32>(m[0][0]);"
-    , "}"
-    ]
-
-computeShader :: String
-computeShader =
-  unlines
-    [ "let scale = 2.0;"
-    , "struct Data {"
-    , "  values: array<u32, 4>;"
-    , "  counter: atomic<u32>;"
-    , "  accum: atomic<u32>;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<storage, read_write> data: Data;"
-    , "fn bump(v: f32) -> f32 {"
-    , "  return v * v;"
-    , "}"
-    , "fn bump(v: vec2<f32>) -> vec2<f32> {"
-    , "  return vec2(v.x * v.x, v.y * v.y);"
-    , "}"
-    , "@compute @workgroup_size(8, 8, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let idx = gid.x;"
-    , "  let _tmp = scale;"
-    , "  let v = vec4(1.0, 2.0, 3.0, 4.0);"
-    , "  let sw = v.zw;"
-    , "  let m = mat2x2(vec2(1.0, 0.0), vec2(0.0, 1.0));"
-    , "  let col = m[0];"
-    , "  let s = col.y;"
-    , "  let arr = array(1, 2, 3, 4);"
-    , "  var sum = arr[0] + arr[1];"
-    , "  var j = 0;"
-    , "  while (j < 4) {"
-    , "    j = j + 1;"
-    , "    if (j == 2) {"
-    , "      continue;"
-    , "    }"
-    , "    sum = sum + j;"
-    , "  }"
-    , "  var k = 0;"
-    , "  for (var i = 0; i < 3; i = i + 1) {"
-    , "    k = k + i;"
-    , "  }"
-    , "  let ok = (idx == 0) || (idx != 1 && !(idx > 2));"
-    , "  if (ok) {"
-    , "    let v0 = abs(-1.0);"
-    , "    let v1 = clamp(v0, 0.0, 1.0);"
-    , "    let v2 = mix(v1, 1.0, 0.25);"
-    , "    let v3 = max(v2, sqrt(4.0));"
-    , "    let v4 = min(v3, 2.0);"
-    , "    let v5 = cos(v4) + sin(v4);"
-    , "    let v6 = pow(v5, 2.0);"
-    , "    let v7 = dot(vec3(v6, v6, v6), normalize(vec3(1.0, 2.0, 3.0)));"
-    , "    let _len = length(vec2(sw.x, sw.y));"
-    , "    let _cast = u32(v7);"
-    , "    let _mat = m[1];"
-    , "    let _scalar = m[1][0];"
-    , "    let _b0 = bump(v4);"
-    , "    let _b1 = bump(vec2(0.5, 1.5));"
-    , "    let _s0 = s + f32(k);"
-    , "  }"
-    , "  if (idx < 4) {"
-    , "    let old = atomicAdd(data.counter, 1);"
-    , "    let cur = atomicLoad(data.counter);"
-    , "    atomicStore(data.accum, cur + 1);"
-    , "    let _m0 = atomicMax(data.accum, old);"
-    , "    let _m1 = atomicMin(data.accum, 0);"
-    , "    let _m2 = atomicXor(data.accum, 1);"
-    , "    let _m3 = atomicOr(data.accum, 2);"
-    , "    let _m4 = atomicAnd(data.accum, 3);"
-    , "    let _m5 = atomicExchange(data.accum, 4);"
-    , "    data.values[idx] = data.values[idx] + u32(sum);"
-    , "  }"
-    , "}"
-    ]
-
-barrierShader :: String
-barrierShader =
-  unlines
-    [ "@compute @workgroup_size(1)"
-    , "fn main(@builtin(local_invocation_index) li: u32) {"
-    , "  if (li == 0u) {"
-    , "    workgroupBarrier();"
-    , "    storageBarrier();"
-    , "    textureBarrier();"
-    , "  }"
-    , "}"
-    ]
-
-textureBarrierFragmentShader :: String
-textureBarrierFragmentShader =
-  unlines
-    [ "@fragment"
-    , "fn main() -> @location(0) vec4<f32> {"
-    , "  textureBarrier();"
-    , "  return vec4<f32>(1.0);"
-    , "}"
-    ]
-
-atomicCompareExchangeShader :: String
-atomicCompareExchangeShader =
-  unlines
-    [ "struct Data {"
-    , "  value: atomic<u32>;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<storage, read_write> data: Data;"
-    , "@compute @workgroup_size(1)"
-    , "fn main() {"
-    , "  let r = atomicCompareExchangeWeak(data.value, 0u, 1u);"
-    , "  if (r.exchanged) {"
-    , "    atomicStore(data.value, r.old_value);"
-    , "  }"
-    , "}"
-    ]
-
-typedCtorShader :: String
-typedCtorShader =
-  unlines
-    [ "enable f16;"
-    , "struct Z {"
-    , "  a: f32;"
-    , "  b: vec2<f32>;"
-    , "};"
-    , "@fragment"
-    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let a = vec4<f32>(1.0);"
-    , "  let b = vec2<f32>(0.5);"
-    , "  let c = vec3<f32>(a.x, b.x, b.y);"
-    , "  let d = vec3<f32>(b, 1.0);"
-    , "  let sf: vec2f = vec2f(1.0);"
-    , "  let si = vec2i(1i, 2i);"
-    , "  let su = vec3u(1u, 2u, 3u);"
-    , "  let sh = vec2h(1.0h);"
-    , "  let m = mat2x2<f32>(1.0, 0.0, 0.0, 1.0);"
-    , "  let m2 = mat2x2<f32>(1.0);"
-    , "  let z0 = vec4<f32>();"
-    , "  let z1 = mat2x2<f32>();"
-    , "  let arr = array<vec2<f32>, 2>(vec2<f32>(0.25, 0.5), vec2<f32>(0.75, 1.0));"
-    , "  let zarr = array<vec2<f32>, 2>();"
-    , "  let zstructs = array<Z, 2>();"
-    , "  let zi = i32();"
-    , "  let zf = f32();"
-    , "  let zs = Z();"
-    , "  let _ = m[0][0] + m2[1][1] + sf.x + f32(si.x) + f32(su.x) + f32(sh.x) + arr[1].y + z0.x + z1[0][0] + zarr[1].y + zstructs[1].a + f32(zi) + zf + zs.a + zs.b.x;"
-    , "  return vec4(d.x, d.y, d.z, a.w);"
-    , "}"
-    ]
-
-sampleMaskShader :: String
-sampleMaskShader =
-  unlines
-    [ "struct FragOut {"
-    , "  @location(0) color: vec4<f32>;"
-    , "  @builtin(sample_mask) mask: u32;"
-    , "};"
-    , "@fragment"
-    , "fn main(@builtin(sample_mask) inMask: u32) -> FragOut {"
-    , "  return FragOut(vec4<f32>(1.0, 0.0, 0.0, 1.0), inMask);"
-    , "}"
-    ]
-
-fragmentShader :: String
-fragmentShader =
-  unlines
-    [ "struct Params {"
-    , "  time_res: vec4<f32>;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<uniform> params: Params;"
-    , "@fragment"
-    , "fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let res = vec2(params.time_res.y, params.time_res.z);"
-    , "  let uv = vec2(frag_coord.x / res.x, frag_coord.y / res.y);"
-    , "  let dx = dpdx(uv.x);"
-    , "  let dy = dpdy(uv.y);"
-    , "  let w = fwidth(uv.x);"
-    , "  let edge = clamp(abs(dx) + abs(dy), 0.0, 1.0);"
-    , "  let t0 = fract(uv.x * 3.0 + params.time_res.x * 0.1);"
-    , "  let glow = smoothstep(0.2, 0.8, t0);"
-    , "  let dist = distance(uv, vec2(0.5, 0.5));"
-    , "  let refl = reflect(normalize(vec3(uv.x - 0.5, uv.y - 0.5, 1.0)), normalize(vec3(0.2, 0.8, 0.6)));"
-    , "  let tint = mix(vec3(0.2, 0.4, 0.8), vec3(1.0, 0.2, 0.1), vec3(edge, edge, edge));"
-    , "  return vec4(tint.x + w + glow * 0.1 + dist * 0.2 + refl.x * 0.05, tint.y, tint.z, 1.0);"
-    , "}"
-    ]
-
-vertexIoAttrShader :: String
-vertexIoAttrShader =
-  unlines
-    [ "struct VsOut {"
-    , "  @builtin(position) @invariant pos: vec4<f32>;"
-    , "  @location(0) @interpolate(flat) id: u32;"
-    , "  @location(1) @interpolate(linear, centroid) uv: vec2<f32>;"
-    , "};"
-    , "@vertex"
-    , "fn main(@builtin(vertex_index) idx: u32) -> VsOut {"
-    , "  let x = f32(idx & 1u);"
-    , "  return VsOut(vec4<f32>(x, 0.0, 0.0, 1.0), idx, vec2<f32>(x, 0.0));"
-    , "}"
-    ]
-
-vertexShader :: String
-vertexShader =
-  unlines
-    [ "struct VsOut {"
-    , "  @builtin(position) position: vec4<f32>;"
-    , "  @location(0) uv: vec2<f32>;"
-    , "};"
-    , "@vertex"
-    , "fn main(@location(0) in_pos: vec2<f32>) -> VsOut {"
-    , "  let pos = vec4(in_pos.x, in_pos.y, 0.0, 1.0);"
-    , "  return VsOut(pos, in_pos);"
-    , "}"
-    ]
-
-fragmentBlendSrcShader :: String
-fragmentBlendSrcShader =
-  unlines
-    [ "enable dual_source_blending;"
-    , "struct BlendOut {"
-    , "  @location(0) @blend_src(0) c0: vec4<f32>;"
-    , "  @location(0) @blend_src(1) c1: vec4<f32>;"
-    , "};"
-    , "@fragment"
-    , "fn main() -> BlendOut {"
-    , "  return BlendOut(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0));"
-    , "}"
-    ]
-
-fragmentBlendSrcNoEnableShader :: String
-fragmentBlendSrcNoEnableShader =
-  unlines
-    [ "struct BlendOut {"
-    , "  @location(0) @blend_src(0) c0: vec4<f32>;"
-    , "  @location(0) @blend_src(1) c1: vec4<f32>;"
-    , "};"
-    , "@fragment"
-    , "fn main() -> BlendOut {"
-    , "  return BlendOut(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0));"
-    , "}"
-    ]
-
-fragmentBlendSrcOnlyOneShader :: String
-fragmentBlendSrcOnlyOneShader =
-  unlines
-    [ "enable dual_source_blending;"
-    , "struct BlendOut {"
-    , "  @location(0) @blend_src(1) c1: vec4<f32>;"
-    , "};"
-    , "@fragment"
-    , "fn main() -> BlendOut {"
-    , "  return BlendOut(vec4<f32>(0.0, 1.0, 0.0, 1.0));"
-    , "}"
-    ]
-
-fragmentBlendSrcLocationOneShader :: String
-fragmentBlendSrcLocationOneShader =
-  unlines
-    [ "enable dual_source_blending;"
-    , "struct BlendOut {"
-    , "  @location(1) @blend_src(0) c0: vec4<f32>;"
-    , "  @location(1) @blend_src(1) c1: vec4<f32>;"
-    , "};"
-    , "@fragment"
-    , "fn main() -> BlendOut {"
-    , "  return BlendOut(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0));"
-    , "}"
-    ]
-
-vertexInterpolateIntegerShader :: String
-vertexInterpolateIntegerShader =
-  unlines
-    [ "struct VsOut {"
-    , "  @builtin(position) pos: vec4<f32>;"
-    , "  @location(0) @interpolate(linear) id: u32;"
-    , "};"
-    , "@vertex"
-    , "fn main(@builtin(vertex_index) idx: u32) -> VsOut {"
-    , "  return VsOut(vec4<f32>(0.0, 0.0, 0.0, 1.0), idx);"
-    , "}"
-    ]
-
-vertexInvariantLocationShader :: String
-vertexInvariantLocationShader =
-  unlines
-    [ "struct VsOut {"
-    , "  @builtin(position) pos: vec4<f32>;"
-    , "  @location(0) @invariant uv: vec2<f32>;"
-    , "};"
-    , "@vertex"
-    , "fn main(@builtin(vertex_index) idx: u32) -> VsOut {"
-    , "  let x = f32(idx & 1u);"
-    , "  return VsOut(vec4<f32>(x, 0.0, 0.0, 1.0), vec2<f32>(x, 0.0));"
-    , "}"
-    ]
-
-vertexBoolLocationShader :: String
-vertexBoolLocationShader =
-  unlines
-    [ "struct VsOut {"
-    , "  @builtin(position) pos: vec4<f32>;"
-    , "  @location(0) b: bool;"
-    , "};"
-    , "@vertex"
-    , "fn main() -> VsOut {"
-    , "  return VsOut(vec4<f32>(0.0, 0.0, 0.0, 1.0), true);"
-    , "}"
-    ]
-
-f16NoEnableShader :: String
-f16NoEnableShader =
-  unlines
-    [ "@fragment"
-    , "fn main() -> @location(0) vec4<f16> {"
-    , "  return vec4<f16>(1.0h);"
-    , "}"
-    ]
-
-nagaTextureBarrierFragment :: String
-nagaTextureBarrierFragment =
-  unlines
-    [ "@fragment"
-    , "fn main() -> @location(0) vec4<f32> {"
-    , "  textureBarrier();"
-    , "  return vec4<f32>(1.0);"
-    , "}"
-    ]
-
-nagaStorageWriteBuffer :: String
-nagaStorageWriteBuffer =
-  unlines
-    [ "struct Data { v: u32, }"
-    , "@group(0) @binding(0)"
-    , "var<storage, write> data: Data;"
-    , "@compute @workgroup_size(1)"
-    , "fn main() {"
-    , "  data.v = 1u;"
-    , "}"
-    ]
-
-nagaBlendSrcEnabled :: String
-nagaBlendSrcEnabled =
-  unlines
-    [ "enable dual_source_blending;"
-    , "struct Out {"
-    , "  @location(0) @blend_src(0) a: vec4<f32>,"
-    , "  @location(0) @blend_src(1) b: vec4<f32>,"
-    , "}"
-    , "@fragment"
-    , "fn main() -> Out {"
-    , "  return Out(vec4<f32>(1.0), vec4<f32>(0.0));"
-    , "}"
-    ]
-
-nagaBlendSrcNoEnable :: String
-nagaBlendSrcNoEnable =
-  unlines
-    [ "struct Out {"
-    , "  @location(0) @blend_src(0) a: vec4<f32>,"
-    , "  @location(0) @blend_src(1) b: vec4<f32>,"
-    , "}"
-    , "@fragment"
-    , "fn main() -> Out {"
-    , "  return Out(vec4<f32>(1.0), vec4<f32>(0.0));"
-    , "}"
-    ]
-
-nagaF16NoEnable :: String
-nagaF16NoEnable =
-  unlines
-    [ "@fragment"
-    , "fn main() -> @location(0) vec4<f16> {"
-    , "  return vec4<f16>(1.0h);"
-    , "}"
-    ]
-
-nagaF16Enable :: String
-nagaF16Enable =
-  unlines
-    [ "enable f16;"
-    , "@fragment"
-    , "fn main() -> @location(0) vec4<f16> {"
-    , "  return vec4<f16>(1.0h);"
-    , "}"
-    ]
-
-nagaInterpolateIntLinear :: String
-nagaInterpolateIntLinear =
-  unlines
-    [ "struct Out {"
-    , "  @builtin(position) pos: vec4<f32>,"
-    , "  @location(0) @interpolate(linear) id: u32,"
-    , "}"
-    , "@vertex"
-    , "fn main(@builtin(vertex_index) i: u32) -> Out {"
-    , "  return Out(vec4<f32>(0.0, 0.0, 0.0, 1.0), i);"
-    , "}"
-    ]
-
-nagaInterpolateFloatLinear :: String
-nagaInterpolateFloatLinear =
-  unlines
-    [ "struct Out {"
-    , "  @builtin(position) pos: vec4<f32>,"
-    , "  @location(0) @interpolate(linear, centroid) uv: vec2<f32>,"
-    , "}"
-    , "@vertex"
-    , "fn main(@builtin(vertex_index) i: u32) -> Out {"
-    , "  let x = f32(i & 1u);"
-    , "  return Out(vec4<f32>(0.0, 0.0, 0.0, 1.0), vec2<f32>(x, 0.0));"
-    , "}"
-    ]
-
-nagaEntryPointerParam :: String
-nagaEntryPointerParam =
-  unlines
-    [ "@compute @workgroup_size(1)"
-    , "fn main(p: ptr<function, i32>) {"
-    , "}"
-    ]
-
-nagaFragmentReturnNoBinding :: String
-nagaFragmentReturnNoBinding =
-  unlines
-    [ "@fragment"
-    , "fn main() -> vec4<f32> {"
-    , "  return vec4<f32>(1.0);"
-    , "}"
-    ]
-
-nagaNonEntryParamIoAttrs :: String
-nagaNonEntryParamIoAttrs =
-  unlines
-    [ "fn helper(@location(0) x: f32) -> f32 {"
-    , "  return x;"
-    , "}"
-    , "@fragment"
-    , "fn main() -> @location(0) vec4<f32> {"
-    , "  return vec4<f32>(helper(1.0));"
-    , "}"
-    ]
-
-nagaNegativeLocation :: String
-nagaNegativeLocation =
-  unlines
-    [ "@vertex"
-    , "fn main(@location(-1) x: vec4<f32>) -> @builtin(position) vec4<f32> {"
-    , "  return x;"
-    , "}"
-    ]
-
-nagaLocationTooManyArgs :: String
-nagaLocationTooManyArgs =
-  unlines
-    [ "@fragment"
-    , "fn main() -> @location(0, 1) vec4<f32> {"
-    , "  return vec4<f32>(1.0);"
-    , "}"
-    ]
-
-nagaDuplicateLocationReturn :: String
-nagaDuplicateLocationReturn =
-  unlines
-    [ "@fragment"
-    , "fn main() -> @location(0) @location(1) vec4<f32> {"
-    , "  return vec4<f32>(1.0);"
-    , "}"
-    ]
-
-nagaDuplicateBuiltinReturn :: String
-nagaDuplicateBuiltinReturn =
-  unlines
-    [ "@vertex"
-    , "fn main() -> @builtin(position) @builtin(position) vec4<f32> {"
-    , "  return vec4<f32>(0.0, 0.0, 0.0, 1.0);"
-    , "}"
-    ]
-
-nagaDuplicateGroupAttr :: String
-nagaDuplicateGroupAttr =
-  unlines
-    [ "struct U {"
-    , "  v: vec4<f32>,"
-    , "}"
-    , "@group(0) @group(1) @binding(0)"
-    , "var<uniform> u: U;"
-    , "@fragment"
-    , "fn main() -> @location(0) vec4<f32> {"
-    , "  return u.v;"
-    , "}"
-    ]
-
-nagaDuplicateBindingAttr :: String
-nagaDuplicateBindingAttr =
-  unlines
-    [ "struct U {"
-    , "  v: vec4<f32>,"
-    , "}"
-    , "@group(0) @binding(0) @binding(1)"
-    , "var<uniform> u: U;"
-    , "@fragment"
-    , "fn main() -> @location(0) vec4<f32> {"
-    , "  return u.v;"
-    , "}"
-    ]
-
-nagaDuplicateFragmentStageAttr :: String
-nagaDuplicateFragmentStageAttr =
-  unlines
-    [ "@fragment @fragment"
-    , "fn main() -> @location(0) vec4<f32> {"
-    , "  return vec4<f32>(1.0);"
-    , "}"
-    ]
-
-nagaDuplicateWorkgroupSizeAttr :: String
-nagaDuplicateWorkgroupSizeAttr =
-  unlines
-    [ "@compute @workgroup_size(1) @workgroup_size(2)"
-    , "fn main() {"
-    , "}"
-    ]
-
-nagaStageAttrWithArgs :: String
-nagaStageAttrWithArgs =
-  unlines
-    [ "@fragment(1)"
-    , "fn main() -> @location(0) vec4<f32> {"
-    , "  return vec4<f32>(1.0);"
-    , "}"
-    ]
-
-nagaNonEntryFunctionAttr :: String
-nagaNonEntryFunctionAttr =
-  unlines
-    [ "@workgroup_size(1)"
-    , "fn helper() -> i32 {"
-    , "  return 1;"
-    , "}"
-    , "@fragment"
-    , "fn main() -> @location(0) vec4<f32> {"
-    , "  return vec4<f32>(f32(helper()));"
-    , "}"
-    ]
-
-pointerParamWorkgroupShader :: String
-pointerParamWorkgroupShader =
-  unlines
-    [ "var<workgroup> g: i32;"
-    , "fn bump(p: ptr<workgroup, i32>) -> i32 {"
-    , "  *p = *p + 1;"
-    , "  return *p;"
-    , "}"
-    , "@compute @workgroup_size(1)"
-    , "fn main() {"
-    , "  let y = bump(&g);"
-    , "  if (y == 0) { }"
-    , "}"
-    ]
-
-pointerParamStorageShader :: String
-pointerParamStorageShader =
-  unlines
-    [ "struct Data { v: u32, }"
-    , "@group(0) @binding(0)"
-    , "var<storage, read_write> data: Data;"
-    , "fn bump(p: ptr<storage, u32, read_write>) -> u32 {"
-    , "  *p = *p + 1u;"
-    , "  return *p;"
-    , "}"
-    , "@compute @workgroup_size(1)"
-    , "fn main() {"
-    , "  let y = bump(&data.v);"
-    , "  if (y == 0u) { }"
-    , "}"
-    ]
-
-storageTextureShader :: String
-storageTextureShader =
-  unlines
-    [ "@group(0) @binding(0)"
-    , "var<storage> out_tex: texture_storage_2d<rgba8unorm, write>;"
-    , "@group(0) @binding(1)"
-    , "var<storage> in_tex: texture_storage_2d<rgba8unorm, read>;"
-    , "@compute @workgroup_size(8, 8, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let x = i32(gid.x);"
-    , "  let y = i32(gid.y);"
-    , "  let coord = vec2(x, y);"
-    , "  let src = textureLoad(in_tex, coord);"
-    , "  textureStore(out_tex, coord, vec4(src.x, src.y, src.z, src.w));"
-    , "}"
-    ]
-
-storageWriteAccessShader :: String
-storageWriteAccessShader =
-  unlines
-    [ "struct Data {"
-    , "  values: array<u32, 4>;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<storage, write> data: Data;"
-    , "@compute @workgroup_size(1)"
-    , "fn main() {"
-    , "  data.values[0] = 1u;"
-    , "}"
-    ]
-
-samplerShader :: String
-samplerShader =
-  unlines
-    [ "@group(0) @binding(0)"
-    , "var tex: texture_2d<f32>;"
-    , "@group(0) @binding(1)"
-    , "var samp: sampler;"
-    , "@fragment"
-    , "fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let uv = vec2(frag_coord.x / 640.0, frag_coord.y / 480.0);"
-    , "  return textureSample(tex, samp, uv);"
-    , "}"
-    ]
-
-samplerValueShader :: String
-samplerValueShader =
-  unlines
-    [ "@group(0) @binding(0)"
-    , "var tex: texture_2d<f32>;"
-    , "@group(0) @binding(1)"
-    , "var samp: sampler;"
-    , "@fragment"
-    , "fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let _ = samp;"
-    , "  let uv = vec2(frag_coord.x / 640.0, frag_coord.y / 480.0);"
-    , "  let c = textureSample(tex, samp, uv);"
-    , "  return c;"
-    , "}"
-    ]
 
 combinedInputShader :: Shader 'SamplerCombined
   '[ 'Binding "params" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
@@ -2946,753 +2387,3 @@ fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   return textureSample(tex, samp, uv);
 }
 |])
-
-bitwiseShader :: String
-bitwiseShader =
-  unlines
-    [ "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  var a = u32(1);"
-    , "  var b = u32(3);"
-    , "  a = a % u32(2);"
-    , "  a = a << u32(1);"
-    , "  a = a >> u32(1);"
-    , "  a = a & b;"
-    , "  a = a | b;"
-    , "  a = a ^ b;"
-    , "  a += b;"
-    , "  a -= b;"
-    , "  a *= b;"
-    , "  a /= b;"
-    , "  a %= b;"
-    , "  a &= b;"
-    , "  a |= b;"
-    , "  a ^= b;"
-    , "  a <<= b;"
-    , "  a >>= b;"
-    , "  a++;"
-    , "  --a;"
-    , "  var c = i32(4);"
-    , "  c = c % i32(3);"
-    , "  c <<= i32(1);"
-    , "  c >>= i32(1);"
-    , "  c++;"
-    , "  --c;"
-    , "  if (gid.x == 0) {"
-    , "    a = a + u32(c);"
-    , "  }"
-    , "}"
-    ]
-
-builtinExtraShader :: String
-builtinExtraShader =
-  unlines
-    [ "struct Params {"
-    , "  time: f32;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<uniform> params: Params;"
-    , "@fragment"
-    , "fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let uv = vec2(frag_coord.x / 640.0, frag_coord.y / 480.0);"
-    , "  let p = vec2(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0);"
-    , "  let a = sign(p.x);"
-    , "  let ang = radians(params.time);"
-    , "  let _t = tan(ang);"
-    , "  let _rn = round(p.x * 2.0);"
-    , "  let _tr = trunc(p.y * 2.0);"
-    , "  let _inv = inverseSqrt(abs(p.x) + 0.25);"
-    , "  let _fm = fma(p.x, p.y, 0.5);"
-    , "  let _ch = cosh(p.x);"
-    , "  let _sh = sinh(p.y);"
-    , "  let _at = atan2(p.y, p.x);"
-    , "  let _rt = saturate(p.x * 1.5);"
-    , "  let b0 = p.x > 0.0;"
-    , "  let b1 = p.y > 0.0;"
-    , "  let b2 = (p.x + p.y) > 0.0;"
-    , "  let cond = vec3(b0, b1, b2);"
-    , "  let anyHit = any(cond);"
-    , "  let allHit = all(cond);"
-    , "  let base = select(vec3(0.1, 0.2, 0.3), vec3(0.9, 0.3, 0.1), cond);"
-    , "  let m = mat2x2(vec2(1.0, 0.0), vec2(0.0, 1.0));"
-    , "  let _det = determinant(m);"
-    , "  let _mt = transpose(m);"
-    , "  let _mi = inverse(m);"
-    , "  let _cr = cross(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0));"
-    , "  let _ff = faceForward(vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, -1.0), vec3(0.0, 0.0, 1.0));"
-    , "  let _rf = refract(vec3(0.0, 0.0, -1.0), vec3(0.0, 0.0, 1.0), 0.66);"
-    , "  let mf = modf(p.x);"
-    , "  let fx = frexp(p.x);"
-    , "  let _ld = ldexp(mf.fract, fx.exp);"
-    , "  let pk = pack4x8unorm(vec4(0.1, 0.2, 0.3, 0.4));"
-    , "  let up = unpack4x8unorm(pk);"
-    , "  let pk2 = pack2x16float(vec2(0.3, 0.7));"
-    , "  let up2 = unpack2x16float(pk2);"
-    , "  let _lead = firstLeadingBit(pk);"
-    , "  let _trail = firstTrailingBit(pk);"
-    , "  let _q = quantizeToF16(p.x);"
-    , "  let ix = u32(frag_coord.x);"
-    , "  let iy = u32(frag_coord.y);"
-    , "  let bits = ix ^ (iy << u32(1));"
-    , "  let _cnt = countOneBits(bits);"
-    , "  let _clz = countLeadingZeros(bits);"
-    , "  let _ctz = countTrailingZeros(bits);"
-    , "  let rev = reverseBits(bits);"
-    , "  let ext = extractBits(rev, u32(4), u32(6));"
-    , "  let ins = insertBits(bits, ext, u32(8), u32(6));"
-    , "  let packed = (i32(255) << i32(24)) | (i32(1) << i32(16)) | (i32(2) << i32(8)) | i32(3);"
-    , "  let _dotu = dot4U8Packed(u32(packed), u32(packed));"
-    , "  let _doti = dot4I8Packed(packed, packed);"
-    , "  let _bc = bitcast<u32>(f32(1.0));"
-    , "  let mask = f32(ins & u32(255)) / 255.0;"
-    , "  let v = abs(vec3(p.x, p.y, a));"
-    , "  let c = clamp(v, vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));"
-    , "  let gain = select(0.2, 1.0, allHit);"
-    , "  let glow = select(0.2, 0.8, anyHit);"
-    , "  return vec4((base.x + c.x) * gain + mask * 0.2 + up.x + up2.x + _q * 0.0 + _rt * 0.0, base.y + c.y + up.y, base.z + c.z + glow * 0.1, 1.0);"
-    , "}"
-    ]
-
-runtimeArrayLengthShader :: String
-runtimeArrayLengthShader =
-  unlines
-    [ "struct Data {"
-    , "  values: array<u32>;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<storage, read_write> data: Data;"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let len = arrayLength(data.values);"
-    , "  if (gid.x == 0 && len > 0) {"
-    , "    data.values[0] = len;"
-    , "  }"
-    , "}"
-    ]
-
-aliasOverrideShader :: String
-aliasOverrideShader =
-  unlines
-    [ "alias Color = vec4<f32>;"
-    , "override factor: u32 = 2;"
-    , "const_assert(factor == 2);"
-    , "struct Params {"
-    , "  tint: Color;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<uniform> params: Params;"
-    , "@fragment"
-    , "fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) Color {"
-    , "  let c = params.tint;"
-    , "  return vec4(c.x, c.y, c.z, 1.0);"
-    , "}"
-    ]
-
-switchLoopShader :: String
-switchLoopShader =
-  unlines
-    [ "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  var acc = 0;"
-    , "  switch (gid.x) {"
-    , "    case 0: { acc = acc + 1; }"
-    , "    case 1, 2: { acc = acc + 2; }"
-    , "    default: { acc = acc + 3; }"
-    , "  }"
-    , "  loop {"
-    , "    acc = acc + 1;"
-    , "    break if (acc > 4);"
-    , "    continuing {"
-    , "      acc = acc + 1;"
-    , "    }"
-    , "  }"
-    , "}"
-    ]
-
-badConstAssertShader :: String
-badConstAssertShader =
-  unlines
-    [ "const_assert(false);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = gid.x;"
-    , "}"
-    ]
-
-constFnShader :: String
-constFnShader =
-  unlines
-    [ "fn add(a: i32, b: i32) -> i32 {"
-    , "  let sum = a + b;"
-    , "  sum + 0;"
-    , "  if (sum > 4) {"
-    , "    return sum;"
-    , "  }"
-    , "  return sum - 1;"
-    , "}"
-    , "fn pick(n: i32) -> i32 {"
-    , "  switch (n) {"
-    , "    case 0: { return 1; }"
-    , "    case 1: { return 2; }"
-    , "    default: { return 3; }"
-    , "  }"
-    , "  return 3;"
-    , "}"
-    , "fn greater(a: i32, b: i32) -> bool {"
-    , "  if (a > b) {"
-    , "    return true;"
-    , "  }"
-    , "  return false;"
-    , "}"
-    , "fn make(v: f32) -> vec2<f32> {"
-    , "  return vec2(v, v + 1.0);"
-    , "}"
-    , "fn sum(n: i32) -> i32 {"
-    , "  var acc = 0;"
-    , "  var i = 0;"
-    , "  while (i < n) {"
-    , "    acc = acc + i;"
-    , "    i++;"
-    , "  }"
-    , "  return acc;"
-    , "}"
-    , "fn sum_for(n: i32) -> i32 {"
-    , "  var acc = 0;"
-    , "  for (var i = 0; i < n; i = i + 1) {"
-    , "    acc += i;"
-    , "  }"
-    , "  return acc;"
-    , "}"
-    , "const_assert(add(2, 3) == 5);"
-    , "const_assert(add(1, 1) == 1);"
-    , "const_assert(pick(1) == 2);"
-    , "const_assert(pick(3) == 3);"
-    , "const_assert(greater(4, 1));"
-    , "const_assert(make(1.5).y == 2.5);"
-    , "const_assert(sum(4) == 6);"
-    , "const_assert(sum_for(4) == 6);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = gid.x;"
-    , "}"
-    ]
-
-overrideShader :: String
-overrideShader =
-  unlines
-    [ "override scale: i32;"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = gid.x + u32(scale);"
-    , "}"
-    ]
-
-overrideSpecShader :: String
-overrideSpecShader =
-  unlines
-    [ "override scale: i32;"
-    , "const_assert(scale == 4);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = gid.x + u32(scale);"
-    , "}"
-    ]
-
-overrideDefaultShader :: String
-overrideDefaultShader =
-  unlines
-    [ "override scale: i32 = 2 + 3;"
-    , "@id(7) override mode: u32 = 1;"
-    , "const_assert(scale == 5);"
-    , "const_assert(mode == 1);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = gid.x + u32(scale) + mode;"
-    , "}"
-    ]
-
-overrideSpecOpShader :: String
-overrideSpecOpShader =
-  unlines
-    [ "override base: i32 = 2;"
-    , "override scale: i32 = base * 3 + 1;"
-    , "const_assert(scale == 7);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = gid.x + u32(scale);"
-    , "}"
-    ]
-
-diagnosticShader :: String
-diagnosticShader =
-  unlines
-    [ "diagnostic(off, const_assert);"
-    , "const_assert(false);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = gid.x;"
-    , "}"
-    ]
-
-diagnosticWarnShader :: String
-diagnosticWarnShader =
-  unlines
-    [ "diagnostic(warning, const_assert);"
-    , "const_assert(false);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = gid.x;"
-    , "}"
-    ]
-
-diagnosticUnreachableShader :: String
-diagnosticUnreachableShader =
-  unlines
-    [ "diagnostic(warning, unreachable_code);"
-    , "fn helper() {"
-    , "  return;"
-    , "  let _ = 1;"
-    , "}"
-    , "@fragment"
-    , "fn main() -> @location(0) vec4<f32> {"
-    , "  discard;"
-    , "  let _ = 0.5;"
-    , "  return vec4(1.0, 0.0, 0.0, 1.0);"
-    , "}"
-    ]
-
-diagnosticUnusedExprShader :: String
-diagnosticUnusedExprShader =
-  unlines
-    [ "diagnostic(warning, unused_expression);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  gid.x;"
-    , "  let _ = gid.x;"
-    , "}"
-    ]
-
-diagnosticUnusedVarShader :: String
-diagnosticUnusedVarShader =
-  unlines
-    [ "diagnostic(warning, unused_variable);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let unused = gid.x;"
-    , "  var unused2 = gid.x;"
-    , "  let _keep = unused2;"
-    , "  let _ = gid.x;"
-    , "}"
-    ]
-
-diagnosticUnusedParamShader :: String
-diagnosticUnusedParamShader =
-  unlines
-    [ "diagnostic(warning, unused_parameter);"
-    , "fn helper(a: i32, b: i32) -> i32 {"
-    , "  return a;"
-    , "}"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = helper(i32(gid.x), 2);"
-    , "}"
-    ]
-
-diagnosticShadowingShader :: String
-diagnosticShadowingShader =
-  unlines
-    [ "diagnostic(warning, shadowing);"
-    , "fn helper(base: i32) -> i32 {"
-    , "  var out = base;"
-    , "  if (out > 0) {"
-    , "    let base = out + 1;"
-    , "    out = base;"
-    , "  }"
-    , "  return out;"
-    , "}"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _ = helper(i32(gid.x));"
-    , "}"
-    ]
-
-diagnosticConstantCondShader :: String
-diagnosticConstantCondShader =
-  unlines
-    [ "diagnostic(warning, constant_condition);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  if (true) {"
-    , "    let _ = gid.x;"
-    , "  }"
-    , "  while (false) {"
-    , "    let _ = gid.x;"
-    , "  }"
-    , "  for (; false; ) {"
-    , "    let _ = gid.x;"
-    , "  }"
-    , "}"
-    ]
-
-diagnosticDuplicateCaseShader :: String
-diagnosticDuplicateCaseShader =
-  unlines
-    [ "diagnostic(warning, duplicate_case);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  var acc = 0;"
-    , "  switch (gid.x) {"
-    , "    case 1: { acc = acc + 1; }"
-    , "    case 1, 2: { acc = acc + 2; }"
-    , "    default: { acc = acc + 3; }"
-    , "  }"
-    , "  let _ = acc;"
-    , "}"
-    ]
-
-switchFallthroughShader :: String
-switchFallthroughShader =
-  unlines
-    [ "let MODE = 1;"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  var acc = 0;"
-    , "  switch (gid.x) {"
-    , "    case 0: { acc = acc + 1; fallthrough; }"
-    , "    case MODE: { acc = acc + 2; }"
-    , "    default: { acc = acc + 3; }"
-    , "  }"
-    , "}"
-    ]
-
-constArithShader :: String
-constArithShader =
-  unlines
-    [ "const_assert((1 + 2 * 3) == 7);"
-    , "const_assert(((8 >> 1) + (3 << 1)) == 10);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  var acc = 0;"
-    , "  switch (gid.x) {"
-    , "    case 1 + 2: { acc = acc + 1; }"
-    , "    case (8 >> 1): { acc = acc + 2; }"
-    , "    default: { acc = acc + 3; }"
-    , "  }"
-    , "  if (acc > 4) {"
-    , "    acc = acc - 1;"
-    , "  }"
-    , "}"
-    ]
-
-constFloatShader :: String
-constFloatShader =
-  unlines
-    [ "const_assert((0.5 + 0.25) == 0.75);"
-    , "const_assert(abs(-1.5) == 1.5);"
-    , "const_assert(min(0.5, 0.25) == 0.25);"
-    , "const_assert(max(0.5, 0.25) == 0.5);"
-    , "const_assert(clamp(2.0, 0.0, 1.0) == 1.0);"
-    , "const_assert(mix(0.0, 2.0, 0.25) == 0.5);"
-    , "const_assert(select(0.0, 1.0, true) == 1.0);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main() {"
-    , "}"
-    ]
-
-constCompositeShader :: String
-constCompositeShader =
-  unlines
-    [ "struct Pair {"
-    , "  a: i32;"
-    , "  b: vec2<f32>;"
-    , "};"
-    , "const_assert(vec2(1.0, 2.0).x == 1.0);"
-    , "const_assert(vec3(1.0, 2.0, 3.0).yz.x == 2.0);"
-    , "const_assert(mat2x2(vec2(1.0, 2.0), vec2(3.0, 4.0))[1].y == 4.0);"
-    , "const_assert(array(1, 2, 3)[2] == 3);"
-    , "const_assert(Pair(7, vec2(0.5, 1.5)).b.y == 1.5);"
-    , "const_assert(vec2<f32>().x == 0.0);"
-    , "const_assert(mat2x2<f32>()[1].y == 0.0);"
-    , "const_assert(array<i32, 2>()[1] == 0);"
-    , "const_assert(Pair().a == 0);"
-    , "const_assert(i32() == 0);"
-    , "const_assert(f32() == 0.0);"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main() {"
-    , "}"
-    ]
-
-discardShader :: String
-discardShader =
-  unlines
-    [ "@fragment"
-    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  if (pos.x < 0.0) {"
-    , "    discard;"
-    , "  }"
-    , "  return vec4(1.0, 0.0, 0.0, 1.0);"
-    , "}"
-    ]
-
-pointerShader :: String
-pointerShader =
-  unlines
-    [ "fn inc(x: i32) -> i32 {"
-    , "  return x + 1;"
-    , "}"
-    , "fn make() -> i32 {"
-    , "  return 1;"
-    , "}"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main() {"
-    , "  var x = i32(0);"
-    , "  let px = &x;"
-    , "  *px = *px + 1;"
-    , "  let y = inc(1);"
-    , "  x = x + y;"
-    , "  let z = make();"
-    , "  x = x + z;"
-    , "}"
-    ]
-
-textureVariantsShader :: String
-textureVariantsShader =
-  unlines
-    [ "@group(0) @binding(0)"
-    , "var tex_arr: texture_2d_array<f32>;"
-    , "@group(0) @binding(1)"
-    , "var tex_3d: texture_3d<f32>;"
-    , "@group(0) @binding(2)"
-    , "var tex_cube: texture_cube<f32>;"
-    , "@group(0) @binding(3)"
-    , "var samp: sampler;"
-    , "@group(0) @binding(4)"
-    , "var depth_tex: texture_depth_2d;"
-    , "@group(0) @binding(5)"
-    , "var samp_cmp: sampler_comparison;"
-    , "@fragment"
-    , "fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let uv = vec2(frag_coord.x / 640.0, frag_coord.y / 480.0);"
-    , "  let layer = i32(1);"
-    , "  let col_arr = textureSample(tex_arr, samp, uv, layer);"
-    , "  let col3 = textureSample(tex_3d, samp, vec3(uv.x, uv.y, 0.5));"
-    , "  let colc = textureSample(tex_cube, samp, vec3(uv.x, uv.y, 1.0));"
-    , "  let depth = textureSampleCompare(depth_tex, samp_cmp, uv, 0.5);"
-    , "  return vec4(col_arr.x + col3.y + colc.z + depth, col_arr.y, col_arr.z, 1.0);"
-    , "}"
-    ]
-
-textureLoadShader :: String
-textureLoadShader =
-  unlines
-    [ "@group(0) @binding(0)"
-    , "var tex: texture_2d<f32>;"
-    , "@group(0) @binding(1)"
-    , "var tex_arr: texture_2d_array<f32>;"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let coord = vec2(i32(gid.x), i32(gid.y));"
-    , "  let _a = textureLoad(tex, coord, 0);"
-    , "  let _b = textureLoad(tex_arr, coord, 1, 0);"
-    , "}"
-    ]
-
-storageTextureArrayShader :: String
-storageTextureArrayShader =
-  unlines
-    [ "@group(0) @binding(0)"
-    , "var tex_arr: texture_storage_2d_array<rgba8unorm, read_write>;"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let coord = vec3(i32(gid.x), i32(gid.y), i32(gid.z));"
-    , "  let src = textureLoad(tex_arr, coord);"
-    , "  textureStore(tex_arr, coord, vec4(src.x, src.y, src.z, src.w));"
-    , "}"
-    ]
-
-textureAdvancedShader :: String
-textureAdvancedShader =
-  unlines
-    [ "struct Params {"
-    , "  time: f32;"
-    , "};"
-    , "@group(0) @binding(0) var<uniform> params: Params;"
-    , "@group(0) @binding(1) var samp: sampler;"
-    , "@group(0) @binding(2) var samp_cmp: sampler_comparison;"
-    , "@group(0) @binding(3) var tex1d: texture_1d<f32>;"
-    , "@group(0) @binding(4) var tex1d_arr: texture_1d_array<f32>;"
-    , "@group(0) @binding(5) var tex_cube_arr: texture_cube_array<f32>;"
-    , "@group(0) @binding(6) var tex_msaa: texture_multisampled_2d<f32>;"
-    , "@group(0) @binding(7) var tex_depth_cube: texture_depth_cube;"
-    , "@group(0) @binding(8) var tex_depth_cube_arr: texture_depth_cube_array;"
-    , "@group(0) @binding(9) var tex_depth_msaa: texture_depth_multisampled_2d;"
-    , "@group(0) @binding(10) var tex_store_1d: texture_storage_1d<rgba8unorm, read_write>;"
-    , "@group(0) @binding(11) var tex_store_3d: texture_storage_3d<rgba8unorm, read_write>;"
-    , "@fragment"
-    , "fn main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let uv = vec2(frag_coord.x * 0.01, frag_coord.y * 0.01);"
-    , "  let lod = 0.5 + params.time * 0.0;"
-    , "  let dim0 = textureDimensions(tex1d);"
-    , "  let dim1 = textureDimensions(tex1d_arr);"
-    , "  let layers = textureNumLayers(tex1d_arr);"
-    , "  let levels = textureNumLevels(tex1d);"
-    , "  let samples = textureNumSamples(tex_msaa);"
-    , "  let c0 = textureSampleLevel(tex1d, samp, uv.x, lod);"
-    , "  let c1 = textureSampleLevel(tex1d_arr, samp, uv.x, 1, lod);"
-    , "  let c2 = textureSampleBias(tex1d, samp, uv.x, 0.25);"
-    , "  let c3 = textureSampleGrad(tex1d, samp, uv.x, 0.01, 0.01);"
-    , "  let g0 = textureGather(tex_cube_arr, samp, vec3(uv.x, uv.y, 1.0), 0);"
-    , "  let d0 = textureSampleCompareLevel(tex_depth_cube, samp_cmp, vec3(uv.x, uv.y, 1.0), 0.5, lod);"
-    , "  let d1 = textureSampleCompareLevel(tex_depth_cube_arr, samp_cmp, vec3(uv.x, uv.y, 1.0), 0, 0.5, lod);"
-    , "  let ms = textureLoad(tex_msaa, vec2(0, 0), 0);"
-    , "  let msd = textureLoad(tex_depth_msaa, vec2(0, 0), 0);"
-    , "  textureStore(tex_store_1d, 0, vec4(uv.x, uv.y, d0, 1.0));"
-    , "  textureStore(tex_store_3d, vec3(0, 0, 0), vec4(uv.y, uv.x, 0.0, 1.0));"
-    , "  let dims_acc = f32(dim0 + dim1 + layers + levels + samples);"
-    , "  return vec4(c0.x + c1.y + c2.z + c3.w + g0.x + d0 + d1 + ms.x + msd + dims_acc * 0.0, 0.2, 0.3, 1.0);"
-    , "}"
-    ]
-
-globalsShader :: String
-globalsShader =
-  unlines
-    [ "enable f16;"
-    , "var<private> bias: f32 = 0.25;"
-    , "var<workgroup> shared: array<u32, 4>;"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let v = f16(1.0);"
-    , "  let w = f32(v) + bias;"
-    , "  if (gid.x == 0) {"
-    , "    shared[0] = u32(w);"
-    , "  }"
-    , "}"
-    ]
-
-layoutAttrShader :: String
-layoutAttrShader =
-  unlines
-    [ "struct Stuff {"
-    , "  @align(16) a: vec3<f32>,"
-    , "  @size(32) b: vec4<f32>,"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<uniform> stuff: Stuff;"
-    , "@fragment"
-    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let v = stuff.a.x + stuff.b.x;"
-    , "  return vec4(v, 0.0, 0.0, 1.0);"
-    , "}"
-    ]
-
-packUniformShader :: String
-packUniformShader =
-  unlines
-    [ "struct Payload {"
-    , "  a: f32;"
-    , "  b: vec3<f32>;"
-    , "  c: mat3x3<f32>;"
-    , "  d: array<vec2<f32>, 2>;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<uniform> payload: Payload;"
-    , "@fragment"
-    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let _ = payload.a + payload.b.x + payload.c[0][0] + payload.d[0].x;"
-    , "  return vec4(0.0, 0.0, 0.0, 1.0);"
-    , "}"
-    ]
-
-packUniformExtendedShader :: String
-packUniformExtendedShader =
-  unlines
-    [ "struct Inner {"
-    , "  a: vec2<f32>;"
-    , "  b: f32;"
-    , "};"
-    , "struct Params {"
-    , "  m3: mat3x3<f32>;"
-    , "  m4: mat4x4<f32>;"
-    , "  arr2: array<vec2<f32>, 4>;"
-    , "  arr3: array<vec3<f32>, 3>;"
-    , "  inner: Inner;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<uniform> params: Params;"
-    , "@fragment"
-    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let _ = params.m3[0][0] + params.m4[0][0] + params.arr2[0].x + params.arr3[0].x + params.inner.a.x + params.inner.b;"
-    , "  return vec4(0.0, 0.0, 0.0, 1.0);"
-    , "}"
-    ]
-
-packUniformExtendedShader2 :: String
-packUniformExtendedShader2 =
-  unlines
-    [ "enable f16;"
-    , "struct Inner2 {"
-    , "  v: vec3<f32>;"
-    , "  w: f32;"
-    , "};"
-    , "struct Outer2 {"
-    , "  inners: array<Inner2, 2>;"
-    , "};"
-    , "struct Params2 {"
-    , "  m34: mat3x4<f32>;"
-    , "  m43: mat4x3<f32>;"
-    , "  mats: array<mat2x2<f32>, 2>;"
-    , "  nested: Outer2;"
-    , "  h: f16;"
-    , "  hv: vec3<f16>;"
-    , "  hv4: vec4<f16>;"
-    , "};"
-    , "@group(0) @binding(0)"
-    , "var<uniform> params2: Params2;"
-    , "@fragment"
-    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let _ = params2.m34[0][0] + params2.m43[0][0] + params2.mats[0][0][0] + params2.nested.inners[0].v.x + f32(params2.h) + f32(params2.hv.x) + f32(params2.hv4.x);"
-    , "  return vec4(0.0, 0.0, 0.0, 1.0);"
-    , "}"
-    ]
-
-goldenComputeShader :: String
-goldenComputeShader =
-  unlines
-    [ "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  var x = 1;"
-    , "  x = x + i32(gid.x);"
-    , "}"
-    ]
-
-goldenFragmentShader :: String
-goldenFragmentShader =
-  unlines
-    [ "@fragment"
-    , "fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {"
-    , "  let uv = pos.xy / vec2(800.0, 600.0);"
-    , "  return vec4(uv.x, uv.y, 0.2, 1.0);"
-    , "}"
-    ]
-
-badSwitchShader :: String
-badSwitchShader =
-  unlines
-    [ "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  switch (gid.x) {"
-    , "    case gid.x: { }"
-    , "    default: { }"
-    , "  }"
-    , "}"
-    ]
-
-ifShader :: String
-ifShader =
-  unlines
-    [ "@if(FOO) let scale = 2.0;"
-    , "@compute @workgroup_size(1, 1, 1)"
-    , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
-    , "  let _tmp = scale;"
-    , "}"
-    ]

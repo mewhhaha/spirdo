@@ -42,7 +42,6 @@ module Spirdo.Wesl.Inputs
   , inputsTextures
   , inputsStorageBuffers
   , inputsStorageTextures
-  , emptyInputs
   , orderedUniforms
   ) where
 
@@ -62,7 +61,7 @@ import Spirdo.Wesl.Types
   , BindingInfo(..)
   , BindingKind(..)
   , BindingMap
-  , Shader(..)
+  , Shader
   , shaderInterface
   , ShaderInterface(..)
   , SamplerBindingMode(..)
@@ -205,7 +204,6 @@ data UniformInput = UniformInput
   , uiBytes :: !ByteString
   } deriving (Eq, Show)
 
--- | Compact uniform slot view: group, binding, bytes.
 -- | Sampler binding entry.
 data SamplerInput = SamplerInput
   { samplerName :: !String
@@ -279,9 +277,8 @@ inputsStorageBuffers inputs = inputs.siStorageBuffers
 inputsStorageTextures :: ShaderInputs iface -> [StorageTextureInput]
 inputsStorageTextures inputs = inputs.siStorageTextures
 
--- | Build an empty input bundle for a given interface.
-emptyInputs :: ShaderInterface -> ShaderInputs iface
-emptyInputs iface =
+inputValidationSeed :: ShaderInterface -> ShaderInputs iface
+inputValidationSeed iface =
   ShaderInputs
     { siInterface = iface
     , siUniforms = []
@@ -295,8 +292,6 @@ emptyInputs iface =
 orderedUniforms :: ShaderInputs iface -> [UniformInput]
 orderedUniforms inputs =
   orderUniforms inputs.siUniforms
-
--- | Uniform slots sorted by @(group, binding, name)@.
 
 normalizeInputs :: ShaderInputs iface -> ShaderInputs iface
 normalizeInputs inputs =
@@ -352,16 +347,16 @@ instance Monoid (InputsBuilder mode iface) where
 uniform :: forall name mode iface a. (KnownSymbol name, RequireUniform name iface, ToUniform a) => a -> InputsBuilder mode iface
 uniform val = InputsBuilder [InputUniform (symbolVal (Proxy @name)) (toUniform val)]
 
--- | Add a sampler binding by name (separate-sampler mode).
-sampler :: forall name mode iface. (KnownSymbol name, RequireSampler name iface) => SamplerHandle -> InputsBuilder mode iface
+-- | Add a sampler binding by name in separate-sampler mode.
+sampler :: forall name iface. (KnownSymbol name, RequireSampler name iface) => SamplerHandle -> InputsBuilder 'SamplerSeparate iface
 sampler handle = InputsBuilder [InputSampler (symbolVal (Proxy @name)) handle]
 
--- | Add a texture binding by name (separate-sampler mode).
-texture :: forall name mode iface. (KnownSymbol name, RequireTexture name iface) => TextureHandle -> InputsBuilder mode iface
+-- | Add a texture binding by name in separate-sampler mode.
+texture :: forall name iface. (KnownSymbol name, RequireTexture name iface) => TextureHandle -> InputsBuilder 'SamplerSeparate iface
 texture handle = InputsBuilder [InputTexture (symbolVal (Proxy @name)) handle]
 
--- | Add a combined texture+sampler binding by name.
-sampledTexture :: forall name mode iface. (KnownSymbol name, RequireTexture name iface) => TextureHandle -> SamplerHandle -> InputsBuilder mode iface
+-- | Add a combined texture+sampler binding by name in combined-sampler mode.
+sampledTexture :: forall name iface. (KnownSymbol name, RequireTexture name iface) => TextureHandle -> SamplerHandle -> InputsBuilder 'SamplerCombined iface
 sampledTexture texHandle samplerHandle =
   InputsBuilder [InputSampledTexture (symbolVal (Proxy @name)) texHandle samplerHandle]
 
@@ -376,9 +371,9 @@ storageTexture handle = InputsBuilder [InputStorageTexture (symbolVal (Proxy @na
 inputsFrom :: forall mode iface. ShaderInterface -> InputsBuilder mode iface -> Either InputsError (ShaderInputs iface)
 inputsFrom iface (InputsBuilder items) =
   let bmap = bindingMap iface
-      initInputs = emptyInputs iface
+      seed = inputValidationSeed iface
   in do
-      (inputs, _) <- foldM (applyItem iface.siSamplerMode bmap) (initInputs, Set.empty) items
+      (inputs, _) <- foldM (applyItem iface.siSamplerMode bmap) (seed, Set.empty) items
       let normalized = normalizeInputs inputs
       let missingBindings = missingBindingNames iface normalized
       unless (null missingBindings) $
@@ -432,6 +427,12 @@ applyBinding mode name info item inputs =
                   : inputs.siUniforms
             }
     (InputSampler _ handle, kind)
+      | mode == SamplerCombined ->
+          Left
+            ( InputsError
+                ("sampler is not supported in SamplerCombined mode: " <> name)
+                (Just name)
+            )
       | isSamplerKind kind ->
           Right inputs
             { siSamplers =
@@ -444,6 +445,12 @@ applyBinding mode name info item inputs =
                   : inputs.siSamplers
             }
     (InputTexture _ handle, kind)
+      | mode == SamplerCombined ->
+          Left
+            ( InputsError
+                ("texture is not supported in SamplerCombined mode: " <> name)
+                (Just name)
+            )
       | isTextureKind kind ->
           Right inputs
             { siTextures =

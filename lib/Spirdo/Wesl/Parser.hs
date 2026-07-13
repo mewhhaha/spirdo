@@ -21,13 +21,57 @@ import qualified Data.Text as T
 import qualified Data.Text.Read as TR
 import Data.Word (Word32)
 import Spirdo.Wesl.Syntax
+import Spirdo.Wesl.SourceFile (maxSourceChars)
 import Spirdo.Wesl.Types
 import Spirdo.Wesl.Util
 
 parseModuleWith :: [String] -> String -> Either CompileError ModuleAst
-parseModuleWith features src = do
-  toks <- lexWesl (T.pack src)
-  parseModuleTokensWith (Set.fromList (map T.pack features)) toks
+parseModuleWith features src =
+  let source = T.pack src
+      sourceChars = T.length source
+  in if sourceChars > maxSourceChars
+      then
+        Left
+          (CompileError
+            ("source length " <> show sourceChars <> " characters exceeds limit " <> show maxSourceChars)
+            (Just 1)
+            (Just 1))
+      else do
+        (toks, eofPos) <- lexWeslWithEnd source
+        case parseModuleTokensWith (Set.fromList (map T.pack features)) toks of
+          Left err -> Left (addFallbackPosition eofPos err)
+          Right ast ->
+            let standardUniformLayout =
+                  any (== DirEnable "uniform_buffer_standard_layout") ast.modDirectives
+                bindings =
+                  [ binding { bdStandardUniformLayout = standardUniformLayout }
+                  | binding <- ast.modBindings
+                  ]
+            in Right ast { modBindings = bindings }
+
+maxTokens :: Int
+maxTokens = 65536
+
+maxNumericLiteralChars :: Int
+maxNumericLiteralChars = 256
+
+maxDelimiterNesting :: Int
+maxDelimiterNesting = 256
+
+maxTypeNesting :: Int
+maxTypeNesting = 256
+
+maxCommentNesting :: Int
+maxCommentNesting = 128
+
+maxPrefixOperators :: Int
+maxPrefixOperators = 256
+
+addFallbackPosition :: SrcPos -> CompileError -> CompileError
+addFallbackPosition pos err =
+  case (err.ceLine, err.ceColumn) of
+    (Just _, Just _) -> err
+    _ -> err { ceLine = Just pos.spLine, ceColumn = Just pos.spCol }
 
 type FeatureSet = Set.Set Text
 
@@ -38,69 +82,88 @@ posOf toks =
     [] -> SrcPos 1 1
 
 lexWesl :: Text -> Either CompileError [Token]
-lexWesl = go (SrcPos 1 1)
+lexWesl source = fst <$> lexWeslWithEnd source
+
+lexWeslWithEnd :: Text -> Either CompileError ([Token], SrcPos)
+lexWeslWithEnd source = do
+  (reversedTokens, eofPos) <- go 0 [] [] (SrcPos 1 1) source
+  Right (reverse reversedTokens, eofPos)
   where
-    go _ src
-      | T.null src = pure []
-    go pos src =
+    go _ _ reversedTokens pos src
+      | T.null src = pure (reversedTokens, pos)
+    go tokenCount delimiters reversedTokens pos src =
       case T.uncons src of
-        Nothing -> pure []
+        Nothing -> pure (reversedTokens, pos)
         Just (c, cs)
-          | c == ' ' || c == '\t' || c == '\n' || c == '\r' ->
-              go (advance pos c) cs
-          | isAlpha c || c == '_' ->
+          | isPatternWhitespace c ->
+              go tokenCount delimiters reversedTokens (advance pos c) cs
+          | isIdentStart c ->
               let (ident, rest, pos') = consumeIdent pos src
-              in (Token (TkIdent ident) pos :) <$> go pos' rest
-          | isDigit c ->
+              in emitToken tokenCount delimiters reversedTokens pos (TkIdent ident) pos' rest
+          | isNumericStart c cs ->
               do
                 (tok, rest, pos') <- consumeNumber pos src
-                (Token tok pos :) <$> go pos' rest
+                emitToken tokenCount delimiters reversedTokens pos tok pos' rest
           | c == '"' ->
-              (\(str, rest, pos') -> (Token (TkString str) pos :) <$> go pos' rest)
+              (\(str, rest, pos') -> emitToken tokenCount delimiters reversedTokens pos (TkString str) pos' rest)
                 =<< consumeString pos cs
           | otherwise ->
               case T.uncons cs of
                 Nothing ->
                   if isSymbolChar c
-                    then emit1 pos c cs
+                    then emit1 tokenCount delimiters reversedTokens pos c cs
                     else Left (CompileError ("unexpected character: " <> [c]) (Just pos.spLine) (Just pos.spCol))
                 Just (c2, rest2) ->
                   case c of
                     '/' | c2 == '/' ->
                       let (_, rest, pos') = consumeLine (advance (advance pos '/') '/') rest2
-                      in go pos' rest
+                      in go tokenCount delimiters reversedTokens pos' rest
                     '/' | c2 == '*' ->
-                      (\(rest, pos') -> go pos' rest)
-                        =<< consumeBlockComment (advance (advance pos '/') '*') rest2
-                    ':' | c2 == ':' -> emit2 pos "::" c c2 rest2
-                    '=' | c2 == '=' -> emit2 pos "==" c c2 rest2
-                    '!' | c2 == '=' -> emit2 pos "!=" c c2 rest2
-                    '<' | c2 == '=' -> emit2 pos "<=" c c2 rest2
-                    '>' | c2 == '=' -> emit2 pos ">=" c c2 rest2
-                    '&' | c2 == '&' -> emit2 pos "&&" c c2 rest2
-                    '|' | c2 == '|' -> emit2 pos "||" c c2 rest2
+                      (\(rest, pos') -> go tokenCount delimiters reversedTokens pos' rest)
+                        =<< consumeBlockComment pos (advance (advance pos '/') '*') rest2
+                    ':' | c2 == ':' -> emit2 tokenCount delimiters reversedTokens pos "::" c c2 rest2
+                    '=' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "==" c c2 rest2
+                    '!' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "!=" c c2 rest2
+                    '<' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "<=" c c2 rest2
+                    '>' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos ">=" c c2 rest2
+                    '&' | c2 == '&' -> emit2 tokenCount delimiters reversedTokens pos "&&" c c2 rest2
+                    '|' | c2 == '|' -> emit2 tokenCount delimiters reversedTokens pos "||" c c2 rest2
                     '<' | c2 == '<' ->
                       case T.uncons rest2 of
-                        Just (c3, rest3) | c3 == '=' -> emit3 pos "<<=" c c2 c3 rest3
-                        _ -> emit2 pos "<<" c c2 rest2
+                        Just (c3, rest3) | c3 == '=' -> emit3 tokenCount delimiters reversedTokens pos "<<=" c c2 c3 rest3
+                        _ -> emit2 tokenCount delimiters reversedTokens pos "<<" c c2 rest2
                     '>' | c2 == '>' ->
                       case T.uncons rest2 of
-                        Just (c3, rest3) | c3 == '=' -> emit3 pos ">>=" c c2 c3 rest3
-                        _ -> emit2 pos ">>" c c2 rest2
-                    '+' | c2 == '+' -> emit2 pos "++" c c2 rest2
-                    '-' | c2 == '-' -> emit2 pos "--" c c2 rest2
-                    '+' | c2 == '=' -> emit2 pos "+=" c c2 rest2
-                    '-' | c2 == '=' -> emit2 pos "-=" c c2 rest2
-                    '*' | c2 == '=' -> emit2 pos "*=" c c2 rest2
-                    '/' | c2 == '=' -> emit2 pos "/=" c c2 rest2
-                    '%' | c2 == '=' -> emit2 pos "%=" c c2 rest2
-                    '&' | c2 == '=' -> emit2 pos "&=" c c2 rest2
-                    '|' | c2 == '=' -> emit2 pos "|=" c c2 rest2
-                    '^' | c2 == '=' -> emit2 pos "^=" c c2 rest2
+                        Just (c3, rest3) | c3 == '=' -> emit3 tokenCount delimiters reversedTokens pos ">>=" c c2 c3 rest3
+                        _ -> emit2 tokenCount delimiters reversedTokens pos ">>" c c2 rest2
+                    '+' | c2 == '+' -> emit2 tokenCount delimiters reversedTokens pos "++" c c2 rest2
+                    '-' | c2 == '-' -> emit2 tokenCount delimiters reversedTokens pos "--" c c2 rest2
+                    '+' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "+=" c c2 rest2
+                    '-' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "-=" c c2 rest2
+                    '*' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "*=" c c2 rest2
+                    '/' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "/=" c c2 rest2
+                    '%' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "%=" c c2 rest2
+                    '&' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "&=" c c2 rest2
+                    '|' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "|=" c c2 rest2
+                    '^' | c2 == '=' -> emit2 tokenCount delimiters reversedTokens pos "^=" c c2 rest2
                     _ ->
                       if isSymbolChar c
-                        then emit1 pos c cs
+                        then emit1 tokenCount delimiters reversedTokens pos c cs
                         else Left (CompileError ("unexpected character: " <> [c]) (Just pos.spLine) (Just pos.spCol))
+
+    isPatternWhitespace ch =
+      ch `elem` [' ', '\t', '\n', '\v', '\f', '\r', '\x85', '\x200e', '\x200f', '\x2028', '\x2029']
+
+    -- Data.Char follows the host Unicode version rather than WGSL's pinned XID
+    -- tables. This preserves the compiler's existing Unicode convention while
+    -- the declaration boundary below enforces WGSL's spelling exclusions.
+    isIdentStart ch = isAlpha ch || ch == '_'
+
+    isIdentContinue ch = isAlphaNum ch || ch == '_'
+
+    isNumericStart ch rest =
+      isDigit ch
+        || (ch == '.' && maybe False (isDigit . fst) (T.uncons rest))
 
     isSymbolChar ch =
       case ch of
@@ -158,18 +221,60 @@ lexWesl = go (SrcPos 1 1)
         '^' -> "^"
         _ -> T.singleton ch
 
-    emit1 p ch rest =
+    emitToken tokenCount delimiters reversedTokens tokenPos kind nextPos rest = do
+      when (tokenCount >= maxTokens) $
+        Left
+          (CompileError
+            ("token count " <> show (tokenCount + 1) <> " exceeds limit " <> show maxTokens)
+            (Just tokenPos.spLine)
+            (Just tokenPos.spCol))
+      go (tokenCount + 1) delimiters (Token kind tokenPos : reversedTokens) nextPos rest
+
+    emit1 tokenCount delimiters reversedTokens p ch rest = do
+      delimiters' <- updateDelimiters p ch delimiters
       let sym = symbolText ch
-      in (Token (TkSymbol sym) p :) <$> go (advance p ch) rest
+      when (tokenCount >= maxTokens) $
+        Left
+          (CompileError
+            ("token count " <> show (tokenCount + 1) <> " exceeds limit " <> show maxTokens)
+            (Just p.spLine)
+            (Just p.spCol))
+      go (tokenCount + 1) delimiters' (Token (TkSymbol sym) p : reversedTokens) (advance p ch) rest
+
+    updateDelimiters p ch delimiters =
+      case ch of
+        '(' -> pushDelimiter p ch delimiters
+        '[' -> pushDelimiter p ch delimiters
+        '{' -> pushDelimiter p ch delimiters
+        ')' -> Right (popDelimiter '(' delimiters)
+        ']' -> Right (popDelimiter '[' delimiters)
+        '}' -> Right (popDelimiter '{' delimiters)
+        _ -> Right delimiters
+
+    pushDelimiter p ch delimiters =
+      let depth = length delimiters + 1
+      in if depth > maxDelimiterNesting
+          then
+            Left
+              (CompileError
+                ("delimiter nesting depth " <> show depth <> " exceeds limit " <> show maxDelimiterNesting)
+                (Just p.spLine)
+                (Just p.spCol))
+          else Right (ch : delimiters)
+
+    popDelimiter opening delimiters =
+      case delimiters of
+        (top : rest) | top == opening -> rest
+        _ -> delimiters
 
     advance2 p a = advance (advance p a)
     advance3 p a b = advance (advance2 p a b)
 
-    emit2 p sym c1 c2 rest =
-      (Token (TkSymbol sym) p :) <$> go (advance2 p c1 c2) rest
+    emit2 tokenCount delimiters reversedTokens p sym c1 c2 rest =
+      emitToken tokenCount delimiters reversedTokens p (TkSymbol sym) (advance2 p c1 c2) rest
 
-    emit3 p sym c1 c2 c3 rest =
-      (Token (TkSymbol sym) p :) <$> go (advance3 p c1 c2 c3) rest
+    emit3 tokenCount delimiters reversedTokens p sym c1 c2 c3 rest =
+      emitToken tokenCount delimiters reversedTokens p (TkSymbol sym) (advance3 p c1 c2 c3) rest
 
     consumeLine p rest =
       let (line, rest') = T.break (== '\n') rest
@@ -178,136 +283,55 @@ lexWesl = go (SrcPos 1 1)
            then (line, T.empty, pos')
            else (line, T.drop 1 rest', advance pos' '\n')
 
-    consumeBlockComment p cs =
-      let goBlock pos' src' =
+    consumeBlockComment openingPos p cs =
+      let goBlock depth pos' src' =
             case T.uncons src' of
-              Nothing -> Left (CompileError "unterminated block comment" (Just pos'.spLine) (Just pos'.spCol))
+              Nothing ->
+                Left
+                  (CompileError
+                    ("unterminated block comment opened here (remaining nesting depth " <> show depth <> ")")
+                    (Just openingPos.spLine)
+                    (Just openingPos.spCol))
               Just (x, rest0) ->
                 case T.uncons rest0 of
                   Just (y, rest)
-                    | x == '*' && y == '/' -> Right (rest, advance (advance pos' x) y)
-                    | otherwise -> goBlock (advance pos' x) rest0
-                  Nothing -> goBlock (advance pos' x) T.empty
-      in goBlock p cs
+                    | x == '/' && y == '*' ->
+                        let depth' = depth + 1
+                        in if depth' > maxCommentNesting
+                            then
+                              Left
+                                (CompileError
+                                  ("block comment nesting depth " <> show depth' <> " exceeds limit " <> show maxCommentNesting)
+                                  (Just pos'.spLine)
+                                  (Just pos'.spCol))
+                            else goBlock depth' (advance (advance pos' x) y) rest
+                    | x == '*' && y == '/' ->
+                        let pos'' = advance (advance pos' x) y
+                        in if depth == 1
+                            then Right (rest, pos'')
+                            else goBlock (depth - 1) pos'' rest
+                    | otherwise -> goBlock depth (advance pos' x) rest0
+                  Nothing -> goBlock depth (advance pos' x) T.empty
+      in goBlock 1 p cs
 
     consumeIdent p cs =
-      let (ident, rest) = T.span (\x -> isAlphaNum x || x == '_') cs
+      let (ident, rest) = T.span isIdentContinue cs
           pos' = advanceCols p (T.length ident)
       in (ident, rest, pos')
 
     consumeNumber p cs =
-      Right =<< case T.stripPrefix "0x" cs <|> T.stripPrefix "0X" cs of
-        Just restHex ->
-          let (hexRaw, rest) = T.span isHexDigitOrUnderscore restHex
-              hexLen = T.length hexRaw
-              pos' = advanceCols p (2 + hexLen)
-          in if T.all (== '_') hexRaw
-              then Left (CompileError "malformed hexadecimal literal" (Just p.spLine) (Just p.spCol))
-              else
-                let val = parseHexUnderscore hexRaw
-                in Right (applySuffix (TkInt val Nothing) rest pos')
-        Nothing ->
-          let (intRaw, rest0) = T.span isDigitOrUnderscore cs
-              intVal = parseDecUnderscore intRaw
-              intRawLen = T.length intRaw
-          in case T.uncons rest0 of
-              Just ('.', r) ->
-                case T.uncons r of
-                  Just (d, _rest1) | isDigit d ->
-                    let (fracRaw, rest1) = T.span isDigitOrUnderscore r
-                        fracDigits = removeUnderscores fracRaw
-                        intDigits = removeUnderscores intRaw
-                        (expTxt, expRaw, rest2, okExp) = parseExponent rest1
-                        numTxt = intDigits <> "." <> fracDigits <> expTxt
-                        consumedLen = intRawLen + 1 + T.length fracRaw + T.length expRaw
-                        pos' = advanceCols p consumedLen
-                    in if okExp
-                        then Right (applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest2 pos')
-                        else
-                          let floatTxt = intDigits <> "." <> fracDigits
-                              floatPos = advanceCols p (intRawLen + 1 + T.length fracRaw)
-                          in Right (applySuffix (TkFloat (parseFloatText floatTxt) Nothing) rest1 floatPos)
-                  _ ->
-                    let (expTxt, expRaw, rest1, okExp) = parseExponent rest0
-                        pos' = advanceCols p (intRawLen + T.length expRaw)
-                    in if okExp
-                        then
-                          let intDigits = removeUnderscores intRaw
-                              numTxt = intDigits <> expTxt
-                          in Right (applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos')
-                        else Right (applySuffix (TkInt intVal Nothing) rest0 (advanceCols p intRawLen))
-              _ ->
-                let (expTxt, expRaw, rest1, okExp) = parseExponent rest0
-                    pos' = advanceCols p (intRawLen + T.length expRaw)
-                in if okExp
-                    then
-                      let intDigits = removeUnderscores intRaw
-                          numTxt = intDigits <> expTxt
-                      in Right (applySuffix (TkFloat (parseFloatText numTxt) Nothing) rest1 pos')
-                    else Right (applySuffix (TkInt intVal Nothing) rest0 (advanceCols p intRawLen))
-      where
-        isDigitOrUnderscore c = isDigit c || c == '_'
-        isHexDigitOrUnderscore c = isHexDigit c || c == '_'
-        removeUnderscores = T.filter (/= '_')
-
-        applySuffix tok rest pos' =
-          case T.uncons rest of
-            Just (s, rest1) ->
-              case tok of
-                TkInt n _ ->
-                  case intSuffix s of
-                    Just suf -> (TkInt n (Just suf), rest1, advance pos' s)
-                    Nothing -> (TkInt n Nothing, rest, pos')
-                TkFloat f _ ->
-                  case floatSuffix s of
-                    Just suf -> (TkFloat f (Just suf), rest1, advance pos' s)
-                    Nothing -> (TkFloat f Nothing, rest, pos')
-                _ -> (tok, rest, pos')
-            _ -> (tok, rest, pos')
-
-        intSuffix s =
-          case s of
-            'i' -> Just IntSuffixI
-            'u' -> Just IntSuffixU
-            _ -> Nothing
-
-        floatSuffix s =
-          case s of
-            'f' -> Just FloatSuffixF
-            'h' -> Just FloatSuffixH
-            _ -> Nothing
-
-        parseExponent rest =
-          case T.uncons rest of
-            Just (e, more) | e == 'e' || e == 'E' ->
-              let (signTxt, rest1) =
-                    case T.uncons more of
-                      Just (s, restSign) | s == '+' || s == '-' -> (T.singleton s, restSign)
-                      _ -> ("", more)
-                  (expRaw, rest2) = T.span isDigitOrUnderscore rest1
-                  expDigits = removeUnderscores expRaw
-                  expHead = T.singleton e <> signTxt
-              in if T.null expDigits
-                  then ("", "", rest, False)
-                  else (expHead <> expDigits, expHead <> expRaw, rest2, True)
-            _ -> ("", "", rest, False)
-
-        parseDecUnderscore = T.foldl' step 0
-          where
-            step acc ch
-              | ch == '_' = acc
-              | otherwise = acc * 10 + fromIntegral (digitToInt ch)
-
-        parseHexUnderscore = T.foldl' step 0
-          where
-            step acc ch
-              | ch == '_' = acc
-              | otherwise = acc * 16 + fromIntegral (digitToInt ch)
-
-        parseFloatText txt =
-          case TR.double txt of
-            Right (v, rest) | T.null rest -> realToFrac v
-            _ -> 0
+      let (raw, rest) = consumeNumericSpelling cs
+          literalChars = T.length raw
+      in if literalChars > maxNumericLiteralChars
+          then
+            Left
+              (CompileError
+                ("numeric literal length " <> show literalChars <> " characters exceeds limit " <> show maxNumericLiteralChars)
+                (Just p.spLine)
+                (Just p.spCol))
+          else do
+            tok <- parseNumericLiteral p raw
+            Right (tok, rest, advanceCols p literalChars)
 
     consumeString p cs =
       let goStr acc pos' src' =
@@ -327,6 +351,233 @@ lexWesl = go (SrcPos 1 1)
       | otherwise = SrcPos l (c + 1)
 
     advanceCols (SrcPos l c) n = SrcPos l (c + n)
+
+consumeNumericSpelling :: Text -> (Text, Text)
+consumeNumericSpelling source = T.splitAt (go Nothing 0 source) source
+  where
+    go previous consumed remaining =
+      case T.uncons remaining of
+        Just (ch, tailText)
+          | isAlphaNum ch || ch == '_' || ch == '.' ->
+              go (Just ch) (consumed + 1) tailText
+          | (ch == '+' || ch == '-') && maybe False (`elem` ['e', 'E', 'p', 'P']) previous ->
+              go (Just ch) (consumed + 1) tailText
+        _ -> consumed
+
+parseNumericLiteral :: SrcPos -> Text -> Either CompileError TokKind
+parseNumericLiteral pos raw
+  | T.any (== '_') raw = numericError pos raw "numeric separators are not part of WGSL literal grammar"
+  | Just hex <- T.stripPrefix "0x" raw <|> T.stripPrefix "0X" raw = parseHexLiteral pos raw hex
+  | otherwise = parseDecimalLiteral pos raw
+
+parseDecimalLiteral :: SrcPos -> Text -> Either CompileError TokKind
+parseDecimalLiteral pos raw
+  | T.any (`elem` ['.', 'e', 'E']) raw = do
+      let (core, suffix) = splitFloatSuffix raw
+      value <- parseDecimalFloatCore pos raw core
+      validateDecimalFloat pos raw suffix value
+      Right (TkFloat value suffix)
+  | otherwise =
+      case T.unsnoc raw of
+        Just (digits, 'f') -> parseSuffixOnlyFloat digits FloatSuffixF
+        Just (digits, 'h') -> parseSuffixOnlyFloat digits FloatSuffixH
+        Just (digits, 'i') -> parseInteger digits (Just IntSuffixI)
+        Just (digits, 'u') -> parseInteger digits (Just IntSuffixU)
+        _ -> parseInteger raw Nothing
+  where
+    parseSuffixOnlyFloat digits suffix = do
+      validateDecimalIntegerDigits pos raw digits
+      value <- parseDecimalDigits pos raw digits
+      validateDecimalFloat pos raw (Just suffix) (fromInteger value)
+      Right (TkFloat (fromInteger value) (Just suffix))
+
+    parseInteger digits suffix = do
+      validateDecimalIntegerDigits pos raw digits
+      value <- parseDecimalDigits pos raw digits
+      Right (TkInt value suffix)
+
+parseDecimalFloatCore :: SrcPos -> Text -> Text -> Either CompileError Double
+parseDecimalFloatCore pos raw core = do
+  let (significandText, exponentPart) = T.break (`elem` ['e', 'E']) core
+      hasExponent = not (T.null exponentPart)
+  decimalExponent <-
+    if hasExponent
+      then parseSignedDecimalExponent pos raw (T.drop 1 exponentPart)
+      else Right 0
+  when (T.any (`elem` ['e', 'E']) (T.drop 1 exponentPart)) $
+    numericError pos raw "multiple decimal exponents"
+  let (whole, dotAndFraction) = T.break (== '.') significandText
+      hasDot = not (T.null dotAndFraction)
+      fraction = if hasDot then T.drop 1 dotAndFraction else T.empty
+  unless (hasDot || hasExponent) $
+    numericError pos raw "floating literal requires a point, exponent, or f/h suffix"
+  when (hasDot && T.any (== '.') fraction) $
+    numericError pos raw "multiple decimal points"
+  when (T.null whole && T.null fraction) $
+    numericError pos raw "decimal significand has no digits"
+  unless (T.all isDigit whole && T.all isDigit fraction) $
+    numericError pos raw "invalid decimal digit or suffix"
+  let canonicalWhole = if T.null whole then "0" else whole
+      canonicalFraction = if hasDot then "." <> (if T.null fraction then "0" else fraction) else ""
+      canonicalExponent = if hasExponent then "e" <> T.pack (show decimalExponent) else ""
+      canonical = canonicalWhole <> canonicalFraction <> canonicalExponent
+  case TR.double canonical of
+    Right (value, rest) | T.null rest -> Right value
+    _ -> numericError pos raw "cannot convert decimal spelling"
+
+parseHexLiteral :: SrcPos -> Text -> Text -> Either CompileError TokKind
+parseHexLiteral pos raw hex =
+  let (significandText, exponentPart) = T.break (`elem` ['p', 'P']) hex
+      hasExponent = not (T.null exponentPart)
+  in if hasExponent
+      then do
+        when (T.any (`elem` ['p', 'P']) (T.drop 1 exponentPart)) $
+          numericError pos raw "multiple binary exponents"
+        let (exponentCore, suffix) = splitFloatSuffix (T.drop 1 exponentPart)
+        binaryExponent <- parseSignedDecimalExponent pos raw exponentCore
+        (significandValue, fractionDigits) <- parseHexSignificand pos raw significandText True
+        validateHexFloat pos raw suffix significandValue fractionDigits binaryExponent
+        let value = encodeHexFloat significandValue fractionDigits binaryExponent
+        validateFiniteAbstractFloat pos raw suffix value
+        Right (TkFloat value suffix)
+      else
+        if T.any (== '.') significandText
+          then do
+            (significandValue, fractionDigits) <- parseHexSignificand pos raw significandText False
+            let value = encodeHexFloat significandValue fractionDigits 0
+            validateFiniteAbstractFloat pos raw Nothing value
+            Right (TkFloat value Nothing)
+          else parseHexInteger pos raw significandText
+
+parseHexInteger :: SrcPos -> Text -> Text -> Either CompileError TokKind
+parseHexInteger pos raw spelling =
+  let (digits, suffix) =
+        case T.unsnoc spelling of
+          Just (body, 'i') -> (body, Just IntSuffixI)
+          Just (body, 'u') -> (body, Just IntSuffixU)
+          _ -> (spelling, Nothing)
+  in do
+    when (T.null digits) $
+      numericError pos raw "hexadecimal integer has no digits"
+    unless (T.all isHexDigit digits) $
+      numericError pos raw "invalid hexadecimal digit or suffix"
+    Right (TkInt (parseDigits 16 digits) suffix)
+
+parseHexSignificand :: SrcPos -> Text -> Text -> Bool -> Either CompileError (Integer, Int)
+parseHexSignificand pos raw spelling allowNoPoint = do
+  let (whole, dotAndFraction) = T.break (== '.') spelling
+      hasPoint = not (T.null dotAndFraction)
+      fraction = if hasPoint then T.drop 1 dotAndFraction else T.empty
+  unless (allowNoPoint || hasPoint) $
+    numericError pos raw "hexadecimal float requires a point or binary exponent"
+  when (hasPoint && T.any (== '.') fraction) $
+    numericError pos raw "multiple hexadecimal points"
+  when (T.null whole && T.null fraction) $
+    numericError pos raw "hexadecimal significand has no digits"
+  unless (T.all isHexDigit whole && T.all isHexDigit fraction) $
+    numericError pos raw "invalid hexadecimal digit or suffix"
+  Right (parseDigits 16 (whole <> fraction), T.length fraction)
+
+parseSignedDecimalExponent :: SrcPos -> Text -> Text -> Either CompileError Int
+parseSignedDecimalExponent pos raw spelling =
+  let (sign, digits) =
+        case T.uncons spelling of
+          Just ('+', rest) -> (1, rest)
+          Just ('-', rest) -> (-1, rest)
+          _ -> (1, spelling)
+  in do
+    when (T.null digits || not (T.all isDigit digits)) $
+      numericError pos raw "exponent requires decimal digits"
+    when (T.length digits > 9) $
+      numericError pos raw "exponent magnitude exceeds 9 decimal digits"
+    Right (sign * fromInteger (parseDigits 10 digits))
+
+validateDecimalIntegerDigits :: SrcPos -> Text -> Text -> Either CompileError ()
+validateDecimalIntegerDigits pos raw digits = do
+  when (T.null digits || not (T.all isDigit digits)) $
+    numericError pos raw "invalid decimal digit or suffix"
+  when (T.length digits > 1 && T.head digits == '0') $
+    numericError pos raw "decimal integer significand must not have a leading zero"
+
+parseDecimalDigits :: SrcPos -> Text -> Text -> Either CompileError Integer
+parseDecimalDigits pos raw digits =
+  if T.all isDigit digits
+    then Right (parseDigits 10 digits)
+    else numericError pos raw "invalid decimal digits"
+
+parseDigits :: Integer -> Text -> Integer
+parseDigits radix = T.foldl' step 0
+  where
+    step acc ch = acc * radix + fromIntegral (digitToInt ch)
+
+splitFloatSuffix :: Text -> (Text, Maybe FloatSuffix)
+splitFloatSuffix spelling =
+  case T.unsnoc spelling of
+    Just (body, 'f') -> (body, Just FloatSuffixF)
+    Just (body, 'h') -> (body, Just FloatSuffixH)
+    _ -> (spelling, Nothing)
+
+validateDecimalFloat :: SrcPos -> Text -> Maybe FloatSuffix -> Double -> Either CompileError ()
+validateDecimalFloat pos raw suffix value =
+  case suffix of
+    Just FloatSuffixF ->
+      when (isInfinite (realToFrac value :: Float)) $
+        numericError pos raw "f32 literal overflows its target type"
+    Just FloatSuffixH ->
+      when (isInfinite value || abs value > 65504) $
+        numericError pos raw "f16 literal overflows its target type"
+    Nothing -> validateFiniteAbstractFloat pos raw suffix value
+
+validateFiniteAbstractFloat :: SrcPos -> Text -> Maybe FloatSuffix -> Double -> Either CompileError ()
+validateFiniteAbstractFloat pos raw suffix value =
+  when (suffix == Nothing && (isNaN value || isInfinite value)) $
+    numericError pos raw "abstract-float literal must be finite binary64"
+
+validateHexFloat :: SrcPos -> Text -> Maybe FloatSuffix -> Integer -> Int -> Int -> Either CompileError ()
+validateHexFloat pos raw suffix significandValue fractionDigits binaryExponent =
+  case suffix of
+    Just FloatSuffixF ->
+      unless (isExactlyRepresentable 24 (-149) 127 significandValue (binaryExponent - 4 * fractionDigits)) $
+        numericError pos raw "f32 hexadecimal literal is not exactly representable"
+    Just FloatSuffixH ->
+      unless (isExactlyRepresentable 11 (-24) 15 significandValue (binaryExponent - 4 * fractionDigits)) $
+        numericError pos raw "f16 hexadecimal literal is not exactly representable"
+    Nothing -> Right ()
+
+isExactlyRepresentable :: Int -> Int -> Int -> Integer -> Int -> Bool
+isExactlyRepresentable precision minSubnormalExponent maxNormalExponent significandValue binaryExponent
+  | significandValue == 0 = True
+  | otherwise =
+      let (oddSignificand, shiftedExponent) = stripTrailingBinaryZeros significandValue binaryExponent
+          significantBits = integerBitLength oddSignificand
+          highestExponent = shiftedExponent + significantBits - 1
+      in significantBits <= precision
+          && shiftedExponent >= minSubnormalExponent
+          && highestExponent <= maxNormalExponent
+
+stripTrailingBinaryZeros :: Integer -> Int -> (Integer, Int)
+stripTrailingBinaryZeros value binaryExponent
+  | even value = stripTrailingBinaryZeros (value `div` 2) (binaryExponent + 1)
+  | otherwise = (value, binaryExponent)
+
+integerBitLength :: Integer -> Int
+integerBitLength = go 0
+  where
+    go bits value
+      | value == 0 = bits
+      | otherwise = go (bits + 1) (value `div` 2)
+
+encodeHexFloat :: Integer -> Int -> Int -> Double
+encodeHexFloat significandValue fractionDigits binaryExponent =
+  encodeFloat significandValue (binaryExponent - 4 * fractionDigits)
+
+numericError :: SrcPos -> Text -> String -> Either CompileError a
+numericError pos raw reason =
+  Left
+    (CompileError
+      ("malformed numeric literal '" <> T.unpack raw <> "': " <> reason)
+      (Just pos.spLine)
+      (Just pos.spCol))
 
 
 parseModuleTokensWith :: FeatureSet -> [Token] -> Either CompileError ModuleAst
@@ -399,14 +650,16 @@ parseModuleTokensWith feats toks =
                 let accConsts' = if keep then constDecl : accConsts else accConsts
                 loop accDirectives accImports accAliases accStructs accBindings accGlobals accConsts' accOverrides accAsserts accFns accEntries True True rest2
               (Token (TkIdent "override") _ : _) -> do
+                let idAttrs = [v | Attr "id" [AttrInt v] <- attrs']
+                when (length idAttrs > 1) $
+                  Left (errorAt rest1 "duplicate @id attributes")
                 let idAttr =
-                      case attrInt "id" attrs' of
-                        Nothing -> Nothing
-                        Just v ->
-                          if v < 0 || v > fromIntegral (maxBound :: Word32)
-                            then Nothing
-                            else Just (fromIntegral v)
-                when (maybe False (\v -> v < 0 || v > fromIntegral (maxBound :: Word32)) (attrInt "id" attrs')) $
+                      case idAttrs of
+                        [] -> Nothing
+                        [v]
+                          | v >= 0 && v <= fromIntegral (maxBound :: Word32) -> Just (fromIntegral v)
+                        _ -> Nothing
+                when (any (\v -> v < 0 || v > fromIntegral (maxBound :: Word32)) idAttrs) $
                   Left (errorAt rest1 "@id must be a non-negative 32-bit integer")
                 let otherAttrs = [a | a <- attrs', not (isIdAttr a)]
                 unless (null otherAttrs) $
@@ -602,12 +855,22 @@ parseConstExpr stop toks = parseConstBitOr toks
               parseConstMulDivTail (CEBinary CMod lhs rhs) rest1
             _ -> Right (lhs, rest)
 
-    parseConstUnary ts =
-      case ts of
-        (Token (TkSymbol "-") _ : more) -> do
-          (expr, rest) <- parseConstUnary more
-          Right (CEUnaryNeg expr, rest)
-        _ -> parseConstPrimary ts
+    parseConstUnary ts = collectConstPrefixes 0 ts
+
+    collectConstPrefixes prefixCount rest =
+      case rest of
+        (Token (TkSymbol "-") pos : more) ->
+          if prefixCount >= maxPrefixOperators
+            then
+              Left
+                (CompileError
+                  ("constant prefix operator count " <> show (prefixCount + 1) <> " exceeds limit " <> show maxPrefixOperators)
+                  (Just pos.spLine)
+                  (Just pos.spCol))
+            else collectConstPrefixes (prefixCount + 1) more
+        _ -> do
+          (expr, more) <- parseConstPrimary rest
+          Right (foldl' (\acc _ -> CEUnaryNeg acc) expr [1 .. prefixCount], more)
 
     parseConstPrimary ts =
       case ts of
@@ -670,12 +933,22 @@ parseTTAnd toks = do
         _ -> Right (lhs, rest)
 
 parseTTNot :: [Token] -> Either CompileError (TTExpr, [Token])
-parseTTNot toks =
-  case toks of
-    (Token (TkSymbol "!") _ : more) -> do
-      (expr, rest) <- parseTTNot more
-      Right (TTNot expr, rest)
-    _ -> parseTTPrimary toks
+parseTTNot = collect 0
+  where
+    collect prefixCount toks =
+      case toks of
+        (Token (TkSymbol "!") pos : more) ->
+          if prefixCount >= maxPrefixOperators
+            then
+              Left
+                (CompileError
+                  ("translate-time prefix operator count " <> show (prefixCount + 1) <> " exceeds limit " <> show maxPrefixOperators)
+                  (Just pos.spLine)
+                  (Just pos.spCol))
+            else collect (prefixCount + 1) more
+        _ -> do
+          (expr, rest) <- parseTTPrimary toks
+          Right (foldl' (\acc _ -> TTNot acc) expr [1 .. prefixCount], rest)
 
 parseTTPrimary :: [Token] -> Either CompileError (TTExpr, [Token])
 parseTTPrimary toks =
@@ -716,11 +989,13 @@ evalTTExpr feats expr =
 parseStruct :: FeatureSet -> [Token] -> Either CompileError (Maybe StructDecl, [Token])
 parseStruct feats toks =
   case toks of
-    (Token (TkIdent "struct") _ : Token (TkIdent name) _ : Token (TkSymbol "{") _ : rest) -> do
-      (fields, rest1) <- parseStructFields feats [] rest
-      case rest1 of
+    (Token (TkIdent "struct") _ : rest) -> do
+      (name, rest1) <- parseDeclaredIdent RejectPhonyName rest
+      rest2 <- expectSymbol "{" rest1
+      (fields, rest3) <- parseStructFields feats [] rest2
+      case rest3 of
         (Token (TkSymbol ";") _ : more) -> Right (Just (StructDecl name fields), more)
-        _ -> Right (Just (StructDecl name fields), rest1)
+        _ -> Right (Just (StructDecl name fields), rest3)
     _ -> Left (errorAt toks "malformed struct declaration")
 
 parseStructFields :: FeatureSet -> [FieldDecl] -> [Token] -> Either CompileError ([FieldDecl], [Token])
@@ -743,12 +1018,11 @@ parseStructField :: FeatureSet -> [Token] -> Either CompileError (Maybe FieldDec
 parseStructField feats toks = do
   (attrs, rest1) <- parseAttributes toks
   (keep, attrs') <- applyIf attrs feats rest1
-  case rest1 of
-    (Token (TkIdent name) _ : Token (TkSymbol ":") _ : rest) -> do
-      (ty, rest2) <- parseType rest
-      let field = FieldDecl name ty attrs'
-      Right (if keep then Just field else Nothing, rest2)
-    _ -> Left (errorAt rest1 "expected struct field")
+  (name, rest2) <- parseDeclaredIdent RejectPhonyName rest1
+  rest3 <- expectSymbol ":" rest2
+  (ty, rest4) <- parseType rest3
+  let field = FieldDecl name ty attrs'
+  Right (if keep then Just field else Nothing, rest4)
 
 parseImportStatement :: [Token] -> Either CompileError (ImportDecl, [Token])
 parseImportStatement toks =
@@ -803,7 +1077,7 @@ parseImportCollection toks =
 
 parseImportPathOrItem :: [Token] -> Either CompileError ([ImportItem], [Token])
 parseImportPathOrItem toks = do
-  (name, rest) <- parseIdent toks
+  (name, rest) <- parseImportIdent toks
   case rest of
     (Token (TkSymbol "::") _ : more) ->
       case more of
@@ -823,7 +1097,7 @@ parseImportAlias :: [Token] -> Either CompileError (Maybe Text, [Token])
 parseImportAlias toks =
   case toks of
     (Token (TkIdent "as") _ : rest) -> do
-      (name, rest1) <- parseIdent rest
+      (name, rest1) <- parseImportIdent rest
       Right (Just name, rest1)
     _ -> Right (Nothing, toks)
 
@@ -832,7 +1106,7 @@ parseBinding attrs toks =
   case toks of
     (Token (TkIdent "var") _ : rest) -> do
       (addrSpace, access, rest1) <- parseAddressSpaceMaybe rest
-      (name, rest2) <- parseIdent rest1
+      (name, rest2) <- parseDeclaredIdent RejectPhonyName rest1
       rest3 <- expectSymbol ":" rest2
       (ty, rest4) <- parseType rest3
       rest5 <- expectSymbol ";" rest4
@@ -840,7 +1114,7 @@ parseBinding attrs toks =
       kind <- case addrSpace of
         Just space -> toBindingKind space access ty
         Nothing -> bindingKindFromType ty
-      Right (BindingDecl name kind group bindingIx ty, rest5)
+      Right (BindingDecl name kind group bindingIx ty False, rest5)
     _ -> Left (errorAt toks "expected var declaration")
 
 parseGlobalVar :: [Attr] -> [Token] -> Either CompileError (GlobalVarDecl, [Token])
@@ -855,7 +1129,7 @@ parseGlobalVar attrs toks = do
         Nothing -> Left (errorAt rest "global variables require an explicit address space (e.g. var<private>)")
       when (isJust access) $
         Left (errorAt rest "global variables do not support access qualifiers")
-      (name, rest2) <- parseIdent rest1
+      (name, rest2) <- parseDeclaredIdent RejectPhonyName rest1
       rest3 <- expectSymbol ":" rest2
       (ty, rest4) <- parseType rest3
       (initExpr, rest5) <- parseGlobalVarInit rest4
@@ -876,7 +1150,7 @@ parseConstDecl attrs toks = do
     Left (errorAt toks "const declarations do not accept attributes other than @if")
   case toks of
     (Token (TkIdent kw) _ : rest) | kw == "let" || kw == "const" -> do
-      (name, rest1) <- parseIdent rest
+      (name, rest1) <- parseDeclaredIdent RejectPhonyName rest
       (mType, rest2) <- parseTypeAnnotationMaybe rest1
       rest3 <- expectSymbol "=" rest2
       (expr, rest4) <- parseExpr rest3
@@ -888,7 +1162,7 @@ parseAliasDecl :: [Token] -> Either CompileError (AliasDecl, [Token])
 parseAliasDecl toks =
   case toks of
     (Token (TkIdent "alias") _ : rest) -> do
-      (name, rest1) <- parseIdent rest
+      (name, rest1) <- parseDeclaredIdent RejectPhonyName rest
       rest2 <- expectSymbol "=" rest1
       (ty, rest3) <- parseType rest2
       rest4 <- expectSymbol ";" rest3
@@ -899,7 +1173,7 @@ parseOverrideDecl :: Maybe Word32 -> [Token] -> Either CompileError (OverrideDec
 parseOverrideDecl overrideId toks =
   case toks of
     (Token (TkIdent "override") _ : rest) -> do
-      (name, rest1) <- parseIdent rest
+      (name, rest1) <- parseDeclaredIdent RejectPhonyName rest
       (mType, rest2) <- parseOverrideTypeMaybe rest1
       (mExpr, rest3) <- parseOverrideInitMaybe rest2
       rest4 <- expectSymbol ";" rest3
@@ -988,12 +1262,14 @@ parseAddressSpace toks =
 parseFunctionGeneric :: FeatureSet -> [Token] -> Either CompileError (Text, [Param], Maybe Type, [Attr], Maybe Word32, Maybe Text, [Stmt], [Token])
 parseFunctionGeneric feats toks =
   case toks of
-    (Token (TkIdent "fn") _ : Token (TkIdent name) _ : Token (TkSymbol "(") _ : rest) -> do
-      (params, rest1) <- parseParams feats rest
-      rest2 <- expectSymbol ")" rest1
-      (rest3, retType, retAttrs, retLoc, retBuiltin) <- parseReturnType rest2
-      (body, rest4) <- parseBody feats rest3
-      Right (name, params, retType, retAttrs, retLoc, retBuiltin, body, rest4)
+    (Token (TkIdent "fn") _ : rest) -> do
+      (name, rest1) <- parseDeclaredIdent RejectPhonyName rest
+      rest2 <- expectSymbol "(" rest1
+      (params, rest3) <- parseParams feats rest2
+      rest4 <- expectSymbol ")" rest3
+      (rest5, retType, retAttrs, retLoc, retBuiltin) <- parseReturnType rest4
+      (body, rest6) <- parseBody feats rest5
+      Right (name, params, retType, retAttrs, retLoc, retBuiltin, body, rest6)
     _ -> Left (errorAt toks "expected fn declaration")
 
 parseParams :: FeatureSet -> [Token] -> Either CompileError ([Param], [Token])
@@ -1013,7 +1289,7 @@ parseParams feats toks =
       (attrs, rest1) <- parseAttributes rest
       (keep, attrs') <- applyIf attrs feats rest1
       let pos = posOf rest1
-      (name, rest2) <- parseIdent rest1
+      (name, rest2) <- parseDeclaredIdent RejectPhonyName rest1
       rest3 <- expectSymbol ":" rest2
       (ty, rest4) <- parseType rest3
       let param = Param pos name ty attrs'
@@ -1117,14 +1393,14 @@ parseStmt feats toks =
       rest1 <- expectSymbol ";" rest
       Right (SFallthrough pos, rest1)
     (Token (TkIdent "let") _ : rest) -> do
-      (name, rest1) <- parseIdent rest
+      (name, rest1) <- parseDeclaredIdent AllowPhonyName rest
       (mType, rest2) <- parseTypeAnnotationMaybe rest1
       rest3 <- expectSymbol "=" rest2
       (expr, rest4) <- parseExpr rest3
       rest5 <- expectSymbol ";" rest4
       Right (SLet pos name mType expr, rest5)
     (Token (TkIdent "var") _ : rest) -> do
-      (name, rest1) <- parseIdent rest
+      (name, rest1) <- parseDeclaredIdent AllowPhonyName rest
       (mType, rest2) <- parseTypeAnnotationMaybe rest1
       case rest2 of
         (Token (TkSymbol "=") _ : more) -> do
@@ -1251,13 +1527,13 @@ parseForClause toks =
       (lv, rest1) <- parseLValue rest
       Right (Just (SDec pos lv), rest1)
     (Token (TkIdent "let") _ : rest) -> do
-      (name, rest1) <- parseIdent rest
+      (name, rest1) <- parseDeclaredIdent AllowPhonyName rest
       (mType, rest2) <- parseTypeAnnotationMaybe rest1
       rest3 <- expectSymbol "=" rest2
       (expr, rest4) <- parseExpr rest3
       Right (Just (SLet pos name mType expr), rest4)
     (Token (TkIdent "var") _ : rest) -> do
-      (name, rest1) <- parseIdent rest
+      (name, rest1) <- parseDeclaredIdent AllowPhonyName rest
       (mType, rest2) <- parseTypeAnnotationMaybe rest1
       case rest2 of
         (Token (TkSymbol "=") _ : more) -> do
@@ -1474,24 +1750,31 @@ parseMulDiv toks = do
         _ -> Right (lhs, toks')
 
 parseUnaryExpr :: [Token] -> Either CompileError (Expr, [Token])
-parseUnaryExpr toks =
-  case toks of
-    (Token (TkSymbol "-") pos : rest) -> do
-      (expr, rest1) <- parseUnaryExpr rest
-      Right (EUnary pos OpNeg expr, rest1)
-    (Token (TkSymbol "!") pos : rest) -> do
-      (expr, rest1) <- parseUnaryExpr rest
-      Right (EUnary pos OpNot expr, rest1)
-    (Token (TkSymbol "~") pos : rest) -> do
-      (expr, rest1) <- parseUnaryExpr rest
-      Right (EUnary pos OpBitNot expr, rest1)
-    (Token (TkSymbol "&") pos : rest) -> do
-      (expr, rest1) <- parseUnaryExpr rest
-      Right (EUnary pos OpAddr expr, rest1)
-    (Token (TkSymbol "*") pos : rest) -> do
-      (expr, rest1) <- parseUnaryExpr rest
-      Right (EUnary pos OpDeref expr, rest1)
-    _ -> parsePostfixExpr toks
+parseUnaryExpr = collect [] 0
+  where
+    collect prefixes prefixCount toks =
+      case unaryPrefix toks of
+        Just (pos, op, rest) ->
+          if prefixCount >= maxPrefixOperators
+            then
+              Left
+                (CompileError
+                  ("unary prefix operator count " <> show (prefixCount + 1) <> " exceeds limit " <> show maxPrefixOperators)
+                  (Just pos.spLine)
+                  (Just pos.spCol))
+            else collect ((pos, op) : prefixes) (prefixCount + 1) rest
+        Nothing -> do
+          (expr, rest) <- parsePostfixExpr toks
+          Right (foldl' (\acc (pos, op) -> EUnary pos op acc) expr prefixes, rest)
+
+    unaryPrefix toks =
+      case toks of
+        (Token (TkSymbol "-") pos : rest) -> Just (pos, OpNeg, rest)
+        (Token (TkSymbol "!") pos : rest) -> Just (pos, OpNot, rest)
+        (Token (TkSymbol "~") pos : rest) -> Just (pos, OpBitNot, rest)
+        (Token (TkSymbol "&") pos : rest) -> Just (pos, OpAddr, rest)
+        (Token (TkSymbol "*") pos : rest) -> Just (pos, OpDeref, rest)
+        _ -> Nothing
 
 parsePostfixExpr :: [Token] -> Either CompileError (Expr, [Token])
 parsePostfixExpr toks = do
@@ -1602,7 +1885,16 @@ scalarName scalar =
 -- Shared parse helpers
 
 parseType :: [Token] -> Either CompileError (Type, [Token])
-parseType toks = do
+parseType = parseTypeAtDepth 1
+
+parseTypeAtDepth :: Int -> [Token] -> Either CompileError (Type, [Token])
+parseTypeAtDepth typeDepth toks = do
+  when (typeDepth > maxTypeNesting) $
+    Left
+      (CompileError
+        ("type nesting depth " <> show typeDepth <> " exceeds limit " <> show maxTypeNesting)
+        (Just (posOf toks).spLine)
+        (Just (posOf toks).spCol))
   (name, rest) <- parseFullIdent toks
   if "::" `T.isInfixOf` name
     then Right (TyStructRef name, rest)
@@ -1616,20 +1908,20 @@ parseType toks = do
               Right (TySamplerComparison, rest)
         "ref" -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               Right (TyPtr "function" Nothing inner, rest3)
         "ptr" -> do
               rest1 <- expectSymbol "<" rest
               (addrName, rest2) <- parseIdent rest1
               rest3 <- expectSymbol "," rest2
-              (inner, rest4) <- parseType rest3
+              (inner, rest4) <- parseTypeAtDepth (typeDepth + 1) rest3
               (access, rest5) <- parsePtrAccessMaybe rest4
               rest6 <- expectSymbol ">" rest5
               Right (TyPtr addrName access inner, rest6)
         "atomic" -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar ->
@@ -1640,56 +1932,56 @@ parseType toks = do
                 _ -> Left (errorAt rest "atomic element must be i32 or u32")
         "texture_1d" -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar -> Right (TyTexture1D scalar, rest3)
                 _ -> Left (errorAt rest "texture_1d element must be a scalar")
         "texture_1d_array" -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar -> Right (TyTexture1DArray scalar, rest3)
                 _ -> Left (errorAt rest "texture_1d_array element must be a scalar")
         "texture_2d" -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar -> Right (TyTexture2D scalar, rest3)
                 _ -> Left (errorAt rest "texture_2d element must be a scalar")
         "texture_2d_array" -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar -> Right (TyTexture2DArray scalar, rest3)
                 _ -> Left (errorAt rest "texture_2d_array element must be a scalar")
         "texture_3d" -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar -> Right (TyTexture3D scalar, rest3)
                 _ -> Left (errorAt rest "texture_3d element must be a scalar")
         "texture_cube" -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar -> Right (TyTextureCube scalar, rest3)
                 _ -> Left (errorAt rest "texture_cube element must be a scalar")
         "texture_cube_array" -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar -> Right (TyTextureCubeArray scalar, rest3)
                 _ -> Left (errorAt rest "texture_cube_array element must be a scalar")
         "texture_multisampled_2d" -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar -> Right (TyTextureMultisampled2D scalar, rest3)
@@ -1734,21 +2026,21 @@ parseType toks = do
               Right (TyStorageTexture3D fmt access, rest5)
         _ | Just (cols, rows) <- parseMatrixName name -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar -> Right (TyMatrix cols rows scalar, rest3)
                 _ -> Left (errorAt rest "matrix element must be a scalar")
         _ | name `elem` ["vec2", "vec3", "vec4"] -> do
               rest1 <- expectSymbol "<" rest
-              (inner, rest2) <- parseType rest1
+              (inner, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               rest3 <- expectSymbol ">" rest2
               case inner of
                 TyScalar scalar -> Right (TyVector (vecSize name) scalar, rest3)
                 _ -> Left (errorAt rest "vector element must be a scalar")
         "array" -> do
               rest1 <- expectSymbol "<" rest
-              (elemTy, rest2) <- parseType rest1
+              (elemTy, rest2) <- parseTypeAtDepth (typeDepth + 1) rest1
               case rest2 of
                 (Token (TkSymbol ",") _ : rest3) -> do
                   (lenExpr, rest4) <- parseConstExpr [">"] rest3
@@ -1785,13 +2077,257 @@ parseIdent toks =
     (Token (TkIdent name) _ : rest) -> Right (name, rest)
     _ -> Left (errorAt toks "expected identifier")
 
+data PhonyNamePolicy
+  = RejectPhonyName
+  | AllowPhonyName
+
+parseDeclaredIdent :: PhonyNamePolicy -> [Token] -> Either CompileError (Text, [Token])
+parseDeclaredIdent phonyPolicy toks =
+  case toks of
+    (Token (TkIdent name) pos : rest) -> do
+      validateDeclaredName phonyPolicy pos name
+      Right (name, rest)
+    _ -> Left (errorAt toks "expected declaration identifier")
+
+parseImportIdent :: [Token] -> Either CompileError (Text, [Token])
+parseImportIdent toks =
+  case toks of
+    (Token (TkIdent name) pos : rest) -> do
+      validateImportName pos name
+      Right (name, rest)
+    _ -> Left (errorAt toks "expected import identifier")
+
+validateImportName :: SrcPos -> Text -> Either CompileError ()
+validateImportName pos name
+  | name == "_" = invalid "the single underscore is not an identifier"
+  | "__" `T.isPrefixOf` name = invalid "names beginning with '__' are reserved"
+  | Set.member name wgslKeywords = invalid "WGSL keywords cannot be import names"
+  | Set.member name weslKeywords = invalid "WESL keywords cannot be import names"
+  | otherwise = Right ()
+  where
+    invalid reason =
+      Left
+        (CompileError
+          ("invalid import identifier '" <> T.unpack name <> "': " <> reason)
+          (Just pos.spLine)
+          (Just pos.spCol))
+
+validateDeclaredName :: PhonyNamePolicy -> SrcPos -> Text -> Either CompileError ()
+validateDeclaredName phonyPolicy pos name
+  | name == "_" =
+      case phonyPolicy of
+        AllowPhonyName -> Right ()
+        RejectPhonyName -> invalid "the single underscore is reserved for phony declarations"
+  | "__" `T.isPrefixOf` name = invalid "names beginning with '__' are reserved"
+  | Set.member name wgslKeywords = invalid "WGSL keywords cannot be declared names"
+  | Set.member name wgslReservedWords = invalid "WGSL reserved words cannot be declared names"
+  | otherwise = Right ()
+  where
+    invalid reason =
+      Left
+        (CompileError
+          ("invalid declaration identifier '" <> T.unpack name <> "': " <> reason)
+          (Just pos.spLine)
+          (Just pos.spCol))
+
+wgslKeywords :: Set.Set Text
+wgslKeywords =
+  Set.fromList
+    [ "alias"
+    , "break"
+    , "case"
+    , "const"
+    , "const_assert"
+    , "continue"
+    , "continuing"
+    , "default"
+    , "diagnostic"
+    , "discard"
+    , "else"
+    , "enable"
+    , "false"
+    , "fn"
+    , "for"
+    , "if"
+    , "let"
+    , "loop"
+    , "override"
+    , "requires"
+    , "return"
+    , "struct"
+    , "switch"
+    , "true"
+    , "var"
+    , "while"
+    ]
+
+weslKeywords :: Set.Set Text
+weslKeywords = Set.fromList ["as", "import", "package", "self", "super"]
+
+wgslReservedWords :: Set.Set Text
+wgslReservedWords =
+  Set.fromList
+    [ "NULL"
+    , "Self"
+    , "abstract"
+    , "active"
+    , "alignas"
+    , "alignof"
+    , "as"
+    , "asm"
+    , "asm_fragment"
+    , "async"
+    , "attribute"
+    , "auto"
+    , "await"
+    , "become"
+    , "cast"
+    , "catch"
+    , "class"
+    , "co_await"
+    , "co_return"
+    , "co_yield"
+    , "coherent"
+    , "column_major"
+    , "common"
+    , "compile"
+    , "compile_fragment"
+    , "concept"
+    , "const_cast"
+    , "consteval"
+    , "constexpr"
+    , "constinit"
+    , "crate"
+    , "debugger"
+    , "decltype"
+    , "delete"
+    , "demote"
+    , "demote_to_helper"
+    , "do"
+    , "dynamic_cast"
+    , "enum"
+    , "explicit"
+    , "export"
+    , "extends"
+    , "extern"
+    , "external"
+    , "fallthrough"
+    , "filter"
+    , "final"
+    , "finally"
+    , "friend"
+    , "from"
+    , "fxgroup"
+    , "get"
+    , "goto"
+    , "groupshared"
+    , "highp"
+    , "impl"
+    , "implements"
+    , "import"
+    , "inline"
+    , "instanceof"
+    , "interface"
+    , "layout"
+    , "lowp"
+    , "macro"
+    , "macro_rules"
+    , "match"
+    , "mediump"
+    , "meta"
+    , "mod"
+    , "module"
+    , "move"
+    , "mut"
+    , "mutable"
+    , "namespace"
+    , "new"
+    , "nil"
+    , "noexcept"
+    , "noinline"
+    , "nointerpolation"
+    , "non_coherent"
+    , "noncoherent"
+    , "noperspective"
+    , "null"
+    , "nullptr"
+    , "of"
+    , "operator"
+    , "package"
+    , "packoffset"
+    , "partition"
+    , "pass"
+    , "patch"
+    , "pixelfragment"
+    , "precise"
+    , "precision"
+    , "premerge"
+    , "priv"
+    , "protected"
+    , "pub"
+    , "public"
+    , "readonly"
+    , "ref"
+    , "regardless"
+    , "register"
+    , "reinterpret_cast"
+    , "require"
+    , "resource"
+    , "restrict"
+    , "self"
+    , "set"
+    , "shared"
+    , "sizeof"
+    , "smooth"
+    , "snorm"
+    , "static"
+    , "static_assert"
+    , "static_cast"
+    , "std"
+    , "subroutine"
+    , "super"
+    , "target"
+    , "template"
+    , "this"
+    , "thread_local"
+    , "throw"
+    , "trait"
+    , "try"
+    , "type"
+    , "typedef"
+    , "typeid"
+    , "typename"
+    , "typeof"
+    , "union"
+    , "unless"
+    , "unorm"
+    , "unsafe"
+    , "unsized"
+    , "use"
+    , "using"
+    , "varying"
+    , "virtual"
+    , "volatile"
+    , "wgsl"
+    , "where"
+    , "with"
+    , "writeonly"
+    , "yield"
+    ]
+
 expectSymbol :: Text -> [Token] -> Either CompileError [Token]
 expectSymbol sym toks =
   case toks of
     (Token (TkSymbol s) _ : rest) | s == sym -> Right rest
+    (Token (TkSymbol ">=") pos : rest) | sym == ">" ->
+      let pos' = SrcPos pos.spLine (pos.spCol + 1)
+      in Right (Token (TkSymbol "=") pos' : rest)
     (Token (TkSymbol ">>") pos : rest) | sym == ">" ->
       let pos' = SrcPos pos.spLine (pos.spCol + 1)
       in Right (Token (TkSymbol ">") pos' : rest)
+    (Token (TkSymbol ">>=") pos : rest) | sym == ">" ->
+      let pos' = SrcPos pos.spLine (pos.spCol + 1)
+      in Right (Token (TkSymbol ">=") pos' : rest)
     _ -> Left (errorAt toks ("expected symbol '" <> textToString sym <> "'"))
 
 parseScalar :: Text -> Scalar

@@ -17,6 +17,9 @@ module Spirdo.Wesl.Types.Interface
   , IOParam(..)
   , StageIO(..)
   , BindingPlan(..)
+  , BindingSlotCount(..)
+  , bindingSlotCounts
+  , singleGroupBindingSlotCount
   , shaderStage
   , PreparedShader(..)
   , SomePreparedShader(..)
@@ -56,7 +59,7 @@ module Spirdo.Wesl.Types.Interface
   , CompiledShader(..)
   , SomeCompiledShader(..)
   , compiledSource
-  , Shader(..)
+  , Shader
   , SomeShader(..)
   , shaderFromPrepared
   , someShaderFromPrepared
@@ -69,11 +72,11 @@ module Spirdo.Wesl.Types.Interface
   ) where
 
 import Data.ByteString (ByteString)
-import Data.List (sortBy)
+import Data.List (intercalate, sortBy)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, mapMaybe)
 import Data.Text (Text)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Data.Ord (comparing)
 import GHC.TypeLits (Symbol, Nat)
 
@@ -175,7 +178,9 @@ data IOParam = IOParam
 -- | Reflected IO for a single entry point.
 data StageIO = StageIO
   { sioStage :: !ShaderStage
-  , sioWorkgroupSize :: !(Maybe (Word32, Word32, Word32))
+  , -- | Known/default compute workgroup size, when every dimension has a
+    -- source or host-supplied default.
+    sioWorkgroupSize :: !(Maybe (Word32, Word32, Word32))
   , sioInputs :: ![IOParam]
   , sioOutputs :: ![IOParam]
   } deriving (Eq, Show, Read)
@@ -190,6 +195,42 @@ data BindingPlan = BindingPlan
   , bpStorageBuffers :: ![BindingInfo]
   , bpStorageTextures :: ![BindingInfo]
   } deriving (Eq, Show, Read)
+
+-- | Slots required within one descriptor group.
+--
+-- The slot count is one more than the highest binding number, so it includes
+-- gaps between sparse bindings. 'Word64' represents the full 'Word32' binding
+-- range without overflow.
+data BindingSlotCount = BindingSlotCount
+  { bscGroup :: !Word32
+  , bscSlots :: !Word64
+  } deriving (Eq, Show, Read)
+
+-- | Binding slot counts kept separate by descriptor group.
+bindingSlotCounts :: [BindingInfo] -> [BindingSlotCount]
+bindingSlotCounts bindings =
+  [ BindingSlotCount group slots
+  | (group, slots) <- Map.toAscList counts
+  ]
+  where
+    counts =
+      Map.fromListWith max
+        [ (binding.biGroup, fromIntegral binding.biBinding + 1)
+        | binding <- bindings
+        ]
+
+-- | Return the slot count when all bindings belong to one descriptor group.
+-- Empty bindings have no group and therefore return 'Nothing'.
+singleGroupBindingSlotCount :: [BindingInfo] -> Either String (Maybe BindingSlotCount)
+singleGroupBindingSlotCount bindings =
+  case bindingSlotCounts bindings of
+    [] -> Right Nothing
+    [slotCount] -> Right (Just slotCount)
+    slotCounts ->
+      Left
+        ( "bindings span multiple descriptor groups: "
+            <> intercalate ", " (map (show . (.bscGroup)) slotCounts)
+        )
 
 -- Runtime interface representation
 

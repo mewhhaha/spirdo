@@ -1,161 +1,172 @@
 ---
 name: use-spirdo
-description: Use this skill when compiling WESL with Spirdo, wiring typed shader inputs, choosing sampler mode, applying overrides, and validating shader integration without binding mistakes.
+description: Compile WESL or WGSL with Spirdo, inspect reflected shader interfaces, build type-checked resource inputs, pack uniforms, select sampler and override modes, and diagnose or validate SPIR-V integration. Use for Spirdo shader authoring, runtime or Template Haskell compilation, renderer binding setup, specialization, and compiler troubleshooting.
 ---
 
-# Use Spirdo Properly
+# Use Spirdo
 
-## When to use this skill
+Keep application code on these public modules:
 
-Use this when the task involves:
+- `Spirdo.Wesl` for runtime compilation and compact bundles.
+- `Spirdo.Wesl.Reflection` for typed Template Haskell shaders and full metadata.
+- `Spirdo.Wesl.Inputs` for named resource submission.
+- `Spirdo.Wesl.Uniform` for layout-aware host value packing.
 
-- Writing or debugging WESL compiled by Spirdo.
-- Integrating shader bindings in host code.
-- Choosing combined vs separate sampler mode.
-- Applying override specialization constants.
-- Verifying compile-time or runtime shader flows.
+Treat every other `Spirdo.Wesl.*` module as internal.
 
-## Preferred path (default)
+## Choose the compilation path
 
-1. Compile with `Spirdo.Wesl.Reflection` (`spirv`) when shader source is known at compile time.
-2. Build bindings with `Spirdo.Wesl.Inputs` using binding names, not numeric slots.
-3. Use `inputsFor` to validate and normalize binding submission.
-4. Feed `orderedUniforms`/`inputs*` outputs into your renderer.
-
-Use runtime compile (`Spirdo.Wesl.compile`) only when source must come from files or external input.
-
-## Public API boundaries
-
-Stay on public modules only:
-
-- `Spirdo.Wesl`
-- `Spirdo.Wesl.Reflection`
-- `Spirdo.Wesl.Inputs`
-- `Spirdo.Wesl.Uniform`
-
-Do not depend on internal modules; treat them as unstable.
-
-## Golden integration pattern
+Use `spirv` when source is known at Haskell compile time. Let the splice infer
+the concrete type-level interface; do not write a polymorphic `iface` signature.
 
 ```haskell
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeApplications #-}
 
+import Spirdo.Wesl.Inputs
+  ( SamplerHandle(..)
+  , TextureHandle(..)
+  , inputsFor
+  , sampledTexture
+  , uniform
+  )
 import Spirdo.Wesl.Reflection
-  ( Shader
-  , SamplerBindingMode(..)
-  , defaultCompileOptions
+  ( defaultCompileOptions
   , imports
   , spirv
   , wesl
   )
-import Spirdo.Wesl.Inputs
-  ( InputsCombined
-  , InputsError
-  , ShaderInputs
-  , ToUniform
-  , inputsFor
-  , uniform
-  , sampledTexture
-  , TextureHandle(..)
-  , SamplerHandle(..)
-  )
 
-shader :: Shader 'SamplerCombined iface
 shader = $(spirv defaultCompileOptions imports [wesl|
-struct Params { tint: vec4f; };
+struct Params { tint: vec4f, }
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var tex0: texture_2d<f32>;
-@group(0) @binding(2) var samp0: sampler;
-@fragment fn main() -> @location(0) vec4<f32> {
-  return textureSample(tex0, samp0, vec2f(0.5, 0.5)) * params.tint;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+@fragment
+fn main() -> @location(0) vec4f {
+  return textureSample(tex, samp, vec2f(0.5)) * params.tint;
 }
 |])
 
-buildInputs
-  :: ToUniform params
-  => params
-  -> Either InputsError (ShaderInputs iface)
-buildInputs paramsValue = do
-  let b :: InputsCombined iface
-      b =
-        uniform @"params" paramsValue
-          <> sampledTexture @"tex0" (TextureHandle 7) (SamplerHandle 9)
-  inputsFor shader b
+buildInputs paramsValue =
+  inputsFor shader
+    ( uniform @"params" paramsValue
+        <> sampledTexture @"tex" (TextureHandle 7) (SamplerHandle 9)
+    )
 ```
 
-## Sampler mode rules
+Omit the explicit `buildInputs` signature when the inferred concrete interface
+is more convenient; the important boundary is `inputsFor`.
 
-- `SamplerCombined` (default): sampler bindings are omitted from interface; use `sampledTexture`.
-- `SamplerSeparate`: sampler and texture are independent; use `texture` and `sampler`.
-- Keep host renderer descriptor layout consistent with the compile mode.
-- In combined mode, keep texture bindings contiguous for predictable implicit sampler slots.
-
-## Binding correctness rules
-
-- `uniform @"name"` and other builders bind by name; names must match shader interface.
-- Resource handles are runtime IDs, not WGSL binding indices.
-- `inputsFor` rejects:
-  - duplicate binding entries
-  - missing names
-  - kind mismatches (for example texture supplied where uniform expected)
-  - missing sampler pairings in combined mode
-- Prefer `orderedUniforms` for deterministic upload order.
-
-## Overrides and specialization
-
-- Default mode is `SpecStrict` (validator-friendly).
-- Use `SpecParity` only when full WESL parity is required and validator limitations are acceptable.
-- Runtime API uses options like:
-  - `OptOverrides [(String, OverrideValue)]`
-  - `OptOverrideSpecMode SpecStrict` or `OptOverrideSpecMode SpecParity`
-- Reflection API uses `CompileOptions` helpers:
-  - `withOverrides`
-  - `withOverrideSpecMode`
-
-## Runtime compile pattern
+Use the runtime API for files, generated text, editor reloads, or user input:
 
 ```haskell
 import Spirdo.Wesl
   ( compile
-  , sourceFile
+  , renderCompileError
   , shaderBindings
-  , shaderSpirv
-  , Option(..)
-  , OverrideSpecMode(..)
+  , sourceNamed
   )
 
-main :: IO ()
-main = do
-  result <- compile [OptOverrideSpecMode SpecStrict] (sourceFile "shaders/main.wesl")
-  case result of
-    Left err -> print err
-    Right bundle -> do
-      print (shaderBindings bundle)
-      print (length (shaderSpirv bundle))
+compileEditorSource source = do
+  result <- compile [] (sourceNamed "editor.wesl" source)
+  pure $ case result of
+    Left err -> Left (renderCompileError err)
+    Right bundle -> Right (shaderBindings bundle)
 ```
 
-## Verification checklist
+Give inline sources meaningful names so diagnostics identify their origin.
+`sourceNamed` is inline-only and cannot resolve filesystem imports. Use
+`sourceFile` for a top-level file with filesystem/package imports. File
+selection tries the exact path, then `.wesl`, then `.wgsl`; a nearby
+`wesl.toml` enables its supported path-dependency and `package::` resolution.
+Treat size/count/depth errors as deliberate compiler boundaries, not transient
+IO failures: a source is limited to 1 MiB decoded characters, and filesystem
+module/package graphs to 256 nodes and depth 64.
 
-Run after changing shader semantics, bindings, or options:
+## Match the sampler mode
 
-```bash
-cabal build
-cabal test
-cd examples && cabal build
-cd examples && cabal run
+- Keep the default `SamplerCombined` when the backend binds a sampled texture
+  as one host resource. Use `sampledTexture`.
+- Select `SamplerSeparate` when texture and sampler slots are independent. Use
+  `texture` and `sampler` separately.
+- Do not coerce an input builder between modes. The builder types reject mode
+  mismatches before runtime.
+
+Keep the mode used for compilation, pipeline creation, and input submission
+identical.
+
+Builders are opaque and `inputsFor` validates missing, duplicate, and wrong-kind
+bindings. For a shader with no bindings, pass `mempty` to `inputsFor`; there is
+no public unchecked empty-input constructor.
+
+## Pack uniforms
+
+Derive `Generic`, define `ToUniform`, and use `uniform @"name" value` or
+`packUniformFrom`. Host record field names must match the shader struct:
+
+```hs
+{-# LANGUAGE DeriveGeneric #-}
+
+import GHC.Generics (Generic)
+import Spirdo.Wesl.Uniform (ToUniform, V4(..))
+
+data Params = Params { tint :: V4 Float }
+  deriving (Generic)
+
+instance ToUniform Params
 ```
 
-Optional SPIR-V file emission during demo runs:
+Prefer this layout-aware path.
 
-```bash
-SPIRDO_WRITE_SPV=1 cabal run
+Use `packUniformStorableUnchecked` only after independently proving field
+offsets, padding, scalar representation, byte order, size, and alignment for
+every target ABI. Its size/alignment check cannot prove full shader layout
+compatibility.
+
+## Apply options
+
+- Select a named entry with `withEntryPoint` or `OptEntryPoint`.
+- Supply specialization values with `withOverrides` or `OptOverrides`.
+- A workgroup-size override without a source initializer compiles, but its
+  reflected size has no default. Specialize it to a positive value before
+  pipeline creation or dispatch; the emitted zero is only SPIR-V's required
+  structural placeholder.
+- Supply the final value for a derived override whose expression uses float
+  arithmetic or another operation unavailable to Shader `OpSpecConstantOp`.
+- Keep `SpecStrict` for validator-compatible output; derived and
+  composite/non-scalar-literal specialization instructions omit `SpecId`.
+  Use `SpecParity` only for toolchains that accept IDs on derived or composite
+  specialization forms.
+- Enable source features in both compiler options and source directives where
+  WGSL requires both.
+
+Pointer parameters preserve identity for `function` and `private` address
+spaces. Gated `workgroup` and `storage` parameters are supported; uniform
+pointer parameters and pointer returns are compile errors. Do not replace them
+with value parameters unless that is an intentional shader API change.
+
+Runtime `[Option]` has no cache controls. For TH compilation only, configure
+the local compiler cache through `CompileOptions` with `withCache`,
+`withCacheDir`, and `withCacheVerbose`. Never commit, download, or share its
+directory: cache entries are versioned local optimization data, may contain
+source text, and are not authenticated artifacts.
+
+Treat unknown entry names, override names, and invalid option combinations as
+source-integration errors; do not silently fall back.
+
+## Verify changes
+
+Run the project checks after changing shader semantics or integration:
+
+```sh
+cabal build all --enable-tests --enable-benchmarks
+cabal test spirdo-tests --test-show-details=direct
+SPIRDO_REQUIRE_VALIDATORS=1 cabal test spirdo-tests --test-show-details=direct
 ```
 
-## Fast iteration notes
-
-- Keep compile-time shaders on `spirv` and leave cache enabled.
-- Keep diagnostics off in hot loops unless you are actively debugging.
-- For parallel compile-time work, set RTS capabilities (`GHCRTS=-N`).
+The validator-required command needs `spirv-val` and `naga` on `PATH`. For a
+focused regression, pass `--test-options='--match SUBSTRING'` to `cabal test`.

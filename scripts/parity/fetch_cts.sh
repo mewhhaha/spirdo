@@ -21,7 +21,8 @@ fi
 mkdir -p "$(dirname "$DEST_DIR")"
 
 if [[ ! -d "$DEST_DIR/.git" ]]; then
-  git clone --no-checkout "$repo_url" "$DEST_DIR"
+  git init "$DEST_DIR"
+  git -C "$DEST_DIR" remote add origin "$repo_url"
 fi
 
 git -C "$DEST_DIR" fetch --depth 1 origin "$cts_commit"

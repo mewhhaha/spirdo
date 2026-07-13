@@ -5,7 +5,10 @@ module Spirdo.Wesl.Emit.Encoding
 
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Data.Word (Word32, Word8)
 import Foreign.Storable (pokeByteOff)
 
@@ -26,13 +29,17 @@ spirvToBytes words32 =
 {-# INLINE spirvToBytes #-}
 
 encodeString :: String -> [Word32]
-encodeString = go 0 0
+encodeString string
+  | '\0' `elem` string = error "SPIR-V strings cannot contain embedded NUL characters"
+  | otherwise = packBytes (BS.unpack (TE.encodeUtf8 (T.pack string)) <> [0])
   where
-    go acc _ [] = [acc]
-    go acc shift (ch:rest) =
-      let byte = fromIntegral (fromEnum ch) .&. 0xFF
-          acc' = acc .|. (byte `shiftL` shift)
+    packBytes [] = []
+    packBytes bytes = packWord 0 0 bytes
+
+    packWord acc _ [] = [acc]
+    packWord acc shift (byte:rest) =
+      let acc' = acc .|. (fromIntegral byte `shiftL` shift)
       in if shift == 24
-          then acc' : go 0 0 rest
-          else go acc' (shift + 8) rest
+          then acc' : packBytes rest
+          else packWord acc' (shift + 8) rest
 {-# INLINE encodeString #-}

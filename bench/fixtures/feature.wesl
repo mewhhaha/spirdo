@@ -89,9 +89,9 @@ for (var j = 0; j < 2; j = j + 1) {
 }
 loop {
   acc = acc + 0.01;
-  break if (acc > 1.0);
   continuing {
     acc = acc + 0.02;
+    break if (acc > 1.0);
   }
 }
 

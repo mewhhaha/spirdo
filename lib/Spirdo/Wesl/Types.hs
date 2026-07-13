@@ -19,7 +19,6 @@ module Spirdo.Wesl.Types
   , OverrideSpecMode(..)
   , OverrideValue(..)
   , Source(..)
-  , CachePolicy(..)
   , Option(..)
   , Imports(..)
   , Import(..)
@@ -158,6 +157,7 @@ data Import (name :: Symbol) = Import
   , importSource :: !Text
   } deriving (Eq, Show, Read)
 
+-- | Append one module name to a type-level import list.
 type family Snoc (mods :: [k]) (x :: k) :: [k] where
   Snoc '[] x = '[x]
   Snoc (y ': ys) x = y ': Snoc ys x
@@ -231,12 +231,6 @@ importsNames = go
     go ImportsNil = []
     go (Import key _ :> rest) = key : go rest
 
--- | Cache configuration for the compile pipeline.
-data CachePolicy
-  = CacheDisabled
-  | CacheInDir FilePath
-  deriving (Eq, Show, Read)
-
 -- | Compile option overrides for ergonomic APIs.
 data Option
   = OptSpirvVersion Word32
@@ -245,8 +239,6 @@ data Option
   | OptOverrideSpecMode OverrideSpecMode
   | OptSamplerMode SamplerBindingMode
   | OptEntryPoint String
-  | OptCache CachePolicy
-  | OptCacheVerbose Bool
   | OptTimingVerbose Bool
   deriving (Eq, Show, Read)
 
@@ -283,9 +275,6 @@ applyOptions opts0 base = foldl applyOne base opts0
         OptOverrideSpecMode mode -> opts { overrideSpecMode = mode }
         OptSamplerMode mode -> opts { samplerBindingMode = mode }
         OptEntryPoint name -> opts { entryPointName = Just name }
-        OptCache CacheDisabled -> opts { cacheEnabled = False }
-        OptCache (CacheInDir dir) -> opts { cacheEnabled = True, cacheDir = dir }
-        OptCacheVerbose verbose -> opts { cacheVerbose = verbose }
         OptTimingVerbose verbose -> opts { timingVerbose = verbose }
 
 -- | Set the SPIR-V version (default is 1.6).
