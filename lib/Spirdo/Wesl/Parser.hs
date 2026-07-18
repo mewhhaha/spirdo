@@ -8,7 +8,10 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 -- | Parser for WESL source.
-module Spirdo.Wesl.Parser where
+module Spirdo.Wesl.Parser
+  ( parseModuleWith
+  , validateImportName
+  ) where
 
 import Control.Applicative ((<|>))
 import Control.Monad (unless, when)
@@ -80,9 +83,6 @@ posOf toks =
   case toks of
     (Token _ pos : _) -> pos
     [] -> SrcPos 1 1
-
-lexWesl :: Text -> Either CompileError [Token]
-lexWesl source = fst <$> lexWeslWithEnd source
 
 lexWeslWithEnd :: Text -> Either CompileError ([Token], SrcPos)
 lexWeslWithEnd source = do
@@ -1482,12 +1482,12 @@ parseSwitchBody feats toks =
       (expr, rest1) <- parseExpr rest
       parseMore [expr] rest1
 
-    parseMore acc rest =
+    parseMore selectorsReversed rest =
       case rest of
         (Token (TkSymbol ",") _ : more) -> do
           (expr, rest1) <- parseExpr more
-          parseMore (acc <> [expr]) rest1
-        _ -> Right (acc, rest)
+          parseMore (expr : selectorsReversed) rest1
+        _ -> Right (reverse selectorsReversed, rest)
 
 parseLoopBody :: FeatureSet -> [Token] -> Either CompileError ([Stmt], Maybe [Stmt], [Token])
 parseLoopBody feats toks =

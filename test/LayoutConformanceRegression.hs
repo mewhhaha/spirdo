@@ -33,7 +33,41 @@ checks =
   , ("layout-conformance: f16 storage capabilities", checkF16Capabilities)
   , ("layout-conformance: uniform layout feature provenance", checkUniformLayoutFeature)
   , ("layout-conformance: Vulkan target environments", checkVulkanVersionTargets)
+  , ("layout-conformance: immediate values", checkImmediateValues)
   ]
+
+checkImmediateValues :: IO ()
+checkImmediateValues = do
+  (vulkanBytes, vulkanInterface) <- compileArtifact [] immediateSource
+  validateSpirv "immediate-vulkan" ["--target-env", "vulkan1.3"] vulkanBytes
+  (openGlBytes, openGlInterface) <-
+    compileArtifact
+      [Wesl.OptTargetEnvironment Wesl.TargetOpenGl]
+      immediateSource
+  validateSpirv "immediate-open-gl" ["--target-env", "opengl4.5"] openGlBytes
+  unless
+    ( fmap Wesl.layoutSize (Wesl.pushConstantLayout vulkanInterface) == Just 8
+        && fmap Wesl.layoutSize (Wesl.pushConstantLayout openGlInterface) == Just 8
+    ) $
+    fail
+      ( "immediate layout reflection mismatch: "
+          <> show
+            ( Wesl.pushConstantLayout vulkanInterface
+            , Wesl.pushConstantLayout openGlInterface
+            )
+      )
+  expectCompileError
+    [Wesl.OptTargetEnvironment Wesl.TargetOpenGl]
+    "OpenGL immediate binding 31 conflicts with uniform"
+    conflictingImmediateSource
+  expectCompileError
+    [ Wesl.OptTargetEnvironment Wesl.TargetOpenGl
+    , Wesl.OptOpenGlBindingRemaps [Wesl.OpenGlBindingRemap 0 0 31]
+    ]
+    "OpenGL immediate binding 31 conflicts with uniform"
+    remappedConflictingImmediateSource
+  expectCompileError [] "assignment target is read-only" writableImmediateSource
+  expectCompileError [] "immediate variables must use host-shareable types" booleanImmediateSource
 
 checkVec3Layouts :: IO ()
 checkVec3Layouts = do
@@ -225,6 +259,50 @@ checkVulkanVersionTargets =
       , (0x00010500, "vulkan1.2")
       , (0x00010600, "vulkan1.3")
       ]
+
+immediateSource :: String
+immediateSource =
+  unlines
+    [ "struct Constants {"
+    , "  ping: u32,"
+    , "  rightmost_slot: u32,"
+    , "}"
+    , "var<immediate> constants: Constants;"
+    , "@compute @workgroup_size(1)"
+    , "fn main() {"
+    , "  let selected = constants.ping + constants.rightmost_slot;"
+    , "}"
+    ]
+
+conflictingImmediateSource :: String
+conflictingImmediateSource =
+  unlines
+    [ "var<immediate> constant: u32;"
+    , "@group(0) @binding(31) var<uniform> conflict: u32;"
+    , "@compute @workgroup_size(1) fn main() { let selected = constant + conflict; }"
+    ]
+
+remappedConflictingImmediateSource :: String
+remappedConflictingImmediateSource =
+  unlines
+    [ "var<immediate> constant: u32;"
+    , "@group(0) @binding(0) var<uniform> conflict: u32;"
+    , "@compute @workgroup_size(1) fn main() { let selected = constant + conflict; }"
+    ]
+
+writableImmediateSource :: String
+writableImmediateSource =
+  unlines
+    [ "var<immediate> constant: u32;"
+    , "@compute @workgroup_size(1) fn main() { constant = 1u; }"
+    ]
+
+booleanImmediateSource :: String
+booleanImmediateSource =
+  unlines
+    [ "var<immediate> enabled: bool;"
+    , "@compute @workgroup_size(1) fn main() { if (enabled) {} }"
+    ]
 
 checkImportedUniformLayoutFeature :: IO ()
 checkImportedUniformLayoutFeature =

@@ -17,8 +17,6 @@ import Data.Word (Word32, Word64)
 import qualified Language.Haskell.TH as TH
 import Spirdo.Wesl.Reflection
   ( CompileError(..)
-  , Import(..)
-  , Imports(..)
   , SomeShader(..)
   , compileFile
   , defaultCompileOptions
@@ -50,6 +48,7 @@ $(do
         duplicateImportCacheDirectory = "dist-newstyle/.wesl-cache-duplicate-import-regression"
         normalizedImportCacheDirectory = "dist-newstyle/.wesl-cache-normalized-import-regression"
         layoutCacheDirectory = "dist-newstyle/.wesl-cache-layout-regression"
+        immediateCacheDirectory = "dist-newstyle/.wesl-cache-immediate-regression"
         cacheDirectories =
           [ hitCacheDirectory
           , defaultlessWorkgroupCacheDirectory
@@ -59,6 +58,7 @@ $(do
           , duplicateImportCacheDirectory
           , normalizedImportCacheDirectory
           , layoutCacheDirectory
+          , immediateCacheDirectory
           ]
         fragmentSource value =
           unlines
@@ -336,9 +336,9 @@ $(do
 
     let normalizedOptions = withCacheDir normalizedImportCacheDirectory defaultCompileOptions
         normalizedCollisionImports =
-          ( Import "foo" (T.pack importedSource)
-              :> (Import "./foo" (T.pack replacedSource) :> ImportsNil)
-          ) :: Imports '["foo", "./foo"]
+          imports
+            <: module_ @"foo" importedSource
+            <: module_ @"./foo" replacedSource
         normalizedRootSource =
           unlines
             [ "import foo;"
@@ -395,6 +395,30 @@ $(do
         (mutateFramedPayload layoutArtifact (Just . BS.cons 0x20))
     _ <- spirv layoutOptions imports layoutSource
     TH.runIO (assertCacheHit layoutArtifact layoutSentinel)
+
+    let immediateOptions = withCacheDir immediateCacheDirectory defaultCompileOptions
+        immediateSource =
+          unlines
+            [ "var<immediate> constants: u32;"
+            , "@compute @workgroup_size(1)"
+            , "fn main() { let selected = constants; }"
+            ]
+    _ <- spirv immediateOptions imports immediateSource
+    immediateArtifact <- TH.runIO (onlyCacheArtifact immediateCacheDirectory)
+    immediateSentinel <-
+      TH.runIO
+        (mutateFramedPayload immediateArtifact (Just . BS.cons 0x20))
+    _ <- spirv immediateOptions imports immediateSource
+    TH.runIO (assertCacheHit immediateArtifact immediateSentinel)
+    runMissRegression
+      immediateOptions
+      immediateSource
+      immediateArtifact
+      (\cachePath ->
+          mutateFramedPayload
+            cachePath
+            (replaceBetween "siPushConstants = Just " ", siSamplerMode =" "TLSampler")
+      )
 
     [d|
       cacheCompileTimeRegressionsPassed :: Bool

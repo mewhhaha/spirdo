@@ -2479,6 +2479,10 @@ validateGlobalVar ctx scope decl = do
       case decl.gvInit of
         Nothing -> Right ()
         Just _ -> Left (CompileError "workgroup variables cannot have initializers" Nothing Nothing)
+    "immediate" ->
+      case decl.gvInit of
+        Nothing -> Right ()
+        Just _ -> Left (CompileError "immediate variables cannot have initializers" Nothing Nothing)
     _ -> Left (CompileError ("unsupported global address space: " <> textToString decl.gvSpace) Nothing Nothing)
 
 validateConst :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Scope -> ConstDecl -> Either CompileError ()

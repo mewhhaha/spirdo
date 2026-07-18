@@ -15,6 +15,7 @@ import Spirdo.Wesl.Uniform
   , UniformValue(..)
   , packUniform
   , packUniformStorableUnchecked
+  , validateUniformStorableUnchecked
   )
 
 data PaddedHost = PaddedHost !Word16 !Word32
@@ -27,9 +28,18 @@ instance Storable PaddedHost where
     pokeByteOff ptr 0 low
     pokeByteOff ptr 4 high
 
+newtype StrictHost = StrictHost Word32
+
+instance Storable StrictHost where
+  sizeOf (StrictHost _) = 4
+  alignment (StrictHost _) = 4
+  peek ptr = StrictHost <$> peekByteOff ptr 0
+  poke ptr (StrictHost value) = pokeByteOff ptr 0 value
+
 checks :: [(String, IO ())]
 checks =
   [ ("uniform-safety:storable-padding-zero", checkStorablePaddingIsZero)
+  , ("uniform-safety:strict-storable-metadata", checkStrictStorableMetadata)
   , ("uniform-safety:short-vector", expectPackingFailure "short vector" vectorLayout shortVector)
   , ("uniform-safety:long-vector", expectPackingFailure "long vector" vectorLayout longVector)
   , ("uniform-safety:negative-vector-width", expectPackingFailure "negative vector width" negativeVectorLayout (UVVector (-1) []))
@@ -41,6 +51,12 @@ checks =
   , ("uniform-safety:runtime-sized-array", expectPackingFailure "runtime-sized array" runtimeArrayLayout (UVArray [scalarValue]))
   , ("uniform-safety:pathological-allocation", expectPackingFailure "pathological allocation" pathologicalArrayLayout (UVArray []))
   ]
+
+checkStrictStorableMetadata :: IO ()
+checkStrictStorableMetadata =
+  case validateUniformStorableUnchecked scalarLayout (StrictHost 0) of
+    Left err -> fail ("strict Storable validation failed: " <> err)
+    Right () -> pure ()
 
 checkStorablePaddingIsZero :: IO ()
 checkStorablePaddingIsZero = do

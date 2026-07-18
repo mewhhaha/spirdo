@@ -13,7 +13,6 @@ module Spirdo.Wesl.Inputs
   , TextureHandle(..)
   , BufferHandle(..)
   , StorageTextureHandle(..)
-  , RequireBinding
   , RequireUniform
   , RequireSampler
   , RequireTexture
@@ -42,7 +41,6 @@ module Spirdo.Wesl.Inputs
   , inputsTextures
   , inputsStorageBuffers
   , inputsStorageTextures
-  , orderedUniforms
   ) where
 
 import Control.Monad (foldM, unless, when)
@@ -76,13 +74,6 @@ import Spirdo.Wesl.Types
   , isUniformKind
   , packUniform
   )
-
--- | Compile-time requirement that a binding named @name@ exists in @iface@.
-type family RequireBinding (name :: Symbol) (iface :: [Binding]) :: K.Constraint where
-  RequireBinding name '[] =
-    TypeError ('Text "binding not found: " ':<>: 'ShowType name)
-  RequireBinding name ('Binding name _ _ _ _ ': _) = ()
-  RequireBinding name (_ ': rest) = RequireBinding name rest
 
 -- | Compile-time requirement that a binding named @name@ is a uniform in @iface@.
 type family RequireUniform (name :: Symbol) (iface :: [Binding]) :: K.Constraint where
@@ -287,11 +278,6 @@ inputValidationSeed iface =
     , siStorageBuffers = []
     , siStorageTextures = []
     }
-
--- | Uniform inputs sorted by @(group, binding, name)@.
-orderedUniforms :: ShaderInputs iface -> [UniformInput]
-orderedUniforms inputs =
-  orderUniforms inputs.siUniforms
 
 normalizeInputs :: ShaderInputs iface -> ShaderInputs iface
 normalizeInputs inputs =

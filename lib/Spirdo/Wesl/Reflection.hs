@@ -32,8 +32,6 @@ module Spirdo.Wesl.Reflection
   , uniform
   , packUniform
   , packUniformFrom
-  , validateUniformStorable
-  , packUniformStorable
   , validateUniformStorableUnchecked
   , packUniformStorableUnchecked
   , V2(..)
@@ -54,6 +52,7 @@ module Spirdo.Wesl.Reflection
   , VertexFormat(..)
   , VertexAttribute(..)
   , pushConstantLayout
+  , layoutSize
   , ShaderInterface(..)
   , OverrideInfo(..)
   , BindingInfo(..)
@@ -65,6 +64,8 @@ module Spirdo.Wesl.Reflection
   , renderCompileErrorWithSource
   , Source(..)
   , Option(..)
+  , SpirvTargetEnvironment(..)
+  , OpenGlBindingRemap(..)
   , CompileOptions
   , SamplerBindingMode(..)
   , OverrideSpecMode(..)
@@ -72,9 +73,9 @@ module Spirdo.Wesl.Reflection
   , Diagnostic(..)
   , DiagnosticSeverity(..)
   , defaultCompileOptions
-  , defaultOptions
   , applyOptions
   , withSpirvVersion
+  , withTargetEnvironment
   , withFeatures
   , withOverrides
   , withOverrideSpecMode
@@ -92,17 +93,12 @@ module Spirdo.Wesl.Reflection
   , compileFileWithDiagnostics
   , wesl
   , spirv
-  , Imports(..)
-  , Import(..)
+  , Imports
+  , Import
   , Snoc
   , imports
-  , importsNil
-  , import_
-  , importText
   , module_
-  , moduleText
   , (<:)
-  , normalizeModuleKey
   ) where
 
 import Spirdo.Wesl.Compiler

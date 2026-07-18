@@ -22,8 +22,6 @@ module Spirdo.Wesl.Types.Uniform
   , packUniformFrom
   , validateUniformStorableUnchecked
   , packUniformStorableUnchecked
-  , validateUniformStorable
-  , packUniformStorable
   ) where
 
 import Data.ByteString (ByteString)
@@ -40,7 +38,6 @@ import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word16, Word32)
-import Data.Proxy (Proxy(..))
 import Foreign.Marshal.Alloc (free, mallocBytes)
 import Foreign.Marshal.Utils (fillBytes)
 import Foreign.Ptr (alignPtr, castPtr)
@@ -314,12 +311,12 @@ packUniformFrom layout value = packUniform layout (uniform value)
 -- This does not verify field offsets, padding, scalar representation, byte
 -- order, or platform ABI compatibility. Prefer 'packUniformFrom' unless the
 -- host type's ABI has been independently verified for every target platform.
-validateUniformStorableUnchecked :: forall a. Storable a => TypeLayout -> Proxy a -> Either String ()
-validateUniformStorableUnchecked layout _ = do
+validateUniformStorableUnchecked :: Storable a => TypeLayout -> a -> Either String ()
+validateUniformStorableUnchecked layout value = do
   wantSize <- validatePackingLayout layout
   let wantAlign = fromIntegral (layoutAlign layout)
-      gotSize = sizeOf (undefined :: a)
-      gotAlign = alignment (undefined :: a)
+      gotSize = sizeOf value
+      gotAlign = alignment value
   if gotSize /= wantSize
     then Left ("storable size mismatch: expected " <> show wantSize <> ", got " <> show gotSize)
     else if not (isPowerOfTwoInt gotAlign) || wantAlign > gotAlign
@@ -333,29 +330,19 @@ validateUniformStorableUnchecked layout _ = do
 -- This inherits the ABI caveats of 'validateUniformStorableUnchecked'. In
 -- particular, it cannot establish that fields or padding match the shader
 -- layout. Prefer 'packUniformFrom' for portable, layout-aware packing.
-packUniformStorableUnchecked :: forall a. Storable a => TypeLayout -> a -> IO (Either String ByteString)
+packUniformStorableUnchecked :: Storable a => TypeLayout -> a -> IO (Either String ByteString)
 packUniformStorableUnchecked layout value =
-  case validateUniformStorableUnchecked layout (Proxy @a) of
+  case validateUniformStorableUnchecked layout value of
     Left err -> pure (Left err)
     Right () -> do
       let size = fromIntegral (layoutSize layout)
-          align = alignment (undefined :: a)
+          align = alignment value
           allocationSize = size + align - 1
       bracket (mallocBytes allocationSize) free $ \allocation -> do
         let ptr = alignPtr allocation align
         fillBytes ptr 0 size
         poke ptr value
         Right <$> BS.packCStringLen (castPtr ptr, size)
-
--- | Legacy name for 'validateUniformStorableUnchecked'.
-{-# DEPRECATED validateUniformStorable "Use validateUniformStorableUnchecked; this check covers only size and alignment, not the complete shader ABI." #-}
-validateUniformStorable :: forall a. Storable a => TypeLayout -> Proxy a -> Either String ()
-validateUniformStorable = validateUniformStorableUnchecked
-
--- | Legacy name for 'packUniformStorableUnchecked'.
-{-# DEPRECATED packUniformStorable "Use packUniformStorableUnchecked; this function relies on an unchecked host ABI layout." #-}
-packUniformStorable :: forall a. Storable a => TypeLayout -> a -> IO (Either String ByteString)
-packUniformStorable = packUniformStorableUnchecked
 
 -- Public layout constructors must not permit unbounded allocation or traversal.
 maxPackingBytes :: Integer

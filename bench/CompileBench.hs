@@ -103,12 +103,14 @@ failScenario scenarioName phase err = do
 benchmarkIterations :: IO Int
 benchmarkIterations = do
   configured <- lookupEnv "SPIRDO_BENCH_ITERS"
-  case configured >>= readMaybe of
-    Just iterations | iterations > 0 -> pure iterations
-    Just _ -> do
-      putStrLn "SPIRDO_BENCH_ITERS must be a positive integer"
-      exitFailure
+  case configured of
     Nothing -> pure 20
+    Just rawValue ->
+      case readMaybe rawValue of
+        Just iterations | iterations > 0 -> pure iterations
+        _ -> do
+          putStrLn ("SPIRDO_BENCH_ITERS must be a positive integer, got " <> show rawValue)
+          exitFailure
 
 main :: IO ()
 main = do

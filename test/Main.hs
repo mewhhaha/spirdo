@@ -17,7 +17,6 @@ import Data.List (find, inits, isInfixOf, isPrefixOf, stripPrefix, tails)
 import qualified Data.Set as Set
 import Data.Foldable (toList)
 import Data.Maybe (isJust, isNothing)
-import Data.Proxy (Proxy(..))
 import Data.Word (Word16, Word32, Word64)
 import GHC.Float (castFloatToWord32)
 import System.Directory
@@ -179,11 +178,6 @@ data ParitySource
   | ParityInline String String
   deriving (Show)
 
-isTruthy :: String -> Bool
-isTruthy raw =
-  let lower = map toLower raw
-  in lower == "1" || lower == "true" || lower == "yes" || lower == "on"
-
 inlineSource :: String -> Source
 inlineSource = SourceInline "<inline>"
 
@@ -313,8 +307,22 @@ main = do
   testFilter <- testFilterFromEnvironmentAndArgs
   spirvVal <- findExecutable "spirv-val"
   nagaExe <- findExecutable "naga"
-  requireValidators <- fmap isTruthy <$> lookupEnv "SPIRDO_REQUIRE_VALIDATORS"
-  when (requireValidators == Just True) $ do
+  configuredValidatorRequirement <- lookupEnv "SPIRDO_REQUIRE_VALIDATORS"
+  requireValidators <-
+    case configuredValidatorRequirement of
+      Nothing -> pure False
+      Just rawValue ->
+        case map toLower rawValue of
+          "1" -> pure True
+          "true" -> pure True
+          "yes" -> pure True
+          "on" -> pure True
+          "0" -> pure False
+          "false" -> pure False
+          "no" -> pure False
+          "off" -> pure False
+          _ -> fail ("SPIRDO_REQUIRE_VALIDATORS must be a boolean, got " <> show rawValue)
+  when requireValidators $ do
     when (isNothing spirvVal) $
       fail "SPIRDO_REQUIRE_VALIDATORS=1 but spirv-val was not found in PATH"
     when (isNothing nagaExe) $
@@ -416,7 +424,6 @@ main = do
     , ("vertex-attributes", checkVertexAttributes)
     , ("binding-plan", checkBindingPlan)
     , ("input-ordering", checkInputOrdering)
-    , ("inputs-combined-rejects-separate-texture", checkInputsCombinedRejectsSeparateTexture)
     , ("inputs-combined-ok", checkInputsCombinedOk)
     , ("inputs-missing-bindings-rejected", checkInputsMissingBindingsRejected)
     , ("inputs-separate-mode-rejects-sampled-texture", checkInputsSeparateModeRejectsSampledTexture)
@@ -427,6 +434,7 @@ main = do
   regressionCheckCount <- runChecks testFilter "Regression Gates"
     [ ("duplicate-bindings", checkDuplicateBindings)
     , ("golden-spirv", checkGoldenSpirv)
+    , ("short-spirv-header", checkShortSpirvHeader)
     ]
   featureCheckCount <- runChecks testFilter "Feature Regressions" $
     ImportSemanticRegression.checks
@@ -456,12 +464,23 @@ main = do
 
 assertSpirv :: Maybe FilePath -> String -> BS.ByteString -> IO ()
 assertSpirv spirvVal label bytes = do
+  unless (BS.length bytes >= 20) $
+    fail (label <> ": SPIR-V output is shorter than the 20-byte header: " <> show (BS.length bytes) <> " bytes")
   unless (BS.length bytes `mod` 4 == 0) $
     fail (label <> ": SPIR-V size not multiple of 4")
   let magic = word32At bytes 0
   unless (magic == 0x07230203) $
     fail (label <> ": bad SPIR-V magic")
   validateSpirvVal spirvVal label bytes
+
+checkShortSpirvHeader :: IO ()
+checkShortSpirvHeader = do
+  result <- try (assertSpirv Nothing "short-header" (BS.replicate 4 0))
+  case result of
+    Left err
+      | "shorter than the 20-byte header: 4 bytes" `isInfixOf` displayException (err :: SomeException) -> pure ()
+      | otherwise -> fail ("short SPIR-V header returned the wrong error: " <> displayException err)
+    Right () -> fail "four bytes were accepted as a complete SPIR-V module"
 
 word32At :: BS.ByteString -> Int -> Word32
 word32At bytes offset =
@@ -943,10 +962,10 @@ checkPackUniformFrom =
 checkUniformStorable :: IO ()
 checkUniformStorable = do
   let layout = TLScalar F32 4 4
-  case validateUniformStorableUnchecked layout (Proxy @Float) of
+  case validateUniformStorableUnchecked layout (0 :: Float) of
     Left err -> fail ("uniform-storable: unexpected failure: " <> err)
     Right () -> pure ()
-  case validateUniformStorableUnchecked layout (Proxy @Word64) of
+  case validateUniformStorableUnchecked layout (0 :: Word64) of
     Left _ -> pure ()
     Right () -> fail "uniform-storable: expected size mismatch for Word64"
   packed <- packUniformStorableUnchecked layout (1.0 :: Float)
@@ -1001,31 +1020,6 @@ checkInputOrdering =
       let names = map (.uiName) (inputsUniforms inputs)
       unless (names == ["a", "b"]) $
         fail ("input-ordering: expected [\"a\",\"b\"], got " <> show names)
-
-checkInputsCombinedRejectsSeparateTexture :: IO ()
-checkInputsCombinedRejectsSeparateTexture =
-  let invalidTextureBuilder =
-        unsafeCoerce
-          ( Inputs.texture @"tex" (TextureHandle 9)
-              :: Inputs.InputsBuilder
-                  'SamplerSeparate
-                  '[ 'Binding "params" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
-                   , 'Binding "tex" 'BTexture2D 0 1 ('TTexture2D 'SF32)
-                   ]
-          )
-          :: Inputs.InputsBuilder
-              'SamplerCombined
-              '[ 'Binding "params" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
-               , 'Binding "tex" 'BTexture2D 0 1 ('TTexture2D 'SF32)
-               ]
-  in case inputsFor combinedInputShader
-        (Inputs.uniform @"params" (ParamsU (V4 1 2 3 4) :: ParamsU)
-          <> invalidTextureBuilder) of
-    Left err ->
-      unless ("texture is not supported in SamplerCombined mode" `isInfixOf` err.ieMessage) $
-        fail ("inputs-combined-separate-texture: unexpected error: " <> err.ieMessage)
-    Right _ ->
-      fail "inputs-combined-separate-texture: expected mode mismatch error"
 
 checkInputsCombinedOk :: IO ()
 checkInputsCombinedOk =
@@ -1651,7 +1645,21 @@ duplicateBindingShader =
 
 checkGoldenSpirv :: IO ()
 checkGoldenSpirv = do
-  update <- fmap (maybe False isTruthy) (lookupEnv "SPIRDO_UPDATE_GOLDEN")
+  configuredUpdate <- lookupEnv "SPIRDO_UPDATE_GOLDEN"
+  update <-
+    case configuredUpdate of
+      Nothing -> pure False
+      Just rawValue ->
+        case map toLower rawValue of
+          "1" -> pure True
+          "true" -> pure True
+          "yes" -> pure True
+          "on" -> pure True
+          "0" -> pure False
+          "false" -> pure False
+          "no" -> pure False
+          "off" -> pure False
+          _ -> fail ("SPIRDO_UPDATE_GOLDEN must be a boolean, got " <> show rawValue)
   let dir = "test" </> "golden"
   let fixtures =
         [ ("compute-basic", goldenComputeShader)

@@ -17,9 +17,26 @@
   deliberately has no cache controls.
 - Imported reflection and override keys now use stable source-qualified names;
   undocumented raw `__wesl__...` keys are no longer accepted.
+- Deprecated `validateUniformStorable` and `packUniformStorable` aliases were
+  removed; use their explicit `Unchecked` replacements.
+- Typed inline imports now expose only abstract `Imports`/`Import` types and the
+  `imports <: module_ @"name" source` construction path; redundant constructor
+  aliases were removed.
+- `orderedUniforms` was removed because validated `inputsUniforms` results are
+  already normalized by group, binding, and name.
+- The unused generic `RequireBinding` constraint was removed; input builders
+  expose only the kind-specific constraints they enforce.
+- The unused `defaultOptions` alias was removed; advanced callers use the
+  canonical `defaultCompileOptions` value.
 
 ### Added
 
+- An explicit OpenGL SPIR-V 1.0 target omits Vulkan descriptor-set decorations,
+  maps vertex built-ins to OpenGL semantics, and accepts pipeline-specific
+  resource-binding remaps. Shader bundles also expose base-compatible SPIR-V
+  words for native graphics APIs.
+- Public half-float conversion functions expose the existing IEEE 754 binary16
+  representation for image and uniform boundaries.
 - Crystal Run is a small rasterized 3D game example with procedural meshes,
   Spirdo-compiled vertex and fragment shaders, pure game-state tests, and an
   Xvfb/Lavapipe screenshot harness for headless rendering checks.
@@ -28,6 +45,8 @@
 - Runtime `ShaderBundle` accessors expose stage, bindings, vertex attributes,
   sampler mode, overrides, and compute workgroup size without requiring full
   Reflection.
+- Runtime binding reflection preserves storage-texture format and access in
+  compact `StorageTextureLayout` metadata.
 - `BindingSlotCount { bscGroup :: Word32, bscSlots :: Word64 }` represents
   sparse binding spans independently per descriptor group and covers the full
   `Word32` binding range without overflow.
@@ -82,16 +101,9 @@
   Mixed i32/u32 workgroup dimensions remain rejected. Strict mode omits
   `SpecId` from derived and composite/non-scalar-literal specialization
   instructions; parity mode may be validator-incompatible for those forms.
-- The optional demo is a separately built GHC 9.12 package; its gallery includes
+- The optional demo is a separately built GHC 9.14 package; its gallery includes
   a validated SDF Text variant and no longer carries an unusable texture-backed
   shader module.
-
-### Deprecated
-
-- `validateUniformStorable` remains a deprecated alias for
-  `validateUniformStorableUnchecked`.
-- `packUniformStorable` remains a deprecated alias for
-  `packUniformStorableUnchecked`.
 
 ## 0.1.0.0 -- 2026-01-25
 
