@@ -13,7 +13,6 @@ module Spirdo.Wesl.Inputs
   , TextureHandle(..)
   , BufferHandle(..)
   , StorageTextureHandle(..)
-  , RequireBinding
   , RequireUniform
   , RequireSampler
   , RequireTexture
@@ -75,13 +74,6 @@ import Spirdo.Wesl.Types
   , isUniformKind
   , packUniform
   )
-
--- | Compile-time requirement that a binding named @name@ exists in @iface@.
-type family RequireBinding (name :: Symbol) (iface :: [Binding]) :: K.Constraint where
-  RequireBinding name '[] =
-    TypeError ('Text "binding not found: " ':<>: 'ShowType name)
-  RequireBinding name ('Binding name _ _ _ _ ': _) = ()
-  RequireBinding name (_ ': rest) = RequireBinding name rest
 
 -- | Compile-time requirement that a binding named @name@ is a uniform in @iface@.
 type family RequireUniform (name :: Symbol) (iface :: [Binding]) :: K.Constraint where

@@ -24,6 +24,8 @@
   aliases were removed.
 - `orderedUniforms` was removed because validated `inputsUniforms` results are
   already normalized by group, binding, and name.
+- The unused generic `RequireBinding` constraint was removed; input builders
+  expose only the kind-specific constraints they enforce.
 
 ### Added
 
