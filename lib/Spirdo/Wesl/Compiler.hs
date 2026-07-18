@@ -54,8 +54,7 @@ overrideValuesText :: [(String, OverrideValue)] -> [(Text, OverrideValue)]
 overrideValuesText = map (first T.pack)
 
 data CompileResult = CompileResult
-  { crAst :: !ModuleAst
-  , crInterface :: !ShaderInterface
+  { crInterface :: !ShaderInterface
   , crSpirv :: !ByteString
   , crDiagnostics :: ![Diagnostic]
   , crSource :: !(Maybe ShaderSource)
@@ -207,8 +206,7 @@ compileInlineResult opts wantDiagnostics name src = do
       then collectDiagnosticsMerged opts [] moduleAst
       else Right []
   pure CompileResult
-    { crAst = moduleAst
-    , crInterface = iface
+    { crInterface = iface
     , crSpirv = spirvBytes
     , crDiagnostics = diags
     , crSource = Just (ShaderSource name (T.pack src))
@@ -305,8 +303,7 @@ compileInlineResultWithImports opts wantDiagnostics rootName importSet src = do
   iface <- buildInterface opts lowered
   spirvBytes <- emitSpirv opts lowered iface
   pure CompileResult
-    { crAst = lowered
-    , crInterface = iface
+    { crInterface = iface
     , crSpirv = spirvBytes
     , crDiagnostics = diags
     , crSource = Just (ShaderSource rootName (T.pack src))
@@ -371,8 +368,7 @@ compileFileResultUnchecked opts wantDiagnostics path =
     iface <- annotate (ExceptT (timedPhase opts "interface" (evaluate (buildInterface opts lowered))))
     spirvBytes <- annotate (ExceptT (timedPhase opts "emit" (evaluate (emitSpirv opts lowered iface))))
     pure CompileResult
-      { crAst = lowered
-      , crInterface = iface
+      { crInterface = iface
       , crSpirv = spirvBytes
       , crDiagnostics = diags
       , crSource = Just (ShaderSource filePath sourceFile.text)
