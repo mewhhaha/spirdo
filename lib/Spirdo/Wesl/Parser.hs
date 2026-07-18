@@ -81,9 +81,6 @@ posOf toks =
     (Token _ pos : _) -> pos
     [] -> SrcPos 1 1
 
-lexWesl :: Text -> Either CompileError [Token]
-lexWesl source = fst <$> lexWeslWithEnd source
-
 lexWeslWithEnd :: Text -> Either CompileError ([Token], SrcPos)
 lexWeslWithEnd source = do
   (reversedTokens, eofPos) <- go 0 [] [] (SrcPos 1 1) source

@@ -513,9 +513,6 @@ discoverPackageInfo filePath = findWeslToml (takeDirectory filePath)
               then pure (Right Nothing)
               else findWeslToml parent
 
-parseWeslToml :: FilePath -> IO (Either CompileError PackageInfo)
-parseWeslToml path = fmap (fmap (\loaded -> loaded.package)) (loadWeslPackage path)
-
 loadWeslPackage :: FilePath -> IO (Either CompileError LoadedPackage)
 loadWeslPackage path = runExceptT $ do
   manifest <- ExceptT (canonicalizeExistingPath "WESL manifest" path)
