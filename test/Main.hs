@@ -179,11 +179,6 @@ data ParitySource
   | ParityInline String String
   deriving (Show)
 
-isTruthy :: String -> Bool
-isTruthy raw =
-  let lower = map toLower raw
-  in lower == "1" || lower == "true" || lower == "yes" || lower == "on"
-
 inlineSource :: String -> Source
 inlineSource = SourceInline "<inline>"
 
@@ -1651,7 +1646,21 @@ duplicateBindingShader =
 
 checkGoldenSpirv :: IO ()
 checkGoldenSpirv = do
-  update <- fmap (maybe False isTruthy) (lookupEnv "SPIRDO_UPDATE_GOLDEN")
+  configuredUpdate <- lookupEnv "SPIRDO_UPDATE_GOLDEN"
+  update <-
+    case configuredUpdate of
+      Nothing -> pure False
+      Just rawValue ->
+        case map toLower rawValue of
+          "1" -> pure True
+          "true" -> pure True
+          "yes" -> pure True
+          "on" -> pure True
+          "0" -> pure False
+          "false" -> pure False
+          "no" -> pure False
+          "off" -> pure False
+          _ -> fail ("SPIRDO_UPDATE_GOLDEN must be a boolean, got " <> show rawValue)
   let dir = "test" </> "golden"
   let fixtures =
         [ ("compute-basic", goldenComputeShader)
