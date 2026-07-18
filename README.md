@@ -13,6 +13,10 @@ The public modules are:
   full reflection.
 - `Spirdo.Wesl.Uniform`: layout-aware host values and packing.
 
+Compact runtime binding reflection includes storage-texture dimension, format,
+and access metadata so renderer integrations can validate native image layouts
+without importing the advanced reflection API.
+
 ## Status and boundaries
 
 The implemented subset includes modules, functions, control flow, composite
@@ -66,8 +70,8 @@ The optional examples require SDL3 and the native SDL3 image, TTF, and mixer
 libraries used by `slop`; the
 [examples CI job](https://github.com/mewhhaha/spirdo/blob/main/.github/workflows/parity-tests.yml)
 shows the Ubuntu setup. `just demo-spv` writes the gallery's SPIR-V outputs for
-inspection. The examples project selects GHC 9.12.2 because the pinned Slop
-revision currently requires `base-4.21`.
+inspection. The examples project selects GHC 9.14.1 and scopes `allow-newer`
+to the pinned Slop revision's stale `base` bound.
 
 `just game` runs Crystal Run, a small rasterized 3D example whose vertex and
 fragment shaders are compiled by Spirdo. Move the ship with WASD or the arrow
@@ -117,7 +121,12 @@ triangleSource =
 
 `compileWithDiagnostics` returns a bundle plus non-fatal diagnostics. Runtime
 `[Option]` controls entries, overrides, sampler mode, features, SPIR-V version,
-and timing. It intentionally has no cache constructors or cache policy.
+target environment, OpenGL pipeline-specific binding remaps, and timing. It
+intentionally has no cache constructors or cache policy.
+
+The OpenGL target supports uniform buffers, combined sampled textures, and
+storage images. Storage-buffer bindings remain Vulkan-only and are rejected for
+OpenGL until their distinct `BufferBlock` lowering is implemented.
 
 ## Files, packages, and imports
 

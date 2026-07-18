@@ -20,6 +20,12 @@
 
 ### Added
 
+- An explicit OpenGL SPIR-V 1.0 target omits Vulkan descriptor-set decorations,
+  maps vertex built-ins to OpenGL semantics, and accepts pipeline-specific
+  resource-binding remaps. Shader bundles also expose base-compatible SPIR-V
+  words for native graphics APIs.
+- Public half-float conversion functions expose the existing IEEE 754 binary16
+  representation for image and uniform boundaries.
 - Crystal Run is a small rasterized 3D game example with procedural meshes,
   Spirdo-compiled vertex and fragment shaders, pure game-state tests, and an
   Xvfb/Lavapipe screenshot harness for headless rendering checks.
@@ -28,6 +34,8 @@
 - Runtime `ShaderBundle` accessors expose stage, bindings, vertex attributes,
   sampler mode, overrides, and compute workgroup size without requiring full
   Reflection.
+- Runtime binding reflection preserves storage-texture format and access in
+  compact `StorageTextureLayout` metadata.
 - `BindingSlotCount { bscGroup :: Word32, bscSlots :: Word64 }` represents
   sparse binding spans independently per descriptor group and covers the full
   `Word32` binding range without overflow.

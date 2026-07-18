@@ -55,7 +55,7 @@ weslCacheSchema = "spirdo.wesl.cache/4"
 -- generated Paths_spirdo module: this code runs while the package is linked
 -- into Template Haskell, where that generated symbol is not always available.
 weslCacheAbiRevision :: String
-weslCacheAbiRevision = "9"
+weslCacheAbiRevision = "10"
 
 weslCompilerIdentity :: String
 weslCompilerIdentity = "spirdo/wesl-cache-abi/" <> weslCacheAbiRevision
@@ -104,6 +104,8 @@ cacheInputLines opts bodyLines =
   [ "schema=" <> weslCacheSchema
   , "compiler=" <> weslCompilerIdentity
   , "v=" <> show (opts.spirvVersion)
+  , "target=" <> show opts.targetEnvironment
+  , "openGlBindingRemaps=" <> show opts.openGlBindingRemaps
   , "features=" <> show (opts.enabledFeatures)
   , "overrides=" <> show opts.overrideValues
   , "spec=" <> show opts.overrideSpecMode
@@ -435,7 +437,7 @@ validShaderInterface opts iface =
     && all (validBinding opts.samplerBindingMode) iface.siBindings
     && all (validOverride opts.overrideSpecMode) iface.siOverrides
     && maybe False validStageIO iface.siStageIO
-    && iface.siPushConstants == Nothing
+    && maybe True validImmediateLayout iface.siPushConstants
     && withinReflectionLayoutNodeLimit iface
     && consistentNamedStructLayouts iface
 
@@ -640,6 +642,13 @@ validStorageBindingLayout :: TypeLayout -> Bool
 validStorageBindingLayout layout =
   isHostShareableLayout layout
     && validStorageRuntimeArrayLayout layout
+
+validImmediateLayout :: TypeLayout -> Bool
+validImmediateLayout layout =
+  validTypeLayout 0 layout
+    && isHostShareableLayout layout
+    && not (containsAtomicLayout layout)
+    && not (containsRuntimeArray layout)
 
 validStorageRuntimeArrayLayout :: TypeLayout -> Bool
 validStorageRuntimeArrayLayout layout =

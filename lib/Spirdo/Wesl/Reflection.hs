@@ -54,6 +54,7 @@ module Spirdo.Wesl.Reflection
   , VertexFormat(..)
   , VertexAttribute(..)
   , pushConstantLayout
+  , layoutSize
   , ShaderInterface(..)
   , OverrideInfo(..)
   , BindingInfo(..)
@@ -65,6 +66,8 @@ module Spirdo.Wesl.Reflection
   , renderCompileErrorWithSource
   , Source(..)
   , Option(..)
+  , SpirvTargetEnvironment(..)
+  , OpenGlBindingRemap(..)
   , CompileOptions
   , SamplerBindingMode(..)
   , OverrideSpecMode(..)
@@ -75,6 +78,7 @@ module Spirdo.Wesl.Reflection
   , defaultOptions
   , applyOptions
   , withSpirvVersion
+  , withTargetEnvironment
   , withFeatures
   , withOverrides
   , withOverrideSpecMode

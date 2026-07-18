@@ -13,10 +13,22 @@ import Data.Proxy (Proxy(..))
 import Unsafe.Coerce (unsafeCoerce)
 
 import Spirdo.Wesl
-  ( OverrideLayout(..)
+  ( BindingLayout(..)
+  , Option(..)
+  , OverrideLayout(..)
+  , OverrideType(..)
+  , OverrideValue(..)
+  , StorageAccess(..)
+  , StorageFormat(..)
+  , StorageTextureLayout(..)
+  , SpirvTargetEnvironment(..)
   , compile
+  , shaderBindings
+  , shaderImmediateByteLength
   , shaderOverrides
+  , overrideValueFromNumber
   , shaderStage
+  , shaderSpirvWords
   , shaderWorkgroupSize
   , sourceNamed
   )
@@ -49,11 +61,52 @@ import Spirdo.Wesl.Reflection
 checks :: [(String, IO ())]
 checks =
   [ ("public-api-source-named", checkSourceNamed)
+  , ("public-api-spirv-words", checkSpirvWords)
+  , ("public-api-storage-texture-layout", checkStorageTextureLayout)
   , ("public-api-entry-point", checkWithEntryPoint)
   , ("public-api-defaultless-workgroup-override", checkDefaultlessWorkgroupOverride)
+  , ("public-api-numeric-override-conversion", checkNumericOverrideConversion)
   , ("public-api-unchecked-storable", checkUncheckedStorablePacking)
   , ("public-api-combined-input-boundary", checkCombinedInputBoundary)
+  , ("public-api-immediate-layout", checkImmediateLayout)
   ]
+
+checkImmediateLayout :: IO ()
+checkImmediateLayout = do
+  vulkanResult <- compile [] (sourceNamed "immediate-vulkan.wesl" immediateSource)
+  openGlResult <-
+    compile
+      [OptTargetEnvironment TargetOpenGl]
+      (sourceNamed "immediate-open-gl.wesl" immediateSource)
+  case (vulkanResult, openGlResult) of
+    (Right vulkanShader, Right openGlShader) ->
+      unless
+        ( shaderImmediateByteLength vulkanShader == Just 8
+            && shaderImmediateByteLength openGlShader == Just 8
+        ) $
+        fail
+          ( "immediate reflection: expected eight bytes, got "
+              <> show
+                ( shaderImmediateByteLength vulkanShader
+                , shaderImmediateByteLength openGlShader
+                )
+          )
+    (Left err, _) -> fail ("Vulkan immediate compilation: " <> show err)
+    (_, Left err) -> fail ("OpenGL immediate compilation: " <> show err)
+
+immediateSource :: String
+immediateSource =
+  unlines
+    [ "struct Constants {"
+    , "  ping: u32,"
+    , "  rightmost_slot: u32,"
+    , "}"
+    , "var<immediate> constants: Constants;"
+    , "@compute @workgroup_size(1)"
+    , "fn main() {"
+    , "  let selected = constants.ping + constants.rightmost_slot;"
+    , "}"
+    ]
 
 checkSourceNamed :: IO ()
 checkSourceNamed = do
@@ -63,6 +116,33 @@ checkSourceNamed = do
     Right shader ->
       unless (shaderStage shader == ShaderStageCompute) $
         fail "sourceNamed: expected compute shader"
+
+checkSpirvWords :: IO ()
+checkSpirvWords = do
+  result <- compile [] (sourceNamed "spirv-words.wesl" computeSource)
+  case result of
+    Left err -> fail ("shaderSpirvWords: " <> show err)
+    Right shader ->
+      case shaderSpirvWords shader of
+        0x07230203 : _ -> pure ()
+        spirvWords -> fail ("shaderSpirvWords: invalid SPIR-V header " <> show (take 1 spirvWords))
+
+checkStorageTextureLayout :: IO ()
+checkStorageTextureLayout = do
+  result <- compile [] (sourceNamed "storage-texture-layout.wesl" storageTextureSource)
+  case result of
+    Left err -> fail ("storage texture reflection: " <> show err)
+    Right shader ->
+      unless
+        ( map (\binding -> (binding.blName, binding.blStorageTexture)) (shaderBindings shader)
+            == [ ("read_texture", Just (StorageTextureLayout FormatR32Float StorageRead))
+               , ("write_texture", Just (StorageTextureLayout FormatRgba8Unorm StorageWrite))
+               , ("array_texture", Just (StorageTextureLayout FormatRg32Uint StorageReadWrite))
+               , ("volume_texture", Just (StorageTextureLayout FormatRgba16Float StorageRead))
+               , ("uniform_value", Nothing)
+               ]
+        ) $
+        fail ("storage texture reflection: unexpected layouts " <> show (shaderBindings shader))
 
 checkWithEntryPoint :: IO ()
 checkWithEntryPoint =
@@ -89,7 +169,7 @@ checkDefaultlessWorkgroupOverride = do
         fail "defaultless workgroup runtime compile: expected compute stage"
       unless (shaderWorkgroupSize shader == Nothing) $
         fail ("defaultless workgroup runtime compile: expected no known workgroup default, got " <> show (shaderWorkgroupSize shader))
-      unless (shaderOverrides shader == [OverrideLayout "x" (Just 7)]) $
+      unless (shaderOverrides shader == [OverrideLayout "x" (Just 7) OverrideU32]) $
         fail ("defaultless workgroup runtime compile: unexpected override reflection " <> show (shaderOverrides shader))
 
   let shader = $(spirv defaultCompileOptions imports (unlines
@@ -107,6 +187,17 @@ checkDefaultlessWorkgroupOverride = do
       | override.oiName == "x"
       , override.oiSpecId == Just 7 -> pure ()
     overrides -> fail ("defaultless workgroup reflection: expected SpecId 7, got " <> show overrides)
+
+checkNumericOverrideConversion :: IO ()
+checkNumericOverrideConversion = do
+  unless (overrideValueFromNumber (OverrideLayout "count" Nothing OverrideU32) 7 == Right (OVU32 7)) $
+    fail "overrideValueFromNumber: expected an exact u32 conversion"
+  case overrideValueFromNumber (OverrideLayout "count" Nothing OverrideU32) 7.5 of
+    Left message | "requires an integer" `isInfixOf` message -> pure ()
+    outcome -> fail ("overrideValueFromNumber: expected fractional u32 rejection, got " <> show outcome)
+  case overrideValueFromNumber (OverrideLayout "enabled" Nothing OverrideBool) 2 of
+    Left message | "requires 0 or 1" `isInfixOf` message -> pure ()
+    outcome -> fail ("overrideValueFromNumber: expected boolean rejection, got " <> show outcome)
 
 defaultlessWorkgroupSource :: String
 defaultlessWorkgroupSource = unlines
@@ -168,5 +259,17 @@ computeSource :: String
 computeSource =
   unlines
     [ "@compute @workgroup_size(1)"
+    , "fn main() {}"
+    ]
+
+storageTextureSource :: String
+storageTextureSource =
+  unlines
+    [ "@group(0) @binding(0) var read_texture: texture_storage_1d<r32float, read>;"
+    , "@group(0) @binding(1) var write_texture: texture_storage_2d<rgba8unorm, write>;"
+    , "@group(0) @binding(2) var array_texture: texture_storage_2d_array<rg32uint, read_write>;"
+    , "@group(0) @binding(3) var volume_texture: texture_storage_3d<rgba16float, read>;"
+    , "@group(0) @binding(4) var<uniform> uniform_value: f32;"
+    , "@compute @workgroup_size(1)"
     , "fn main() {}"
     ]

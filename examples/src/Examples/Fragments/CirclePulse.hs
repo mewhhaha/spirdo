@@ -14,7 +14,7 @@ struct Params {
   color: vec4<f32>;
 };
 
-@group(3) @binding(0)
+@group(0) @binding(0)
 var<uniform> params: Params;
 
 fn palette(t: f32) -> vec3<f32> {

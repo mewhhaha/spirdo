@@ -13,7 +13,7 @@ author:             mewhhaha
 maintainer:         kopatheonlyone@hotmail.com
 category:           Graphics
 build-type:         Simple
-tested-with:         GHC ==9.12.2
+tested-with:         GHC ==9.14.1
 
 common warnings
     ghc-options: -Wall

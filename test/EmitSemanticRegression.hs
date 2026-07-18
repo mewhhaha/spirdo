@@ -40,6 +40,8 @@ checks =
   , ("nested uniform layout overflow is rejected", checkNestedUniformLayoutOverflow)
   , ("supported SPIR-V version endpoints emit", checkSupportedSpirvVersions)
   , ("unsupported SPIR-V versions are rejected", checkUnsupportedSpirvVersions)
+  , ("OpenGL target emits OpenGL SPIR-V decorations", checkOpenGlTargetDecorations)
+  , ("OpenGL resource bindings respect native namespaces", checkOpenGlBindingValidation)
   , ("structured scopes restore outer bindings", checkStructuredScopeBindings)
   , ("continuing break if emits the loop back-edge branch", checkContinuingBreakIf)
   , ("override workgroup size uses OpExecutionModeId", checkWorkgroupSizeExecutionMode)
@@ -366,6 +368,94 @@ checkUnsupportedSpirvVersions =
       ["unsupported SPIR-V version word " <> show version, "1.0 through 1.6"]
       singleEntrySource
 
+checkOpenGlTargetDecorations :: IO ()
+checkOpenGlTargetDecorations = do
+  bytes <-
+    compileBytes
+      [ Wesl.OptTargetEnvironment Wesl.TargetOpenGl
+      , Wesl.OptOpenGlBindingRemaps [Wesl.OpenGlBindingRemap 0 3 7]
+      ]
+      openGlVertexSource
+  unless (word32At bytes 4 == 0x00010000) $
+    fail ("OpenGL target emitted SPIR-V version word " <> show (word32At bytes 4))
+  instructions <- decodeSpirv bytes
+  when (any (hasDecoration 34) instructions) $
+    fail "OpenGL target emitted a DescriptorSet decoration"
+  unless (any (hasDecorationValue 33 7) instructions) $
+    fail "OpenGL target omitted the remapped resource Binding decoration"
+  unless (any (hasDecorationValue 11 5) instructions) $
+    fail "OpenGL target omitted the VertexId built-in"
+  unless (any (hasDecorationValue 11 6) instructions) $
+    fail "OpenGL target omitted the InstanceId built-in"
+  when (any (hasDecorationValue 11 42) instructions || any (hasDecorationValue 11 43) instructions) $
+    fail "OpenGL target emitted Vulkan vertex built-ins"
+  validateSpirvWithOptions "opengl-target" ["--target-env", "opengl4.5"] bytes
+  vulkanBytes <- compileBytes [] openGlVertexSource
+  vulkanInstructions <- decodeSpirv vulkanBytes
+  unless (any (hasDecorationValue 34 0) vulkanInstructions) $
+    fail "default Vulkan target omitted the DescriptorSet decoration"
+  unless (any (hasDecorationValue 11 42) vulkanInstructions && any (hasDecorationValue 11 43) vulkanInstructions) $
+    fail "default Vulkan target omitted Vulkan vertex built-ins"
+  expectCompileErrorWith
+    [ Wesl.OptTargetEnvironment Wesl.TargetOpenGl
+    , Wesl.OptSpirvVersion 0x00010100
+    ]
+    ["OpenGL requires SPIR-V 1.0", "65792"]
+    openGlVertexSource
+  expectCompileErrorWith
+    [ Wesl.OptTargetEnvironment Wesl.TargetOpenGl
+    , Wesl.OptOpenGlBindingRemaps
+        [ Wesl.OpenGlBindingRemap 0 3 1
+        , Wesl.OpenGlBindingRemap 0 3 2
+        ]
+    ]
+    ["duplicate OpenGL binding remap", "group 0 binding 3"]
+    openGlVertexSource
+  where
+    hasDecoration decoration (71, _target : actual : _) = actual == decoration
+    hasDecoration _ _ = False
+
+    hasDecorationValue decoration value (71, _target : actual : actualValue : _) =
+      actual == decoration && actualValue == value
+    hasDecorationValue _ _ _ = False
+
+checkOpenGlBindingValidation :: IO ()
+checkOpenGlBindingValidation = do
+  expectCompileErrorWith
+    [Wesl.OptTargetEnvironment Wesl.TargetOpenGl]
+    ["OpenGL uniform-buffer binding 0 maps both", "first", "second"]
+    collidingOpenGlUniformsSource
+  expectCompileErrorWith
+    [ Wesl.OptTargetEnvironment Wesl.TargetOpenGl
+    , Wesl.OptOpenGlBindingRemaps
+        [ Wesl.OpenGlBindingRemap 0 0 7
+        , Wesl.OpenGlBindingRemap 0 1 7
+        ]
+    ]
+    ["OpenGL uniform-buffer binding 7 maps both", "first", "second"]
+    remappedOpenGlUniformsSource
+  crossNamespaceBytes <-
+    compileBytes
+      [Wesl.OptTargetEnvironment Wesl.TargetOpenGl]
+      openGlCrossNamespaceSource
+  validateSpirvWithOptions "opengl-binding-namespaces" ["--target-env", "opengl4.5"] crossNamespaceBytes
+  expectCompileErrorWith
+    [ Wesl.OptTargetEnvironment Wesl.TargetOpenGl
+    , Wesl.OptSamplerMode Wesl.SamplerSeparate
+    ]
+    ["OpenGL target requires combined sampler bindings"]
+    openGlVertexSource
+  expectCompileErrorWith
+    [Wesl.OptTargetEnvironment Wesl.TargetOpenGl]
+    ["OpenGL storage-buffer binding values", "is not supported"]
+    openGlStorageBufferSource
+  expectCompileErrorWith
+    [ Wesl.OptTargetEnvironment Wesl.TargetOpenGl
+    , Wesl.OptOpenGlBindingRemaps [Wesl.OpenGlBindingRemap 9 9 1]
+    ]
+    ["OpenGL binding remap does not match a resource", "group 9 binding 9"]
+    openGlVertexSource
+
 checkStructuredScopeBindings :: IO ()
 checkStructuredScopeBindings = do
   bytes <- compileBytes [] structuredScopeSource
@@ -483,7 +573,7 @@ checkStrictCompositeOverrideIds = do
     fail "strict composite override SPIR-V retained SpecId decorations"
   validateSpirv "strict-composite-overrides" bytes
   where
-    hasNoSpecId (Wesl.OverrideLayout _ Nothing) = True
+    hasNoSpecId (Wesl.OverrideLayout _ Nothing _) = True
     hasNoSpecId _ = False
     isSpecIdDecoration (71, [_target, 1, _specId]) = True
     isSpecIdDecoration _ = False
@@ -899,6 +989,53 @@ runtimeArrayLengthGlobalAliasSource = unlines
 
 singleEntrySource :: String
 singleEntrySource = "@compute @workgroup_size(1) fn main() {}"
+
+openGlVertexSource :: String
+openGlVertexSource = unlines
+  [ "struct Params { offset: vec2f, }"
+  , "@group(0) @binding(3) var<uniform> params: Params;"
+  , "@vertex"
+  , "fn main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> @builtin(position) vec4f {"
+  , "  let x = f32(vertex + instance) + params.offset.x;"
+  , "  return vec4f(x, params.offset.y, 0.0, 1.0);"
+  , "}"
+  ]
+
+collidingOpenGlUniformsSource :: String
+collidingOpenGlUniformsSource = unlines
+  [ "@group(0) @binding(0) var<uniform> first: u32;"
+  , "@group(1) @binding(0) var<uniform> second: u32;"
+  , "@compute @workgroup_size(1) fn main() { let value = first + second; }"
+  ]
+
+remappedOpenGlUniformsSource :: String
+remappedOpenGlUniformsSource = unlines
+  [ "@group(0) @binding(0) var<uniform> first: u32;"
+  , "@group(0) @binding(1) var<uniform> second: u32;"
+  , "@compute @workgroup_size(1) fn main() { let value = first + second; }"
+  ]
+
+openGlCrossNamespaceSource :: String
+openGlCrossNamespaceSource = unlines
+  [ "struct Params { color: vec4f, }"
+  , "@group(0) @binding(0) var<uniform> params: Params;"
+  , "@group(1) @binding(0) var sampled_texture: texture_2d<f32>;"
+  , "@group(1) @binding(1) var sampled_sampler: sampler;"
+  , "@group(2) @binding(0) var<storage> storage_texture: texture_storage_2d<rgba8unorm, write>;"
+  , "@fragment"
+  , "fn main(@builtin(position) position: vec4f) -> @location(0) vec4f {"
+  , "  let color = textureSample(sampled_texture, sampled_sampler, position.xy);"
+  , "  textureStore(storage_texture, vec2i(0), params.color);"
+  , "  return color;"
+  , "}"
+  ]
+
+openGlStorageBufferSource :: String
+openGlStorageBufferSource = unlines
+  [ "struct Values { value: u32, }"
+  , "@group(0) @binding(0) var<storage, read> values: Values;"
+  , "@compute @workgroup_size(1) fn main() { let value = values.value; }"
+  ]
 
 negativeI32ConstantSource :: String
 negativeI32ConstantSource = unlines

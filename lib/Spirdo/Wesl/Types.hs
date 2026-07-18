@@ -15,6 +15,9 @@ module Spirdo.Wesl.Types
   , CompileError(..)
   , Diagnostic(..)
   , CompileOptions(..)
+  , SpirvTargetEnvironment(..)
+  , OpenGlBindingRemap(..)
+  , openGlImmediateBinding
   , SamplerBindingMode(..)
   , OverrideSpecMode(..)
   , OverrideValue(..)
@@ -37,6 +40,7 @@ module Spirdo.Wesl.Types
   , defaultOptions
   , applyOptions
   , withSpirvVersion
+  , withTargetEnvironment
   , withFeatures
   , withOverrides
   , withOverrideSpecMode
@@ -110,6 +114,8 @@ data Diagnostic = Diagnostic
 -- | Compilation options for WESL → SPIR-V.
 data CompileOptions = CompileOptions
   { spirvVersion :: Word32
+  , targetEnvironment :: SpirvTargetEnvironment
+  , openGlBindingRemaps :: [OpenGlBindingRemap]
   , enabledFeatures :: [String]
   , overrideValues :: [(String, OverrideValue)]
   , overrideSpecMode :: OverrideSpecMode
@@ -120,6 +126,24 @@ data CompileOptions = CompileOptions
   , cacheVerbose :: Bool
   , timingVerbose :: Bool
   }
+
+-- | Runtime environment whose SPIR-V rules the compiler follows.
+data SpirvTargetEnvironment
+  = TargetVulkan
+  | TargetOpenGl
+  deriving (Eq, Show, Read)
+
+-- | Pipeline-specific OpenGL binding assigned to one logical bind-group slot.
+data OpenGlBindingRemap = OpenGlBindingRemap
+  { openGlBindingRemapGroup :: !Word32
+  , openGlBindingRemapBinding :: !Word32
+  , openGlBindingRemapNativeBinding :: !Word32
+  }
+  deriving (Eq, Show, Read)
+
+-- | Uniform-buffer binding reserved for OpenGL lowering of immediate values.
+openGlImmediateBinding :: Word32
+openGlImmediateBinding = 31
 
 -- | Override specialization mode.
 data OverrideSpecMode
@@ -234,6 +258,8 @@ importsNames = go
 -- | Compile option overrides for ergonomic APIs.
 data Option
   = OptSpirvVersion Word32
+  | OptTargetEnvironment SpirvTargetEnvironment
+  | OptOpenGlBindingRemaps [OpenGlBindingRemap]
   | OptEnableFeature String
   | OptOverrides [(String, OverrideValue)]
   | OptOverrideSpecMode OverrideSpecMode
@@ -242,11 +268,13 @@ data Option
   | OptTimingVerbose Bool
   deriving (Eq, Show, Read)
 
--- | Default options (SPIR-V 1.6, combined samplers, caching enabled).
+-- | Default options (Vulkan SPIR-V 1.6, combined samplers, caching enabled).
 defaultCompileOptions :: CompileOptions
 defaultCompileOptions =
   CompileOptions
     0x00010600
+    TargetVulkan
+    []
     []
     []
     SpecStrict
@@ -268,6 +296,8 @@ applyOptions opts0 base = foldl applyOne base opts0
     applyOne opts opt =
       case opt of
         OptSpirvVersion v -> opts { spirvVersion = v }
+        OptTargetEnvironment target -> withTargetEnvironment target opts
+        OptOpenGlBindingRemaps remaps -> opts { openGlBindingRemaps = remaps }
         OptEnableFeature feat ->
           let feats = nub (feat : opts.enabledFeatures)
           in opts { enabledFeatures = feats }
@@ -280,6 +310,16 @@ applyOptions opts0 base = foldl applyOne base opts0
 -- | Set the SPIR-V version (default is 1.6).
 withSpirvVersion :: Word32 -> CompileOptions -> CompileOptions
 withSpirvVersion v opts = opts { spirvVersion = v }
+
+-- | Select the SPIR-V runtime environment. OpenGL consumes SPIR-V 1.0.
+withTargetEnvironment :: SpirvTargetEnvironment -> CompileOptions -> CompileOptions
+withTargetEnvironment target opts =
+  opts
+    { targetEnvironment = target
+    , spirvVersion = case target of
+        TargetVulkan -> opts.spirvVersion
+        TargetOpenGl -> 0x00010000
+    }
 
 -- | Enable WGSL/WESL feature toggles (e.g. translate-time @\@if@ flags).
 withFeatures :: [String] -> CompileOptions -> CompileOptions

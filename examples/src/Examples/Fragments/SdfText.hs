@@ -14,7 +14,7 @@ time_res: vec4<f32>;
 color: vec4<f32>;
 };
 
-@group(3) @binding(0)
+@group(0) @binding(0)
 var<uniform> params: Params;
 
 fn sdBox(p: vec2<f32>, b: vec2<f32>) -> f32 {

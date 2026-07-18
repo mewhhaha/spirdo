@@ -56,10 +56,164 @@ buildInterface opts modAst = do
   overrides <- buildOverrideInfo opts.overrideSpecMode structLayouts (modAst.modOverrides)
   entry <- selectEntryPoint opts modAst.modEntries
   stageInfo <- buildStageIO modAst structLayouts structEnv entry
+  immediateLayout <- buildImmediateLayout structLayouts (modAst.modGlobals)
+  validateOpenGlBindings opts immediateLayout bindings
   pure
     ( publicShaderInterface
-        (ShaderInterface bindings overrides stageInfo Nothing opts.samplerBindingMode)
+        (ShaderInterface bindings overrides stageInfo immediateLayout opts.samplerBindingMode)
     )
+
+data OpenGlBindingNamespace
+  = OpenGlUniformBuffer
+  | OpenGlTextureUnit
+  | OpenGlImageUnit
+  deriving (Eq, Ord)
+
+validateOpenGlBindings
+  :: CompileOptions
+  -> Maybe TypeLayout
+  -> [BindingInfo]
+  -> Either CompileError ()
+validateOpenGlBindings options immediateLayout bindings
+  | options.targetEnvironment /= TargetOpenGl =
+      unless (null options.openGlBindingRemaps) $
+        Left (CompileError "OpenGL binding remaps require the OpenGL target environment" Nothing Nothing)
+  | options.samplerBindingMode == SamplerSeparate =
+      Left (CompileError "OpenGL target requires combined sampler bindings" Nothing Nothing)
+  | Just binding <- find (isStorageBufferKind . (.biKind)) bindings =
+      Left
+        ( CompileError
+            ("OpenGL storage-buffer binding " <> bindingLocation binding <> " is not supported")
+            Nothing
+            Nothing
+        )
+  | Just (group, binding) <- duplicateOpenGlBindingRemap options.openGlBindingRemaps =
+      Left
+        ( CompileError
+            ("duplicate OpenGL binding remap for group " <> show group <> " binding " <> show binding)
+            Nothing
+            Nothing
+        )
+  | Just remap <- find (not . remapMatchesBinding) options.openGlBindingRemaps =
+      Left
+        ( CompileError
+            ( "OpenGL binding remap does not match a resource at group "
+                <> show remap.openGlBindingRemapGroup
+                <> " binding "
+                <> show remap.openGlBindingRemapBinding
+            )
+            Nothing
+            Nothing
+        )
+  | Just binding <- conflictingImmediateBinding =
+      Left
+        ( CompileError
+            ( "OpenGL immediate binding "
+                <> show openGlImmediateBinding
+                <> " conflicts with uniform "
+                <> binding.biName
+                <> " at group "
+                <> show binding.biGroup
+                <> " binding "
+                <> show binding.biBinding
+            )
+            Nothing
+            Nothing
+        )
+  | otherwise = do
+      _ <- foldM insertBinding Map.empty bindings
+      Right ()
+  where
+    conflictingImmediateBinding =
+      case immediateLayout of
+        Nothing -> Nothing
+        Just _ ->
+          find
+            ( \binding ->
+                openGlBindingNamespace binding.biKind == OpenGlUniformBuffer
+                  && openGlNativeBindingFor options.openGlBindingRemaps binding == openGlImmediateBinding
+            )
+            bindings
+
+    remapMatchesBinding remap =
+      any
+        ( \binding ->
+            binding.biGroup == remap.openGlBindingRemapGroup
+              && binding.biBinding == remap.openGlBindingRemapBinding
+        )
+        bindings
+
+    insertBinding known binding =
+      let nativeBinding = openGlNativeBindingFor options.openGlBindingRemaps binding
+          bindingKey = (openGlBindingNamespace binding.biKind, nativeBinding)
+      in case Map.lookup bindingKey known of
+          Nothing -> Right (Map.insert bindingKey binding known)
+          Just existing ->
+            Left
+              ( CompileError
+                  ( "OpenGL "
+                      <> openGlBindingNamespaceName (fst bindingKey)
+                      <> " binding "
+                      <> show nativeBinding
+                      <> " maps both "
+                      <> bindingLocation existing
+                      <> " and "
+                      <> bindingLocation binding
+                  )
+                  Nothing
+                  Nothing
+              )
+
+    bindingLocation binding =
+      binding.biName
+        <> " (group "
+        <> show binding.biGroup
+        <> " binding "
+        <> show binding.biBinding
+        <> ")"
+
+openGlBindingNamespace :: BindingKind -> OpenGlBindingNamespace
+openGlBindingNamespace kind
+  | isUniformKind kind = OpenGlUniformBuffer
+  | isStorageTextureKind kind = OpenGlImageUnit
+  | otherwise = OpenGlTextureUnit
+
+openGlBindingNamespaceName :: OpenGlBindingNamespace -> String
+openGlBindingNamespaceName namespace =
+  case namespace of
+    OpenGlUniformBuffer -> "uniform-buffer"
+    OpenGlTextureUnit -> "texture-unit"
+    OpenGlImageUnit -> "image-unit"
+
+buildImmediateLayout
+  :: StructLayoutCache
+  -> [GlobalVarDecl]
+  -> Either CompileError (Maybe TypeLayout)
+buildImmediateLayout layoutCache globals =
+  case [decl | decl <- globals, decl.gvSpace == "immediate"] of
+    [] -> Right Nothing
+    [decl] -> do
+      layout <- resolveTypeLayoutWithCache layoutCache decl.gvType
+      unless (isHostShareableLayout layout) $
+        Left (CompileError "immediate variables must use host-shareable types" Nothing Nothing)
+      when (containsPointer layout) $
+        Left (CompileError "immediate variables cannot contain pointer types" Nothing Nothing)
+      when (containsResource layout) $
+        Left (CompileError "immediate variables cannot contain resource types" Nothing Nothing)
+      when (containsRuntimeArray layout) $
+        Left (CompileError "immediate variables cannot contain runtime arrays" Nothing Nothing)
+      when (containsAtomic layout) $
+        Left (CompileError "immediate variables cannot contain atomic values" Nothing Nothing)
+      Right (Just layout)
+    declarations ->
+      Left
+        ( CompileError
+            ( "shader declares multiple immediate variables: "
+                <> show (map (textToString . (.gvName)) declarations)
+            )
+            Nothing
+            Nothing
+        )
 
 publicShaderInterface :: ShaderInterface -> ShaderInterface
 publicShaderInterface (ShaderInterface bindings overrides stageInfo pushConstants samplerMode) =
@@ -899,6 +1053,14 @@ checkedMatrixLayout context cols rows scalar = do
 
 emitSpirv :: CompileOptions -> ModuleAst -> ShaderInterface -> Either CompileError ByteString
 emitSpirv opts modAst _iface = do
+  when (opts.targetEnvironment == TargetOpenGl && opts.spirvVersion /= 0x00010000) $
+    Left
+      (CompileError
+        ( "OpenGL requires SPIR-V 1.0, got version word " <> show opts.spirvVersion
+        )
+        Nothing
+        Nothing
+      )
   unless (opts.spirvVersion `elem` supportedSpirvVersions) $
     Left
       (CompileError
@@ -931,6 +1093,8 @@ emitSpirv opts modAst _iface = do
   let ctx = buildModuleContext [] "" node
   let state0 =
         emptyGenState
+          opts.targetEnvironment
+          opts.openGlBindingRemaps
           opts.samplerBindingMode
           entry.epStage
           structLayouts
@@ -3063,6 +3227,9 @@ storageClassWorkgroup = 4
 storageClassPrivate :: Word32
 storageClassPrivate = 6
 
+storageClassPushConstant :: Word32
+storageClassPushConstant = 9
+
 decorationBlock :: Word32
 decorationBlock = 2
 
@@ -3332,6 +3499,8 @@ glslStd450FindUMsb = 75
 
 data GenState = GenState
   { gsNextId :: Word32
+  , gsTargetEnvironment :: SpirvTargetEnvironment
+  , gsOpenGlBindingRemaps :: [OpenGlBindingRemap]
   , gsStructLayouts :: [(Text, TypeLayout)]
   , gsStructIds :: [(Text, Word32)]
   , gsTypeCache :: Map.Map TypeKey Word32
@@ -3372,11 +3541,13 @@ data GenState = GenState
   , gsConstEvalStructIndex :: !StructIndex
   }
 
-emptyGenState :: SamplerBindingMode -> Stage -> [(Text, TypeLayout)] -> Map.Map Text TypeLayout -> [Text] -> ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> GenState
-emptyGenState samplerMode stage structLayouts samplerLayouts enabledFeatures constEvalContext constEvalIndex constEvalFunctionIndex constEvalStructIndex =
+emptyGenState :: SpirvTargetEnvironment -> [OpenGlBindingRemap] -> SamplerBindingMode -> Stage -> [(Text, TypeLayout)] -> Map.Map Text TypeLayout -> [Text] -> ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> GenState
+emptyGenState target bindingRemaps samplerMode stage structLayouts samplerLayouts enabledFeatures constEvalContext constEvalIndex constEvalFunctionIndex constEvalStructIndex =
   let (ids, nextId) = assignStructIds 1 structLayouts
   in GenState
       { gsNextId = nextId
+      , gsTargetEnvironment = target
+      , gsOpenGlBindingRemaps = bindingRemaps
       , gsStructLayouts = structLayouts
       , gsStructIds = ids
       , gsTypeCache = Map.empty
@@ -3727,8 +3898,10 @@ emitGlobals layoutCache structEnv samplerMode bindingDecls entry retLayout globa
                 in (pointerType, [], pointerState)
           (varId, st2) = freshId st1
           st3 = addGlobal (Instr opVariable [ptrTy, varId, storageClass]) st2
-          st4 = addDecoration (Instr opDecorate [varId, decorationDescriptorSet, bindInfo.biGroup]) st3
-          st5 = addDecoration (Instr opDecorate [varId, decorationBinding, bindInfo.biBinding]) st4
+          st4 = case st3.gsTargetEnvironment of
+            TargetVulkan -> addDecoration (Instr opDecorate [varId, decorationDescriptorSet, bindInfo.biGroup]) st3
+            TargetOpenGl -> st3
+          st5 = addDecoration (Instr opDecorate [varId, decorationBinding, openGlNativeBinding st4 bindInfo]) st4
           st6 = addName (Instr opName (varId : encodeString bindInfo.biName)) st5
           access = case bindInfo.biKind of
             BStorageReadWrite -> ReadWrite
@@ -3736,6 +3909,33 @@ emitGlobals layoutCache structEnv samplerMode bindingDecls entry retLayout globa
           info = VarInfo bindInfo.biType varId storageClass access path
           st7 = registerPointerView varId (PointerView (PointerGlobal (T.pack bindInfo.biName)) True storageClass Nothing) st6
       in (envAcc <> [(T.pack bindInfo.biName, info)], idAcc <> [varId], st7)
+
+openGlNativeBinding :: GenState -> BindingInfo -> Word32
+openGlNativeBinding st = openGlNativeBindingFor st.gsOpenGlBindingRemaps
+
+openGlNativeBindingFor :: [OpenGlBindingRemap] -> BindingInfo -> Word32
+openGlNativeBindingFor remaps bindInfo =
+  case find matchesBinding remaps of
+    Just remap -> remap.openGlBindingRemapNativeBinding
+    Nothing -> bindInfo.biBinding
+  where
+    matchesBinding remap =
+      remap.openGlBindingRemapGroup == bindInfo.biGroup
+        && remap.openGlBindingRemapBinding == bindInfo.biBinding
+
+duplicateOpenGlBindingRemap :: [OpenGlBindingRemap] -> Maybe (Word32, Word32)
+duplicateOpenGlBindingRemap remaps =
+  case duplicates logicalBinding remaps of
+    duplicate : _ -> Just duplicate
+    [] -> Nothing
+  where
+    logicalBinding remap = (remap.openGlBindingRemapGroup, remap.openGlBindingRemapBinding)
+
+    duplicates key values =
+      [ value
+      | (value, count) <- Map.toList (Map.fromListWith (+) [(key candidate, 1 :: Int) | candidate <- values])
+      , count > 1
+      ]
 
 emitBufferBindingPointer :: GenState -> BindingInfo -> Word32 -> (Word32, [Word32], GenState)
 emitBufferBindingPointer st bindInfo storageClass =
@@ -3766,31 +3966,69 @@ emitModuleGlobals layoutCache decls st0 = foldM emitOne ([], st0) decls
         Left (CompileError "global variables cannot contain resource types" Nothing Nothing)
       when (containsRuntimeArray layout) $
         Left (CompileError "runtime arrays are only supported in storage buffers" Nothing Nothing)
-      storageClass <- case decl.gvSpace of
-        "private" -> Right storageClassPrivate
-        "workgroup" -> Right storageClassWorkgroup
-        other -> Left (CompileError ("unsupported global address space: " <> textToString other) Nothing Nothing)
-      when (containsAtomic layout && storageClass /= storageClassWorkgroup) $
-        Left (CompileError "module-scope atomic types require the workgroup address space" Nothing Nothing)
-      (initId, st1) <- case decl.gvInit of
-        Nothing -> Right (Nothing, st)
-        Just expr -> do
-          when (storageClass == storageClassWorkgroup) $
-            Left (CompileError "workgroup variables cannot have initializers" Nothing Nothing)
-          (st3, val') <- emitConstExprAsLayout layout expr st
-          Right (Just (val'.valId), st3)
-      let (baseTy, st2) = emitTypeFromLayout st1 layout
-      let (ptrTy, st3) = emitPointerType st2 storageClass baseTy
-      let (varId, st4) = freshId st3
-      let operands =
-            case initId of
-              Nothing -> [ptrTy, varId, storageClass]
-              Just cid -> [ptrTy, varId, storageClass, cid]
-      let st5 = addGlobal (Instr opVariable operands) st4
-      let st6 = addName (Instr opName (varId : encodeString (textToString (decl.gvName)))) st5
-      let info = VarInfo layout varId storageClass ReadWrite []
-      let st7 = registerPointerView varId (PointerView (PointerGlobal decl.gvName) True storageClass Nothing) st6
-      Right (envAcc <> [(decl.gvName, info)], st7)
+      if decl.gvSpace == "immediate"
+        then emitImmediate envAcc st decl layout
+        else do
+          storageClass <- case decl.gvSpace of
+            "private" -> Right storageClassPrivate
+            "workgroup" -> Right storageClassWorkgroup
+            other -> Left (CompileError ("unsupported global address space: " <> textToString other) Nothing Nothing)
+          when (containsAtomic layout && storageClass /= storageClassWorkgroup) $
+            Left (CompileError "module-scope atomic types require the workgroup address space" Nothing Nothing)
+          (initId, st1) <- case decl.gvInit of
+            Nothing -> Right (Nothing, st)
+            Just expr -> do
+              when (storageClass == storageClassWorkgroup) $
+                Left (CompileError "workgroup variables cannot have initializers" Nothing Nothing)
+              (st3, val') <- emitConstExprAsLayout layout expr st
+              Right (Just (val'.valId), st3)
+          let (baseTy, st2) = emitTypeFromLayout st1 layout
+          let (ptrTy, st3) = emitPointerType st2 storageClass baseTy
+          let (varId, st4) = freshId st3
+          let operands =
+                case initId of
+                  Nothing -> [ptrTy, varId, storageClass]
+                  Just cid -> [ptrTy, varId, storageClass, cid]
+          let st5 = addGlobal (Instr opVariable operands) st4
+          let st6 = addName (Instr opName (varId : encodeString (textToString (decl.gvName)))) st5
+          let info = VarInfo layout varId storageClass ReadWrite []
+          let st7 = registerPointerView varId (PointerView (PointerGlobal decl.gvName) True storageClass Nothing) st6
+          Right (envAcc <> [(decl.gvName, info)], st7)
+
+    emitImmediate envAcc st decl layout = do
+      when (isJust decl.gvInit) $
+        Left (CompileError "immediate variables cannot have initializers" Nothing Nothing)
+      when (containsAtomic layout) $
+        Left (CompileError "immediate variables cannot contain atomic values" Nothing Nothing)
+      let storageClass =
+            case st.gsTargetEnvironment of
+              TargetVulkan -> storageClassPushConstant
+              TargetOpenGl -> storageClassUniform
+          (storeTypeId, st1) = emitTypeFromLayout st layout
+          (blockTypeId, st2) = freshId st1
+          st3 = addType (Instr opTypeStruct [blockTypeId, storeTypeId]) st2
+          st4 = addName (Instr opName (blockTypeId : encodeString "__spirdo_immediate_block")) st3
+          st5 = addName (Instr opMemberName (blockTypeId : 0 : encodeString "store")) st4
+          st6 = decorateStructMember blockTypeId 0 0 layout st5
+          st7 = addDecoration (Instr opDecorate [blockTypeId, decorationBlock]) st6
+          (pointerType, st8) = emitPointerType st7 storageClass blockTypeId
+          (variableId, st9) = freshId st8
+          st10 = addGlobal (Instr opVariable [pointerType, variableId, storageClass]) st9
+          st11 =
+            case st.gsTargetEnvironment of
+              TargetVulkan -> st10
+              TargetOpenGl ->
+                addDecoration
+                  (Instr opDecorate [variableId, decorationBinding, openGlImmediateBinding])
+                  st10
+          st12 = addName (Instr opName (variableId : encodeString (textToString decl.gvName))) st11
+          variable = VarInfo layout variableId storageClass ReadOnly [0]
+          st13 =
+            registerPointerView
+              variableId
+              (PointerView (PointerGlobal decl.gvName) True storageClass Nothing)
+              st12
+      Right (envAcc <> [(decl.gvName, variable)], st13)
 
 emitEntryInputs :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> GenState -> Either CompileError ([(Text, VarInfo)], [EntryParamInit], [Word32], GenState)
 emitEntryInputs layoutCache structEnv entry st0 =
@@ -3932,12 +4170,19 @@ emitInputVar stage name layout attrs deco st0 = do
   let (varId, st3) = freshId st2
   let st4 = addGlobal (Instr opVariable [ptrTy, varId, storageClassInput]) st3
   let st5a = case deco of
-        InputBuiltin bid -> addDecoration (Instr opDecorate [varId, decorationBuiltIn, bid]) st4
+        InputBuiltin bid -> addDecoration (Instr opDecorate [varId, decorationBuiltIn, targetInputBuiltin st4 bid]) st4
         InputLocation loc -> addDecoration (Instr opDecorate [varId, decorationLocation, loc]) st4
   st5 <- applyIOAttrDecorations stage False layout attrs deco varId st5a
   let st6 = addName (Instr opName (varId : encodeString (textToString name))) st5
   let info = VarInfo layout varId storageClassInput ReadOnly path
   pure (info, varId, st6)
+
+targetInputBuiltin :: GenState -> Word32 -> Word32
+targetInputBuiltin st builtin
+  | st.gsTargetEnvironment /= TargetOpenGl = builtin
+  | builtin == builtInVertexIndex = 5
+  | builtin == builtInInstanceIndex = 6
+  | otherwise = builtin
 
 emitStageOutput :: StructLayoutCache -> [(Text, StructDecl)] -> EntryPoint -> Maybe TypeLayout -> GenState -> Either CompileError ([OutputTarget], [Word32], GenState)
 emitStageOutput _ structEnv entry retLayout st0 =
