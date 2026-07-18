@@ -22,8 +22,6 @@ module Spirdo.Wesl.Types.Uniform
   , packUniformFrom
   , validateUniformStorableUnchecked
   , packUniformStorableUnchecked
-  , validateUniformStorable
-  , packUniformStorable
   ) where
 
 import Data.ByteString (ByteString)
@@ -345,16 +343,6 @@ packUniformStorableUnchecked layout value =
         fillBytes ptr 0 size
         poke ptr value
         Right <$> BS.packCStringLen (castPtr ptr, size)
-
--- | Legacy name for 'validateUniformStorableUnchecked'.
-{-# DEPRECATED validateUniformStorable "Use validateUniformStorableUnchecked; this check covers only size and alignment, not the complete shader ABI." #-}
-validateUniformStorable :: Storable a => TypeLayout -> a -> Either String ()
-validateUniformStorable = validateUniformStorableUnchecked
-
--- | Legacy name for 'packUniformStorableUnchecked'.
-{-# DEPRECATED packUniformStorable "Use packUniformStorableUnchecked; this function relies on an unchecked host ABI layout." #-}
-packUniformStorable :: Storable a => TypeLayout -> a -> IO (Either String ByteString)
-packUniformStorable = packUniformStorableUnchecked
 
 -- Public layout constructors must not permit unbounded allocation or traversal.
 maxPackingBytes :: Integer

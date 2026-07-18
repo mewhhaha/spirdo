@@ -116,13 +116,13 @@ host allocation and packing helpers reject them. They are permitted only as a
 direct storage type or final member of a storage-buffer struct, never in a
 uniform buffer.
 
-The old `validateUniformStorable` and `packUniformStorable` names are the only
-retained deprecations. They alias the intentionally explicit APIs below, which
-check size and alignment only—not offsets, padding, representation, byte
-order, or cross-platform `Storable` ABI compatibility:
+The old `validateUniformStorable` and `packUniformStorable` names were removed.
+Their intentionally explicit replacements check size and alignment only—not
+offsets, padding, representation, byte order, or cross-platform `Storable` ABI
+compatibility:
 
 ```hs
-validateUniformStorableUnchecked layout (Proxy @HostRecord)
+validateUniformStorableUnchecked layout hostRecord
 packUniformStorableUnchecked layout hostRecord
 ```
 

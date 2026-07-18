@@ -17,6 +17,8 @@
   deliberately has no cache controls.
 - Imported reflection and override keys now use stable source-qualified names;
   undocumented raw `__wesl__...` keys are no longer accepted.
+- Deprecated `validateUniformStorable` and `packUniformStorable` aliases were
+  removed; use their explicit `Unchecked` replacements.
 
 ### Added
 
@@ -93,13 +95,6 @@
 - The optional demo is a separately built GHC 9.12 package; its gallery includes
   a validated SDF Text variant and no longer carries an unusable texture-backed
   shader module.
-
-### Deprecated
-
-- `validateUniformStorable` remains a deprecated alias for
-  `validateUniformStorableUnchecked`.
-- `packUniformStorable` remains a deprecated alias for
-  `packUniformStorableUnchecked`.
 
 ## 0.1.0.0 -- 2026-01-25
 

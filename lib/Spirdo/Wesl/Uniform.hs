@@ -20,8 +20,6 @@ module Spirdo.Wesl.Uniform
   , packUniformFrom
   , validateUniformStorableUnchecked
   , packUniformStorableUnchecked
-  , validateUniformStorable
-  , packUniformStorable
   ) where
 
 import Spirdo.Wesl.Types.Uniform

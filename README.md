@@ -304,10 +304,9 @@ builder cannot typecheck through the normal API.
 
 Prefer `inputsFor` and `uniform`, or use `packUniformFrom` with a reflected
 `TypeLayout`. They pack `ToUniform` values according to WESL layout, including
-field offsets and padding. The old `validateUniformStorable` and
-`packUniformStorable` names remain deprecated aliases; their explicit
-`Unchecked` replacements check only size and alignment and cannot prove a host
-ABI's offsets, padding, representation, byte order, or portability.
+field offsets and padding. `validateUniformStorableUnchecked` and
+`packUniformStorableUnchecked` check only size and alignment and cannot prove a
+host ABI's offsets, padding, representation, byte order, or portability.
 
 Layout reflection follows WGSL's natural alignment and size rules: for example,
 a `vec3`'s natural size differs from its alignment. Runtime arrays reflect size

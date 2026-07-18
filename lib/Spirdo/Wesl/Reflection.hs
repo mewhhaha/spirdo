@@ -32,8 +32,6 @@ module Spirdo.Wesl.Reflection
   , uniform
   , packUniform
   , packUniformFrom
-  , validateUniformStorable
-  , packUniformStorable
   , validateUniformStorableUnchecked
   , packUniformStorableUnchecked
   , V2(..)
