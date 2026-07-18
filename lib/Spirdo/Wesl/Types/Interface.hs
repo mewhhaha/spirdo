@@ -22,7 +22,6 @@ module Spirdo.Wesl.Types.Interface
   , singleGroupBindingSlotCount
   , shaderStage
   , PreparedShader(..)
-  , SomePreparedShader(..)
   , prepareShader
   , preparedSpirv
   , preparedInterface
@@ -30,8 +29,6 @@ module Spirdo.Wesl.Types.Interface
   , preparedPlan
   , preparedVertexAttributes
   , preparedSource
-  , somePreparedSpirv
-  , somePreparedInterface
   , stageIO
   , stageInputs
   , stageOutputs
@@ -62,7 +59,6 @@ module Spirdo.Wesl.Types.Interface
   , Shader
   , SomeShader(..)
   , shaderFromPrepared
-  , someShaderFromPrepared
   , shaderSpirv
   , shaderInterface
   , shaderPlan
@@ -488,9 +484,6 @@ data PreparedShader (mode :: SamplerBindingMode) iface = PreparedShader
   , psVertexAttributes :: Maybe [VertexAttribute]
   }
 
--- | Existential wrapper for prepared shaders.
-data SomePreparedShader = forall mode iface. SomePreparedShader (PreparedShader mode iface)
-
 -- | Prepare a compiled shader for host use (stage + plan + vertex attrs).
 prepareShader :: CompiledShader mode iface -> Either String (PreparedShader mode iface)
 prepareShader shader =
@@ -567,15 +560,3 @@ shaderFromPrepared prep =
     , shaderVertexAttributes = preparedVertexAttributes prep
     , shaderSource = preparedSource prep
     }
-
--- | Convert an existential prepared shader to a shader.
-someShaderFromPrepared :: SomePreparedShader -> SomeShader
-someShaderFromPrepared (SomePreparedShader prep) = SomeShader (shaderFromPrepared prep)
-
--- | SPIR-V bytes for an existential prepared shader.
-somePreparedSpirv :: SomePreparedShader -> ByteString
-somePreparedSpirv (SomePreparedShader prep) = preparedSpirv prep
-
--- | Interface for an existential prepared shader.
-somePreparedInterface :: SomePreparedShader -> ShaderInterface
-somePreparedInterface (SomePreparedShader prep) = preparedInterface prep

@@ -140,50 +140,6 @@ compileFileWithDiagnostics overrides path = do
       prep <- toCompileError (prepareShader shader)
       pure (SomeShader (shaderFromPrepared prep), cr.crDiagnostics)
 
--- | Compile inline WESL to a prepared shader (runtime).
-prepareWesl :: String -> Either CompileError SomePreparedShader
-prepareWesl = prepareWeslWith defaultCompileOptions
-
--- | Compile inline WESL with explicit options (runtime).
-prepareWeslWith :: CompileOptions -> String -> Either CompileError SomePreparedShader
-prepareWeslWith opts src = do
-  result <- first (annotateErrorWithSource (Just "<inline>") src) (compileInlineResult opts False "<inline>" src)
-  withCompiled opts result $ \shader -> do
-    prep <- toCompileError (prepareShader shader)
-    pure (SomePreparedShader prep)
-
--- | Compile inline WESL with diagnostics (runtime).
-prepareWeslWithDiagnostics :: CompileOptions -> String -> Either CompileError (SomePreparedShader, [Diagnostic])
-prepareWeslWithDiagnostics opts src = do
-  result <- first (annotateErrorWithSource (Just "<inline>") src) (compileInlineResult opts True "<inline>" src)
-  withCompiled opts result $ \shader -> do
-    prep <- toCompileError (prepareShader shader)
-    pure (SomePreparedShader prep, result.crDiagnostics)
-
--- | Compile a WESL file (imports supported).
-prepareWeslFile :: FilePath -> IO (Either CompileError SomePreparedShader)
-prepareWeslFile = prepareWeslFileWith defaultCompileOptions
-
--- | Compile a WESL file with explicit options.
-prepareWeslFileWith :: CompileOptions -> FilePath -> IO (Either CompileError SomePreparedShader)
-prepareWeslFileWith opts path = do
-  result <- compileFileResult opts False path
-  pure $ do
-    cr <- result
-    withCompiled opts cr $ \shader -> do
-      prep <- toCompileError (prepareShader shader)
-      pure (SomePreparedShader prep)
-
--- | Compile a WESL file and return diagnostics.
-prepareWeslFileWithDiagnostics :: CompileOptions -> FilePath -> IO (Either CompileError (SomePreparedShader, [Diagnostic]))
-prepareWeslFileWithDiagnostics opts path = do
-  result <- compileFileResult opts True path
-  pure $ do
-    cr <- result
-    withCompiled opts cr $ \shader -> do
-      prep <- toCompileError (prepareShader shader)
-      pure (SomePreparedShader prep, cr.crDiagnostics)
-
 compileInlineResult :: CompileOptions -> Bool -> FilePath -> String -> Either CompileError CompileResult
 compileInlineResult opts wantDiagnostics name src = do
   moduleAst0 <- parseModuleWith opts.enabledFeatures src
