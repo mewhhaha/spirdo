@@ -94,17 +94,12 @@ module Spirdo.Wesl.Reflection
   , compileFileWithDiagnostics
   , wesl
   , spirv
-  , Imports(..)
-  , Import(..)
+  , Imports
+  , Import
   , Snoc
   , imports
-  , importsNil
-  , import_
-  , importText
   , module_
-  , moduleText
   , (<:)
-  , normalizeModuleKey
   ) where
 
 import Spirdo.Wesl.Compiler

@@ -27,11 +27,7 @@ module Spirdo.Wesl.Types
   , Import(..)
   , Snoc
   , imports
-  , importsNil
-  , import_
-  , importText
   , module_
-  , moduleText
   , (<:)
   , importsMap
   , importsNames
@@ -187,30 +183,14 @@ type family Snoc (mods :: [k]) (x :: k) :: [k] where
   Snoc (y ': ys) x = y ': Snoc ys x
 
 -- | Empty import set.
-importsNil :: Imports '[]
-importsNil = ImportsNil
-
--- | Alias for 'importsNil' to read better in left-to-right DSLs.
 imports :: Imports '[]
 imports = ImportsNil
 
--- | Add an import source using a type-level module name.
-import_ :: forall name. KnownSymbol name => String -> Import name
-import_ src = importText @name (T.pack src)
-
--- | Add an import source using a type-level module name and 'Text'.
-importText :: forall name. KnownSymbol name => Text -> Import name
-importText src =
-  let key = normalizeModuleKey (symbolVal (Proxy @name))
-  in Import key src
-
--- | Alias for 'import_' to read like module declarations.
+-- | Add an inline source using a type-level module name.
 module_ :: forall name. KnownSymbol name => String -> Import name
-module_ = import_
-
--- | Alias for 'importText' to read like module declarations.
-moduleText :: forall name. KnownSymbol name => Text -> Import name
-moduleText = importText
+module_ src =
+  let key = normalizeModuleKey (symbolVal (Proxy @name))
+  in Import key (T.pack src)
 
 infixl 5 <:
 

@@ -19,6 +19,9 @@
   undocumented raw `__wesl__...` keys are no longer accepted.
 - Deprecated `validateUniformStorable` and `packUniformStorable` aliases were
   removed; use their explicit `Unchecked` replacements.
+- Typed inline imports now expose only abstract `Imports`/`Import` types and the
+  `imports <: module_ @"name" source` construction path; redundant constructor
+  aliases were removed.
 
 ### Added
 

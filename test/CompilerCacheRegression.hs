@@ -17,8 +17,6 @@ import Data.Word (Word32, Word64)
 import qualified Language.Haskell.TH as TH
 import Spirdo.Wesl.Reflection
   ( CompileError(..)
-  , Import(..)
-  , Imports(..)
   , SomeShader(..)
   , compileFile
   , defaultCompileOptions
@@ -338,9 +336,9 @@ $(do
 
     let normalizedOptions = withCacheDir normalizedImportCacheDirectory defaultCompileOptions
         normalizedCollisionImports =
-          ( Import "foo" (T.pack importedSource)
-              :> (Import "./foo" (T.pack replacedSource) :> ImportsNil)
-          ) :: Imports '["foo", "./foo"]
+          imports
+            <: module_ @"foo" importedSource
+            <: module_ @"./foo" replacedSource
         normalizedRootSource =
           unlines
             [ "import foo;"
