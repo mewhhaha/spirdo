@@ -167,8 +167,8 @@ jobs:
       - name: Setup Haskell
         uses: haskell-actions/setup@33d9e1bb5b321fa8d6de86d9e9bbc251b4690b80 # v2
         with:
-          ghc-version: '9.12.2'
-          cabal-version: '3.14.1.1'
+          ghc-version: '9.14.1'
+          cabal-version: '3.16.1.0'
 
       - name: Install SDL3 development packages
         run: |

@@ -92,7 +92,7 @@
   Mixed i32/u32 workgroup dimensions remain rejected. Strict mode omits
   `SpecId` from derived and composite/non-scalar-literal specialization
   instructions; parity mode may be validator-incompatible for those forms.
-- The optional demo is a separately built GHC 9.12 package; its gallery includes
+- The optional demo is a separately built GHC 9.14 package; its gallery includes
   a validated SDF Text variant and no longer carries an unusable texture-backed
   shader module.
 
