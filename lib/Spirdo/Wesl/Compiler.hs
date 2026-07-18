@@ -14,8 +14,14 @@
 
 -- | Compiler pipeline and quasiquoter implementation.
 module Spirdo.Wesl.Compiler
-  ( module Spirdo.Wesl.Compiler
-  , module Spirdo.Wesl.Compiler.Cache
+  ( compile
+  , compileWith
+  , compileWithDiagnostics
+  , compileFile
+  , compileFileWith
+  , compileFileWithDiagnostics
+  , wesl
+  , spirv
   ) where
 
 import Control.Exception (IOException, evaluate, try)
