@@ -313,8 +313,22 @@ main = do
   testFilter <- testFilterFromEnvironmentAndArgs
   spirvVal <- findExecutable "spirv-val"
   nagaExe <- findExecutable "naga"
-  requireValidators <- fmap isTruthy <$> lookupEnv "SPIRDO_REQUIRE_VALIDATORS"
-  when (requireValidators == Just True) $ do
+  configuredValidatorRequirement <- lookupEnv "SPIRDO_REQUIRE_VALIDATORS"
+  requireValidators <-
+    case configuredValidatorRequirement of
+      Nothing -> pure False
+      Just rawValue ->
+        case map toLower rawValue of
+          "1" -> pure True
+          "true" -> pure True
+          "yes" -> pure True
+          "on" -> pure True
+          "0" -> pure False
+          "false" -> pure False
+          "no" -> pure False
+          "off" -> pure False
+          _ -> fail ("SPIRDO_REQUIRE_VALIDATORS must be a boolean, got " <> show rawValue)
+  when requireValidators $ do
     when (isNothing spirvVal) $
       fail "SPIRDO_REQUIRE_VALIDATORS=1 but spirv-val was not found in PATH"
     when (isNothing nagaExe) $
