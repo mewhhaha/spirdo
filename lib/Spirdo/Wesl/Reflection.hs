@@ -73,7 +73,6 @@ module Spirdo.Wesl.Reflection
   , Diagnostic(..)
   , DiagnosticSeverity(..)
   , defaultCompileOptions
-  , defaultOptions
   , applyOptions
   , withSpirvVersion
   , withTargetEnvironment

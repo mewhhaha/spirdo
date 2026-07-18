@@ -33,7 +33,6 @@ module Spirdo.Wesl.Types
   , importsNames
   , normalizeModuleKey
   , defaultCompileOptions
-  , defaultOptions
   , applyOptions
   , withSpirvVersion
   , withTargetEnvironment
@@ -264,10 +263,6 @@ defaultCompileOptions =
     "dist-newstyle/.wesl-cache"
     False
     False
-
--- | Default options alias for the ergonomic API.
-defaultOptions :: CompileOptions
-defaultOptions = defaultCompileOptions
 
 -- | Apply a list of option overrides to compile options.
 applyOptions :: [Option] -> CompileOptions -> CompileOptions

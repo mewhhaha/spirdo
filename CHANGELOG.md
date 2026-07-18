@@ -26,6 +26,8 @@
   already normalized by group, binding, and name.
 - The unused generic `RequireBinding` constraint was removed; input builders
   expose only the kind-specific constraints they enforce.
+- The unused `defaultOptions` alias was removed; advanced callers use the
+  canonical `defaultCompileOptions` value.
 
 ### Added
 
