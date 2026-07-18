@@ -1482,12 +1482,12 @@ parseSwitchBody feats toks =
       (expr, rest1) <- parseExpr rest
       parseMore [expr] rest1
 
-    parseMore acc rest =
+    parseMore selectorsReversed rest =
       case rest of
         (Token (TkSymbol ",") _ : more) -> do
           (expr, rest1) <- parseExpr more
-          parseMore (acc <> [expr]) rest1
-        _ -> Right (acc, rest)
+          parseMore (expr : selectorsReversed) rest1
+        _ -> Right (reverse selectorsReversed, rest)
 
 parseLoopBody :: FeatureSet -> [Token] -> Either CompileError ([Stmt], Maybe [Stmt], [Token])
 parseLoopBody feats toks =
