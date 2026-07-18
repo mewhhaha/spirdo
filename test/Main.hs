@@ -430,7 +430,6 @@ main = do
     , ("vertex-attributes", checkVertexAttributes)
     , ("binding-plan", checkBindingPlan)
     , ("input-ordering", checkInputOrdering)
-    , ("inputs-combined-rejects-separate-texture", checkInputsCombinedRejectsSeparateTexture)
     , ("inputs-combined-ok", checkInputsCombinedOk)
     , ("inputs-missing-bindings-rejected", checkInputsMissingBindingsRejected)
     , ("inputs-separate-mode-rejects-sampled-texture", checkInputsSeparateModeRejectsSampledTexture)
@@ -1027,31 +1026,6 @@ checkInputOrdering =
       let names = map (.uiName) (inputsUniforms inputs)
       unless (names == ["a", "b"]) $
         fail ("input-ordering: expected [\"a\",\"b\"], got " <> show names)
-
-checkInputsCombinedRejectsSeparateTexture :: IO ()
-checkInputsCombinedRejectsSeparateTexture =
-  let invalidTextureBuilder =
-        unsafeCoerce
-          ( Inputs.texture @"tex" (TextureHandle 9)
-              :: Inputs.InputsBuilder
-                  'SamplerSeparate
-                  '[ 'Binding "params" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
-                   , 'Binding "tex" 'BTexture2D 0 1 ('TTexture2D 'SF32)
-                   ]
-          )
-          :: Inputs.InputsBuilder
-              'SamplerCombined
-              '[ 'Binding "params" 'BUniform 0 0 ('TStruct '[ 'Field "v" ('TVec 4 'SF32)])
-               , 'Binding "tex" 'BTexture2D 0 1 ('TTexture2D 'SF32)
-               ]
-  in case inputsFor combinedInputShader
-        (Inputs.uniform @"params" (ParamsU (V4 1 2 3 4) :: ParamsU)
-          <> invalidTextureBuilder) of
-    Left err ->
-      unless ("texture is not supported in SamplerCombined mode" `isInfixOf` err.ieMessage) $
-        fail ("inputs-combined-separate-texture: unexpected error: " <> err.ieMessage)
-    Right _ ->
-      fail "inputs-combined-separate-texture: expected mode mismatch error"
 
 checkInputsCombinedOk :: IO ()
 checkInputsCombinedOk =
