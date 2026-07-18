@@ -8,7 +8,10 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 -- | Parser for WESL source.
-module Spirdo.Wesl.Parser where
+module Spirdo.Wesl.Parser
+  ( parseModuleWith
+  , validateImportName
+  ) where
 
 import Control.Applicative ((<|>))
 import Control.Monad (unless, when)
