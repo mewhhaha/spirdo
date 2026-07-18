@@ -12,7 +12,13 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 -- | SPIR-V emission backend.
-module Spirdo.Wesl.Emit where
+module Spirdo.Wesl.Emit
+  ( buildInterface
+  , emitSpirv
+  , bytesToExp
+  , interfaceToExp
+  , interfaceToType
+  ) where
 
 import Control.Monad (foldM, unless, zipWithM_, when)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, xor)
@@ -1649,57 +1655,6 @@ emitSpecConstValueToLayout layout val st =
           (st', val') <- emitConstValueToLayout fld.flType v stAcc
           Right (st', val' : acc)
 
-constValueLayout :: GenState -> ConstValue -> Either CompileError TypeLayout
-constValueLayout st val =
-  case val of
-    CVBool _ ->
-      let (a, sz) = scalarLayout Bool
-      in Right (TLScalar Bool a sz)
-    CVInt (ConstInt scalar _) ->
-      let (a, sz) = scalarLayout scalar
-      in Right (TLScalar scalar a sz)
-    CVFloat cf ->
-      let scalar = constFloatDefaultScalar cf
-          (a, sz) = scalarLayout scalar
-      in Right (TLScalar scalar a sz)
-    CVVector n scalar _ ->
-      let (a, sz) = vectorLayout scalar n
-      in Right (TLVector n scalar a sz)
-    CVMatrix cols rows scalar _ ->
-      checkedMatrixLayout "constant matrix layout" cols rows scalar
-    CVArray elemTy elems -> do
-      elemLayout <- typeLayoutFromValue elemTy
-      checkedFixedArrayLayout "constant array layout" (length elems) elemLayout
-    CVStruct name _ ->
-      case lookup name (st.gsStructLayouts) of
-        Just layout -> Right layout
-        Nothing -> Left (CompileError ("unknown struct layout for constant: " <> textToString name) Nothing Nothing)
-    CVPointer _ _ ->
-      Left (CompileError "pointer constants are not supported" Nothing Nothing)
-  where
-    typeLayoutFromValue ty =
-      case ty of
-        TyScalar scalar ->
-          let (a, sz) = scalarLayout scalar
-          in Right (TLScalar scalar a sz)
-        TyVector n scalar ->
-          let (a, sz) = vectorLayout scalar n
-          in Right (TLVector n scalar a sz)
-        TyMatrix cols rows scalar ->
-          checkedMatrixLayout "constant matrix type layout" cols rows scalar
-        TyArray elemTy (ArrayLenFixed count) -> do
-          elemLayout <- typeLayoutFromValue elemTy
-          checkedFixedArrayLayout "constant array type layout" count elemLayout
-        TyArray _ ArrayLenRuntime ->
-          Left (CompileError "runtime array constants are not supported" Nothing Nothing)
-        TyArray _ (ArrayLenExpr _) ->
-          Left (CompileError "array length expressions must be resolved before layout" Nothing Nothing)
-        TyStructRef name ->
-          case lookup name (st.gsStructLayouts) of
-            Just layout -> Right layout
-            Nothing -> Left (CompileError ("unknown struct layout for constant: " <> textToString name) Nothing Nothing)
-        _ -> Left (CompileError "unsupported constant type layout" Nothing Nothing)
-
 emitSpecConstOp :: TypeLayout -> Word16 -> [Word32] -> GenState -> Either CompileError (GenState, Value)
 emitSpecConstOp layout opcode operands st = do
   unless (shaderSpecConstantOpcode opcode) $
@@ -2274,15 +2229,6 @@ emitSpecConstExprListAsLayouts ctx constIndex fnIndex structIndex layouts expres
       go st1 (value : acc) remainingLayouts remainingExpressions
     go _ _ _ _ = Left (CompileError "constructor arity mismatch" Nothing Nothing)
 
-coerceSpecConstArgsToLayouts :: [Value] -> [TypeLayout] -> GenState -> Either CompileError (GenState, [Value])
-coerceSpecConstArgsToLayouts vals tys st = go st [] vals tys
-  where
-    go st' acc [] [] = Right (st', reverse acc)
-    go st' acc (v:vs) (t:ts) = do
-      (st1, v') <- coerceSpecConstValueToLayout t v st'
-      go st1 (v':acc) vs ts
-    go _ _ _ _ = Left (CompileError "constructor arity mismatch" Nothing Nothing)
-
 emitConstExprList :: GenState -> [Expr] -> Either CompileError (GenState, [Value])
 emitConstExprList st = go st []
   where
@@ -2308,12 +2254,6 @@ emitConstExprListWithScalarHint scalarHint st = go st []
             Right (nextState, Value (TLScalar scalar align size) cid)
           _ -> emitConstExpr st' expr
       go st1 (value : acc) rest
-
-scalarHintFromLayout :: TypeLayout -> Maybe Scalar
-scalarHintFromLayout layout =
-  case layout of
-    TLScalar scalar _ _ -> Just scalar
-    _ -> Nothing
 
 emitConstVectorCtor :: Int -> Maybe Scalar -> [Expr] -> GenState -> Either CompileError (GenState, Value)
 emitConstVectorCtor n targetScalar args st =
@@ -8076,15 +8016,6 @@ flattenConstScalars st vals = fmap concat (mapM flatten vals)
     scalarLayoutType s =
       let (a, sz) = scalarLayout s
       in TLScalar s a sz
-
-coerceConstArgsToLayouts :: [Value] -> [TypeLayout] -> GenState -> Either CompileError (GenState, [Value])
-coerceConstArgsToLayouts vals tys st = go st [] vals tys
-  where
-    go st' acc [] [] = Right (st', reverse acc)
-    go st' acc (v:vs) (t:ts) = do
-      (st1, v') <- coerceConstValueToLayout t v st'
-      go st1 (v':acc) vs ts
-    go _ _ _ _ = Left (CompileError "constructor arity mismatch" Nothing Nothing)
 
 emitVectorComponent :: Value -> Word32 -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitVectorComponent vecVal idx st fs =
