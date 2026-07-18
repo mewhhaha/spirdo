@@ -9,7 +9,6 @@ module PublicApiRegression (checks) where
 import Control.Monad (unless)
 import qualified Data.ByteString as BS
 import Data.List (isInfixOf)
-import Data.Proxy (Proxy(..))
 import Unsafe.Coerce (unsafeCoerce)
 
 import Spirdo.Wesl
@@ -208,7 +207,7 @@ defaultlessWorkgroupSource = unlines
 checkUncheckedStorablePacking :: IO ()
 checkUncheckedStorablePacking = do
   let layout = TLScalar F32 4 4
-  case validateUniformStorableUnchecked layout (Proxy @Float) of
+  case validateUniformStorableUnchecked layout (0 :: Float) of
     Left err -> fail ("validateUniformStorableUnchecked: " <> err)
     Right () -> pure ()
   packed <- packUniformStorableUnchecked layout (1.0 :: Float)

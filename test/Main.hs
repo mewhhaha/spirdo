@@ -17,7 +17,6 @@ import Data.List (find, inits, isInfixOf, isPrefixOf, stripPrefix, tails)
 import qualified Data.Set as Set
 import Data.Foldable (toList)
 import Data.Maybe (isJust, isNothing)
-import Data.Proxy (Proxy(..))
 import Data.Word (Word16, Word32, Word64)
 import GHC.Float (castFloatToWord32)
 import System.Directory
@@ -963,10 +962,10 @@ checkPackUniformFrom =
 checkUniformStorable :: IO ()
 checkUniformStorable = do
   let layout = TLScalar F32 4 4
-  case validateUniformStorableUnchecked layout (Proxy @Float) of
+  case validateUniformStorableUnchecked layout (0 :: Float) of
     Left err -> fail ("uniform-storable: unexpected failure: " <> err)
     Right () -> pure ()
-  case validateUniformStorableUnchecked layout (Proxy @Word64) of
+  case validateUniformStorableUnchecked layout (0 :: Word64) of
     Left _ -> pure ()
     Right () -> fail "uniform-storable: expected size mismatch for Word64"
   packed <- packUniformStorableUnchecked layout (1.0 :: Float)
