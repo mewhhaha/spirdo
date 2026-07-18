@@ -441,6 +441,7 @@ main = do
   regressionCheckCount <- runChecks testFilter "Regression Gates"
     [ ("duplicate-bindings", checkDuplicateBindings)
     , ("golden-spirv", checkGoldenSpirv)
+    , ("short-spirv-header", checkShortSpirvHeader)
     ]
   featureCheckCount <- runChecks testFilter "Feature Regressions" $
     ImportSemanticRegression.checks
@@ -470,12 +471,23 @@ main = do
 
 assertSpirv :: Maybe FilePath -> String -> BS.ByteString -> IO ()
 assertSpirv spirvVal label bytes = do
+  unless (BS.length bytes >= 20) $
+    fail (label <> ": SPIR-V output is shorter than the 20-byte header: " <> show (BS.length bytes) <> " bytes")
   unless (BS.length bytes `mod` 4 == 0) $
     fail (label <> ": SPIR-V size not multiple of 4")
   let magic = word32At bytes 0
   unless (magic == 0x07230203) $
     fail (label <> ": bad SPIR-V magic")
   validateSpirvVal spirvVal label bytes
+
+checkShortSpirvHeader :: IO ()
+checkShortSpirvHeader = do
+  result <- try (assertSpirv Nothing "short-header" (BS.replicate 4 0))
+  case result of
+    Left err
+      | "shorter than the 20-byte header: 4 bytes" `isInfixOf` displayException (err :: SomeException) -> pure ()
+      | otherwise -> fail ("short SPIR-V header returned the wrong error: " <> displayException err)
+    Right () -> fail "four bytes were accepted as a complete SPIR-V module"
 
 word32At :: BS.ByteString -> Int -> Word32
 word32At bytes offset =
