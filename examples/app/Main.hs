@@ -50,10 +50,10 @@ import Spirdo.Wesl.Inputs
   , InputsBuilder
   , inputsFor
   , inputsInterface
+  , inputsUniforms
   , inputsSamplers
   , inputsStorageTextures
   , inputsTextures
-  , orderedUniforms
   )
 import qualified Spirdo.Wesl.Inputs as Inputs
 
@@ -369,7 +369,7 @@ bindingsFromInputs inputs =
   let iface = inputsInterface inputs
       uniforms =
         [ fUniformBytes u.uiBinding u.uiBytes
-        | u <- orderedUniforms inputs
+        | u <- inputsUniforms inputs
         ]
       samplers =
         case iface of

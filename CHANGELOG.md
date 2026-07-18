@@ -22,6 +22,8 @@
 - Typed inline imports now expose only abstract `Imports`/`Import` types and the
   `imports <: module_ @"name" source` construction path; redundant constructor
   aliases were removed.
+- `orderedUniforms` was removed because validated `inputsUniforms` results are
+  already normalized by group, binding, and name.
 
 ### Added
 

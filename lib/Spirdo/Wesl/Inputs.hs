@@ -42,7 +42,6 @@ module Spirdo.Wesl.Inputs
   , inputsTextures
   , inputsStorageBuffers
   , inputsStorageTextures
-  , orderedUniforms
   ) where
 
 import Control.Monad (foldM, unless, when)
@@ -287,11 +286,6 @@ inputValidationSeed iface =
     , siStorageBuffers = []
     , siStorageTextures = []
     }
-
--- | Uniform inputs sorted by @(group, binding, name)@.
-orderedUniforms :: ShaderInputs iface -> [UniformInput]
-orderedUniforms inputs =
-  orderUniforms inputs.siUniforms
 
 normalizeInputs :: ShaderInputs iface -> ShaderInputs iface
 normalizeInputs inputs =
