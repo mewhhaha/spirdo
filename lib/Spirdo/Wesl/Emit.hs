@@ -1152,7 +1152,21 @@ emitModuleOverrides ctx constIndex fnIndex structIndex specMode layoutCache stru
       let declMap = Map.fromList [(d.odName, d) | d <- decls]
       let depsMap = overrideDependencies decls
       order <- topoSortOverrides (map (.odName) decls) depsMap
-      foldM (emitOne specIds depsMap) st0 (map (declMap Map.!) order)
+      orderedDecls <-
+        traverse
+          ( \name ->
+              case Map.lookup name declMap of
+                Just decl -> Right decl
+                Nothing ->
+                  Left
+                    ( CompileError
+                        ("override dependency order references an unknown declaration: " <> textToString name)
+                        Nothing
+                        Nothing
+                    )
+          )
+          order
+      foldM (emitOne specIds depsMap) st0 orderedDecls
   where
     emitOne specIds depsMap st decl = do
       ty <- maybe (Left (CompileError "override type could not be inferred" Nothing Nothing)) Right decl.odType
@@ -2479,6 +2493,14 @@ emitConstScalarCtor scalar args st =
 lookupConstKeyById :: GenState -> Word32 -> Maybe ConstKey
 lookupConstKeyById st cid = Map.lookup cid st.gsConstKeyById
 
+lookupConstIntegerById :: GenState -> Word32 -> Maybe Integer
+lookupConstIntegerById st cid = do
+  key <- lookupConstKeyById st cid
+  case key of
+    ConstI32 value -> Just (fromIntegral (fromIntegral value :: Int32))
+    ConstU32 value -> Just (fromIntegral value)
+    _ -> Nothing
+
 emitConstFromKey :: GenState -> ConstKey -> (Word32, GenState)
 emitConstFromKey st key =
   case key of
@@ -2535,29 +2557,16 @@ constKeyToU32 key =
     ConstBool _ -> Left (CompileError "cannot convert bool literal to u32" Nothing Nothing)
 
 checkedFloatToI32 :: Float -> Either CompileError Int32
-checkedFloatToI32 value =
-  fromInteger <$> checkedFloatToInteger "i32" (toInteger (minBound :: Int32)) (toInteger (maxBound :: Int32)) value
+checkedFloatToI32 value = do
+  finiteValue <- checkedFiniteFloat "i32" value
+  let clamped = max (-2147483648) (min 2147483520 finiteValue)
+  Right (fromInteger (truncate clamped))
 
 checkedFloatToU32 :: Float -> Either CompileError Word32
-checkedFloatToU32 value =
-  fromInteger <$> checkedFloatToInteger "u32" 0 (toInteger (maxBound :: Word32)) value
-
-checkedFloatToInteger :: String -> Integer -> Integer -> Float -> Either CompileError Integer
-checkedFloatToInteger target lower upper value = do
-  finiteValue <- checkedFiniteFloat target value
-  let converted = truncate finiteValue
-  if converted < lower || converted > upper
-    then
-      Left
-        (CompileError
-          ( "constant " <> target <> " conversion is out of range: " <> show value
-              <> " truncates to " <> show converted
-              <> ", expected " <> show lower <> " through " <> show upper
-          )
-          Nothing
-          Nothing
-        )
-    else Right converted
+checkedFloatToU32 value = do
+  finiteValue <- checkedFiniteFloat "u32" value
+  let clamped = max 0 (min 4294967040 finiteValue)
+  Right (fromInteger (truncate clamped))
 
 checkedFiniteFloat :: String -> Float -> Either CompileError Float
 checkedFiniteFloat target value
@@ -4223,11 +4232,10 @@ emitStructOutputs stage structName layout structDecl st0 =
       when (stage == StageFragment) $
         validateBlendSrcStructRules fields
       let go _idx accTargets accIds usedLocs usedBuiltins st [] = Right (reverse accTargets, reverse accIds, st, usedLocs, usedBuiltins)
-          go idx accTargets accIds usedLocs usedBuiltins st (field:rest) = do
+          go idx accTargets accIds usedLocs usedBuiltins st ((field, layoutField):rest) = do
             let fieldName = field.fdName
                 attrs = field.fdAttrs
                 fty = field.fdType
-                layoutField = fieldLayouts !! idx
                 fieldLayout = layoutField.flType
             when (containsResource fieldLayout) $
               Left (CompileError "resource types are not allowed as stage outputs" Nothing Nothing)
@@ -4267,7 +4275,7 @@ emitStructOutputs stage structName layout structDecl st0 =
                 (info, varId, st1) <- emitOutputVar stage (structName <> "_" <> fieldName) fieldLayout attrs (InputLocation loc) st
                 let target = OutputTarget info fieldLayout [fromIntegral idx]
                 go (idx + 1) (target:accTargets) (varId:accIds) (locKey:usedLocs) usedBuiltins st1 rest
-      (targets, ids, st1, _usedLocs, _usedBuiltins) <- go 0 [] [] [] [] st0 fields
+      (targets, ids, st1, _usedLocs, _usedBuiltins) <- go (0 :: Int) [] [] [] [] st0 (zip fields fieldLayouts)
       case stage of
         StageVertex ->
           if any (\f -> attrBuiltin (f.fdAttrs) == Just "position") fields
@@ -5840,6 +5848,7 @@ emitExpr st fs expr =
               emitBinary op layout (lval'.valId) (rval'.valId) st3 fs3
         _ -> do
           (st3, fs3, lval', rval', layout) <- coerceBinaryOperands lval rval st2 fs2
+          validateConstantBinaryOperands layout op lhs rhs st3
           emitBinary op layout (lval'.valId) (rval'.valId) st3 fs3
     ECall pos name args -> emitCall pos name args st fs
     EBitcast _ targetTy inner -> do
@@ -5852,6 +5861,50 @@ emitExpr st fs expr =
       if val.valType == targetLayout
         then Right (st1, fs1, val)
         else emitBitcastValue targetLayout val st1 fs1
+
+validateConstantBinaryOperands :: TypeLayout -> BinOp -> Expr -> Expr -> GenState -> Either CompileError ()
+validateConstantBinaryOperands layout op lhs rhs st =
+  case classifyNumeric layout of
+    Just (_, I32) -> validateIntegerOperation
+    Just (_, U32) -> validateIntegerOperation
+    _ -> Right ()
+  where
+    lhsConstant = constIntegerExprValue st lhs
+    rhsConstant = constIntegerExprValue st rhs
+
+    validateIntegerOperation =
+      case op of
+        OpDiv -> validateDivision "division"
+        OpMod -> validateDivision "modulo"
+        OpShl -> validateShift
+        OpShr -> validateShift
+        _ -> Right ()
+
+    validateDivision operation =
+      case rhsConstant of
+        Just (_, 0) -> Left (CompileError (operation <> " by zero in constant expression") Nothing Nothing)
+        Just (I32, -1)
+          | lhsConstant == Just (I32, fromIntegral (minBound :: Int32)) ->
+              Left (CompileError (operation <> " overflows i32 in constant expression") Nothing Nothing)
+        _ -> Right ()
+
+    validateShift =
+      case rhsConstant of
+        Just (_, amount) | amount < 0 ->
+          Left (CompileError ("shift amount must be non-negative: " <> show amount) Nothing Nothing)
+        Just (_, amount) | amount >= 32 ->
+          Left (CompileError ("shift amount must be less than 32: " <> show amount) Nothing Nothing)
+        _ -> Right ()
+
+constIntegerExprValue :: GenState -> Expr -> Maybe (Scalar, Integer)
+constIntegerExprValue st expr = do
+  (st1, value) <- either (const Nothing) Just (emitConstExpr st expr)
+  scalar <- case value.valType of
+    TLScalar I32 _ _ -> Just I32
+    TLScalar U32 _ _ -> Just U32
+    _ -> Nothing
+  integer <- lookupConstIntegerById st1 value.valId
+  Just (scalar, integer)
 
 emitShortCircuitLogical :: BinOp -> Expr -> Expr -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitShortCircuitLogical op lhs rhs st fs = do
@@ -5946,7 +5999,11 @@ emitBinary op layout lhs rhs st fs =
     OpAdd -> emitArith
     OpSub -> emitArith
     OpMul -> emitArith
-    OpDiv -> emitArith
+    OpDiv ->
+      case classifyNumeric layout of
+        Just (_, I32) -> emitIntegerDivision I32 layout lhs rhs st fs
+        Just (_, U32) -> emitIntegerDivision U32 layout lhs rhs st fs
+        _ -> emitArith
     OpMod -> emitMod
     OpAnd -> emitLogical
     OpOr -> emitLogical
@@ -5994,8 +6051,8 @@ emitBinary op layout lhs rhs st fs =
       case classifyNumeric layout of
         Nothing -> Left (CompileError "modulo only supports scalar or vector integer types" Nothing Nothing)
         Just (_, scalar) -> case scalar of
-          I32 -> emitIntOp opSRem
-          U32 -> emitIntOp opUMod
+          I32 -> emitIntegerRemainder I32 layout lhs rhs st fs
+          U32 -> emitIntegerRemainder U32 layout lhs rhs st fs
           _ -> Left (CompileError "modulo only supports i32 or u32 types" Nothing Nothing)
     emitLogical =
       case layout of
@@ -6013,8 +6070,8 @@ emitBinary op layout lhs rhs st fs =
       case classifyNumeric layout of
         Nothing -> Left (CompileError "bitwise operators require i32 or u32 scalar or vector types" Nothing Nothing)
         Just (_, scalar) -> case scalar of
-          I32 -> emitIntOp opcode
-          U32 -> emitIntOp opcode
+          I32 -> emitIntegerInstruction opcode layout lhs rhs st fs
+          U32 -> emitIntegerInstruction opcode layout lhs rhs st fs
           _ -> Left (CompileError "bitwise operators require i32 or u32 types" Nothing Nothing)
       where
         opcode = case op of
@@ -6026,8 +6083,8 @@ emitBinary op layout lhs rhs st fs =
       case classifyNumeric layout of
         Nothing -> Left (CompileError "shift operators require i32 or u32 scalar or vector types" Nothing Nothing)
         Just (_, scalar) -> case scalar of
-          I32 -> emitIntOp shiftOp
-          U32 -> emitIntOp shiftOp
+          I32 -> emitMaskedShift shiftOp
+          U32 -> emitMaskedShift shiftOp
           _ -> Left (CompileError "shift operators require i32 or u32 types" Nothing Nothing)
       where
         shiftOp = case op of
@@ -6038,11 +6095,10 @@ emitBinary op layout lhs rhs st fs =
               Just (_, U32) -> opShiftRightLogical
               _ -> opShiftRightLogical
           _ -> opShiftLeftLogical
-    emitIntOp opcode = do
-      let (tyId, st1) = emitTypeFromLayout st layout
-      let (resId, st2) = freshId st1
-      let fs1 = addFuncInstr (Instr opcode [tyId, resId, lhs, rhs]) fs
-      Right (st2, fs1, Value layout resId)
+        emitMaskedShift opcode = do
+          (st1, mask) <- emitConstIntSplat layout 31 st
+          (st2, fs1, maskedRhs) <- emitIntegerInstruction opBitwiseAnd layout rhs mask.valId st1 fs
+          emitIntegerInstruction opcode layout lhs maskedRhs.valId st2 fs1
     emitCompare =
       case classifyNumeric layout of
         Nothing -> Left (CompileError "comparison operators only support scalar or vector numeric types" Nothing Nothing)
@@ -6096,6 +6152,57 @@ emitBinary op layout lhs rhs st fs =
                 _ -> Left (CompileError "unsupported uint comparison" Nothing Nothing)
           let fs1 = addFuncInstr (Instr opcode [tyId, resId, lhs, rhs]) fs
           Right (st2, fs1, Value resultLayout resId)
+
+emitIntegerDivision :: Scalar -> TypeLayout -> Word32 -> Word32 -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
+emitIntegerDivision scalar layout lhs rhs st fs = do
+  (st1, fs1, exceptional, safeRhs) <- prepareIntegerDivisor scalar layout lhs rhs st fs
+  let opcode = if scalar == I32 then opSDiv else opUDiv
+  (st2, fs2, quotient) <- emitIntegerInstruction opcode layout lhs safeRhs.valId st1 fs1
+  emitSelectValue layout (Value layout lhs) quotient exceptional st2 fs2
+
+emitIntegerRemainder :: Scalar -> TypeLayout -> Word32 -> Word32 -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
+emitIntegerRemainder scalar layout lhs rhs st fs = do
+  (st1, fs1, exceptional, safeRhs) <- prepareIntegerDivisor scalar layout lhs rhs st fs
+  let opcode = if scalar == I32 then opSRem else opUMod
+  (st2, fs2, remainder) <- emitIntegerInstruction opcode layout lhs safeRhs.valId st1 fs1
+  (st3, zero) <- emitConstIntSplat layout 0 st2
+  emitSelectValue layout zero remainder exceptional st3 fs2
+
+prepareIntegerDivisor :: Scalar -> TypeLayout -> Word32 -> Word32 -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value, Value)
+prepareIntegerDivisor scalar layout lhs rhs st fs = do
+  (st1, zero) <- emitConstIntSplat layout 0 st
+  (st2, fs1, isZero) <- emitBinary OpEq layout rhs zero.valId st1 fs
+  (st3, fs2, exceptional) <-
+    case scalar of
+      I32 -> do
+        (st3, minimumValue) <- emitConstIntSplat layout (fromIntegral (minBound :: Int32)) st2
+        (st4, negativeOne) <- emitConstIntSplat layout (-1) st3
+        (st5, fs2, isMinimum) <- emitBinary OpEq layout lhs minimumValue.valId st4 fs1
+        (st6, fs3, isNegativeOne) <- emitBinary OpEq layout rhs negativeOne.valId st5 fs2
+        (st7, fs4, overflows) <- emitBooleanInstruction opLogicalAnd isMinimum isNegativeOne st6 fs3
+        emitBooleanInstruction opLogicalOr isZero overflows st7 fs4
+      U32 -> Right (st2, fs1, isZero)
+      _ -> Left (CompileError "integer division requires i32 or u32 operands" Nothing Nothing)
+  (st4, one) <- emitConstIntSplat layout 1 st3
+  (st5, fs3, safeRhs) <- emitSelectValue layout one (Value layout rhs) exceptional st4 fs2
+  Right (st5, fs3, exceptional, safeRhs)
+
+emitBooleanInstruction :: Word16 -> Value -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
+emitBooleanInstruction opcode lhs rhs st fs = do
+  when (lhs.valType /= rhs.valType) $
+    Left (CompileError "boolean operation requires matching operand types" Nothing Nothing)
+  let layout = lhs.valType
+  let (tyId, st1) = emitTypeFromLayout st layout
+  let (resId, st2) = freshId st1
+  let fs1 = addFuncInstr (Instr opcode [tyId, resId, lhs.valId, rhs.valId]) fs
+  Right (st2, fs1, Value layout resId)
+
+emitIntegerInstruction :: Word16 -> TypeLayout -> Word32 -> Word32 -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
+emitIntegerInstruction opcode layout lhs rhs st fs = do
+  let (tyId, st1) = emitTypeFromLayout st layout
+  let (resId, st2) = freshId st1
+  let fs1 = addFuncInstr (Instr opcode [tyId, resId, lhs, rhs]) fs
+  Right (st2, fs1, Value layout resId)
 
 emitCall :: SrcPos -> Text -> [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitCall pos name args st fs =
@@ -6957,30 +7064,17 @@ bitcastLayoutInfo layout =
           in Right (n, sz, scalar)
     _ -> Left (CompileError "bitcast expects a scalar or vector type" Nothing Nothing)
 
-normalizeBitFieldIndex :: TypeLayout -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
-normalizeBitFieldIndex baseLayout idxVal st fs =
-  case baseLayout of
-    TLScalar baseScalar _ _ -> do
-      ensureIndexType (idxVal.valType)
-      case idxVal.valType of
-        TLScalar s _ _ | s == baseScalar -> Right (st, fs, idxVal)
-        TLScalar s _ _ -> emitScalarConvert s baseScalar idxVal st fs
-        _ -> Left (CompileError "bitfield indices must be scalar" Nothing Nothing)
-    TLVector n baseScalar _ _ ->
-      case idxVal.valType of
-        TLScalar s _ _ -> do
-          ensureIndexType (idxVal.valType)
-          (st1, fs1, scalarVal) <-
-            if s == baseScalar
-              then Right (st, fs, idxVal)
-              else emitScalarConvert s baseScalar idxVal st fs
-          let (a, sz) = vectorLayout baseScalar n
-          let layout = TLVector n baseScalar a sz
-          emitSplatVector layout (scalarVal.valId) st1 fs1
-        TLVector m s _ _ | m == n && s == baseScalar -> Right (st, fs, idxVal)
-        TLVector {} -> Left (CompileError "bitfield indices must match vector size and scalar type" Nothing Nothing)
-        _ -> Left (CompileError "bitfield indices must be scalar or matching vector" Nothing Nothing)
-    _ -> Left (CompileError "bitfield indices require integer scalars or vectors" Nothing Nothing)
+clampBitFieldRange :: Value -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value, Value)
+clampBitFieldRange offset count st fs = do
+  let (align, size) = scalarLayout U32
+  let layout = TLScalar U32 align size
+  when (offset.valType /= layout || count.valType /= layout) $
+    Left (CompileError "bitfield offset and count must be u32 scalars" Nothing Nothing)
+  (st1, width) <- emitConstIntSplat layout 32 st
+  (st2, fs1, clampedOffset) <- emitMinMaxInt OpLt layout offset width st1 fs
+  (st3, fs2, remaining) <- emitBinary OpSub layout width.valId clampedOffset.valId st2 fs1
+  (st4, fs3, clampedCount) <- emitMinMaxInt OpLt layout count remaining st3 fs2
+  Right (st4, fs3, clampedOffset, clampedCount)
 
 emitBitcastValue :: TypeLayout -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitBitcastValue target val st fs = do
@@ -7022,12 +7116,12 @@ emitExtractBitsBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError
 emitExtractBitsBuiltin args st fs =
   case args of
     [baseExpr, offsetExpr, countExpr] -> do
+      validateConstantBitFieldRange offsetExpr countExpr st
       (st1, fs1, baseVal) <- emitExpr st fs baseExpr
       ensureIntNumeric (baseVal.valType)
       (st2, fs2, offsetVal) <- emitExpr st1 fs1 offsetExpr
       (st3, fs3, countVal) <- emitExpr st2 fs2 countExpr
-      (st4, fs4, offsetVal') <- normalizeBitFieldIndex (baseVal.valType) offsetVal st3 fs3
-      (st5, fs5, countVal') <- normalizeBitFieldIndex (baseVal.valType) countVal st4 fs4
+      (st5, fs5, offsetVal', countVal') <- clampBitFieldRange offsetVal countVal st3 fs3
       scalar <- case classifyNumeric (baseVal.valType) of
         Just (_, s) -> Right s
         Nothing -> Left (CompileError "extractBits expects integer types" Nothing Nothing)
@@ -7045,6 +7139,7 @@ emitInsertBitsBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError 
 emitInsertBitsBuiltin args st fs =
   case args of
     [baseExpr, insertExpr, offsetExpr, countExpr] -> do
+      validateConstantBitFieldRange offsetExpr countExpr st
       (st1, fs1, baseVal) <- emitExpr st fs baseExpr
       (st2, fs2, insertVal) <- emitExpr st1 fs1 insertExpr
       (st3, fs3, offsetVal) <- emitExpr st2 fs2 offsetExpr
@@ -7054,13 +7149,27 @@ emitInsertBitsBuiltin args st fs =
           then Right (st4, fs4, baseVal, insertVal, baseVal.valType)
           else coerceBinaryOperands baseVal insertVal st4 fs4
       ensureIntNumeric layout
-      (st6, fs6, offsetVal') <- normalizeBitFieldIndex layout offsetVal st5 fs5
-      (st7, fs7, countVal') <- normalizeBitFieldIndex layout countVal st6 fs6
+      (st7, fs7, offsetVal', countVal') <- clampBitFieldRange offsetVal countVal st5 fs5
       let (tyId, st8) = emitTypeFromLayout st7 layout
       let (resId, st9) = freshId st8
       let fs8 = addFuncInstr (Instr opBitFieldInsert [tyId, resId, baseVal'.valId, insertVal'.valId, offsetVal'.valId, countVal'.valId]) fs7
       Right (st9, fs8, Value layout resId)
     _ -> Left (CompileError "insertBits expects (base, insert, offset, count)" Nothing Nothing)
+
+validateConstantBitFieldRange :: Expr -> Expr -> GenState -> Either CompileError ()
+validateConstantBitFieldRange offset count st =
+  case (constIntegerExprValue st offset, constIntegerExprValue st count) of
+    (Just (_, constantOffset), Just (_, constantCount))
+      | constantOffset + constantCount > 32 ->
+          Left
+            ( CompileError
+                ( "bitfield range exceeds 32 bits: offset " <> show constantOffset
+                    <> " + count " <> show constantCount
+                )
+                Nothing
+                Nothing
+            )
+    _ -> Right ()
 
 emitArrayLengthBuiltin :: [Expr] -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitArrayLengthBuiltin args st fs =
@@ -7896,23 +8005,52 @@ emitScalarCtor scalar args st fs =
     _ -> Left (CompileError "scalar cast requires a single argument" Nothing Nothing)
 
 emitScalarConvert :: Scalar -> Scalar -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
-emitScalarConvert fromScalar toScalarTy val st fs = do
-  opcode <- case (fromScalar, toScalarTy) of
+emitScalarConvert fromScalar targetScalar val st fs =
+  case (fromScalar, targetScalar) of
+    (F32, U32) -> emitFloatToIntegerConvert U32 val st fs
+    (F32, I32) -> emitFloatToIntegerConvert I32 val st fs
+    (F16, U32) -> emitFloatToIntegerConvert U32 val st fs
+    (F16, I32) -> emitFloatToIntegerConvert I32 val st fs
+    _ -> do
+      opcode <- scalarConvertOpcode fromScalar targetScalar
+      emitScalarConvertInstruction opcode targetScalar val st fs
+
+scalarConvertOpcode :: Scalar -> Scalar -> Either CompileError Word16
+scalarConvertOpcode fromScalar targetScalar =
+  case (fromScalar, targetScalar) of
     (U32, F32) -> Right opConvertUToF
     (I32, F32) -> Right opConvertSToF
     (U32, F16) -> Right opConvertUToF
     (I32, F16) -> Right opConvertSToF
-    (F32, U32) -> Right opConvertFToU
-    (F32, I32) -> Right opConvertFToS
-    (F16, U32) -> Right opConvertFToU
-    (F16, I32) -> Right opConvertFToS
     (F16, F32) -> Right opFConvert
     (F32, F16) -> Right opFConvert
     (U32, I32) -> Right opBitcast
     (I32, U32) -> Right opBitcast
     _ -> Left (CompileError "unsupported scalar conversion" Nothing Nothing)
-  let (a, sz) = scalarLayout toScalarTy
-  let layout = TLScalar toScalarTy a sz
+
+emitFloatToIntegerConvert :: Scalar -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
+emitFloatToIntegerConvert target val st fs =
+  case target of
+    I32 -> emitClampedConvert (-2147483648) 2147483520 opConvertFToS
+    U32 -> emitClampedConvert 0 4294967040 opConvertFToU
+    _ -> Left (CompileError "float-to-integer conversion requires an integer target" Nothing Nothing)
+  where
+    emitClampedConvert lower upper opcode = do
+      (st1, fs1, floatVal) <-
+        case val.valType of
+          TLScalar F32 _ _ -> Right (st, fs, val)
+          TLScalar F16 _ _ -> emitScalarConvertInstruction opFConvert F32 val st fs
+          _ -> Left (CompileError "float-to-integer conversion requires a float scalar" Nothing Nothing)
+      let (lowerId, st2) = emitConstF32 st1 lower
+      let (upperId, st3) = emitConstF32 st2 upper
+      (st4, fs2, clamped) <-
+        emitExtInst floatVal.valType glslStd450FClamp [floatVal.valId, lowerId, upperId] st3 fs1
+      emitScalarConvertInstruction opcode target clamped st4 fs2
+
+emitScalarConvertInstruction :: Word16 -> Scalar -> Value -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
+emitScalarConvertInstruction opcode target val st fs = do
+  let (a, sz) = scalarLayout target
+  let layout = TLScalar target a sz
   let (tyId, st1) = emitTypeFromLayout st layout
   let (resId, st2) = freshId st1
   let fs1 = addFuncInstr (Instr opcode [tyId, resId, val.valId]) fs

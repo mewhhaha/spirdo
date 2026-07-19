@@ -266,7 +266,7 @@ defaultCompileOptions =
 
 -- | Apply a list of option overrides to compile options.
 applyOptions :: [Option] -> CompileOptions -> CompileOptions
-applyOptions opts0 base = foldl applyOne base opts0
+applyOptions opts0 base = foldl' applyOne base opts0
   where
     applyOne opts opt =
       case opt of

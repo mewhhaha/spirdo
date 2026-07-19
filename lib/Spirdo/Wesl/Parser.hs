@@ -496,8 +496,10 @@ validateDecimalIntegerDigits :: SrcPos -> Text -> Text -> Either CompileError ()
 validateDecimalIntegerDigits pos raw digits = do
   when (T.null digits || not (T.all isDigit digits)) $
     numericError pos raw "invalid decimal digit or suffix"
-  when (T.length digits > 1 && T.head digits == '0') $
-    numericError pos raw "decimal integer significand must not have a leading zero"
+  case T.uncons digits of
+    Just ('0', rest) | not (T.null rest) ->
+      numericError pos raw "decimal integer significand must not have a leading zero"
+    _ -> Right ()
 
 parseDecimalDigits :: SrcPos -> Text -> Text -> Either CompileError Integer
 parseDecimalDigits pos raw digits =

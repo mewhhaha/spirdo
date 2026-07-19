@@ -45,6 +45,13 @@ authoritative record of accepted, rejected, and expected-failure cases.
 - Unsuffixed floating-point literals and scalar constant expressions retain
   binary64 `AbstractFloat` precision until an f32 or f16 boundary; target
   materialization uses checked, round-to-nearest-even conversion.
+- Floating-point-to-integer constructors clamp to the target range before
+  truncation, including the source type's representable boundary values.
+- Integer division and remainder preserve WGSL's defined runtime results for
+  zero divisors and signed minimum-value overflow.
+- Runtime integer shift counts are reduced modulo the 32-bit operand width.
+- Runtime `extractBits` and `insertBits` ranges are clamped to the 32-bit
+  operand width before SPIR-V lowering.
 
 ## Build, test, and demo
 

@@ -32,7 +32,7 @@ import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import Data.Char (isAlpha, isAlphaNum, isSpace)
 import Data.Graph (SCC(..), stronglyConnComp)
-import Data.List (isInfixOf, isPrefixOf, sort)
+import Data.List (isInfixOf, isPrefixOf, sort, unsnoc)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -575,11 +575,15 @@ parseWeslTomlText manifest contents = do
 parseSection :: FilePath -> Int -> String -> ManifestState -> Either CompileError ManifestState
 parseSection manifest lineNumber line =
   case line of
-    '[' : rest
-      | not (null rest) && last rest == ']' && '[' `notElem` init rest && ']' `notElem` init rest ->
-          selectSection (init rest)
-    _ -> const (Left (manifestError manifest (Just lineNumber) "malformed manifest section header"))
+    '[' : rest ->
+      case unsnoc rest of
+        Just (name, ']')
+          | '[' `notElem` name && ']' `notElem` name -> selectSection name
+        _ -> malformedSection
+    _ -> malformedSection
   where
+    malformedSection = const (Left (manifestError manifest (Just lineNumber) "malformed manifest section header"))
+
     selectSection name state =
       case name of
         "package" -> enterRelevantSection name TomlSectionPackage state
@@ -713,13 +717,18 @@ parseInlineDependency :: FilePath -> Int -> String -> Either CompileError (Map.M
 parseInlineDependency manifest lineNumber raw =
   let value = trim raw
   in case value of
-      '{' : rest | not (null rest) && last rest == '}' -> do
-        let body = trim (init rest)
-        if null body
-          then Right Map.empty
-          else foldM addField Map.empty (splitTomlComma body)
-      _ -> Left (manifestError manifest (Just lineNumber) "dependency must be an inline table with package or path")
+      '{' : rest ->
+        case unsnoc rest of
+          Just (rawBody, '}') -> do
+            let body = trim rawBody
+            if null body
+              then Right Map.empty
+              else foldM addField Map.empty (splitTomlComma body)
+          _ -> malformedDependency
+      _ -> malformedDependency
   where
+    malformedDependency = Left (manifestError manifest (Just lineNumber) "dependency must be an inline table with package or path")
+
     addField fields rawField = do
       (rawKey, rawValue) <- parseAssignment manifest lineNumber rawField
       let key = trim rawKey

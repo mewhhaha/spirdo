@@ -593,7 +593,7 @@ pickSourceFile packageRoot (candidate:rest) = do
         pure (Just canonical)
 
 appendPathSegments :: FilePath -> [Text] -> FilePath
-appendPathSegments base segs = foldl (</>) base (map T.unpack segs)
+appendPathSegments base segs = foldl' (</>) base (map T.unpack segs)
 
 splitImportTarget :: [Text] -> Maybe ([Text], Text)
 splitImportTarget segs =
@@ -2864,6 +2864,23 @@ isConstFloatEvaluationError err =
     , "constant float operation"
     ]
 
+clampConstFloatToInt :: Scalar -> ConstFloat -> Either CompileError ConstInt
+clampConstFloatToInt target (ConstFloat kind value) =
+  case target of
+    I32 -> do
+      ensureFiniteConstFloat "i32" value
+      Right (ConstInt I32 (clampToInteger (fromIntegral minI32) (i32UpperBound kind)))
+    U32 -> do
+      ensureFiniteConstFloat "u32" value
+      Right (ConstInt U32 (clampToInteger 0 (u32UpperBound kind)))
+    _ -> Left (CompileError "float-to-integer conversion requires an integer target" Nothing Nothing)
+  where
+    clampToInteger lower upper = truncate (max lower (min upper value))
+    i32UpperBound ConstConcreteF32 = 2147483520
+    i32UpperBound _ = fromIntegral maxI32
+    u32UpperBound ConstConcreteF32 = 4294967040
+    u32UpperBound _ = fromIntegral (maxBound :: Word32)
+
 coerceConstScalarValue :: Scalar -> ConstValue -> Either CompileError ConstValue
 coerceConstScalarValue target val =
   case target of
@@ -2874,22 +2891,12 @@ coerceConstScalarValue target val =
     I32 ->
       case val of
         CVInt ci -> CVInt <$> coerceConstIntToScalar I32 ci
-        CVFloat (ConstFloat _ v) -> do
-          ensureFiniteConstFloat "i32" v
-          let n = truncate v :: Integer
-          when (n < minI32 || n > maxI32) $
-            Left (CompileError "constant i32 is out of range" Nothing Nothing)
-          Right (CVInt (ConstInt I32 n))
+        CVFloat cf -> CVInt <$> clampConstFloatToInt I32 cf
         _ -> Left (CompileError "expected integer constant" Nothing Nothing)
     U32 ->
       case val of
         CVInt ci -> CVInt <$> coerceConstIntToScalar U32 ci
-        CVFloat (ConstFloat _ v) -> do
-          ensureFiniteConstFloat "u32" v
-          let n = truncate v :: Integer
-          when (n < 0 || n > fromIntegral (maxBound :: Word32)) $
-            Left (CompileError "constant u32 is out of range" Nothing Nothing)
-          Right (CVInt (ConstInt U32 n))
+        CVFloat cf -> CVInt <$> clampConstFloatToInt U32 cf
         _ -> Left (CompileError "expected integer constant" Nothing Nothing)
     F32 ->
       case val of
@@ -3774,9 +3781,9 @@ evalConstFieldAccess val field =
     CVVector n scalar comps -> do
       idxs <- vectorFieldIndices field n
       case idxs of
-        [ix] -> Right (comps !! fromIntegral ix)
+        [ix] -> constComponentAt "vector swizzle" (fromIntegral ix) comps
         _ -> do
-          let comps' = map (\ix -> comps !! fromIntegral ix) idxs
+          comps' <- mapM (\ix -> constComponentAt "vector swizzle" (fromIntegral ix) comps) idxs
           Right (CVVector (length idxs) scalar comps')
     CVStruct _ fields ->
       case lookup field fields of
@@ -3793,12 +3800,20 @@ evalConstIndexAccess val (ConstInt _ raw) = do
   let ix = fromIntegral raw :: Int
   case val of
     CVVector n _ comps ->
-      if ix < n then Right (comps !! ix) else Left (CompileError "vector index out of range" Nothing Nothing)
+      if ix < n then constComponentAt "vector" ix comps else Left (CompileError "vector index out of range" Nothing Nothing)
     CVMatrix cols _ _ colsVals ->
-      if ix < cols then Right (colsVals !! ix) else Left (CompileError "matrix index out of range" Nothing Nothing)
+      if ix < cols then constComponentAt "matrix" ix colsVals else Left (CompileError "matrix index out of range" Nothing Nothing)
     CVArray _ vals ->
-      if ix < length vals then Right (vals !! ix) else Left (CompileError "array index out of range" Nothing Nothing)
+      constComponentAt "array" ix vals
     _ -> Left (CompileError "indexing requires array, vector, or matrix type" Nothing Nothing)
+
+constComponentAt :: String -> Int -> [a] -> Either CompileError a
+constComponentAt valueKind index _ | index < 0 =
+  Left (CompileError (valueKind <> " index must be non-negative: " <> show index) Nothing Nothing)
+constComponentAt valueKind index components =
+  case drop index components of
+    component : _ -> Right component
+    [] -> Left (CompileError (valueKind <> " index out of range: " <> show index) Nothing Nothing)
 
 evalConstIntExpr :: ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> Expr -> Either CompileError ConstInt
 evalConstIntExpr ctx constIndex fnIndex structIndex =
@@ -3838,28 +3853,18 @@ evalConstIntExprWithEnv ctx constIndex fnIndex structIndex env = go
           Left (CompileError "const int expression references a float literal" Nothing Nothing)
         ECall _ "u32" [arg] ->
           case go seen fnSeen arg of
-            Right (ConstInt _ n) -> do
-              checkU32 n
-              Right (ConstInt U32 n)
+            Right value -> coerceConstIntToScalar U32 value
             _ -> do
-              ConstFloat _ v <- evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen arg
-              ensureFiniteConstFloat "u32" v
-              let n = truncate v :: Integer
-              checkU32 n
-              Right (ConstInt U32 n)
+              value <- evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen arg
+              clampConstFloatToInt U32 value
         ECall _ "u32" [] ->
           Right (ConstInt U32 0)
         ECall _ "i32" [arg] ->
           case go seen fnSeen arg of
-            Right (ConstInt _ n) -> do
-              checkI32 n
-              Right (ConstInt I32 n)
+            Right value -> coerceConstIntToScalar I32 value
             _ -> do
-              ConstFloat _ v <- evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen arg
-              ensureFiniteConstFloat "i32" v
-              let n = truncate v :: Integer
-              checkI32 n
-              Right (ConstInt I32 n)
+              value <- evalConstFloatExprWithEnv ctx constIndex fnIndex structIndex env seen fnSeen arg
+              clampConstFloatToInt I32 value
         ECall _ "i32" [] ->
           Right (ConstInt I32 0)
         ECall _ "select" [aExpr, bExpr, condExpr] -> do
@@ -4325,15 +4330,11 @@ coerceConstIntToScalar target (ConstInt scalar val) =
   case (target, scalar) of
     (I32, I32) -> Right (ConstInt I32 val)
     (U32, U32) -> Right (ConstInt U32 val)
-    (I32, U32) ->
-      if val <= maxI32
-        then Right (ConstInt I32 val)
-        else Left (CompileError "constant u32 is out of range for i32" Nothing Nothing)
-    (U32, I32) ->
-      if val >= 0 && val <= fromIntegral (maxBound :: Word32)
-        then Right (ConstInt U32 val)
-        else Left (CompileError "constant i32 is out of range for u32" Nothing Nothing)
+    (I32, U32) -> Right (ConstInt I32 (if val <= maxI32 then val else val - integerModulus))
+    (U32, I32) -> Right (ConstInt U32 (if val >= 0 then val else val + integerModulus))
     _ -> Left (CompileError "unsupported const integer coercion" Nothing Nothing)
+  where
+    integerModulus = 2 ^ (32 :: Int)
 
 
 resolveConstRef :: ModuleContext -> Text -> Either CompileError ([Text], Text)

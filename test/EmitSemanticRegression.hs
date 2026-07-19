@@ -36,8 +36,12 @@ checks =
   , ("pointer return types are rejected", checkPointerReturnTypes)
   , ("single entry honors requested name", checkSingleEntrySelection)
   , ("negative i32 constants emit", checkNegativeI32Constants)
-  , ("finite float-to-integer boundary casts emit", checkFloatIntegerCastBoundaries)
-  , ("invalid float-to-integer casts are rejected", checkInvalidFloatIntegerCasts)
+  , ("integer constructors reinterpret signedness", checkIntegerConstructorSignedness)
+  , ("runtime integer division guards exceptional operands", checkRuntimeIntegerDivision)
+  , ("runtime integer shifts mask their counts", checkRuntimeIntegerShifts)
+  , ("runtime bitfield ranges clamp to the operand width", checkRuntimeBitfieldRanges)
+  , ("float-to-integer casts clamp before truncation", checkFloatIntegerCastClamping)
+  , ("non-finite float-to-integer casts are rejected", checkInvalidFloatIntegerCasts)
   , ("non-finite float constants are rejected", checkFloatConstantOverflow)
   , ("abstract floats retain binary64 precision", checkAbstractFloatPrecision)
   , ("float literals materialize with ties-to-even", checkFloatLiteralMaterialization)
@@ -286,9 +290,63 @@ checkNegativeI32Constants = do
     fail "i32 minimum constant was not emitted"
   validateSpirv "negative-i32-constants" bytes
 
-checkFloatIntegerCastBoundaries :: IO ()
-checkFloatIntegerCastBoundaries = do
-  bytes <- compileBytes [Wesl.OptEnableFeature "f16"] floatIntegerCastBoundariesSource
+checkIntegerConstructorSignedness :: IO ()
+checkIntegerConstructorSignedness = do
+  bytes <- compileBytes [] integerConstructorSignednessSource
+  instructions <- decodeSpirv bytes
+  unless (length [() | (124, _) <- instructions] >= 2) $
+    fail "runtime integer constructors did not reinterpret their operands"
+  validateSpirv "integer-constructor-signedness" bytes
+
+checkRuntimeIntegerDivision :: IO ()
+checkRuntimeIntegerDivision = do
+  bytes <- compileBytes [] runtimeIntegerDivisionSource
+  instructions <- decodeSpirv bytes
+  unless (length [() | (169, _) <- instructions] >= 8) $
+    fail "runtime integer division and remainder did not select defined exceptional results"
+  validateSpirv "runtime-integer-division" bytes
+  expectCompileError ["division by zero"] constantRuntimeDivisorSource
+  expectCompileError ["modulo by zero"] constantRuntimeRemainderSource
+
+checkRuntimeIntegerShifts :: IO ()
+checkRuntimeIntegerShifts = do
+  bytes <- compileBytes [] runtimeIntegerShiftSource
+  instructions <- decodeSpirv bytes
+  unless (length [() | (199, _) <- instructions] >= 4) $
+    fail "runtime integer shifts did not mask their counts"
+  validateSpirv "runtime-integer-shifts" bytes
+  expectCompileError ["shift amount must be less than 32"] constantRuntimeShiftSource
+
+checkRuntimeBitfieldRanges :: IO ()
+checkRuntimeBitfieldRanges = do
+  bytes <- compileBytes [] runtimeBitfieldRangeSource
+  instructions <- decodeSpirv bytes
+  unless (length [() | (169, _) <- instructions] >= 4) $
+    fail "runtime bitfield offset and count values were not clamped"
+  validateSpirv "runtime-bitfield-ranges" bytes
+  expectCompileError ["bitfield range exceeds 32 bits"] constantRuntimeBitfieldRangeSource
+
+checkFloatIntegerCastClamping :: IO ()
+checkFloatIntegerCastClamping = do
+  bytes <- compileBytes [Wesl.OptEnableFeature "f16"] floatIntegerCastClampingSource
+  instructions <- decodeSpirv bytes
+  let constantWords =
+        [ literal
+        | (43, [_typeId, _resultId, literal]) <- instructions
+        ]
+      expectedWords =
+        [ 0x7fffffff
+        , 0x7fffff80
+        , 0x80000000
+        , 0xffffffff
+        , 0xffffff00
+        , 0x00000000
+        ]
+  forM_ expectedWords $ \expected ->
+    unless (expected `elem` constantWords) $
+      fail ("clamped float-to-integer constant was not emitted: " <> show expected)
+  unless (length [() | (12, _typeId : _resultId : _setId : 43 : _) <- instructions] >= 4) $
+    fail "runtime float-to-integer casts did not clamp their operands"
   validateSpirv "float-integer-cast-boundaries" bytes
 
 checkInvalidFloatIntegerCasts :: IO ()
@@ -1336,28 +1394,129 @@ negativeI32ConstantSource = unlines
   , "}"
   ]
 
-floatIntegerCastBoundariesSource :: String
-floatIntegerCastBoundariesSource = unlines
+integerConstructorSignednessSource :: String
+integerConstructorSignednessSource = unlines
+  [ "const_assert(i32(4294967295u) == -1i);"
+  , "const_assert(i32(2147483648u) == -2147483648);"
+  , "const_assert(u32(-1i) == 4294967295u);"
+  , "fn to_i32(value: u32) -> i32 { return i32(value); }"
+  , "fn to_u32(value: i32) -> u32 { return u32(value); }"
+  , "@compute @workgroup_size(1)"
+  , "fn main() {"
+  , "  let signed = to_i32(0u);"
+  , "  let unsigned = to_u32(0i);"
+  , "}"
+  ]
+
+runtimeIntegerDivisionSource :: String
+runtimeIntegerDivisionSource = unlines
+  [ "fn div_i32(a: i32, b: i32) -> i32 { return a / b; }"
+  , "fn div_u32(a: u32, b: u32) -> u32 { return a / b; }"
+  , "fn rem_i32(a: i32, b: i32) -> i32 { return a % b; }"
+  , "fn rem_u32(a: u32, b: u32) -> u32 { return a % b; }"
+  , "fn div_vec(a: vec2i, b: vec2i) -> vec2i { return a / b; }"
+  , "fn rem_vec(a: vec2u, b: vec2u) -> vec2u { return a % b; }"
+  , "@compute @workgroup_size(1)"
+  , "fn main() {"
+  , "  let a = div_i32(1i, 1i);"
+  , "  let b = div_u32(1u, 1u);"
+  , "  let c = rem_i32(1i, 1i);"
+  , "  let d = rem_u32(1u, 1u);"
+  , "  let e = div_vec(vec2i(1i), vec2i(1i));"
+  , "  let f = rem_vec(vec2u(1u), vec2u(1u));"
+  , "}"
+  ]
+
+constantRuntimeDivisorSource :: String
+constantRuntimeDivisorSource = unlines
+  [ "fn invalid(value: i32) -> i32 { return value / 0i; }"
+  , "@compute @workgroup_size(1) fn main() { let value = invalid(1i); }"
+  ]
+
+constantRuntimeRemainderSource :: String
+constantRuntimeRemainderSource = unlines
+  [ "fn invalid(value: u32) -> u32 { return value % 0u; }"
+  , "@compute @workgroup_size(1) fn main() { let value = invalid(1u); }"
+  ]
+
+runtimeIntegerShiftSource :: String
+runtimeIntegerShiftSource = unlines
+  [ "fn shl_i32(a: i32, b: i32) -> i32 { return a << b; }"
+  , "fn shr_u32(a: u32, b: u32) -> u32 { return a >> b; }"
+  , "fn shl_vec(a: vec2i, b: vec2i) -> vec2i { return a << b; }"
+  , "fn shr_vec(a: vec2u, b: vec2u) -> vec2u { return a >> b; }"
+  , "@compute @workgroup_size(1)"
+  , "fn main() {"
+  , "  let a = shl_i32(1i, 1i);"
+  , "  let b = shr_u32(1u, 1u);"
+  , "  let c = shl_vec(vec2i(1i), vec2i(1i));"
+  , "  let d = shr_vec(vec2u(1u), vec2u(1u));"
+  , "}"
+  ]
+
+constantRuntimeShiftSource :: String
+constantRuntimeShiftSource = unlines
+  [ "fn invalid(value: u32) -> u32 { return value << 32u; }"
+  , "@compute @workgroup_size(1) fn main() { let value = invalid(1u); }"
+  ]
+
+runtimeBitfieldRangeSource :: String
+runtimeBitfieldRangeSource = unlines
+  [ "fn extract(value: vec2u, offset: u32, count: u32) -> vec2u {"
+  , "  return extractBits(value, offset, count);"
+  , "}"
+  , "fn insert(base: vec2i, value: vec2i, offset: u32, count: u32) -> vec2i {"
+  , "  return insertBits(base, value, offset, count);"
+  , "}"
+  , "@compute @workgroup_size(1)"
+  , "fn main() {"
+  , "  let a = extract(vec2u(1u), 0u, 1u);"
+  , "  let b = insert(vec2i(1i), vec2i(2i), 0u, 1u);"
+  , "}"
+  ]
+
+constantRuntimeBitfieldRangeSource :: String
+constantRuntimeBitfieldRangeSource = unlines
+  [ "fn invalid(value: u32) -> u32 { return extractBits(value, 31u, 2u); }"
+  , "@compute @workgroup_size(1) fn main() { let value = invalid(1u); }"
+  ]
+
+floatIntegerCastClampingSource :: String
+floatIntegerCastClampingSource = unlines
   [ "enable f16;"
   , "const i_min: i32 = i32(-2147483648.0f);"
-  , "const i_max: i32 = i32(2147483520.0f);"
-  , "const u_max: u32 = u32(4294967040.0f);"
+  , "const i_max_abstract: i32 = i32(1e20);"
+  , "const i_max_f32: i32 = i32(1e20f);"
+  , "const i_min_f32: i32 = i32(-1e20f);"
+  , "const u_max_abstract: u32 = u32(1e20);"
+  , "const u_max_f32: u32 = u32(1e20f);"
+  , "const u_min_f32: u32 = u32(-1.0f);"
   , "const h_max: i32 = i32(65504.0h);"
+  , "fn to_i32(value: f32) -> i32 { return i32(value); }"
+  , "fn to_u32(value: f32) -> u32 { return u32(value); }"
+  , "fn h_to_i32(value: f16) -> i32 { return i32(value); }"
+  , "fn h_to_u32(value: f16) -> u32 { return u32(value); }"
   , "@compute @workgroup_size(1)"
   , "fn main() {"
   , "  let a = i_min;"
-  , "  let b = i_max;"
-  , "  let c = u_max;"
-  , "  let d = h_max;"
+  , "  let b = i_max_abstract;"
+  , "  let c = i_max_f32;"
+  , "  let d = i_min_f32;"
+  , "  let e = u_max_abstract;"
+  , "  let f = u_max_f32;"
+  , "  let g = u_min_f32;"
+  , "  let h = h_max;"
+  , "  let i = to_i32(0.0f);"
+  , "  let j = to_u32(0.0f);"
+  , "  let k = h_to_i32(0.0h);"
+  , "  let l = h_to_u32(0.0h);"
   , "}"
   ]
 
 invalidFloatIntegerCastCases :: [([Wesl.Option], [String], String)]
 invalidFloatIntegerCastCases =
-  [ ([], ["out of range for i32"], constantCastSource "const value: i32 = i32(2147483648.0f);")
-  , ([], ["out of range for i32"], constantCastSource "const value: i32 = i32(-2147483904.0f);")
-  , ([], ["out of range for u32"], constantCastSource "const value: u32 = u32(-1.0f);")
-  , ([], ["out of range for u32"], constantCastSource "const value: u32 = u32(4294967296.0f);")
+  [ ([], ["division by zero"], constantCastSource "const value: i32 = i32(0.0 / 0.0);")
+  , ([], ["division by zero"], constantCastSource "const value: u32 = u32(1.0 / 0.0);")
   , ([], ["f32 literal overflows its target type"], constantCastSource "const value: i32 = i32(1e39f);")
   , ( [Wesl.OptEnableFeature "f16"]
     , ["i32"]

@@ -179,6 +179,7 @@ findIdentMatches ident src =
       ]
 
 findWordPositions :: String -> String -> [Int]
+findWordPositions [] _ = []
 findWordPositions needle lineText =
   [ ix + 1
   | ix <- matchIndices 0 lineText
@@ -193,14 +194,10 @@ findWordPositions needle lineText =
       | otherwise = matchIndices (ix + 1) (drop 1 rest)
     boundaryOk ix =
       let beforeOk =
-            if ix <= 0
-              then True
-              else not (isIdentChar (lineText !! (ix - 1)))
+            ix <= 0
+              || maybe True (not . isIdentChar) (listToMaybe (drop (ix - 1) lineText))
           afterIdx = ix + nlen
-          afterOk =
-            if afterIdx >= length lineText
-              then True
-              else not (isIdentChar (lineText !! afterIdx))
+          afterOk = maybe True (not . isIdentChar) (listToMaybe (drop afterIdx lineText))
       in beforeOk && afterOk
 
 textToString :: Text -> String
@@ -322,7 +319,7 @@ entryAttributesMaybe attrs =
                [] -> Just (StageVertex, Nothing)
                _ -> Nothing
            _ -> Nothing
-  where
+
 attrArgToConstExpr :: AttrArg -> ConstExpr
 attrArgToConstExpr arg =
   case arg of
