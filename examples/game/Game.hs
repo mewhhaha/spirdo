@@ -42,6 +42,7 @@ import Examples.Game.Meshes
   , rotationY
   , rotationZ
   , scale
+  , shipModel
   , shipVertices
   , translation
   )
@@ -194,14 +195,7 @@ movementFromInput input = movementFromKeys (`keyDown` input.inputNow)
 
 drawShip :: Pipeline -> Mesh -> M44 Float -> GroundPosition -> Float -> MoveDirection -> Loop ()
 drawShip pipeline mesh viewProjection playerPosition facing direction =
-  drawModel pipeline mesh viewProjection model
-  where
-    bank = (-direction.x) * 0.16
-    model =
-      translation playerPosition.x 0.48 playerPosition.z
-        * rotationY facing
-        * rotationZ bank
-        * scale 0.78 0.78 0.78
+  drawModel pipeline mesh viewProjection (shipModel playerPosition facing direction)
 
 drawCrystals :: Pipeline -> Mesh -> M44 Float -> Float -> [Crystal] -> Loop ()
 drawCrystals pipeline mesh viewProjection gameTime crystals =

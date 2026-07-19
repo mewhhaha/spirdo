@@ -1084,36 +1084,6 @@ emitSpirv opts modAst _iface = do
   let structEnv = [(s.sdName, s) | s <- modAst.modStructs]
   structLayoutsMap <- resolveStructLayouts structEnv
   let structLayouts = Map.toList structLayoutsMap
-  let stageIOStructs =
-        Set.fromList
-          ( [ name
-            | param <- entry.epParams
-            , TyStructRef name <- [param.paramType]
-            ]
-              <> [name | Just (TyStructRef name) <- [entry.epReturnType]]
-          )
-  bindingInfos <- mapM (layoutBinding structLayoutsMap) (modAst.modBindings)
-  immediateLayouts <-
-    mapM
-      (resolveTypeLayoutWithCache structLayoutsMap . (.gvType))
-      (filter ((== "immediate") . (.gvSpace)) (modAst.modGlobals))
-  let hostStructs =
-        Set.unions
-          ( map structNamesInLayout
-              ( [binding.biType | binding <- bindingInfos, isBufferBindingKind binding.biKind]
-                  <> immediateLayouts
-              )
-          )
-      sharedStageHostStructs = Set.intersection stageIOStructs hostStructs
-  unless (Set.null sharedStageHostStructs) $
-    Left
-      ( CompileError
-          ( "stage I/O structs cannot also be used for host buffers: "
-              <> intercalate ", " (map textToString (Set.toList sharedStageHostStructs))
-          )
-          Nothing
-          Nothing
-      )
   samplerLayouts <- collectSamplerLayouts structLayoutsMap (modAst.modBindings)
   retLayout <- case (entry.epStage, entry.epReturnType) of
     (StageFragment, Just ty) -> Just <$> resolveTypeLayoutWithCache structLayoutsMap ty
@@ -1133,7 +1103,6 @@ emitSpirv opts modAst _iface = do
           opts.openGlBindingRemaps
           opts.samplerBindingMode
           entry.epStage
-          stageIOStructs
           structLayouts
           samplerLayouts
           enabledFeatures
@@ -3468,12 +3437,15 @@ glslStd450FindUMsb = 75
 
 -- Generator state
 
+data TypeFlavor = ValueType | HostType
+  deriving (Eq, Ord, Show)
+
 data GenState = GenState
   { gsNextId :: Word32
   , gsTargetEnvironment :: SpirvTargetEnvironment
   , gsOpenGlBindingRemaps :: [OpenGlBindingRemap]
   , gsStructLayouts :: [(Text, TypeLayout)]
-  , gsStructIds :: [(Text, Word32)]
+  , gsStructIds :: [((TypeFlavor, Text), Word32)]
   , gsTypeCache :: Map.Map TypeKey Word32
   , gsConstCache :: Map.Map ConstKey Word32
   , gsConstKeyById :: Map.Map Word32 ConstKey
@@ -3484,7 +3456,6 @@ data GenState = GenState
   , gsFunctionTable :: [FunctionInfo]
   , gsFunctionsByName :: Map.Map Text [FunctionInfo]
   , gsEntryStage :: Stage
-  , gsStageIOStructs :: !(Set.Set Text)
   , gsEnabledFeatures :: Set.Set Text
   , gsConstValues :: [(Text, Value)]
   , gsConstValuesByName :: Map.Map Text Value
@@ -3513,8 +3484,8 @@ data GenState = GenState
   , gsConstEvalStructIndex :: !StructIndex
   }
 
-emptyGenState :: SpirvTargetEnvironment -> [OpenGlBindingRemap] -> SamplerBindingMode -> Stage -> Set.Set Text -> [(Text, TypeLayout)] -> Map.Map Text TypeLayout -> [Text] -> ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> GenState
-emptyGenState target bindingRemaps samplerMode stage stageIOStructs structLayouts samplerLayouts enabledFeatures constEvalContext constEvalIndex constEvalFunctionIndex constEvalStructIndex =
+emptyGenState :: SpirvTargetEnvironment -> [OpenGlBindingRemap] -> SamplerBindingMode -> Stage -> [(Text, TypeLayout)] -> Map.Map Text TypeLayout -> [Text] -> ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> GenState
+emptyGenState target bindingRemaps samplerMode stage structLayouts samplerLayouts enabledFeatures constEvalContext constEvalIndex constEvalFunctionIndex constEvalStructIndex =
   let (ids, nextId) = assignStructIds 1 structLayouts
   in GenState
       { gsNextId = nextId
@@ -3532,7 +3503,6 @@ emptyGenState target bindingRemaps samplerMode stage stageIOStructs structLayout
       , gsFunctionTable = []
       , gsFunctionsByName = Map.empty
       , gsEntryStage = stage
-      , gsStageIOStructs = stageIOStructs
       , gsEnabledFeatures = Set.fromList enabledFeatures
       , gsConstValues = []
       , gsConstValuesByName = Map.empty
@@ -3561,11 +3531,13 @@ emptyGenState target bindingRemaps samplerMode stage stageIOStructs structLayout
       , gsConstEvalStructIndex = constEvalStructIndex
       }
 
-assignStructIds :: Word32 -> [(Text, TypeLayout)] -> ([(Text, Word32)], Word32)
+assignStructIds :: Word32 -> [(Text, TypeLayout)] -> ([((TypeFlavor, Text), Word32)], Word32)
 assignStructIds start layouts =
-  let go next acc [] = (reverse acc, next)
-      go next acc ((name, _):rest) = go (next + 1) ((name, next):acc) rest
-  in go start [] layouts
+  let names = [name | (name, layout) <- layouts, not (containsRuntimeArray layout)]
+      keys = [(ValueType, name) | name <- names]
+      go next acc [] = (reverse acc, next)
+      go next acc (key:rest) = go (next + 1) ((key, next):acc) rest
+  in go start [] keys
 
 mapFromAssocFirstWins :: Ord k => [(k, v)] -> Map.Map k v
 mapFromAssocFirstWins = foldr (uncurry Map.insert) Map.empty
@@ -3649,34 +3621,36 @@ specConstLiteralResultId (Instr op ops)
 addGlobal :: Instr -> GenState -> GenState
 addGlobal = addInstr (.gsGlobals) (\st v -> st { gsGlobals = v })
 
--- Emit struct types with member decorations
+-- Preserve stable IDs for value structs; host-layout variants are emitted on demand.
 emitStructs :: GenState -> ((), GenState)
 emitStructs st0 =
-  let st1 = foldl' emitStruct st0 st0.gsStructLayouts
+  let valueStructs = filter (not . containsRuntimeArray . snd) st0.gsStructLayouts
+      st1 = foldl' (emitStruct ValueType) st0 valueStructs
   in ((), st1)
   where
-    emitStruct st (name, layout) =
+    emitStruct flavor st (name, layout) =
       case layout of
         TLStruct _ fields _ _ ->
           let (structId, st1) =
-                case lookup name (st.gsStructIds) of
+                case lookup (flavor, name) (st.gsStructIds) of
                   Just sid -> (sid, st)
                   Nothing ->
                     let (sid, st') = freshId st
-                    in (sid, st' { gsStructIds = (name, sid) : st'.gsStructIds })
-              (st2, fieldTypeIds) = mapAccumL emitFieldType st1 fields
+                    in (sid, st' { gsStructIds = ((flavor, name), sid) : st'.gsStructIds })
+              (st2, fieldTypeIds) = mapAccumL (emitFieldType flavor) st1 fields
               st3 = addType (Instr opTypeStruct (structId : fieldTypeIds)) st2
-              st4 = addName (Instr opName (structId : encodeString (textToString name))) st3
+              typeName = textToString name <> if flavor == HostType then "$host" else ""
+              st4 = addName (Instr opName (structId : encodeString typeName)) st3
               st5 =
-                if Set.member name st4.gsStageIOStructs
-                  then st4
-                  else foldl' (emitMemberDecorate structId) st4 (zip [0 :: Int ..] fields)
+                if flavor == HostType
+                  then foldl' (emitMemberDecorate structId) st4 (zip [0 :: Int ..] fields)
+                  else st4
               st6 = foldl' (emitMemberName structId) st5 (zip [0 :: Int ..] fields)
           in st6
         _ -> st
 
-    emitFieldType st field =
-      let (tyId, st') = emitTypeFromLayout st field.flType
+    emitFieldType flavor st field =
+      let (tyId, st') = emitTypeFromLayoutWith flavor st field.flType
       in (st', tyId)
 
     emitMemberDecorate structId st (ix, field) =
@@ -3916,7 +3890,7 @@ duplicateOpenGlBindingRemap remaps =
 emitBufferBindingPointer :: GenState -> BindingInfo -> Word32 -> (Word32, [Word32], GenState)
 emitBufferBindingPointer st bindInfo storageClass =
   let layout = bindInfo.biType
-      (storeTypeId, st1) = emitTypeFromLayout st layout
+      (storeTypeId, st1) = emitTypeFromLayoutWith HostType st layout
       st2 = addBufferF16Capability bindInfo.biKind layout st1
   in case layout of
       TLStruct _ _ _ _ | containsRuntimeArray layout ->
@@ -3980,7 +3954,7 @@ emitModuleGlobals layoutCache decls st0 = foldM emitOne ([], st0) decls
             case st.gsTargetEnvironment of
               TargetVulkan -> storageClassPushConstant
               TargetOpenGl -> storageClassUniform
-          (storeTypeId, st1) = emitTypeFromLayout st layout
+          (storeTypeId, st1) = emitTypeFromLayoutWith HostType st layout
           (blockTypeId, st2) = freshId st1
           st3 = addType (Instr opTypeStruct [blockTypeId, storeTypeId]) st2
           st4 = addName (Instr opName (blockTypeId : encodeString "__spirdo_immediate_block")) st3
@@ -5226,11 +5200,49 @@ emitLoadFromPtr :: GenState -> FuncState -> VarInfo -> Either CompileError (GenS
 emitLoadFromPtr st fs info = do
   (st1, fs1, ptrId) <- resolveVarPtr st fs info
   let st1' = recordPointerRead ptrId st1
-  let (tyId, st2) = emitTypeFromLayout st1' (info.viType)
+  let sourceFlavor = typeFlavorForStorage info.viStorage
+  let (tyId, st2) = emitTypeFromLayoutWith sourceFlavor st1' (info.viType)
   let (resId, st3) = freshId st2
   let fs2 = addFuncInstr (Instr opLoad [tyId, resId, ptrId]) fs1
-  Right (st3, fs2, Value (info.viType) resId)
+  (st4, fs3, valueId) <- convertPhysicalValue sourceFlavor ValueType (info.viType) resId st3 fs2
+  Right (st4, fs3, Value (info.viType) valueId)
 {-# INLINE emitLoadFromPtr #-}
+
+convertPhysicalValue :: TypeFlavor -> TypeFlavor -> TypeLayout -> Word32 -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Word32)
+convertPhysicalValue sourceFlavor targetFlavor layout valueId st fs
+  | sourceFlavor == targetFlavor = Right (st, fs, valueId)
+  | otherwise =
+      case layout of
+        TLStruct _ fields _ _ -> do
+          (st1, fs1, reversedFieldIds) <- foldM convertField (st, fs, []) (zip [0 :: Word32 ..] fields)
+          let (targetTypeId, st2) = emitTypeFromLayoutWith targetFlavor st1 layout
+          let (resultId, st3) = freshId st2
+          let fs2 = addFuncInstr (Instr opCompositeConstruct (targetTypeId : resultId : reverse reversedFieldIds)) fs1
+          Right (st3, fs2, resultId)
+        TLArray (Just count) _ elementLayout _ _ -> do
+          checkedCompositeArrayLength "host/value array conversion" count
+          (st1, fs1, reversedElementIds) <- foldM (convertElement elementLayout) (st, fs, []) [0 .. count - 1]
+          let (targetTypeId, st2) = emitTypeFromLayoutWith targetFlavor st1 layout
+          let (resultId, st3) = freshId st2
+          let fs2 = addFuncInstr (Instr opCompositeConstruct (targetTypeId : resultId : reverse reversedElementIds)) fs1
+          Right (st3, fs2, resultId)
+        TLArray Nothing _ _ _ _ ->
+          Left (CompileError "runtime arrays cannot be copied as values" Nothing Nothing)
+        _ -> Right (st, fs, valueId)
+  where
+    convertElement elementLayout (st', fs', converted) index = do
+      let (sourceTypeId, st1) = emitTypeFromLayoutWith sourceFlavor st' elementLayout
+      let (sourceId, st2) = freshId st1
+      let fs1 = addFuncInstr (Instr opCompositeExtract [sourceTypeId, sourceId, valueId, fromIntegral index]) fs'
+      (st3, fs2, convertedId) <- convertPhysicalValue sourceFlavor targetFlavor elementLayout sourceId st2 fs1
+      Right (st3, fs2, convertedId : converted)
+
+    convertField (st', fs', converted) (index, field) = do
+      let (sourceTypeId, st1) = emitTypeFromLayoutWith sourceFlavor st' field.flType
+      let (sourceId, st2) = freshId st1
+      let fs1 = addFuncInstr (Instr opCompositeExtract [sourceTypeId, sourceId, valueId, index]) fs'
+      (st3, fs2, convertedId) <- convertPhysicalValue sourceFlavor targetFlavor field.flType sourceId st2 fs1
+      Right (st3, fs2, convertedId : converted)
 
 resolveVarPtr :: GenState -> FuncState -> VarInfo -> Either CompileError (GenState, FuncState, Word32)
 resolveVarPtr st fs info =
@@ -5241,7 +5253,7 @@ resolveVarPtr st fs info =
             let (cid, acc') = emitConstU32 acc ix
             in (acc', ids <> [cid])
       let (st1, indexIds) = foldl' addIx (st, []) path
-      let (elemTy, st2) = emitTypeFromLayout st1 info.viType
+      let (elemTy, st2) = emitTypeFromLayoutForStorage info.viStorage st1 info.viType
       let (ptrTy, st3) = emitPointerType st2 info.viStorage elemTy
       let (ptrId, st4) = freshId st3
       let fs1 = addFuncInstr (Instr opAccessChain (ptrTy : ptrId : info.viPtrId : indexIds)) fs
@@ -5260,10 +5272,12 @@ resolveVarPtr st fs info =
 
 emitStoreToVar :: GenState -> FuncState -> VarInfo -> Word32 -> Either CompileError (GenState, FuncState)
 emitStoreToVar st fs info valueId = do
-  (st1, fs1, ptrId) <- resolveVarPtr st fs info
-  let st2 = recordPointerWrite ptrId st1
-  let fs2 = addFuncInstr (Instr opStore [ptrId, valueId]) fs1
-  Right (st2, fs2)
+  let targetFlavor = typeFlavorForStorage info.viStorage
+  (st1, fs1, storedValueId) <- convertPhysicalValue ValueType targetFlavor (info.viType) valueId st fs
+  (st2, fs2, ptrId) <- resolveVarPtr st1 fs1 info
+  let st3 = recordPointerWrite ptrId st2
+  let fs3 = addFuncInstr (Instr opStore [ptrId, storedValueId]) fs2
+  Right (st3, fs3)
 {-# INLINE emitStoreToVar #-}
 
 emitConstOne :: TypeLayout -> GenState -> Either CompileError (Word32, GenState)
@@ -5711,7 +5725,7 @@ emitExpr st fs expr =
                 Just _ | st.gsSamplerMode == SamplerCombined ->
                   Left (CompileError "sampler values are unavailable in combined mode; pass the sampler directly to textureSample" Nothing Nothing)
                 _ -> emitLoadFromExpr st fs expr
-    EField _ base field -> emitFieldExpr st fs base field
+    EField pos base field -> emitFieldExpr pos st fs base field
     EIndex _ _ _ -> emitLoadFromExpr st fs expr
     EUnary _ OpNeg inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
@@ -5774,12 +5788,14 @@ emitExpr st fs expr =
     EUnary _ OpDeref inner -> do
       (st1, fs1, val) <- emitExpr st fs inner
       case val.valType of
-        TLPointer _ _ elemLayout -> do
+        TLPointer storageClass _ elemLayout -> do
           let st1' = recordPointerRead val.valId st1
-          let (tyId, st2) = emitTypeFromLayout st1' elemLayout
+          let sourceFlavor = typeFlavorForStorage storageClass
+          let (tyId, st2) = emitTypeFromLayoutWith sourceFlavor st1' elemLayout
           let (resId, st3) = freshId st2
           let fs2 = addFuncInstr (Instr opLoad [tyId, resId, val.valId]) fs1
-          Right (st3, fs2, Value elemLayout resId)
+          (st4, fs3, valueId) <- convertPhysicalValue sourceFlavor ValueType elemLayout resId st3 fs2
+          Right (st4, fs3, Value elemLayout valueId)
         _ -> Left (CompileError "deref requires a pointer value" Nothing Nothing)
     EBinary _ OpAnd lhs rhs -> emitShortCircuitLogical OpAnd lhs rhs st fs
     EBinary _ OpOr lhs rhs -> emitShortCircuitLogical OpOr lhs rhs st fs
@@ -5882,36 +5898,46 @@ emitLoadFromExpr st fs expr =
         TLAtomic _ -> Left (CompileError "use atomicLoad for atomic values" Nothing Nothing)
         _ -> emitLoadFromPtr st1 fs1 ptrInfo
 
-emitFieldExpr :: GenState -> FuncState -> Expr -> Text -> Either CompileError (GenState, FuncState, Value)
-emitFieldExpr st fs base field = do
-  (st1, fs1, baseVal) <- emitExpr st fs base
-  case baseVal.valType of
-    TLVector n scalar _ _ -> do
-      idxs <- vectorFieldIndices field n
-      case idxs of
-        [ix] -> do
-          let (a, sz) = scalarLayout scalar
-          let layout = TLScalar scalar a sz
-          let (tyId, st2) = emitTypeFromLayout st1 layout
+emitFieldExpr :: SrcPos -> GenState -> FuncState -> Expr -> Text -> Either CompileError (GenState, FuncState, Value)
+emitFieldExpr pos st fs base field =
+  case emitValueField of
+    Right result -> Right result
+    Left valueError ->
+      case exprToLValue (EField pos base field) of
+        Just lvalue -> do
+          (st1, fs1, fieldInfo) <- emitLValuePtr st fs lvalue
+          emitLoadFromPtr st1 fs1 fieldInfo
+        Nothing -> Left valueError
+  where
+    emitValueField = do
+      (st1, fs1, baseVal) <- emitExpr st fs base
+      case baseVal.valType of
+        TLVector n scalar _ _ -> do
+          idxs <- vectorFieldIndices field n
+          case idxs of
+            [ix] -> do
+              let (a, sz) = scalarLayout scalar
+              let layout = TLScalar scalar a sz
+              let (tyId, st2) = emitTypeFromLayout st1 layout
+              let (resId, st3) = freshId st2
+              let fs2 = addFuncInstr (Instr opCompositeExtract [tyId, resId, baseVal.valId, ix]) fs1
+              Right (st3, fs2, Value layout resId)
+            _ -> do
+              let len = length idxs
+              let (a, sz) = vectorLayout scalar len
+              let layout = TLVector len scalar a sz
+              let (tyId, st2) = emitTypeFromLayout st1 layout
+              let (resId, st3) = freshId st2
+              let shuffleOps = [tyId, resId, baseVal.valId, baseVal.valId] <> idxs
+              let fs2 = addFuncInstr (Instr opVectorShuffle shuffleOps) fs1
+              Right (st3, fs2, Value layout resId)
+        TLStruct _ fields _ _ -> do
+          (ix, fieldLayout) <- findField (textToString field) fields
+          let (tyId, st2) = emitTypeFromLayout st1 fieldLayout
           let (resId, st3) = freshId st2
-          let fs2 = addFuncInstr (Instr opCompositeExtract [tyId, resId, baseVal.valId, ix]) fs1
-          Right (st3, fs2, Value layout resId)
-        _ -> do
-          let len = length idxs
-          let (a, sz) = vectorLayout scalar len
-          let layout = TLVector len scalar a sz
-          let (tyId, st2) = emitTypeFromLayout st1 layout
-          let (resId, st3) = freshId st2
-          let shuffleOps = [tyId, resId, baseVal.valId, baseVal.valId] <> idxs
-          let fs2 = addFuncInstr (Instr opVectorShuffle shuffleOps) fs1
-          Right (st3, fs2, Value layout resId)
-    TLStruct _ fields _ _ -> do
-      (ix, fieldLayout) <- findField (textToString field) fields
-      let (tyId, st2) = emitTypeFromLayout st1 fieldLayout
-      let (resId, st3) = freshId st2
-      let fs2 = addFuncInstr (Instr opCompositeExtract [tyId, resId, baseVal.valId, fromIntegral ix]) fs1
-      Right (st3, fs2, Value fieldLayout resId)
-    _ -> Left (CompileError "field access requires struct or vector type" Nothing Nothing)
+          let fs2 = addFuncInstr (Instr opCompositeExtract [tyId, resId, baseVal.valId, fromIntegral ix]) fs1
+          Right (st3, fs2, Value fieldLayout resId)
+        _ -> Left (CompileError "field access requires struct or vector type" Nothing Nothing)
 
 emitBinary :: BinOp -> TypeLayout -> Word32 -> Word32 -> GenState -> FuncState -> Either CompileError (GenState, FuncState, Value)
 emitBinary op layout lhs rhs st fs =
@@ -9533,7 +9559,7 @@ emitAccessChain :: GenState -> FuncState -> VarInfo -> [Word32] -> TypeLayout ->
 emitAccessChain st fs baseInfo indices elemLayout = do
   let storageClass = baseInfo.viStorage
   (st1, fs1, basePointerId) <- resolveVarPtr st fs baseInfo
-  let (elemTy, st2) = emitTypeFromLayout st1 elemLayout
+  let (elemTy, st2) = emitTypeFromLayoutForStorage storageClass st1 elemLayout
   let (ptrTy, st3) = emitPointerType st2 storageClass elemTy
   let (resId, st4) = freshId st3
   let instr = Instr opAccessChain (ptrTy : resId : basePointerId : indices)
@@ -9989,27 +10015,33 @@ emitSampledImageType :: Word32 -> GenState -> (Word32, GenState)
 emitSampledImageType imageId st =
   emitTypeCached st (TKSampledImage imageId) (Instr opTypeSampledImage [imageId])
 
-emitArrayType :: Word32 -> Word32 -> Word32 -> GenState -> (Word32, GenState)
-emitArrayType elemId lenVal stride st =
-  let key = TKArray elemId (Just lenVal) stride
+emitArrayType :: TypeFlavor -> Word32 -> Word32 -> Word32 -> GenState -> (Word32, GenState)
+emitArrayType flavor elemId lenVal stride st =
+  let key = TKArray flavor elemId (Just lenVal) stride
   in case Map.lookup key (st.gsTypeCache) of
        Just tid -> (tid, st)
        Nothing ->
          let (lenId, st1) = emitTypeConstU32 st lenVal
              instr = Instr opTypeArray [elemId, lenId]
              (tyId, st2) = emitTypeCached st1 key instr
-             st3 = addDecoration (Instr opDecorate [tyId, decorationArrayStride, stride]) st2
+             st3 =
+               if flavor == HostType
+                 then addDecoration (Instr opDecorate [tyId, decorationArrayStride, stride]) st2
+                 else st2
          in (tyId, st3)
 
-emitRuntimeArrayType :: Word32 -> Word32 -> GenState -> (Word32, GenState)
-emitRuntimeArrayType elemId stride st =
-  let key = TKArray elemId Nothing stride
+emitRuntimeArrayType :: TypeFlavor -> Word32 -> Word32 -> GenState -> (Word32, GenState)
+emitRuntimeArrayType flavor elemId stride st =
+  let key = TKArray flavor elemId Nothing stride
       instr = Instr opTypeRuntimeArray [elemId]
   in case Map.lookup key (st.gsTypeCache) of
        Just tid -> (tid, st)
        Nothing ->
          let (tyId, st1) = emitTypeCached st key instr
-             st2 = addDecoration (Instr opDecorate [tyId, decorationArrayStride, stride]) st1
+             st2 =
+               if flavor == HostType
+                 then addDecoration (Instr opDecorate [tyId, decorationArrayStride, stride]) st1
+                 else st1
          in (tyId, st2)
 
 emitPointerType :: GenState -> Word32 -> Word32 -> (Word32, GenState)
@@ -10021,7 +10053,21 @@ emitFunctionType st retTy paramTys =
   emitTypeCached st (TKFunction retTy paramTys) (Instr opTypeFunction (retTy : paramTys))
 
 emitTypeFromLayout :: GenState -> TypeLayout -> (Word32, GenState)
-emitTypeFromLayout st layout =
+emitTypeFromLayout = emitTypeFromLayoutWith ValueType
+
+emitTypeFromLayoutForStorage :: Word32 -> GenState -> TypeLayout -> (Word32, GenState)
+emitTypeFromLayoutForStorage storageClass =
+  emitTypeFromLayoutWith (typeFlavorForStorage storageClass)
+
+typeFlavorForStorage :: Word32 -> TypeFlavor
+typeFlavorForStorage storageClass
+  | storageClass == storageClassUniform = HostType
+  | storageClass == storageClassStorageBuffer = HostType
+  | storageClass == storageClassPushConstant = HostType
+  | otherwise = ValueType
+
+emitTypeFromLayoutWith :: TypeFlavor -> GenState -> TypeLayout -> (Word32, GenState)
+emitTypeFromLayoutWith flavor st layout =
   case layout of
     TLScalar s _ _ ->
       case s of
@@ -10032,11 +10078,11 @@ emitTypeFromLayout st layout =
         F16 -> emitFloatTypeWidth 16 st
     TLVector n s _ _ ->
       let (a, sz) = scalarLayout s
-          (elemId, st1) = emitTypeFromLayout st (TLScalar s a sz)
+          (elemId, st1) = emitTypeFromLayoutWith flavor st (TLScalar s a sz)
       in emitVecType elemId (fromIntegral n) st1
     TLMatrix cols rows s _ _ _ ->
       let (a, sz) = scalarLayout s
-          (elemId, st1) = emitTypeFromLayout st (TLScalar s a sz)
+          (elemId, st1) = emitTypeFromLayoutWith flavor st (TLScalar s a sz)
           (vecId, st2) = emitVecType elemId (fromIntegral rows) st1
           key = TKMatrix (fromIntegral cols) (fromIntegral rows) s
           instr = Instr opTypeMatrix [vecId, fromIntegral cols]
@@ -10092,33 +10138,34 @@ emitTypeFromLayout st layout =
         U32 -> emitIntType False st
         _ -> emitIntType True st
     TLPointer storageClass _ elemLayout ->
-      let (elemId, st1) = emitTypeFromLayout st elemLayout
+      let (elemId, st1) = emitTypeFromLayoutForStorage storageClass st elemLayout
       in emitPointerType st1 storageClass elemId
     TLArray mlen stride elemLayout _ _ ->
-      let (elemId, st1) = emitTypeFromLayout st elemLayout
+      let (elemId, st1) = emitTypeFromLayoutWith flavor st elemLayout
       in case mlen of
-        Nothing -> emitRuntimeArrayType elemId stride st1
+        Nothing -> emitRuntimeArrayType flavor elemId stride st1
         Just n ->
-          emitArrayType elemId (fromIntegral n) stride st1
+          emitArrayType flavor elemId (fromIntegral n) stride st1
     TLStruct name fields _ _ ->
       let nameT = T.pack name
-      in case lookup nameT (st.gsStructIds) of
+      in case lookup (flavor, nameT) (st.gsStructIds) of
         Just sid -> (sid, st)
         Nothing ->
           let (sid, st1) = freshId st
-              st2 = st1 { gsStructIds = (nameT, sid) : st1.gsStructIds }
+              st2 = st1 { gsStructIds = ((flavor, nameT), sid) : st1.gsStructIds }
               (st3, fieldTypeIds) = mapAccumL emitFieldType st2 fields
               st4 = addType (Instr opTypeStruct (sid : fieldTypeIds)) st3
-              st5 = addName (Instr opName (sid : encodeString name)) st4
+              typeName = name <> if flavor == HostType then "$host" else ""
+              st5 = addName (Instr opName (sid : encodeString typeName)) st4
               st6 =
-                if Set.member nameT st5.gsStageIOStructs
-                  then st5
-                  else foldl' (emitMemberDecorate sid) st5 (zip [0 :: Int ..] fields)
+                if flavor == HostType
+                  then foldl' (emitMemberDecorate sid) st5 (zip [0 :: Int ..] fields)
+                  else st5
               st7 = foldl' (emitMemberName sid) st6 (zip [0 :: Int ..] fields)
           in (sid, st7)
   where
     emitFieldType st' field =
-      let (tyId, st'') = emitTypeFromLayout st' field.flType
+      let (tyId, st'') = emitTypeFromLayoutWith flavor st' field.flType
       in (st'', tyId)
     emitSampledImageIfNeeded imageId st' =
       if st'.gsSamplerMode == SamplerCombined
@@ -10218,15 +10265,6 @@ isBufferBindingKind kind =
     BStorageRead -> True
     BStorageReadWrite -> True
     _ -> False
-
-structNamesInLayout :: TypeLayout -> Set.Set Text
-structNamesInLayout layout =
-  case layout of
-    TLArray _ _ elementLayout _ _ -> structNamesInLayout elementLayout
-    TLStruct name fields _ _ ->
-      Set.insert (T.pack name) (Set.unions (map (structNamesInLayout . (.flType)) fields))
-    TLPointer _ _ elementLayout -> structNamesInLayout elementLayout
-    _ -> Set.empty
 
 addBufferF16Capability :: BindingKind -> TypeLayout -> GenState -> GenState
 addBufferF16Capability kind layout st
@@ -10491,7 +10529,7 @@ data TypeKey
   | TKStorageImage2DArray StorageFormat
   | TKStorageImage3D StorageFormat
   | TKSampledImage Word32
-  | TKArray Word32 (Maybe Word32) Word32
+  | TKArray TypeFlavor Word32 (Maybe Word32) Word32
   | TKPointer Word32 Word32
   | TKFunction Word32 [Word32]
   deriving (Eq, Ord, Show)

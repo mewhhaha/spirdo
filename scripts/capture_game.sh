@@ -64,20 +64,14 @@ scene_matches_capture() {
 
 stop_child() {
   local child_pid="$1"
-  local watchdog_pid
   if [[ -z "$child_pid" ]]; then
     return
   fi
 
   kill "$child_pid" 2>/dev/null || true
-  (
-    sleep 2
-    kill -KILL "$child_pid" 2>/dev/null || true
-  ) &
-  watchdog_pid=$!
+  sleep 0.2
+  kill -KILL "$child_pid" 2>/dev/null || true
   wait "$child_pid" 2>/dev/null || true
-  kill "$watchdog_pid" 2>/dev/null || true
-  wait "$watchdog_pid" 2>/dev/null || true
 }
 
 cleanup() {
@@ -137,6 +131,7 @@ game_binary="$(cd "$repo_root/examples" && cabal list-bin spirdo-examples:exe:sp
 game_environment=(
   env
   "DISPLAY=$display"
+  SDL_AUDIO_DRIVER=dummy
   SDL_VIDEO_DRIVER=x11
   "SPIRDO_CAPTURE_READY_FILE=$run_dir/game-ready"
 )

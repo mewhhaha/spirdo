@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 module Examples.Game.Meshes
   ( cubeVertices
   , crystalVertices
@@ -5,11 +7,14 @@ module Examples.Game.Meshes
   , rotationY
   , rotationZ
   , scale
+  , shipModel
   , shipVertices
   , translation
   ) where
 
 import Slop (M44(..), Vertex3D(..))
+
+import Examples.Game.Logic (GroundPosition(..), MoveDirection(..))
 
 type Point3 = (Float, Float, Float)
 type Tint = (Float, Float, Float)
@@ -37,6 +42,13 @@ shipVertices =
     blue = (0.08, 0.3, 0.9)
     violet = (0.55, 0.25, 1.0)
     darkViolet = (0.22, 0.08, 0.55)
+
+shipModel :: GroundPosition -> Float -> MoveDirection -> M44 Float
+shipModel playerPosition facing direction =
+  translation playerPosition.x 0.48 playerPosition.z
+    * rotationY facing
+    * rotationZ ((-direction.x) * 0.16)
+    * scale 0.78 0.78 0.78
 
 crystalVertices :: [Vertex3D]
 crystalVertices =

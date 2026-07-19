@@ -20,6 +20,12 @@ checks =
   [ ("logical operators short-circuit", checkLogicalShortCircuit)
   , ("logical loop conditions preserve structured control flow", checkLogicalLoopConditions)
   , ("stage struct inputs satisfy Vulkan layout rules", checkStageStructInputLayout)
+  , ("ordinary struct values satisfy Vulkan layout rules", checkOrdinaryStructValueLayout)
+  , ("local arrays satisfy Vulkan layout rules", checkLocalArrayValueLayout)
+  , ("stage structs can also be uniform buffers", checkSharedStageUniformLayout)
+  , ("whole host composites load into value types", checkWholeHostCompositeLoad)
+  , ("oversized whole host composites fail before conversion", checkWholeHostCompositeLimit)
+  , ("whole value composites store into host types", checkWholeHostCompositeStore)
   , ("pointer parameters remain SSA pointer values", checkPointerParameterEmission)
   , ("pointer-containing type shapes are rejected", checkPointerTypeShapes)
   , ("pointer call aliases follow WGSL restrictions", checkPointerCallAliases)
@@ -88,9 +94,37 @@ checkStageStructInputLayout :: IO ()
 checkStageStructInputLayout = do
   bytes <- compileBytes [] stageStructInputSource
   validateSpirvWithOptions "stage-struct-input-vulkan" ["--target-env", "vulkan1.3"] bytes
+
+checkOrdinaryStructValueLayout :: IO ()
+checkOrdinaryStructValueLayout = do
+  bytes <- compileBytes [] ordinaryStructValueSource
+  validateSpirvWithOptions "ordinary-struct-value-vulkan" ["--target-env", "vulkan1.3"] bytes
+
+checkLocalArrayValueLayout :: IO ()
+checkLocalArrayValueLayout = do
+  bytes <- compileBytes [] localArrayValueSource
+  validateSpirvWithOptions "local-array-value-vulkan" ["--target-env", "vulkan1.3"] bytes
+
+checkSharedStageUniformLayout :: IO ()
+checkSharedStageUniformLayout = do
+  bytes <- compileBytes [] sharedStageUniformSource
+  validateSpirvWithOptions "shared-stage-uniform-vulkan" ["--target-env", "vulkan1.3"] bytes
+
+checkWholeHostCompositeLoad :: IO ()
+checkWholeHostCompositeLoad = do
+  bytes <- compileBytes [] wholeHostCompositeLoadSource
+  validateSpirvWithOptions "whole-host-composite-load-vulkan" ["--target-env", "vulkan1.3"] bytes
+
+checkWholeHostCompositeLimit :: IO ()
+checkWholeHostCompositeLimit =
   expectCompileError
-    ["stage I/O structs cannot also be used for host buffers", "Shared"]
-    sharedStageHostStructSource
+    ["host/value array conversion length 65533 exceeds SPIR-V composite limit 65532"]
+    wholeHostCompositeLimitSource
+
+checkWholeHostCompositeStore :: IO ()
+checkWholeHostCompositeStore = do
+  bytes <- compileBytes [] wholeHostCompositeStoreSource
+  validateSpirvWithOptions "whole-host-composite-store-vulkan" ["--target-env", "vulkan1.3"] bytes
 
 checkPointerParameterEmission :: IO ()
 checkPointerParameterEmission = do
@@ -785,13 +819,86 @@ stageStructInputSource = unlines
   , "}"
   ]
 
-sharedStageHostStructSource :: String
-sharedStageHostStructSource = unlines
-  [ "struct Shared { @location(0) value: vec4f, }"
+ordinaryStructValueSource :: String
+ordinaryStructValueSource = unlines
+  [ "struct Payload {"
+  , "  value: vec4f,"
+  , "}"
+  , "fn shade(input: Payload) -> vec4f {"
+  , "  var copy = input;"
+  , "  return copy.value;"
+  , "}"
+  , "@fragment"
+  , "fn main(@location(0) color: vec4f) -> @location(0) vec4f {"
+  , "  let payload = Payload(color);"
+  , "  return shade(payload);"
+  , "}"
+  ]
+
+localArrayValueSource :: String
+localArrayValueSource = unlines
+  [ "fn select_color(values: array<vec4f, 2>, index: u32) -> vec4f {"
+  , "  var copy = values;"
+  , "  return copy[index];"
+  , "}"
+  , "@fragment"
+  , "fn main(@location(0) color: vec4f) -> @location(0) vec4f {"
+  , "  let values = array<vec4f, 2>(color, color.wzyx);"
+  , "  return select_color(values, u32(color.x) % 2u);"
+  , "}"
+  ]
+
+sharedStageUniformSource :: String
+sharedStageUniformSource = unlines
+  [ "struct Shared {"
+  , "  @location(0) value: vec4f,"
+  , "}"
   , "@group(0) @binding(0) var<uniform> config: Shared;"
   , "@vertex"
   , "fn main(input: Shared) -> @builtin(position) vec4f {"
   , "  return input.value + config.value * 0.0;"
+  , "}"
+  ]
+
+wholeHostCompositeLoadSource :: String
+wholeHostCompositeLoadSource = unlines
+  [ "struct Inner {"
+  , "  tint: vec4f,"
+  , "}"
+  , "struct Params {"
+  , "  inner: Inner,"
+  , "  values: array<vec4f, 2>,"
+  , "}"
+  , "@group(0) @binding(0) var<uniform> params: Params;"
+  , "@fragment"
+  , "fn main(@location(0) @interpolate(flat) index: u32) -> @location(0) vec4f {"
+  , "  let local = params;"
+  , "  var copy = local;"
+  , "  return copy.inner.tint * copy.values[index % 2u];"
+  , "}"
+  ]
+
+wholeHostCompositeLimitSource :: String
+wholeHostCompositeLimitSource = unlines
+  [ "@group(0) @binding(0) var<storage, read> values: array<u32, 65533>;"
+  , "@compute @workgroup_size(1)"
+  , "fn main() {"
+  , "  let local = values;"
+  , "}"
+  ]
+
+wholeHostCompositeStoreSource :: String
+wholeHostCompositeStoreSource = unlines
+  [ "struct Payload {"
+  , "  value: vec4u,"
+  , "  values: array<vec4u, 2>,"
+  , "}"
+  , "@group(0) @binding(0) var<storage, read_write> output: Payload;"
+  , "@compute @workgroup_size(1)"
+  , "fn main(@builtin(global_invocation_id) invocation: vec3u) {"
+  , "  let value = vec4u(invocation.x);"
+  , "  let local = Payload(value, array<vec4u, 2>(value, value));"
+  , "  output = local;"
   , "}"
   ]
 

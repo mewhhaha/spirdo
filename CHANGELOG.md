@@ -85,10 +85,10 @@
 - Runtime logical operators short-circuit through structured SPIR-V control
   flow; specialization workgroup sizes use `OpExecutionModeId`, and SPIR-V
   strings use UTF-8.
-- Vulkan stage-I/O structs omit host-buffer layout decorations so immutable and
-  mutable local copies remain valid. Reusing one source struct for both stage
-  I/O and a host buffer is rejected until those contexts have distinct SPIR-V
-  type identities.
+- Vulkan host-buffer composites use distinct decorated SPIR-V type identities;
+  stage I/O, function parameters, and local structs or arrays remain
+  undecorated, with whole-composite loads and stores converted at host-memory
+  boundaries.
 - Unsuffixed scalar floats retain binary64 `AbstractFloat` precision until
   checked f32/f16 materialization, including direct round-to-nearest-even f16
   conversion without an intermediate f32 rounding step.

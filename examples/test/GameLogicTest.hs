@@ -20,14 +20,17 @@ import Examples.Game.Logic
   , gameScore
   , initialGame
   )
+import Examples.Game.Meshes (shipModel)
 
 main :: IO ()
 main = do
+  individualMovementKeysUseTheExpectedDirections
   movementAliasesDoNotStack
   interactiveFramesHaveABoundedDuration
   movingForOneSecondAdvancesFiveUnits
   diagonalMovementKeepsTheSameSpeed
   movingRightPointsThePlayerRight
+  shipModelFacesItsMovementDirection
   neutralInputPreservesThePlayerHeading
   movementStopsAtTheArenaBoundary
   slidingAlongAWallPreservesMovementSpeed
@@ -39,6 +42,31 @@ main = do
   resetRestoresTheInitialGame
   invalidFrameDurationDoesNotChangeTheGame
   putStrLn "game logic tests passed"
+
+individualMovementKeysUseTheExpectedDirections :: IO ()
+individualMovementKeysUseTheExpectedDirections =
+  mapM_ assertKeyDirection
+    [ (KeyA, MoveDirection (-1) 0)
+    , (KeyLeft, MoveDirection (-1) 0)
+    , (KeyD, MoveDirection 1 0)
+    , (KeyRight, MoveDirection 1 0)
+    , (KeyW, MoveDirection 0 (-1))
+    , (KeyUp, MoveDirection 0 (-1))
+    , (KeyS, MoveDirection 0 1)
+    , (KeyDown, MoveDirection 0 1)
+    ]
+  where
+    assertKeyDirection (key, expected) = do
+      let actual = movementFromKeys (== key)
+      unless (actual == expected) $
+        fail
+          ( "movement key "
+              <> show key
+              <> ": expected "
+              <> show expected
+              <> ", got "
+              <> show actual
+          )
 
 movementAliasesDoNotStack :: IO ()
 movementAliasesDoNotStack = do
@@ -69,6 +97,22 @@ movingRightPointsThePlayerRight :: IO ()
 movingRightPointsThePlayerRight = do
   let state = advanceGame 0.1 (moving 1 0) initialGame
   assertApprox "rightward player heading" (-pi / 2) (gamePlayerHeading state)
+
+shipModelFacesItsMovementDirection :: IO ()
+shipModelFacesItsMovementDirection = do
+  let localForward = V4 0 0 (-1) 0
+      neutralDirection = MoveDirection 0 0
+      GroundPosition playerX playerZ = gamePlayerPosition initialGame
+      V4 rightX _ _ _ =
+        m44MulV4
+          (shipModel (GroundPosition playerX playerZ) (-pi / 2) neutralDirection)
+          localForward
+      V4 leftX _ _ _ =
+        m44MulV4
+          (shipModel (GroundPosition playerX playerZ) (pi / 2) neutralDirection)
+          localForward
+  unless (rightX > 0 && leftX < 0) $
+    fail ("ship model does not face its movement direction: " <> show (rightX, leftX))
 
 neutralInputPreservesThePlayerHeading :: IO ()
 neutralInputPreservesThePlayerHeading = do

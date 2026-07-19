@@ -240,7 +240,8 @@ jobs:
           lavapipe_icd="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           test -n "$lavapipe_icd"
           SPIRDO_VULKAN_ICD="$lavapipe_icd" \
-            timeout --kill-after=15s 60s bash scripts/capture_game.sh /tmp/spirdo-game.png
+            timeout --kill-after=15s 60s bash scripts/capture_game.sh /tmp/spirdo-game.png \
+              2>&1 | tee /tmp/spirdo-game-capture.log
           test -s /tmp/spirdo-game.png
 
       - name: Upload game capture
@@ -248,5 +249,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: spirdo-game-capture
-          path: /tmp/spirdo-game.png
+          path: |
+            /tmp/spirdo-game.png
+            /tmp/spirdo-game-capture.log
           if-no-files-found: ignore
