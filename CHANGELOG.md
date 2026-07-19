@@ -89,6 +89,8 @@
   stage I/O, function parameters, and local structs or arrays remain
   undecorated, with whole-composite loads and stores converted at host-memory
   boundaries.
+- Whole values containing atomics are rejected before ordinary loads or stores;
+  atomic field operations continue to lower through SPIR-V atomic instructions.
 - Unsuffixed scalar floats retain binary64 `AbstractFloat` precision until
   checked f32/f16 materialization, including direct round-to-nearest-even f16
   conversion without an intermediate f32 rounding step.

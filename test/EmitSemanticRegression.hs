@@ -26,6 +26,10 @@ checks =
   , ("whole host composites load into value types", checkWholeHostCompositeLoad)
   , ("oversized whole host composites fail before conversion", checkWholeHostCompositeLimit)
   , ("whole value composites store into host types", checkWholeHostCompositeStore)
+  , ("physical composite conversion preserves member order", checkCompositeConversionOrder)
+  , ("immediate composites use valid push-constant layouts", checkImmediateCompositeLoad)
+  , ("atomic-containing values require atomic field operations", checkAtomicValueBoundaries)
+  , ("oversized SPIR-V instructions are rejected before encoding", checkInstructionWordCountLimit)
   , ("pointer parameters remain SSA pointer values", checkPointerParameterEmission)
   , ("pointer-containing type shapes are rejected", checkPointerTypeShapes)
   , ("pointer call aliases follow WGSL restrictions", checkPointerCallAliases)
@@ -125,6 +129,46 @@ checkWholeHostCompositeStore :: IO ()
 checkWholeHostCompositeStore = do
   bytes <- compileBytes [] wholeHostCompositeStoreSource
   validateSpirvWithOptions "whole-host-composite-store-vulkan" ["--target-env", "vulkan1.3"] bytes
+
+checkCompositeConversionOrder :: IO ()
+checkCompositeConversionOrder = do
+  bytes <- compileBytes [] compositeConversionOrderSource
+  instructions <- decodeSpirv bytes
+  let extractedByIndex index =
+        [ resultId
+        | (81, _typeId : resultId : _compositeId : memberIndex : _) <- instructions
+        , memberIndex == index
+        ]
+      expectedPairs = zip (extractedByIndex 0) (extractedByIndex 1)
+      constructedPairs =
+        [ (firstId, secondId)
+        | (80, _typeId : _resultId : firstId : secondId : []) <- instructions
+        ]
+  unless (length expectedPairs >= 2 && all (`elem` constructedPairs) expectedPairs) $
+    fail "host/value struct conversion changed source member order"
+  validateSpirvWithOptions "composite-conversion-order-vulkan" ["--target-env", "vulkan1.3"] bytes
+
+checkImmediateCompositeLoad :: IO ()
+checkImmediateCompositeLoad = do
+  bytes <- compileBytes [] immediateCompositeLoadSource
+  validateSpirvWithOptions "immediate-composite-load-vulkan" ["--target-env", "vulkan1.3"] bytes
+
+checkAtomicValueBoundaries :: IO ()
+checkAtomicValueBoundaries = do
+  expectCompileError ["atomic-containing values cannot be loaded"] storageAtomicCopySource
+  expectCompileError ["atomic-containing values cannot be loaded"] workgroupAtomicCopySource
+  expectCompileError ["atomic-containing values cannot be loaded"] nestedAtomicCopySource
+  expectCompileError ["atomic-containing values cannot be loaded"] atomicCompositeStoreSource
+  expectCompileError ["atomic-containing values cannot be loaded"] atomicPointerDerefSource
+  expectCompileError ["struct constructor Counters cannot contain atomic fields"] atomicStructConstructorSource
+  bytes <- compileBytes [] legalAtomicFieldOperationsSource
+  validateSpirvWithOptions "legal-atomic-field-operations-vulkan" ["--target-env", "vulkan1.3"] bytes
+
+checkInstructionWordCountLimit :: IO ()
+checkInstructionWordCountLimit =
+  expectCompileError
+    ["SPIR-V OpEntryPoint word count 65536 exceeds limit 65535"]
+    (longEntryPointSource (replicate 262129 'a'))
 
 checkPointerParameterEmission :: IO ()
 checkPointerParameterEmission = do
@@ -900,6 +944,106 @@ wholeHostCompositeStoreSource = unlines
   , "  let local = Payload(value, array<vec4u, 2>(value, value));"
   , "  output = local;"
   , "}"
+  ]
+
+compositeConversionOrderSource :: String
+compositeConversionOrderSource = unlines
+  [ "struct Pair {"
+  , "  first: u32,"
+  , "  second: u32,"
+  , "}"
+  , "@group(0) @binding(0) var<storage, read> input: Pair;"
+  , "@group(0) @binding(1) var<storage, read_write> output: Pair;"
+  , "@compute @workgroup_size(1)"
+  , "fn main() {"
+  , "  let local = input;"
+  , "  output = local;"
+  , "}"
+  ]
+
+immediateCompositeLoadSource :: String
+immediateCompositeLoadSource = unlines
+  [ "struct ImmediateInner {"
+  , "  color: vec4f,"
+  , "}"
+  , "struct ImmediateValues {"
+  , "  inner: ImmediateInner,"
+  , "  weights: array<vec4f, 2>,"
+  , "}"
+  , "var<immediate> constants: ImmediateValues;"
+  , "@fragment"
+  , "fn main() -> @location(0) vec4f {"
+  , "  let local = constants;"
+  , "  return local.inner.color + local.weights[1];"
+  , "}"
+  ]
+
+storageAtomicCopySource :: String
+storageAtomicCopySource = unlines
+  [ "struct Counters { value: atomic<u32>, sibling: u32, }"
+  , "@group(0) @binding(0) var<storage, read_write> counters: Counters;"
+  , "@compute @workgroup_size(1)"
+  , "fn main() { let snapshot = counters; }"
+  ]
+
+workgroupAtomicCopySource :: String
+workgroupAtomicCopySource = unlines
+  [ "struct Counters { value: atomic<u32>, sibling: u32, }"
+  , "var<workgroup> counters: Counters;"
+  , "@compute @workgroup_size(1)"
+  , "fn main() { let snapshot = counters; }"
+  ]
+
+nestedAtomicCopySource :: String
+nestedAtomicCopySource = unlines
+  [ "struct Counters { value: atomic<u32>, sibling: u32, }"
+  , "struct State { counters: Counters, generation: u32, }"
+  , "@group(0) @binding(0) var<storage, read_write> state: State;"
+  , "@compute @workgroup_size(1)"
+  , "fn main() { let snapshot = state; }"
+  ]
+
+atomicCompositeStoreSource :: String
+atomicCompositeStoreSource = unlines
+  [ "struct Counters { value: atomic<u32>, sibling: u32, }"
+  , "@group(0) @binding(0) var<storage, read_write> counters: Counters;"
+  , "@compute @workgroup_size(1)"
+  , "fn main() { counters = counters; }"
+  ]
+
+atomicPointerDerefSource :: String
+atomicPointerDerefSource = unlines
+  [ "struct Counters { value: atomic<u32>, sibling: u32, }"
+  , "@group(0) @binding(0) var<storage, read_write> counters: Counters;"
+  , "@compute @workgroup_size(1)"
+  , "fn main() { let local = *(&counters); }"
+  ]
+
+atomicStructConstructorSource :: String
+atomicStructConstructorSource = unlines
+  [ "struct Counters { value: atomic<u32>, sibling: u32, }"
+  , "@compute @workgroup_size(1)"
+  , "fn main() { let counters = Counters(); }"
+  ]
+
+legalAtomicFieldOperationsSource :: String
+legalAtomicFieldOperationsSource = unlines
+  [ "struct Counters { value: atomic<u32>, sibling: u32, }"
+  , "@group(0) @binding(0) var<storage, read_write> counters: Counters;"
+  , "@compute @workgroup_size(1)"
+  , "fn main() {"
+  , "  let loaded = atomicLoad(counters.value);"
+  , "  let previous = atomicAdd(counters.value, 1u);"
+  , "  atomicStore(counters.value, loaded + previous);"
+  , "  let sibling = counters.sibling;"
+  , "  counters.sibling = sibling + 1u;"
+  , "}"
+  ]
+
+longEntryPointSource :: String -> String
+longEntryPointSource name = unlines
+  [ "@compute @workgroup_size(1)"
+  , "fn " <> name <> "() {}"
   ]
 
 logicalLoopConditionsSource :: String

@@ -1034,7 +1034,10 @@ checkedFixedArrayLayout context len elemLayout = do
   Right (TLArray (Just len) stride elemLayout elemAlign total)
 
 checkedCompositeArrayLength :: String -> Int -> Either CompileError ()
-checkedCompositeArrayLength context len = do
+checkedCompositeArrayLength = checkedCompositeElementCount
+
+checkedCompositeElementCount :: String -> Int -> Either CompileError ()
+checkedCompositeElementCount context len = do
   checkedArrayLength len
   when (len > maxSpirvCompositeElements) $
     Left
@@ -3625,36 +3628,27 @@ addGlobal = addInstr (.gsGlobals) (\st v -> st { gsGlobals = v })
 emitStructs :: GenState -> ((), GenState)
 emitStructs st0 =
   let valueStructs = filter (not . containsRuntimeArray . snd) st0.gsStructLayouts
-      st1 = foldl' (emitStruct ValueType) st0 valueStructs
+      st1 = foldl' emitStruct st0 valueStructs
   in ((), st1)
   where
-    emitStruct flavor st (name, layout) =
+    emitStruct st (name, layout) =
       case layout of
         TLStruct _ fields _ _ ->
           let (structId, st1) =
-                case lookup (flavor, name) (st.gsStructIds) of
+                case lookup (ValueType, name) (st.gsStructIds) of
                   Just sid -> (sid, st)
                   Nothing ->
                     let (sid, st') = freshId st
-                    in (sid, st' { gsStructIds = ((flavor, name), sid) : st'.gsStructIds })
-              (st2, fieldTypeIds) = mapAccumL (emitFieldType flavor) st1 fields
+                    in (sid, st' { gsStructIds = ((ValueType, name), sid) : st'.gsStructIds })
+              (st2, fieldTypeIds) = mapAccumL emitFieldType st1 fields
               st3 = addType (Instr opTypeStruct (structId : fieldTypeIds)) st2
-              typeName = textToString name <> if flavor == HostType then "$host" else ""
-              st4 = addName (Instr opName (structId : encodeString typeName)) st3
-              st5 =
-                if flavor == HostType
-                  then foldl' (emitMemberDecorate structId) st4 (zip [0 :: Int ..] fields)
-                  else st4
-              st6 = foldl' (emitMemberName structId) st5 (zip [0 :: Int ..] fields)
-          in st6
+              st4 = addName (Instr opName (structId : encodeString (textToString name))) st3
+          in foldl' (emitMemberName structId) st4 (zip [0 :: Int ..] fields)
         _ -> st
 
-    emitFieldType flavor st field =
-      let (tyId, st') = emitTypeFromLayoutWith flavor st field.flType
+    emitFieldType st field =
+      let (tyId, st') = emitTypeFromLayout st field.flType
       in (st', tyId)
-
-    emitMemberDecorate structId st (ix, field) =
-      decorateStructMember structId (fromIntegral ix) field.flOffset field.flType st
 
     emitMemberName structId st (ix, field) =
       addName (Instr opMemberName (structId : fromIntegral ix : encodeString field.flName)) st
@@ -5198,6 +5192,8 @@ emitBarrierBuiltin name semMask args st fs =
 
 emitLoadFromPtr :: GenState -> FuncState -> VarInfo -> Either CompileError (GenState, FuncState, Value)
 emitLoadFromPtr st fs info = do
+  when (containsAtomic info.viType) $
+    Left (CompileError "atomic-containing values cannot be loaded; use atomic operations on individual fields" Nothing Nothing)
   (st1, fs1, ptrId) <- resolveVarPtr st fs info
   let st1' = recordPointerRead ptrId st1
   let sourceFlavor = typeFlavorForStorage info.viStorage
@@ -5214,6 +5210,7 @@ convertPhysicalValue sourceFlavor targetFlavor layout valueId st fs
   | otherwise =
       case layout of
         TLStruct _ fields _ _ -> do
+          checkedCompositeElementCount "host/value struct conversion" (length fields)
           (st1, fs1, reversedFieldIds) <- foldM convertField (st, fs, []) (zip [0 :: Word32 ..] fields)
           let (targetTypeId, st2) = emitTypeFromLayoutWith targetFlavor st1 layout
           let (resultId, st3) = freshId st2
@@ -5272,6 +5269,8 @@ resolveVarPtr st fs info =
 
 emitStoreToVar :: GenState -> FuncState -> VarInfo -> Word32 -> Either CompileError (GenState, FuncState)
 emitStoreToVar st fs info valueId = do
+  when (containsAtomic info.viType) $
+    Left (CompileError "atomic-containing values cannot be stored; use atomic operations on individual fields" Nothing Nothing)
   let targetFlavor = typeFlavorForStorage info.viStorage
   (st1, fs1, storedValueId) <- convertPhysicalValue ValueType targetFlavor (info.viType) valueId st fs
   (st2, fs2, ptrId) <- resolveVarPtr st1 fs1 info
@@ -5789,6 +5788,8 @@ emitExpr st fs expr =
       (st1, fs1, val) <- emitExpr st fs inner
       case val.valType of
         TLPointer storageClass _ elemLayout -> do
+          when (containsAtomic elemLayout) $
+            Left (CompileError "atomic-containing values cannot be loaded; use atomic operations on individual fields" Nothing Nothing)
           let st1' = recordPointerRead val.valId st1
           let sourceFlavor = typeFlavorForStorage storageClass
           let (tyId, st2) = emitTypeFromLayoutWith sourceFlavor st1' elemLayout
@@ -7835,6 +7836,9 @@ emitStructCtor :: Text -> TypeLayout -> [Expr] -> GenState -> FuncState -> Eithe
 emitStructCtor name layout args st fs =
   case layout of
     TLStruct _ fields _ _ -> do
+      checkedCompositeElementCount "struct constructor" (length fields)
+      when (containsAtomic layout) $
+        Left (CompileError ("struct constructor " <> textToString name <> " cannot contain atomic fields") Nothing Nothing)
       case args of
         [] -> do
           (st1, v) <- emitZeroConstValue layout st
@@ -9733,8 +9737,33 @@ boolResultLayout n =
 buildSpirvBytes :: CompileOptions -> EntryPoint -> ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> GenState -> Either CompileError ByteString
 buildSpirvBytes opts entry ctx constIndex fnIndex structIndex st = do
   (emitState, execModeInstr) <- computeExecModeInstruction st
+  validateInstructionWordCounts emitState
   pure (spirvToBytes (header emitState <> body emitState execModeInstr))
   where
+    validateInstructionWordCounts emitState = do
+      mapM_ (validateInstructionWordCount "OpEntryPoint") (entryPointInstruction emitState)
+      mapM_
+        (\instr@(Instr opcode _) -> validateInstructionWordCount ("opcode " <> show opcode) instr)
+        ( emitState.gsExtInstImports
+            <> emitState.gsNames
+            <> emitState.gsDecorations
+            <> emitState.gsTypes
+            <> emitState.gsConstants
+            <> emitState.gsGlobals
+            <> emitState.gsFunctions
+        )
+
+    validateInstructionWordCount label (Instr _ operands) =
+      let wordCount = 1 + length operands
+          limit = fromIntegral (maxBound :: Word16)
+      in when (wordCount > limit) $
+          Left
+            (CompileError
+              ("SPIR-V " <> label <> " word count " <> show wordCount <> " exceeds limit " <> show limit)
+              Nothing
+              Nothing
+            )
+
     emitWorkgroupSizeIds exprs st0 = do
       when (null exprs || length exprs > 3) $
         Left (CompileError "@workgroup_size expects 1, 2, or 3 values" Nothing Nothing)
@@ -9818,9 +9847,9 @@ buildSpirvBytes opts entry ctx constIndex fnIndex structIndex st = do
     header emitState =
       [0x07230203, opts.spirvVersion, 0, emitState.gsNextId, 0]
 
-    entryPointInstr emitState =
+    entryPointInstruction emitState =
       case emitState.gsEntryPoint of
-        Nothing -> mempty
+        Nothing -> Nothing
         Just epId ->
           let nameWords = encodeString (textToString entry.epName)
               model = case entry.epStage of
@@ -9832,7 +9861,10 @@ buildSpirvBytes opts entry ctx constIndex fnIndex structIndex st = do
                   then emitState.gsInterfaceIds
                   else filter (`elem` inputOutputIds emitState) emitState.gsInterfaceIds
               operands = model : epId : nameWords <> interfaceIds
-          in encodeInstr (Instr opEntryPoint operands)
+          in Just (Instr opEntryPoint operands)
+
+    entryPointInstr emitState =
+      maybe mempty encodeInstr (entryPointInstruction emitState)
 
     capInstrs emitState =
       concatMap (\cap -> encodeInstr (Instr opCapability [cap])) (capabilityShader : emitState.gsCapabilities)
