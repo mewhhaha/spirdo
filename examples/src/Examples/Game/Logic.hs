@@ -14,6 +14,7 @@ module Examples.Game.Logic
   , initialGame
   , advanceGame
   , gamePlayerPosition
+  , gamePlayerHeading
   , gameScore
   , activeCrystals
   ) where
@@ -44,6 +45,7 @@ data Crystal = Crystal
 
 data GameState = GameState
   { player :: !GroundPosition
+  , heading :: !Float
   , elapsed :: !Float
   , score :: !Int
   , collected :: ![CrystalId]
@@ -88,6 +90,7 @@ initialGame :: GameState
 initialGame =
   GameState
     { player = GroundPosition 0 0
+    , heading = 0
     , elapsed = 0
     , score = 0
     , collected = []
@@ -112,6 +115,7 @@ advanceSimulationStep :: Float -> MoveDirection -> GameState -> GameState
 advanceSimulationStep stepSeconds direction state =
   GameState
     { player = nextPlayerPosition
+    , heading = nextHeading
     , elapsed = nextElapsed
     , score = state.score + length newlyCollected
     , collected = state.collected <> newlyCollected
@@ -119,6 +123,11 @@ advanceSimulationStep stepSeconds direction state =
   where
     nextElapsed = state.elapsed + stepSeconds
     nextPlayerPosition = movePlayer stepSeconds direction state.player
+    movementX = nextPlayerPosition.x - state.player.x
+    movementZ = nextPlayerPosition.z - state.player.z
+    nextHeading
+      | movementX == 0 && movementZ == 0 = state.heading
+      | otherwise = atan2 (-movementX) (-movementZ)
     newlyCollected =
       fmap (.id)
         ( filter
@@ -128,6 +137,9 @@ advanceSimulationStep stepSeconds direction state =
 
 gamePlayerPosition :: GameState -> GroundPosition
 gamePlayerPosition = (.player)
+
+gamePlayerHeading :: GameState -> Float
+gamePlayerHeading = (.heading)
 
 gameScore :: GameState -> Int
 gameScore = (.score)
@@ -156,14 +168,22 @@ crystalAt gameTime seed =
 movePlayer :: Float -> MoveDirection -> GroundPosition -> GroundPosition
 movePlayer frameSeconds direction position
   | not (isFinite direction.x && isFinite direction.z) = position
-  | directionMagnitude == 0 = position
+  | availableMagnitude == 0 = position
   | otherwise =
       GroundPosition
-        { x = clampArena (position.x + distance * direction.x / directionMagnitude)
-        , z = clampArena (position.z + distance * direction.z / directionMagnitude)
+        { x = clampArena (position.x + distance * availableX / availableMagnitude)
+        , z = clampArena (position.z + distance * availableZ / availableMagnitude)
         }
   where
-    directionMagnitude = sqrt (direction.x * direction.x + direction.z * direction.z)
+    availableX
+      | position.x <= -arenaHalfExtent && direction.x < 0 = 0
+      | position.x >= arenaHalfExtent && direction.x > 0 = 0
+      | otherwise = direction.x
+    availableZ
+      | position.z <= -arenaHalfExtent && direction.z < 0 = 0
+      | position.z >= arenaHalfExtent && direction.z > 0 = 0
+      | otherwise = direction.z
+    availableMagnitude = sqrt (availableX * availableX + availableZ * availableZ)
     distance = playerSpeed * frameSeconds
 
 isWithinCollectionRange :: GroundPosition -> GroundPosition -> Float -> Float -> CrystalSeed -> Bool

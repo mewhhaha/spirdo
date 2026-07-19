@@ -5,9 +5,10 @@
 module Main (main) where
 
 import Control.Monad (unless)
-import Slop (V4(..), m44MulV4)
+import Slop (Key(..), V4(..), m44MulV4)
 
 import Examples.Game.Camera (gameViewProjection)
+import Examples.Game.Input (interactiveFrameSeconds, movementFromKeys)
 import Examples.Game.Logic
   ( GameInput(..)
   , GroundPosition(..)
@@ -15,15 +16,21 @@ import Examples.Game.Logic
   , activeCrystals
   , advanceGame
   , gamePlayerPosition
+  , gamePlayerHeading
   , gameScore
   , initialGame
   )
 
 main :: IO ()
 main = do
+  movementAliasesDoNotStack
+  interactiveFramesHaveABoundedDuration
   movingForOneSecondAdvancesFiveUnits
   diagonalMovementKeepsTheSameSpeed
+  movingRightPointsThePlayerRight
+  neutralInputPreservesThePlayerHeading
   movementStopsAtTheArenaBoundary
+  slidingAlongAWallPreservesMovementSpeed
   reachingACrystalCollectsItOnce
   crossingACrystalDuringALongFrameCollectsIt
   orbitingCrystalIsCollectedBetweenMatchingEndpoints
@@ -32,6 +39,17 @@ main = do
   resetRestoresTheInitialGame
   invalidFrameDurationDoesNotChangeTheGame
   putStrLn "game logic tests passed"
+
+movementAliasesDoNotStack :: IO ()
+movementAliasesDoNotStack = do
+  let direction = movementFromKeys (`elem` [KeyW, KeyUp, KeyS])
+  unless (direction == MoveDirection 0 0) $
+    fail ("movement aliases did not cancel the opposite direction: " <> show direction)
+
+interactiveFramesHaveABoundedDuration :: IO ()
+interactiveFramesHaveABoundedDuration = do
+  assertApprox "interactive frame duration cap" 0.25 (interactiveFrameSeconds 4)
+  assertApprox "ordinary interactive frame duration" 0.1 (interactiveFrameSeconds 0.1)
 
 movingForOneSecondAdvancesFiveUnits :: IO ()
 movingForOneSecondAdvancesFiveUnits = do
@@ -47,11 +65,34 @@ diagonalMovementKeepsTheSameSpeed = do
       distance = sqrt (position.x * position.x + position.z * position.z)
   assertApprox "diagonal movement distance" 5 distance
 
+movingRightPointsThePlayerRight :: IO ()
+movingRightPointsThePlayerRight = do
+  let state = advanceGame 0.1 (moving 1 0) initialGame
+  assertApprox "rightward player heading" (-pi / 2) (gamePlayerHeading state)
+
+neutralInputPreservesThePlayerHeading :: IO ()
+neutralInputPreservesThePlayerHeading = do
+  let movingState = advanceGame 0.1 (moving 1 0) initialGame
+      neutralState = advanceGame 0.1 (moving 0 0) movingState
+  assertApprox
+    "neutral input preserves player heading"
+    (gamePlayerHeading movingState)
+    (gamePlayerHeading neutralState)
+
 movementStopsAtTheArenaBoundary :: IO ()
 movementStopsAtTheArenaBoundary = do
   let state = advanceGame 10 (moving 1 0) initialGame
       position = gamePlayerPosition state
   assertApprox "arena boundary" 8 position.x
+
+slidingAlongAWallPreservesMovementSpeed :: IO ()
+slidingAlongAWallPreservesMovementSpeed = do
+  let atWall = advanceGame 2 (moving 1 0) initialGame
+      state = advanceGame 1 (moving 1 1) atWall
+      position = gamePlayerPosition state
+  assertApprox "wall slide remains on boundary" 8 position.x
+  assertApprox "wall slide preserves tangent speed" 5 position.z
+  assertApprox "wall slide faces its tangent direction" pi (abs (gamePlayerHeading state))
 
 reachingACrystalCollectsItOnce :: IO ()
 reachingACrystalCollectsItOnce = do

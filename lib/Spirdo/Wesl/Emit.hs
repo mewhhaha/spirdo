@@ -1084,6 +1084,36 @@ emitSpirv opts modAst _iface = do
   let structEnv = [(s.sdName, s) | s <- modAst.modStructs]
   structLayoutsMap <- resolveStructLayouts structEnv
   let structLayouts = Map.toList structLayoutsMap
+  let stageIOStructs =
+        Set.fromList
+          ( [ name
+            | param <- entry.epParams
+            , TyStructRef name <- [param.paramType]
+            ]
+              <> [name | Just (TyStructRef name) <- [entry.epReturnType]]
+          )
+  bindingInfos <- mapM (layoutBinding structLayoutsMap) (modAst.modBindings)
+  immediateLayouts <-
+    mapM
+      (resolveTypeLayoutWithCache structLayoutsMap . (.gvType))
+      (filter ((== "immediate") . (.gvSpace)) (modAst.modGlobals))
+  let hostStructs =
+        Set.unions
+          ( map structNamesInLayout
+              ( [binding.biType | binding <- bindingInfos, isBufferBindingKind binding.biKind]
+                  <> immediateLayouts
+              )
+          )
+      sharedStageHostStructs = Set.intersection stageIOStructs hostStructs
+  unless (Set.null sharedStageHostStructs) $
+    Left
+      ( CompileError
+          ( "stage I/O structs cannot also be used for host buffers: "
+              <> intercalate ", " (map textToString (Set.toList sharedStageHostStructs))
+          )
+          Nothing
+          Nothing
+      )
   samplerLayouts <- collectSamplerLayouts structLayoutsMap (modAst.modBindings)
   retLayout <- case (entry.epStage, entry.epReturnType) of
     (StageFragment, Just ty) -> Just <$> resolveTypeLayoutWithCache structLayoutsMap ty
@@ -1103,6 +1133,7 @@ emitSpirv opts modAst _iface = do
           opts.openGlBindingRemaps
           opts.samplerBindingMode
           entry.epStage
+          stageIOStructs
           structLayouts
           samplerLayouts
           enabledFeatures
@@ -3453,6 +3484,7 @@ data GenState = GenState
   , gsFunctionTable :: [FunctionInfo]
   , gsFunctionsByName :: Map.Map Text [FunctionInfo]
   , gsEntryStage :: Stage
+  , gsStageIOStructs :: !(Set.Set Text)
   , gsEnabledFeatures :: Set.Set Text
   , gsConstValues :: [(Text, Value)]
   , gsConstValuesByName :: Map.Map Text Value
@@ -3481,8 +3513,8 @@ data GenState = GenState
   , gsConstEvalStructIndex :: !StructIndex
   }
 
-emptyGenState :: SpirvTargetEnvironment -> [OpenGlBindingRemap] -> SamplerBindingMode -> Stage -> [(Text, TypeLayout)] -> Map.Map Text TypeLayout -> [Text] -> ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> GenState
-emptyGenState target bindingRemaps samplerMode stage structLayouts samplerLayouts enabledFeatures constEvalContext constEvalIndex constEvalFunctionIndex constEvalStructIndex =
+emptyGenState :: SpirvTargetEnvironment -> [OpenGlBindingRemap] -> SamplerBindingMode -> Stage -> Set.Set Text -> [(Text, TypeLayout)] -> Map.Map Text TypeLayout -> [Text] -> ModuleContext -> ConstIndex -> FunctionIndex -> StructIndex -> GenState
+emptyGenState target bindingRemaps samplerMode stage stageIOStructs structLayouts samplerLayouts enabledFeatures constEvalContext constEvalIndex constEvalFunctionIndex constEvalStructIndex =
   let (ids, nextId) = assignStructIds 1 structLayouts
   in GenState
       { gsNextId = nextId
@@ -3500,6 +3532,7 @@ emptyGenState target bindingRemaps samplerMode stage structLayouts samplerLayout
       , gsFunctionTable = []
       , gsFunctionsByName = Map.empty
       , gsEntryStage = stage
+      , gsStageIOStructs = stageIOStructs
       , gsEnabledFeatures = Set.fromList enabledFeatures
       , gsConstValues = []
       , gsConstValuesByName = Map.empty
@@ -3634,7 +3667,10 @@ emitStructs st0 =
               (st2, fieldTypeIds) = mapAccumL emitFieldType st1 fields
               st3 = addType (Instr opTypeStruct (structId : fieldTypeIds)) st2
               st4 = addName (Instr opName (structId : encodeString (textToString name))) st3
-              st5 = foldl' (emitMemberDecorate structId) st4 (zip [0 :: Int ..] fields)
+              st5 =
+                if Set.member name st4.gsStageIOStructs
+                  then st4
+                  else foldl' (emitMemberDecorate structId) st4 (zip [0 :: Int ..] fields)
               st6 = foldl' (emitMemberName structId) st5 (zip [0 :: Int ..] fields)
           in st6
         _ -> st
@@ -10074,7 +10110,10 @@ emitTypeFromLayout st layout =
               (st3, fieldTypeIds) = mapAccumL emitFieldType st2 fields
               st4 = addType (Instr opTypeStruct (sid : fieldTypeIds)) st3
               st5 = addName (Instr opName (sid : encodeString name)) st4
-              st6 = foldl' (emitMemberDecorate sid) st5 (zip [0 :: Int ..] fields)
+              st6 =
+                if Set.member nameT st5.gsStageIOStructs
+                  then st5
+                  else foldl' (emitMemberDecorate sid) st5 (zip [0 :: Int ..] fields)
               st7 = foldl' (emitMemberName sid) st6 (zip [0 :: Int ..] fields)
           in (sid, st7)
   where
@@ -10179,6 +10218,15 @@ isBufferBindingKind kind =
     BStorageRead -> True
     BStorageReadWrite -> True
     _ -> False
+
+structNamesInLayout :: TypeLayout -> Set.Set Text
+structNamesInLayout layout =
+  case layout of
+    TLArray _ _ elementLayout _ _ -> structNamesInLayout elementLayout
+    TLStruct name fields _ _ ->
+      Set.insert (T.pack name) (Set.unions (map (structNamesInLayout . (.flType)) fields))
+    TLPointer _ _ elementLayout -> structNamesInLayout elementLayout
+    _ -> Set.empty
 
 addBufferF16Capability :: BindingKind -> TypeLayout -> GenState -> GenState
 addBufferF16Capability kind layout st

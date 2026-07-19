@@ -6,7 +6,9 @@ module Main (main) where
 
 import Control.Monad (forM_, when)
 import Control.Monad.IO.Class (liftIO)
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Word (Word32)
+import System.Environment (lookupEnv)
 import Slop hiding (Shader)
 import Spirdo.Wesl.Reflection
   ( BindingInfo
@@ -19,6 +21,7 @@ import Spirdo.Wesl.Reflection
   )
 
 import Examples.Game.Camera (gameViewProjection)
+import Examples.Game.Input (interactiveFrameSeconds, movementFromKeys)
 import Examples.Game.Logic
   ( Crystal(..)
   , GameInput(..)
@@ -28,6 +31,7 @@ import Examples.Game.Logic
   , activeCrystals
   , advanceGame
   , gamePlayerPosition
+  , gamePlayerHeading
   , gameScore
   , initialGame
   )
@@ -50,9 +54,15 @@ data GameMeshes = GameMeshes
   , pillar :: !Mesh
   }
 
+data GameMode
+  = Interactive
+  | HeadlessCapture !FilePath
+
 main :: IO ()
 main = do
-  let cfg =
+  captureReadyFile <- lookupEnv "SPIRDO_CAPTURE_READY_FILE"
+  let gameMode = maybe Interactive HeadlessCapture captureReadyFile
+      cfg =
         defaultConfig
           { windowTitle = "Spirdo Crystal Run — WASD/arrows move, R resets"
           , windowWidth = 960
@@ -61,6 +71,7 @@ main = do
           }
   runWindow cfg $ do
     meshes <- createGameMeshes
+    startedFrames <- liftIO (newIORef 0)
     -- SDL_gpu's SPIR-V ABI assigns vertex and fragment uniforms to sets 1 and 3.
     vertexShaderCounts <- requireShaderCounts "vertex shader" 1 gameVertexShader
     vertexShader <-
@@ -89,7 +100,7 @@ main = do
       putStrLn "Crystal Run: collect all five crystals."
       putStrLn "Move with WASD or the arrow keys; press R to reset."
 
-    _ <- loop initialGame (gameFrame meshes pipeline)
+    _ <- loop initialGame (gameFrame gameMode startedFrames meshes pipeline)
     pure ()
 
 createGameMeshes :: WindowM GameMeshes
@@ -138,18 +149,34 @@ uniformBindingCount expectedGroup bindings = do
           Left ("uniform slot count exceeds Word32: " <> show count.bscSlots)
       | otherwise -> Right (fromIntegral count.bscSlots)
 
-gameFrame :: GameMeshes -> Pipeline -> Frame -> GameState -> Loop (LoopControl GameState)
-gameFrame meshes pipeline frame state = do
+gameFrame :: GameMode -> IORef Int -> GameMeshes -> Pipeline -> Frame -> GameState -> Loop (LoopControl GameState)
+gameFrame gameMode startedFrames meshes pipeline frame state = do
+  liftLoop $ liftIO $
+    case gameMode of
+      Interactive -> pure ()
+      HeadlessCapture readyFile -> do
+        startedFrame <- atomicModifyIORef' startedFrames (\count -> let next = count + 1 in (next, next))
+        when (startedFrame == 2) (writeFile readyFile "ready\n")
+
   let moveDirection = movementFromInput frame.input
+      frameSeconds =
+        case gameMode of
+          Interactive -> interactiveFrameSeconds frame.delta
+          HeadlessCapture _ -> 0
+      animationTime =
+        case gameMode of
+          Interactive -> frame.time
+          HeadlessCapture _ -> 0
       input =
         GameInput
           { move = moveDirection
           , reset = keyPressed KeyR frame.input
           }
-      nextState = advanceGame frame.delta input state
+      nextState = advanceGame frameSeconds input state
       score = gameScore nextState
       previousScore = gameScore state
       playerPosition = gamePlayerPosition nextState
+      playerHeading = gamePlayerHeading nextState
       viewProjection = gameViewProjection frame.renderSize playerPosition
 
   when (score /= previousScore) $
@@ -158,35 +185,17 @@ gameFrame meshes pipeline frame state = do
   clear (rgb 0.055 0.08 0.15)
   drawModel pipeline meshes.ground viewProjection (scale 1 1 1)
   drawArenaPillars pipeline meshes.pillar viewProjection
-  drawCrystals pipeline meshes.crystal viewProjection frame.time (activeCrystals nextState)
-  drawShip pipeline meshes.ship viewProjection playerPosition moveDirection
+  drawCrystals pipeline meshes.crystal viewProjection animationTime (activeCrystals nextState)
+  drawShip pipeline meshes.ship viewProjection playerPosition playerHeading moveDirection
   pure (Continue nextState)
 
 movementFromInput :: InputFrame -> MoveDirection
-movementFromInput input =
-  MoveDirection
-    { x = keyAxis KeyA KeyLeft KeyD KeyRight
-    , z = keyAxis KeyW KeyUp KeyS KeyDown
-    }
-  where
-    current = input.inputNow
-    keyAxis negativeKey alternateNegativeKey positiveKey alternatePositiveKey =
-      keyValue positiveKey current
-        + keyValue alternatePositiveKey current
-        - keyValue negativeKey current
-        - keyValue alternateNegativeKey current
+movementFromInput input = movementFromKeys (`keyDown` input.inputNow)
 
-keyValue :: Key -> InputState -> Float
-keyValue key current =
-  if keyDown key current then 1 else 0
-
-drawShip :: Pipeline -> Mesh -> M44 Float -> GroundPosition -> MoveDirection -> Loop ()
-drawShip pipeline mesh viewProjection playerPosition direction =
+drawShip :: Pipeline -> Mesh -> M44 Float -> GroundPosition -> Float -> MoveDirection -> Loop ()
+drawShip pipeline mesh viewProjection playerPosition facing direction =
   drawModel pipeline mesh viewProjection model
   where
-    facing
-      | direction.x == 0 && direction.z == 0 = 0
-      | otherwise = atan2 (-direction.x) (-direction.z)
     bank = (-direction.x) * 0.16
     model =
       translation playerPosition.x 0.48 playerPosition.z
@@ -223,7 +232,7 @@ drawArenaPillars pipeline mesh viewProjection =
 
 drawModel :: Pipeline -> Mesh -> M44 Float -> M44 Float -> Loop ()
 drawModel pipeline mesh viewProjection model =
-  drawMesh pipeline mesh [vUniform 0 (viewProjection * model)]
+  drawMesh pipeline mesh [vUniform 0 viewProjection, vUniform 1 model]
 
 announceScore :: Int -> IO ()
 announceScore score = do

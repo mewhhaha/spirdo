@@ -83,7 +83,8 @@ to `/tmp/spirdo-game.png`. This Linux/X11 smoke check requires Xvfb, FFmpeg,
 SDL3, and a Vulkan driver. On a machine without a physical GPU, set
 `SPIRDO_VULKAN_ICD` to an absolute Lavapipe ICD manifest path. Set
 `SPIRDO_VULKAN_LIB_DIR` as well only when Lavapipe's shared libraries are not on
-the system loader path.
+the system loader path. Capture mode freezes animation time and polls until the
+expected ship and crystal regions contain enough matching pixels.
 
 ## Runtime compilation
 

@@ -188,33 +188,65 @@ jobs:
         run: |
           set -euo pipefail
           mixer_dir="$(mktemp -d)"
+          mixer_prefix="$RUNNER_TEMP/sdl3-mixer"
           trap 'rm -rf "$mixer_dir"' EXIT
           git init "$mixer_dir"
           git -C "$mixer_dir" remote add origin https://github.com/libsdl-org/SDL_mixer.git
           git -C "$mixer_dir" fetch --depth=1 origin 72a81869b45e249e8e67102db4e98dd2441f05a1
           git -C "$mixer_dir" checkout --detach FETCH_HEAD
           cmake -S "$mixer_dir" -B "$mixer_dir/build" \
+            -DCMAKE_INSTALL_PREFIX="$mixer_prefix" \
             -DSDLMIXER_INSTALL=ON \
             -DSDLMIXER_VENDORED=OFF
           cmake --build "$mixer_dir/build" --parallel
-          sudo cmake --install "$mixer_dir/build"
-          pkg-config --atleast-version=3.2 sdl3-mixer
+          cmake --install "$mixer_dir/build"
+          mixer_pc="$(find "$mixer_prefix" -name sdl3-mixer.pc -print -quit)"
+          mixer_library="$(find "$mixer_prefix" -name 'libSDL3_mixer.so.0*' -print -quit)"
+          test -n "$mixer_pc"
+          test -n "$mixer_library"
+          mixer_pc_dir="$(dirname "$mixer_pc")"
+          mixer_library_dir="$(dirname "$mixer_library")"
+          echo "PKG_CONFIG_PATH=$mixer_pc_dir${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$mixer_library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          PKG_CONFIG_PATH="$mixer_pc_dir${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+            pkg-config --atleast-version=3.2 sdl3-mixer
 
       - name: Refresh Cabal index
         working-directory: examples
         run: cabal update
 
-      - name: Build examples package with pinned Slop source
-        working-directory: examples
+      - name: Build bundled examples from source distribution
         run: |
-          cabal build --project-file=cabal.project --enable-tests all
-          cabal test --project-file=cabal.project spirdo-game-tests
+          set -euo pipefail
+          sdist_dir="$RUNNER_TEMP/spirdo-sdist"
+          mkdir -p "$sdist_dir"
+          cabal sdist --output-directory="$sdist_dir"
+          tarball="$(find "$sdist_dir" -maxdepth 1 -name 'spirdo-*.tar.gz' -print -quit)"
+          test -n "$tarball"
+          tar -xzf "$tarball" -C "$sdist_dir"
+          package_dir="$(find "$sdist_dir" -mindepth 1 -maxdepth 1 -type d -name 'spirdo-*' -print -quit)"
+          test -n "$package_dir"
+          echo "SPIRDO_PACKAGE_DIR=$package_dir" >> "$GITHUB_ENV"
+          (
+            cd "$package_dir/examples"
+            cabal build --project-file=cabal.project --enable-tests all
+            cabal test --project-file=cabal.project spirdo-game-tests
+          )
 
       - name: Capture game with Lavapipe
         run: |
           set -euo pipefail
+          cd "$SPIRDO_PACKAGE_DIR"
           lavapipe_icd="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           test -n "$lavapipe_icd"
           SPIRDO_VULKAN_ICD="$lavapipe_icd" \
-            timeout 60s bash scripts/capture_game.sh /tmp/spirdo-game.png
+            timeout --kill-after=15s 60s bash scripts/capture_game.sh /tmp/spirdo-game.png
           test -s /tmp/spirdo-game.png
+
+      - name: Upload game capture
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spirdo-game-capture
+          path: /tmp/spirdo-game.png
+          if-no-files-found: ignore

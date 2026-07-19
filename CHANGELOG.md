@@ -1,6 +1,6 @@
 # Revision history for Spirdo
 
-## 0.2.0.0 -- 2026-07-13
+## 0.2.0.0 -- Unreleased
 
 ### Breaking changes
 
@@ -85,6 +85,10 @@
 - Runtime logical operators short-circuit through structured SPIR-V control
   flow; specialization workgroup sizes use `OpExecutionModeId`, and SPIR-V
   strings use UTF-8.
+- Vulkan stage-I/O structs omit host-buffer layout decorations so immutable and
+  mutable local copies remain valid. Reusing one source struct for both stage
+  I/O and a host buffer is rejected until those contexts have distinct SPIR-V
+  type identities.
 - Unsuffixed scalar floats retain binary64 `AbstractFloat` precision until
   checked f32/f16 materialization, including direct round-to-nearest-even f16
   conversion without an intermediate f32 rounding step.
@@ -101,7 +105,7 @@
   Mixed i32/u32 workgroup dimensions remain rejected. Strict mode omits
   `SpecId` from derived and composite/non-scalar-literal specialization
   instructions; parity mode may be validator-incompatible for those forms.
-- The optional demo is a separately built GHC 9.14 package; its gallery includes
+- The optional examples are a separately built GHC 9.14 package; the gallery includes
   a validated SDF Text variant and no longer carries an unusable texture-backed
   shader module.
 

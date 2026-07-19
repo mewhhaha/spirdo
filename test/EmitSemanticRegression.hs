@@ -19,6 +19,7 @@ checks :: [(String, IO ())]
 checks =
   [ ("logical operators short-circuit", checkLogicalShortCircuit)
   , ("logical loop conditions preserve structured control flow", checkLogicalLoopConditions)
+  , ("stage struct inputs satisfy Vulkan layout rules", checkStageStructInputLayout)
   , ("pointer parameters remain SSA pointer values", checkPointerParameterEmission)
   , ("pointer-containing type shapes are rejected", checkPointerTypeShapes)
   , ("pointer call aliases follow WGSL restrictions", checkPointerCallAliases)
@@ -82,6 +83,14 @@ checkLogicalLoopConditions = do
     fail "logical loop conditions did not emit all four structured loop headers"
   validateSpirv "logical-loop-conditions" bytes
   validateSpirvWithOptions "logical-loop-conditions-vulkan" ["--target-env", "vulkan1.3"] bytes
+
+checkStageStructInputLayout :: IO ()
+checkStageStructInputLayout = do
+  bytes <- compileBytes [] stageStructInputSource
+  validateSpirvWithOptions "stage-struct-input-vulkan" ["--target-env", "vulkan1.3"] bytes
+  expectCompileError
+    ["stage I/O structs cannot also be used for host buffers", "Shared"]
+    sharedStageHostStructSource
 
 checkPointerParameterEmission :: IO ()
 checkPointerParameterEmission = do
@@ -755,6 +764,34 @@ logicalShortCircuitSource = unlines
   , "fn main() {"
   , "  let and_result = false && side_effect();"
   , "  let or_result = true || side_effect();"
+  , "}"
+  ]
+
+stageStructInputSource :: String
+stageStructInputSource = unlines
+  [ "struct FragmentInput {"
+  , "  @location(0) position: vec3f,"
+  , "  @location(1) color: vec4f,"
+  , "}"
+  , "fn shade(input: FragmentInput) -> vec4f {"
+  , "  return input.color * input.position.x;"
+  , "}"
+  , "@fragment"
+  , "fn main(input: FragmentInput) -> @location(0) vec4f {"
+  , "  let immutable_copy = input;"
+  , "  var mutable_copy = immutable_copy;"
+  , "  mutable_copy.color = shade(mutable_copy);"
+  , "  return mutable_copy.color;"
+  , "}"
+  ]
+
+sharedStageHostStructSource :: String
+sharedStageHostStructSource = unlines
+  [ "struct Shared { @location(0) value: vec4f, }"
+  , "@group(0) @binding(0) var<uniform> config: Shared;"
+  , "@vertex"
+  , "fn main(input: Shared) -> @builtin(position) vec4f {"
+  , "  return input.value + config.value * 0.0;"
   , "}"
   ]
 

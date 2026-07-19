@@ -1,11 +1,12 @@
 cabal-version:      3.14
 name:               spirdo-examples
 version:            0.2.0.0
-synopsis:           Interactive GPU shader demo for Spirdo
+synopsis:           Interactive GPU shader examples for Spirdo
 description:
-    An optional SDL GPU demo that renders the WESL and WGSL shaders compiled
-    by Spirdo. It exercises fragment, vertex, compute, resource, and override
-    workflows against a live GPU backend.
+    Optional SDL GPU examples that render WESL and WGSL shaders compiled by
+    Spirdo. The package includes a shader gallery and the Crystal Run 3D game,
+    exercising fragment, vertex, compute, resource, and override workflows
+    against a live GPU backend.
 homepage:            https://github.com/mewhhaha/spirdo
 bug-reports:         https://github.com/mewhhaha/spirdo/issues
 license:            MIT
@@ -54,6 +55,7 @@ executable spirdo-game
     main-is:          Game.hs
     other-modules:
         Examples.Game.Camera
+        Examples.Game.Input
         Examples.Game.Logic
         Examples.Game.Meshes
         Examples.Game.Shaders
@@ -71,6 +73,7 @@ test-suite spirdo-game-tests
     main-is:          GameLogicTest.hs
     other-modules:
         Examples.Game.Camera
+        Examples.Game.Input
         Examples.Game.Logic
     build-depends:
         base >=4.21 && <4.23,

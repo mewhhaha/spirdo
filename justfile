@@ -43,7 +43,7 @@ game-test:
 
 # Capture one game frame under Xvfb; use Lavapipe when no physical GPU is available.
 game-capture output="/tmp/spirdo-game.png":
-    bash scripts/capture_game.sh "{{output}}"
+    bash scripts/capture_game.sh {{ quote(output) }}
 
 # Run the demo and write its SPIR-V outputs in examples/.
 demo-spv:
